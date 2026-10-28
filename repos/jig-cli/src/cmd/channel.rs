@@ -32,6 +32,7 @@ use jig_client::blocks::{
     build_member_remove, build_with_metadata, merge,
 };
 use jig_client::read_auth::{ReadProof, signable_path};
+use jig_core::tier::{JoinRole, Tier};
 use jig_core::{BlockKind, HlcTimestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -157,21 +158,147 @@ async fn post_channel_op(base: &str, suffix: &str, block: &BuiltBlock) -> Result
 // create
 // ============================================================================
 
-/// Apply `jig channel create <slug> [--visibility ...] [--exist-ok]`.
+/// The tier a new channel gets, and its `join` role for `server` and
+/// `shared` (JEP-0014).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TierChoice {
+    pub tier: Tier,
+    pub join: Option<JoinRole>,
+}
+
+impl TierChoice {
+    pub const PRIVATE: TierChoice = TierChoice {
+        tier: Tier::Private,
+        join: None,
+    };
+}
+
+/// Resolve `jig channel create`'s flags to a tier.
+///
+/// `--tier` names it. Without it, the older flags mean what they always did,
+/// as JEP-0014 rule 21 reads such channels: `--visibility restricted` is
+/// `private`, `--encrypted` open is `server` with `join = guest`, and
+/// `--visibility open` is `public`. With no flag at all a channel is
+/// `private`: encrypted, and joined only by being added.
+pub fn choose_tier(
+    tier: Option<&str>,
+    join: Option<&str>,
+    visibility: Option<&str>,
+    encrypted: bool,
+) -> Result<TierChoice> {
+    let join = join
+        .map(|j| j.trim().to_lowercase().parse::<JoinRole>())
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("--join must be `member` or `guest`: {e}"))?;
+    let choice = match tier {
+        Some(tier) => {
+            if visibility.is_some() || encrypted {
+                anyhow::bail!(
+                    "--tier says what --visibility and --encrypted used to; pass --tier alone"
+                );
+            }
+            let tier = tier.trim().to_lowercase().parse::<Tier>().map_err(|_| {
+                anyhow::anyhow!(
+                    "--tier must be `private`, `server`, `shared` or `public` (got `{tier}`)"
+                )
+            })?;
+            TierChoice {
+                tier,
+                join: tier.takes_join().then(|| join.unwrap_or_default()),
+            }
+        }
+        None => match (visibility.map(|v| v.trim().to_lowercase()), encrypted) {
+            (None, false) => TierChoice::PRIVATE,
+            (Some(v), _) if v == "restricted" => TierChoice::PRIVATE,
+            (Some(v), _) if v != "open" => {
+                anyhow::bail!("--visibility must be `open` or `restricted` (got `{v}`)")
+            }
+            (_, true) => TierChoice {
+                tier: Tier::Server,
+                join: Some(join.unwrap_or(JoinRole::Guest)),
+            },
+            (Some(_), false) => TierChoice {
+                tier: Tier::Public,
+                join: None,
+            },
+        },
+    };
+    if join.is_some() && !choice.tier.takes_join() {
+        anyhow::bail!(
+            "--join is for `server` and `shared` channels, not `{}`",
+            choice.tier
+        );
+    }
+    Ok(choice)
+}
+
+/// What a channel of `tier` means to the people in it, shown wherever the
+/// channel is (JEP-0014 rule 5 asks it of `public`).
+pub fn tier_label(tier: &str) -> String {
+    match tier {
+        "public" => "public: anyone, including the server operator, can read it".to_string(),
+        "private" => "private, end-to-end encrypted".to_string(),
+        "server" | "shared" => format!("{tier}, end-to-end encrypted"),
+        "frozen" => "frozen: read-only, created unencrypted before channel tiers".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Whether the server granted `tiers` in the welcome of a connection that
+/// asked for them (JEP-0014 rule 1).
+async fn server_has_tiers(ctx: &CliContext) -> Result<bool> {
+    let server = ctx.server_url()?;
+    let client = crate::cmd::secure::connect_pinned(&server, ctx.identity()?)
+        .await
+        .with_context(|| {
+            format!("connecting to {server} to see whether it supports channel tiers")
+        })?;
+    Ok(client.welcome().is_some_and(|w| w.capabilities.tiers))
+}
+
+/// Rule 5: the creator confirms a `public` channel before it is signed.
+fn public_confirmed(slug: &str, yes: bool, stdin_is_tty: bool) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    if !stdin_is_tty {
+        anyhow::bail!(
+            "{slug} would be public: anyone, including the server operator, can read it. \
+             Pass --yes to confirm (stdin is not a terminal, so there is nobody to ask)"
+        );
+    }
+    use std::io::Write;
+    print!(
+        "{slug} will be public: anyone, including the server operator, can read it. Create it? [y/N] "
+    );
+    std::io::stdout().flush().ok();
+    let mut answer = String::new();
+    std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut answer)
+        .context("reading confirmation from stdin")?;
+    Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
+}
+
+/// Apply `jig channel create <slug> [--tier ...] [--exist-ok]`.
 ///
 /// Builds a signed channel-create block, POSTs it to
 /// `/api/v1/channels`, and prints the new channel slug + block CID
 /// on success. A taken slug is an error unless `exist_ok`, in which case it
-/// is reported and treated as success (the channel's existing visibility and
+/// is reported and treated as success (the channel's existing tier and
 /// owner are left as they are).
 pub async fn create(
     ctx: &CliContext,
     slug: String,
-    visibility: String,
+    choice: TierChoice,
     exist_ok: bool,
-    encrypted: bool,
+    yes: bool,
 ) -> Result<()> {
-    create_with(ctx, &slug, &visibility, exist_ok, encrypted, json!({})).await?;
+    if choice.tier == Tier::Public {
+        use std::io::IsTerminal;
+        if !public_confirmed(&slug, yes, std::io::stdin().is_terminal())? {
+            anyhow::bail!("not created: {slug} was not confirmed as public");
+        }
+    }
+    create_with(ctx, &slug, choice, exist_ok, json!({})).await?;
 
     // A freshly created channel is almost always the one the operator wants
     // to talk in next; without this, a bare `jig send hi` still goes to
@@ -190,27 +317,26 @@ pub async fn create(
 pub(crate) async fn create_with(
     ctx: &CliContext,
     slug: &str,
-    visibility: &str,
+    choice: TierChoice,
     exist_ok: bool,
-    encrypted: bool,
     extra: serde_json::Value,
 ) -> Result<bool> {
-    let visibility = visibility.trim().to_lowercase();
-    if !matches!(visibility.as_str(), "open" | "restricted") {
-        anyhow::bail!("--visibility must be `open` or `restricted` (got `{visibility}`)");
+    let visibility = choice.tier.legacy_visibility().to_string();
+    let encrypted = choice.tier.is_encrypted();
+    // A server that predates tiers ignores `tier` and reads a `server` or
+    // `shared` channel as open: any authenticated caller could join it
+    // (JEP-0014 rule 1). Only one that granted `tiers` gets those tiers.
+    if matches!(choice.tier, Tier::Server | Tier::Shared) && !server_has_tiers(ctx).await? {
+        anyhow::bail!(
+            "this server does not support channel tiers, so it would let anyone join a `{}` \
+             channel; create a `private` one instead",
+            choice.tier
+        );
     }
-    // A restricted channel is always end-to-end encrypted (ROADMAP D25): the
-    // server refuses a plaintext one. Only an open channel is a choice.
-    let encrypted = encrypted || visibility == "restricted";
-
-    // The tier these flags have always meant (JEP-0014 rule 21): restricted
-    // is `private`, open encrypted is `server` joinable by any caller the
-    // server admits, open plaintext is `public`.
-    let tier = match (encrypted, visibility.as_str()) {
-        (true, "restricted") => json!({"tier": "private"}),
-        (true, _) => json!({"tier": "server", "join": "guest"}),
-        (false, _) => json!({"tier": "public"}),
-    };
+    let mut tier = json!({"tier": choice.tier.as_str()});
+    if let Some(join) = choice.join {
+        tier["join"] = json!(join.as_str());
+    }
 
     let id = ctx.identity()?;
     let hlc = HlcTimestamp::now_wall(id.did().clone());
@@ -277,11 +403,7 @@ pub(crate) async fn create_with(
             }
         }
     }
-    let label = if encrypted {
-        format!("{visibility}, end-to-end encrypted")
-    } else {
-        visibility.clone()
-    };
+    let label = tier_label(choice.tier.as_str());
     match outcome {
         Ok(result) => {
             println!("channel created: {slug} ({label})");
@@ -773,6 +895,18 @@ struct ChannelView {
     /// `none` or `mls`. Absent from servers before v0.2.
     #[serde(default)]
     suite: String,
+    /// The channel's tier (JEP-0014), or `frozen`. Absent from servers
+    /// before tiers, which show `visibility` instead.
+    #[serde(default)]
+    tier: Option<String>,
+}
+
+impl ChannelView {
+    /// What the list shows for the channel's kind: its tier, or, from a server
+    /// before tiers, its visibility.
+    fn kind(&self) -> &str {
+        self.tier.as_deref().unwrap_or(&self.visibility)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -838,7 +972,7 @@ fn print_channels(channels: &[ChannelView]) {
         .max(8);
     let vis_w = channels
         .iter()
-        .map(|c| c.visibility.len())
+        .map(|c| c.kind().len())
         .max()
         .unwrap_or(0)
         .max(10);
@@ -848,10 +982,16 @@ fn print_channels(channels: &[ChannelView]) {
         } else {
             "  "
         };
+        // JEP-0014 rule 5: a public channel says so wherever it is shown.
+        let note = match c.tier.as_deref() {
+            Some("public") => "  (anyone, including the server operator, can read it)",
+            Some("frozen") => "  (read-only: created unencrypted before channel tiers)",
+            _ => "",
+        };
         println!(
-            "{:<slug_w$}  {:<vis_w$}  {sealed}  {}",
+            "{:<slug_w$}  {:<vis_w$}  {sealed}  {}{note}",
             c.slug,
-            c.visibility,
+            c.kind(),
             c.owner_did,
             slug_w = slug_w,
             vis_w = vis_w,
@@ -862,6 +1002,108 @@ fn print_channels(channels: &[ChannelView]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bare_create_is_private_and_tier_names_the_rest() {
+        let choose = |tier, join, vis, enc| choose_tier(tier, join, vis, enc);
+        assert_eq!(
+            choose(None, None, None, false).unwrap(),
+            TierChoice::PRIVATE
+        );
+        assert_eq!(
+            choose(Some("server"), None, None, false).unwrap(),
+            TierChoice {
+                tier: Tier::Server,
+                join: Some(JoinRole::Member)
+            }
+        );
+        assert_eq!(
+            choose(Some("Shared"), Some("guest"), None, false).unwrap(),
+            TierChoice {
+                tier: Tier::Shared,
+                join: Some(JoinRole::Guest)
+            }
+        );
+        assert_eq!(
+            choose(Some("public"), None, None, false).unwrap(),
+            TierChoice {
+                tier: Tier::Public,
+                join: None
+            }
+        );
+        // The older flags mean what rule 21 reads them as.
+        assert_eq!(
+            choose(None, None, Some("restricted"), false).unwrap(),
+            TierChoice::PRIVATE
+        );
+        assert_eq!(
+            choose(None, None, Some("restricted"), true).unwrap(),
+            TierChoice::PRIVATE
+        );
+        assert_eq!(
+            choose(None, None, Some("open"), false).unwrap(),
+            TierChoice {
+                tier: Tier::Public,
+                join: None
+            }
+        );
+        assert_eq!(
+            choose(None, None, None, true).unwrap(),
+            TierChoice {
+                tier: Tier::Server,
+                join: Some(JoinRole::Guest)
+            }
+        );
+        // Refused: an unknown tier or role, --tier with the older flags, a
+        // join for a tier without one, an unknown visibility.
+        for (tier, join, vis, enc) in [
+            (Some("secret"), None, None, false),
+            (Some("server"), Some("stranger"), None, false),
+            (Some("private"), None, Some("open"), false),
+            (Some("private"), None, None, true),
+            (Some("private"), Some("guest"), None, false),
+            (Some("public"), Some("member"), None, false),
+            (None, None, Some("hidden"), false),
+        ] {
+            assert!(
+                choose(tier, join, vis, enc).is_err(),
+                "{tier:?} {join:?} {vis:?} {enc}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_public_channel_is_confirmed_or_refused_off_a_terminal() {
+        assert!(public_confirmed("#news", true, false).unwrap());
+        let err = public_confirmed("#news", false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("anyone, including the server operator, can read it"),
+            "{err}"
+        );
+        assert!(err.contains("--yes"), "{err}");
+    }
+
+    #[test]
+    fn the_list_names_a_channels_tier_and_says_public_is_readable_by_anyone() {
+        assert!(tier_label("public").contains("anyone, including the server operator"));
+        assert!(tier_label("frozen").contains("read-only"));
+        let view = |tier: Option<&str>| ChannelView {
+            slug: "#x".to_string(),
+            visibility: "open".to_string(),
+            owner_did: String::new(),
+            created_at: 0,
+            suite: String::new(),
+            tier: tier.map(str::to_string),
+        };
+        assert_eq!(view(Some("public")).kind(), "public");
+        assert_eq!(
+            view(None).kind(),
+            "open",
+            "a server before tiers shows its visibility"
+        );
+    }
 
     #[test]
     fn a_did_resolves_to_one_spelling_however_it_is_written() {
@@ -1052,6 +1294,7 @@ mod tests {
                 owner_did: "did:jig:zAlice".into(),
                 created_at: 0,
                 suite: "none".into(),
+                tier: None,
             },
             ChannelView {
                 slug: "#devops".into(),
@@ -1059,6 +1302,7 @@ mod tests {
                 owner_did: "did:jig:zBob".into(),
                 created_at: 0,
                 suite: "mls".into(),
+                tier: None,
             },
         ]);
     }
