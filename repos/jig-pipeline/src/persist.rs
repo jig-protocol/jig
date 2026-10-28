@@ -119,6 +119,13 @@ pub struct ChannelTiering {
 }
 
 impl ChannelTiering {
+    /// Whether the channel's tier takes self-joins on a join rule: `server`
+    /// and `shared` (JEP-0014 rules 12 and 13).
+    pub fn takes_self_join(&self) -> bool {
+        use jig_core::tier::{StoredTier, Tier};
+        matches!(self.tier, StoredTier::Tier(Tier::Server | Tier::Shared))
+    }
+
     /// `tier`, with the defaults its creation block would carry: `join =
     /// member` for `server` and `shared`, `join_servers = owner` for `shared`.
     pub fn of(tier: Tier) -> Self {

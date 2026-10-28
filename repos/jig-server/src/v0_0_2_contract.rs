@@ -3658,25 +3658,128 @@ mod tests {
     /// A `shared` MLS channel on `p`'s owner, created by its user: the
     /// channel, the user's MLS member and the group's id.
     async fn shared_mls_channel(p: &Pair) -> (String, jig_mls::member::Member, Vec<u8>) {
+        shared_mls_channel_with(p, "#across", serde_json::json!({})).await
+    }
+
+    /// [`shared_mls_channel`] as `slug`, its creation block carrying `terms`
+    /// too (`join`, `join_servers`).
+    async fn shared_mls_channel_with(
+        p: &Pair,
+        slug: &str,
+        terms: serde_json::Value,
+    ) -> (String, jig_mls::member::Member, Vec<u8>) {
         let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
         let did = jig_core::did::Did::from_ed25519_pubkey(p.user.verifying_key().as_bytes());
         let creator = jig_mls::member::Member::new(&p.user.to_bytes(), &did).unwrap();
         let created = creator.create_group().unwrap();
-        let channel = post(
-            &p.owner,
-            &p.user,
-            BlockKind::ChannelCreate,
-            serde_json::json!({
-                "slug": "#across",
-                "tier": "shared",
-                "suite": "mls",
-                "mls_group_info": b64(&created.group_info),
-                "mls_ratchet_tree": b64(&created.ratchet_tree),
-            }),
-        )
-        .await
-        .unwrap();
+        let mut meta = serde_json::json!({
+            "slug": slug,
+            "tier": "shared",
+            "suite": "mls",
+            "mls_group_info": b64(&created.group_info),
+            "mls_ratchet_tree": b64(&created.ratchet_tree),
+        });
+        if let (Some(meta), serde_json::Value::Object(terms)) = (meta.as_object_mut(), terms) {
+            meta.extend(terms);
+        }
+        let channel = post(&p.owner, &p.user, BlockKind::ChannelCreate, meta)
+            .await
+            .unwrap();
         (channel, creator, created.group_id)
+    }
+
+    /// JEP-0014 rule 13: a self-join through a follower, by an MLS external
+    /// commit against the group the follower mirrors. The follower checks
+    /// the joiner's role on its side and relays it under its `member` grant
+    /// only if the channel lets granted servers' roles count; the owner then
+    /// takes it on that grant.
+    #[tokio::test]
+    async fn a_self_join_through_a_follower_needs_granted_servers_and_the_followers_role() {
+        use jig_mls::member::Member;
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let p = pair(OfferPolicy::Accept).await;
+        // A joiner on the follower is a guest there: admitted, not recorded.
+        let cases = [
+            (
+                "#granted",
+                serde_json::json!({"join": "guest", "join_servers": "granted"}),
+                None,
+            ),
+            (
+                "#owners",
+                serde_json::json!({"join": "guest"}),
+                Some("join there"),
+            ),
+            (
+                "#members",
+                serde_json::json!({"join": "member", "join_servers": "granted"}),
+                Some("below"),
+            ),
+        ];
+        for (slug, terms, refused) in cases {
+            let (channel, _, _) = shared_mls_channel_with(&p, slug, terms).await;
+            p.share(&channel, "member").await;
+            p.both(&channel, OfferState::Accepted).await;
+            p.follows.stream.pull_all();
+            p.caught_up(&channel).await;
+
+            let key = SigningKey::from_bytes(&rand::random());
+            let did = jig_core::did::Did::from_ed25519_pubkey(key.verifying_key().as_bytes());
+            let joiner = Member::new(&key.to_bytes(), &did).unwrap();
+            let mirrored = p
+                .follower
+                .ingest_ctx
+                .store
+                .get_mls_group_by_id(&channel)
+                .unwrap()
+                .unwrap();
+            let (_, commit) = joiner.join_external(&mirrored.group_info.unwrap()).unwrap();
+            let did = did.to_did_jig_string();
+            let parts = signed(
+                &key,
+                BlockKind::MemberAdd,
+                serde_json::json!({
+                    "channel_id": channel,
+                    "member_did": did,
+                    "mls_commit": b64(&commit.commit),
+                }),
+            );
+            let joined = client_post(&p.follower, &parts).await;
+            let at_owner = p
+                .owner
+                .ingest_ctx
+                .store
+                .is_member_by_id(&channel, &did)
+                .unwrap();
+            match refused {
+                None => {
+                    joined.unwrap();
+                    assert!(at_owner, "{slug}: the owner took the join");
+                }
+                Some(why) => {
+                    let refusal = joined.unwrap_err();
+                    assert_eq!(refusal.code, "JOIN_REFUSED", "{slug}: {refusal:?}");
+                    assert!(refusal.message.contains(why), "{slug}: {}", refusal.message);
+                    assert!(!at_owner, "{slug}: nothing reached the owner");
+                    // A follower that relays it anyway meets the owner's own
+                    // check where only the owner's roles count.
+                    if slug == "#owners" {
+                        let answer = p
+                            .owner_relay()
+                            .accept(&p.follower.server_did, submit_of(&channel, &parts))
+                            .await;
+                        assert!(!answer.code.is_empty(), "{answer:?}");
+                        assert!(
+                            !p.owner
+                                .ingest_ctx
+                                .store
+                                .is_member_by_id(&channel, &did)
+                                .unwrap()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// A `shared` channel's offer goes only to a peer whose handshake says
