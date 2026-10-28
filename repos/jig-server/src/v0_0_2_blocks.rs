@@ -449,6 +449,9 @@ pub struct HistoryQuery {
     /// A block CID: return the page of blocks just older than it, for paging
     /// back through history. Omitted means the newest page.
     pub before: Option<String>,
+    /// A block CID: return the page of blocks just newer than it, for paging
+    /// forward from where a reader left off. Not with `before`.
+    pub after: Option<String>,
     /// `1`: cut the page at [`HISTORY_PAGE_BUDGET_BYTES`]. Only a client
     /// that pages on until an empty page asks for it: one that takes a short
     /// page for the start of the channel (every release through
@@ -707,52 +710,82 @@ pub async fn get_channel_history(
     // A reference that names no channel has no history, as the slug
     // wrappers answer: an empty page, or a cursor that is none of its blocks.
     let limit = query.limit.unwrap_or(MAX_HISTORY_LIMIT);
-    let bad_cursor = || {
+    let bad_cursor = |name: &str| {
         err(
             StatusCode::BAD_REQUEST,
             "BAD_CURSOR",
-            format!("`before` is not a block of {channel_ref}"),
+            format!("`{name}` is not a block of {channel_ref}"),
         )
     };
+    let (before, after) = (query.before.as_deref(), query.after.as_deref());
+    if before.is_some() && after.is_some() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "BAD_CURSOR",
+            "give `before` or `after`, not both".to_string(),
+        ));
+    }
     let blocks = if query.budget == Some(1) {
-        // Choose the page from what each block stores, newest first, then
-        // load only those blocks: the server holds one page, not the window.
-        let sizes = match (query.before.as_deref(), channel.as_ref()) {
-            (None, None) => Vec::new(),
-            (before, Some(channel)) => store
-                .history_window_sizes(&channel.id, limit, before)
-                .map_err(persist_err)?
-                .ok_or_else(bad_cursor)?,
-            (Some(_), None) => return Err(bad_cursor()),
+        // Choose the page from what each block stores, nearest the cursor
+        // first, then load only those blocks: the server holds one page, not
+        // the window. Back from the newest or from `before`, that is newest
+        // first; forward from `after`, oldest first, so the page continues
+        // from the cursor and the client pages on from its last block.
+        let (sizes, newest_first) = match (after, channel.as_ref()) {
+            (None, None) if before.is_some() => return Err(bad_cursor("before")),
+            (None, None) => (Vec::new(), true),
+            (None, Some(channel)) => (
+                store
+                    .history_window_sizes(&channel.id, limit, before)
+                    .map_err(persist_err)?
+                    .ok_or_else(|| bad_cursor("before"))?,
+                true,
+            ),
+            (Some(_), None) => return Err(bad_cursor("after")),
+            (Some(after), Some(channel)) => (
+                store
+                    .history_after_window_sizes(&channel.id, limit, after)
+                    .map_err(persist_err)?
+                    .ok_or_else(|| bad_cursor("after"))?,
+                false,
+            ),
         };
-        let mut newest_first = Vec::new();
+        let mut page = Vec::new();
         let mut bytes = 0usize;
         for (cid, stored) in sizes {
             let entry = page_entry_bytes(stored as usize);
             // Always one block, however large: a page that holds none would
             // stop a client that pages on.
-            if !newest_first.is_empty() && bytes + entry > HISTORY_PAGE_BUDGET_BYTES {
+            if !page.is_empty() && bytes + entry > HISTORY_PAGE_BUDGET_BYTES {
                 break;
             }
             bytes += entry;
             if let Some(block) = store.get_block(&cid).map_err(persist_err)? {
-                newest_first.push(block);
+                page.push(block);
             }
         }
-        newest_first.reverse();
-        newest_first
+        if newest_first {
+            page.reverse();
+        }
+        page
     } else {
-        match (query.before.as_deref(), channel.as_ref()) {
-            (None, None) => Vec::new(),
-            (None, Some(channel)) => store
+        match (before, after, channel.as_ref()) {
+            (None, None, None) => Vec::new(),
+            (None, None, Some(channel)) => store
                 .list_blocks_by_channel_id(&channel.id, limit, None)
                 .map_err(persist_err)?,
-            (Some(before), channel) => channel
+            (Some(before), _, channel) => channel
                 .map(|c| store.list_blocks_before_by_channel_id(&c.id, limit, before))
                 .transpose()
                 .map_err(persist_err)?
                 .flatten()
-                .ok_or_else(bad_cursor)?,
+                .ok_or_else(|| bad_cursor("before"))?,
+            (None, Some(after), channel) => channel
+                .map(|c| store.list_blocks_after_by_channel_id(&c.id, limit, after))
+                .transpose()
+                .map_err(persist_err)?
+                .flatten()
+                .ok_or_else(|| bad_cursor("after"))?,
         }
     };
 
@@ -1290,6 +1323,14 @@ mod tests {
             count,
             "a client that did not ask gets every block"
         );
+        let cid_of = |entry: &serde_json::Value| {
+            entry["delivery_cid"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("delivery:")
+                .to_string()
+        };
+        let first = cid_of(&body.as_array().unwrap()[0]);
 
         let mut seen: Vec<String> = Vec::new();
         let mut before: Option<String> = None;
@@ -1333,6 +1374,45 @@ mod tests {
         }
         let want: Vec<String> = (0..count).map(|i| format!("b{i}")).collect();
         assert_eq!(seen, want, "every block once, in order, over {pages} pages");
+
+        // Forward from the first block (`after`), the same: each page is cut
+        // at the budget and continues from the cursor, oldest first, and
+        // paging on from its newest block ends on an empty page.
+        let mut seen: Vec<String> = Vec::new();
+        let mut after = first;
+        let mut pages = 0;
+        loop {
+            let path = format!("/api/v1/channels/%23big/blocks?limit=50&budget=1&after={after}");
+            let (status, body) = get_path(router.clone(), &path).await;
+            assert_eq!(status, StatusCode::OK);
+            let page = body.as_array().unwrap().clone();
+            if page.is_empty() {
+                break;
+            }
+            pages += 1;
+            let size = serde_json::to_vec(&body).unwrap().len();
+            assert!(
+                size <= HISTORY_PAGE_BUDGET_BYTES + jig_core::bundle::MAX_ENVELOPE_BYTES,
+                "forward page {pages} is {size} bytes"
+            );
+            if pages == 1 {
+                assert!(
+                    page.len() < count - 1,
+                    "the first forward page is cut at the budget"
+                );
+            }
+            seen.extend(
+                page.iter()
+                    .map(|b| text_of(b["bundle_b64"].as_str().unwrap())),
+            );
+            after = cid_of(page.last().unwrap());
+            assert!(pages <= count, "forward paging does not end");
+        }
+        assert_eq!(
+            seen,
+            want[1..].to_vec(),
+            "every later block once, in order, over {pages} pages"
+        );
     }
 
     /// History carries each block's signed record, and the records endpoint
@@ -1403,6 +1483,70 @@ mod tests {
             .map(|b| text_of(b["bundle_b64"].as_str().unwrap()))
             .collect();
         assert_eq!(texts, vec!["b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn channel_history_pages_forward_from_an_after_cursor() {
+        let state = Arc::new(unauthenticated_state());
+        let router = build_blocks_router(state.clone());
+        let id = test_identity();
+        submit_texts(&state, &router, &id, "#hello", &["a", "b", "c", "d"]).await;
+        submit_texts(&state, &router, &id, "#other", &["elsewhere"]).await;
+
+        let page = |body: &serde_json::Value| -> Vec<String> {
+            body.as_array()
+                .unwrap()
+                .iter()
+                .map(|b| text_of(b["bundle_b64"].as_str().unwrap()))
+                .collect()
+        };
+        let cid_of = |b: &serde_json::Value| {
+            b["delivery_cid"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("delivery:")
+                .to_string()
+        };
+        let (_, all) = get_path(router.clone(), "/api/v1/channels/%23hello/blocks").await;
+        let texts = page(&all);
+        let a = cid_of(&all[texts.iter().position(|t| t == "a").unwrap()]);
+
+        // Forward two at a time from `a` meets everything after it, once.
+        let mut forward = Vec::new();
+        let mut cursor = a;
+        loop {
+            let (status, newer) = get_path(
+                router.clone(),
+                &format!("/api/v1/channels/%23hello/blocks?limit=2&after={cursor}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let Some(last) = newer.as_array().unwrap().last() else {
+                break;
+            };
+            cursor = cid_of(last);
+            forward.extend(page(&newer));
+        }
+        assert_eq!(forward, vec!["b", "c", "d"]);
+
+        let (_, other) = get_path(router.clone(), "/api/v1/channels/%23other/blocks").await;
+        let foreign = cid_of(&other[0]);
+        for cursor in [foreign.as_str(), "bafy-unknown"] {
+            let (status, body) = get_path(
+                router.clone(),
+                &format!("/api/v1/channels/%23hello/blocks?after={cursor}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["code"], "BAD_CURSOR");
+        }
+        let (status, body) = get_path(
+            router.clone(),
+            &format!("/api/v1/channels/%23hello/blocks?after={cursor}&before={cursor}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "BAD_CURSOR");
     }
 
     #[tokio::test]

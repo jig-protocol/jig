@@ -131,6 +131,12 @@ struct ServerInfoResponse {
     /// one chain from an earlier DID to `server_did` (JEP-0012).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     prior_key_links: Vec<String>,
+    /// Channel history pages forward from a block (`?after=`), not only back
+    /// (`?before=`). A client pages forward only from a server that says so,
+    /// and holds each page to the chain it already has: this is unsigned.
+    /// Absent when the v0.0.2 module, which serves history, is not active.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    history_after: bool,
 }
 
 /// [`jig_pipeline::server_manifest::PeerPolicy`] as JSON.
@@ -322,6 +328,7 @@ async fn server_info(State(state): State<AppState>) -> Json<ServerInfoResponse> 
                     .collect()
             })
             .unwrap_or_default(),
+        history_after: state.v0_0_2.is_some(),
     })
 }
 
@@ -494,6 +501,7 @@ mod tests {
         assert!(body.unsafe_options_active.is_empty());
         assert!(body.allowed_block_kinds.is_empty());
         assert!(body.peers.is_empty());
+        assert!(!body.history_after, "no history is served without v0.0.2");
     }
 
     #[tokio::test]
@@ -558,6 +566,8 @@ mod tests {
         );
         // default config has no federation peers configured
         assert!(body.peers.is_empty());
+        // Its history pages forward, and it says so.
+        assert!(body.history_after);
         // default config has no bridges configured (deny-by-default)
         assert!(body.bridges.is_empty());
     }
