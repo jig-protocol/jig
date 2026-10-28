@@ -11,7 +11,7 @@
 //! [`BlockStream`] ends and further `submit` calls fail, so callers can
 //! detect the loss and decide what to do (a supervising shell loop, for now).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::time::Duration;
@@ -20,7 +20,7 @@ use futures_util::{SinkExt, StreamExt};
 use jig_pipeline::envelope::{
     Envelope, EnvelopeParseError, Frame, HlcCursor, ReceiptRef, Scope, SubscribeAuth,
 };
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::{connect_async_with_config, tungstenite::Message};
 use url::Url;
 
@@ -72,7 +72,8 @@ pub enum ClientError {
 pub struct Client {
     identity: Arc<Identity>,
     write_tx: mpsc::UnboundedSender<Message>,
-    inbound_rx: Mutex<mpsc::Receiver<Frame>>,
+    /// Requests sent and not yet answered, in the order sent.
+    asked: AskedQueue,
     pending_subscriptions: SubscriptionMap,
     last_cursors: Arc<Mutex<HashMap<String, HlcCursor>>>,
     /// Set by [`ReaderCleanup`] when the reader task exits. Lets `submit`
@@ -199,16 +200,109 @@ type SubscriptionMap = Arc<StdMutex<HashMap<String, Subscription>>>;
 /// 138 MB, and a few hundred kilobytes for chat.
 pub const SUBSCRIPTION_QUEUE: usize = 64;
 
-/// How many frames other than deliveries (`Ack`, `Error`) wait for a
-/// `submit` to take them. Only one submit waits at a time, so more are
-/// unsolicited: past this they are dropped.
-const INBOUND_QUEUE: usize = 64;
-
 /// A channel subscription's end of the reader task.
 struct Subscription {
     tx: mpsc::Sender<DeliveredBlock>,
     /// Set when the reader dropped this subscription because it was full.
     lagged: Arc<AtomicBool>,
+}
+
+/// A request the server has yet to answer.
+///
+/// The server answers a connection's frames one at a time, in the order they
+/// arrive: a submit with one `Ack` or `Error`, a subscribe with an `Error`
+/// only when it refuses. So an answer that names a block (every `Ack`, and
+/// the `Error` refusing a submit from a server that names it in `ref_cid`)
+/// goes to the submit of that block, and everything asked before it has been
+/// answered. An `Error` naming nothing goes to the oldest request still open.
+enum Asked {
+    Subscribe,
+    Submit {
+        cid: String,
+        reply: oneshot::Sender<Answer>,
+    },
+}
+
+/// What the server said to a submit.
+enum Answer {
+    Ack(String),
+    Refused {
+        code: String,
+        message: String,
+    },
+    /// A later request was answered first, so this one's answer never came:
+    /// the one case an older server cannot match exactly. Read as a timeout.
+    Missed,
+}
+
+type AskedQueue = Arc<StdMutex<VecDeque<Asked>>>;
+
+/// Subscribes left open at the front of [`AskedQueue`], at most. A subscribe
+/// the server takes draws no answer, so only a later submit's answer closes
+/// it; a client that resubscribes and never submits would otherwise grow the
+/// queue without end. A refusal arrives as soon as the server reads the
+/// subscribe, long before this many more are sent.
+const MAX_OPEN_SUBSCRIBES: usize = 64;
+
+fn lock_asked(asked: &StdMutex<VecDeque<Asked>>) -> MutexGuard<'_, VecDeque<Asked>> {
+    asked
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Record a subscribe as asked.
+fn ask_subscribe(asked: &mut VecDeque<Asked>) {
+    let open = asked
+        .iter()
+        .take_while(|a| matches!(a, Asked::Subscribe))
+        .count();
+    if open >= MAX_OPEN_SUBSCRIBES {
+        asked.pop_front();
+    }
+    asked.push_back(Asked::Subscribe);
+}
+
+/// Hand `frame`, if it is an `Ack` or `Error`, to the request it answers.
+fn answer(asked: &mut VecDeque<Asked>, frame: Frame) {
+    let (named, answer) = match frame {
+        Frame::Ack { block_cid } => (Some(block_cid.clone()), Answer::Ack(block_cid)),
+        Frame::Error {
+            code,
+            ref_cid,
+            message,
+            ..
+        } => (ref_cid, Answer::Refused { code, message }),
+        other => {
+            tracing::debug!("ignoring an unexpected frame: {other:?}");
+            return;
+        }
+    };
+    let at = match &named {
+        Some(cid) => asked
+            .iter()
+            .position(|a| matches!(a, Asked::Submit { cid: c, .. } if c == cid)),
+        // A refused subscribe, or a submit refused by a server that does not
+        // name the block.
+        None => (!asked.is_empty()).then_some(0),
+    };
+    let Some(at) = at else {
+        tracing::debug!("dropping an answer to no open request ({named:?})");
+        return;
+    };
+    // A submit that timed out stays here until answered; its reply then
+    // goes nowhere, rather than to the next submit. One still waiting ahead
+    // of the matched request was passed over: say so, rather than drop its
+    // reply, which `submit` would read as the connection closing.
+    let mut passed: Vec<Asked> = asked.drain(..=at).collect();
+    let matched = passed.pop();
+    for earlier in passed {
+        if let Asked::Submit { reply, .. } = earlier {
+            let _ = reply.send(Answer::Missed);
+        }
+    }
+    if let Some(Asked::Submit { reply, .. }) = matched {
+        let _ = reply.send(answer);
+    }
 }
 
 /// Lock the subscription map, recovering from poisoning: a panicking holder
@@ -227,6 +321,7 @@ fn lock_subscriptions(map: &SubscriptionMap) -> MutexGuard<'_, HashMap<String, S
 /// subscriber's sender is what makes `BlockStream::next` return `None`.
 struct ReaderCleanup {
     pending_subscriptions: SubscriptionMap,
+    asked: AskedQueue,
     closed: Arc<AtomicBool>,
 }
 
@@ -237,6 +332,8 @@ impl Drop for ReaderCleanup {
         // be registered after the clear and left dangling forever.
         self.closed.store(true, Ordering::SeqCst);
         lock_subscriptions(&self.pending_subscriptions).clear();
+        // Dropping each reply ends its `submit` at once.
+        lock_asked(&self.asked).clear();
     }
 }
 
@@ -419,7 +516,7 @@ impl Client {
         let contradiction: Arc<StdMutex<Option<Contradiction>>> = Arc::new(StdMutex::new(None));
 
         let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Message>();
-        let (inbound_tx, inbound_rx) = mpsc::channel::<Frame>(INBOUND_QUEUE);
+        let asked: AskedQueue = Arc::new(StdMutex::new(VecDeque::new()));
         let pending_subscriptions: SubscriptionMap = Arc::new(StdMutex::new(HashMap::new()));
         let last_cursors: Arc<Mutex<HashMap<String, HlcCursor>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -435,11 +532,12 @@ impl Client {
         });
 
         // Reader task — dispatches incoming Block frames to per-channel
-        // subscriber channels; forwards Ack / Error frames via inbound_tx
-        // so callers awaiting a reply can pick them up. On every exit path
+        // subscriber channels; hands Ack / Error frames to the request they
+        // answer (`answer`). On every exit path
         // `ReaderCleanup` drops the subscription senders so each BlockStream
         // terminates instead of blocking forever.
         let pending_subs_for_reader = pending_subscriptions.clone();
+        let asked_for_reader = asked.clone();
         let cursors_for_reader = last_cursors.clone();
         let closed_for_reader = closed.clone();
         let contradiction_for_reader = contradiction.clone();
@@ -455,6 +553,7 @@ impl Client {
         tokio::spawn(async move {
             let _cleanup = ReaderCleanup {
                 pending_subscriptions: pending_subs_for_reader.clone(),
+                asked: asked_for_reader.clone(),
                 closed: closed_for_reader,
             };
             let contradict_with =
@@ -632,11 +731,7 @@ impl Client {
                                 },
                             );
                         }
-                        other => {
-                            if inbound_tx.try_send(other).is_err() {
-                                tracing::debug!("dropping a frame no submit is waiting for");
-                            }
-                        }
+                        other => answer(&mut lock_asked(&asked_for_reader), other),
                     }
                 }
             }
@@ -645,7 +740,7 @@ impl Client {
         Ok(Self {
             identity: Arc::new(identity),
             write_tx,
-            inbound_rx: Mutex::new(inbound_rx),
+            asked,
             pending_subscriptions,
             last_cursors,
             closed,
@@ -774,9 +869,16 @@ impl Client {
             );
         }
 
-        if self.write_tx.send(Message::Text(json.into())).is_err() {
-            lock_subscriptions(&self.pending_subscriptions).remove(slug);
-            return Err(ClientError::ConnectionClosed);
+        {
+            // Recorded and sent under one lock, so the queue is in the order
+            // the server reads.
+            let mut asked = lock_asked(&self.asked);
+            if self.write_tx.send(Message::Text(json.into())).is_err() {
+                drop(asked);
+                lock_subscriptions(&self.pending_subscriptions).remove(slug);
+                return Err(ClientError::ConnectionClosed);
+            }
+            ask_subscribe(&mut asked);
         }
 
         Ok(BlockStream {
@@ -801,62 +903,72 @@ impl Client {
             sig_b64,
         });
         let json = serde_json::to_string(&env)?;
-        self.write_tx
-            .send(Message::Text(json.into()))
-            .map_err(|_| ClientError::ConnectionClosed)?;
+        let (reply, answered) = oneshot::channel();
+        {
+            // Recorded and sent under one lock, so the queue is in the order
+            // the server reads. Checked closed under it too: the reader's
+            // cleanup clears the queue under the same lock.
+            let mut asked = lock_asked(&self.asked);
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(ClientError::ConnectionClosed);
+            }
+            self.write_tx
+                .send(Message::Text(json.into()))
+                .map_err(|_| ClientError::ConnectionClosed)?;
+            asked.push_back(Asked::Submit {
+                cid: block.cid(),
+                reply,
+            });
+        }
 
-        // Await the first non-Block frame (Ack/Error).
+        // Await this block's own answer, matched by `answer`.
         let timeout = Duration::from_secs(self.submit_ack_timeout_seconds);
-        let mut rx = self.inbound_rx.lock().await;
-        loop {
-            let received = tokio::time::timeout(timeout, rx.recv())
-                .await
-                .map_err(|_| ClientError::AckTimeout(self.submit_ack_timeout_seconds))?;
-            let Some(frame) = received else {
+        let answer = match tokio::time::timeout(timeout, answered).await {
+            Err(_) => return Err(ClientError::AckTimeout(self.submit_ack_timeout_seconds)),
+            Ok(Err(_)) => {
                 return Err(self
                     .contradiction()
                     .map_or(ClientError::ConnectionClosed, ClientError::Contradiction));
-            };
-            match frame {
-                Frame::Ack { block_cid } => return Ok(block_cid),
-                Frame::Error { code, message, .. } => {
-                    // Refusing a kind the welcome advertised contradicts it.
-                    if code == DISALLOWED_BLOCK_KIND
-                        && let Some(kind) = block_kind(&block)
-                        && self
-                            .welcome
-                            .as_ref()
-                            .is_some_and(|w| w.capabilities.block_kinds.contains(&kind))
-                    {
-                        let error = Envelope::new(Frame::Error {
-                            status: None,
-                            code: code.clone(),
-                            ref_cid: None,
-                            message: message.clone(),
-                        });
-                        contradicted(
-                            &self.contradiction,
-                            &self.write_tx,
-                            self.on_contradiction.as_ref(),
-                            Contradiction {
-                                code: "kind-refused",
-                                reason: format!(
-                                    "the server refused `{kind}`, a block kind its welcome advertises"
-                                ),
-                                welcome: self.welcome.as_ref().map(|w| w.evidence.clone()),
-                                evidence: vec![serde_json::to_string(&error)?],
-                                proof: None,
-                            },
-                        );
-                        return Err(ClientError::Contradiction(
-                            self.contradiction().expect("just recorded"),
-                        ));
-                    }
-                    return Err(ClientError::ServerError { code, message });
+            }
+            Ok(Ok(answer)) => answer,
+        };
+        match answer {
+            Answer::Ack(block_cid) => Ok(block_cid),
+            Answer::Missed => Err(ClientError::AckTimeout(self.submit_ack_timeout_seconds)),
+            Answer::Refused { code, message } => {
+                // Refusing a kind the welcome advertised contradicts it.
+                if code == DISALLOWED_BLOCK_KIND
+                    && let Some(kind) = block_kind(&block)
+                    && self
+                        .welcome
+                        .as_ref()
+                        .is_some_and(|w| w.capabilities.block_kinds.contains(&kind))
+                {
+                    let error = Envelope::new(Frame::Error {
+                        status: None,
+                        code: code.clone(),
+                        ref_cid: None,
+                        message: message.clone(),
+                    });
+                    contradicted(
+                        &self.contradiction,
+                        &self.write_tx,
+                        self.on_contradiction.as_ref(),
+                        Contradiction {
+                            code: "kind-refused",
+                            reason: format!(
+                                "the server refused `{kind}`, a block kind its welcome advertises"
+                            ),
+                            welcome: self.welcome.as_ref().map(|w| w.evidence.clone()),
+                            evidence: vec![serde_json::to_string(&error)?],
+                            proof: None,
+                        },
+                    );
+                    return Err(ClientError::Contradiction(
+                        self.contradiction().expect("just recorded"),
+                    ));
                 }
-                // Ignore other non-Block frames while waiting for ack;
-                // Block frames go directly to the per-channel subscriber.
-                _ => continue,
+                Err(ClientError::ServerError { code, message })
             }
         }
     }
@@ -1046,6 +1158,46 @@ pub mod envelope {
 
 #[cfg(test)]
 mod tests {
+    /// A submit passed over by an answer to a later one hears that it was
+    /// missed, and the connection is not reported closed.
+    #[test]
+    fn a_submit_passed_over_is_told_it_was_missed() {
+        use std::collections::VecDeque;
+        let (a_tx, mut a_rx) = oneshot::channel();
+        let (b_tx, mut b_rx) = oneshot::channel();
+        let mut asked: VecDeque<Asked> = VecDeque::from([
+            Asked::Subscribe,
+            Asked::Submit {
+                cid: "a".into(),
+                reply: a_tx,
+            },
+            Asked::Submit {
+                cid: "b".into(),
+                reply: b_tx,
+            },
+        ]);
+        // An old server's refusal of `a` names no block, so it answers the
+        // oldest request, the subscribe; then `b`'s Ack names `b`.
+        answer(
+            &mut asked,
+            Frame::Error {
+                status: None,
+                code: "RATE_LIMITED".into(),
+                ref_cid: None,
+                message: String::new(),
+            },
+        );
+        answer(
+            &mut asked,
+            Frame::Ack {
+                block_cid: "b".into(),
+            },
+        );
+        assert!(asked.is_empty());
+        assert!(matches!(a_rx.try_recv(), Ok(Answer::Missed)));
+        assert!(matches!(b_rx.try_recv(), Ok(Answer::Ack(cid)) if cid == "b"));
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio_tungstenite::accept_async;
@@ -1401,9 +1553,7 @@ mod tests {
         let (url, frame_counter) = start_test_server(|env| async move {
             // Echo back an Ack for any Submit frame
             match env.frame {
-                Frame::Submit { .. } => vec![Envelope::new(Frame::Ack {
-                    block_cid: "bafy_test_ack".to_string(),
-                })],
+                Frame::Submit { bundle_b64, .. } => vec![ack(&bundle_b64)],
                 _ => vec![],
             }
         })
@@ -1420,9 +1570,142 @@ mod tests {
             server_did: client.identity.did().clone(),
         };
         let block = build_text_render(&client.identity, "#hello", "hi", hlc);
+        let expected = block.cid();
         let cid = client.submit(block).await.unwrap();
-        assert_eq!(cid, "bafy_test_ack");
+        assert_eq!(cid, expected);
         assert!(frame_counter.load(Ordering::SeqCst) >= 1);
+    }
+
+    /// The `Ack` a server sends for the submitted bundle.
+    fn ack(bundle_b64: &str) -> Envelope {
+        Envelope::new(Frame::Ack {
+            block_cid: block_cid_of(bundle_b64).expect("a block the client built"),
+        })
+    }
+
+    /// A refusal; `ref_cid` names the block, as servers since it was filled do.
+    fn refusal(code: &str, ref_cid: Option<String>) -> Envelope {
+        Envelope::new(Frame::Error {
+            status: Some(403),
+            code: code.to_string(),
+            ref_cid,
+            message: format!("refused: {code}"),
+        })
+    }
+
+    fn text_block(client: &Client, body: &str) -> BuiltBlock {
+        let hlc = jig_core::HlcTimestamp::now_wall(client.identity.did().clone());
+        crate::blocks::build_text_render(&client.identity, "#hello", body, hlc)
+    }
+
+    /// The bug: a refused subscribe's `Error` sat queued until the next
+    /// submit read it as its own answer, so a block that landed was reported
+    /// refused. A server that names no block in its refusals (one that
+    /// predates `ref_cid` on submits) is the hard case, and is this one.
+    #[tokio::test]
+    async fn a_refused_subscribe_is_not_read_as_a_submits_answer() {
+        let (url, _) = start_test_server(|env| async move {
+            match env.frame {
+                Frame::Subscribe { .. } => vec![refusal("AUTH_MISSING", None)],
+                Frame::Submit { bundle_b64, .. } => vec![ack(&bundle_b64)],
+                _ => vec![],
+            }
+        })
+        .await;
+        let client = Client::connect(&url, test_identity()).await.unwrap();
+        let _stream = client.subscribe_channel("#hello").await.unwrap();
+        // Long enough for the refusal to arrive before the submit is sent.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let block = text_block(&client, "hi");
+        let expected = block.cid();
+        assert_eq!(client.submit(block).await.unwrap(), expected);
+        // Sent back to back, with the refusal still in flight.
+        let _stream = client.subscribe_channel("#hello").await.unwrap();
+        let block = text_block(&client, "again");
+        let expected = block.cid();
+        assert_eq!(client.submit(block).await.unwrap(), expected);
+    }
+
+    /// An answer that comes after its submit gave up answers nothing else:
+    /// not as an `Ack` (the next submit would report the wrong CID), and not
+    /// as an `Error` naming no block (it would report a refusal for a block
+    /// that landed).
+    #[tokio::test]
+    async fn a_late_answer_does_not_answer_the_next_submit() {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let (url, _) = start_test_server(move |env| {
+            let seen = seen.clone();
+            async move {
+                let Frame::Submit { bundle_b64, .. } = env.frame else {
+                    return vec![];
+                };
+                match seen.fetch_add(1, Ordering::SeqCst) {
+                    // The server answers in order, so its delay holds the
+                    // next answer back too.
+                    0 => {
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                        vec![ack(&bundle_b64)]
+                    }
+                    1 => {
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                        vec![refusal("RATE_LIMITED", None)]
+                    }
+                    _ => vec![ack(&bundle_b64)],
+                }
+            }
+        })
+        .await;
+        let mut client = Client::connect(&url, test_identity()).await.unwrap();
+        client.submit_ack_timeout_seconds = 1;
+
+        let late = text_block(&client, "late ack");
+        assert!(matches!(
+            client.submit(late).await,
+            Err(ClientError::AckTimeout(1))
+        ));
+        let refused = text_block(&client, "late refusal");
+        // Its own answer is the late Ack's successor: it, too, times out.
+        assert!(matches!(
+            client.submit(refused).await,
+            Err(ClientError::AckTimeout(1))
+        ));
+        client.submit_ack_timeout_seconds = 5;
+        let block = text_block(&client, "on time");
+        let expected = block.cid();
+        assert_eq!(client.submit(block).await.unwrap(), expected);
+    }
+
+    /// Two submits in flight: each gets the answer that names it.
+    #[tokio::test]
+    async fn concurrent_submits_each_get_their_own_answer() {
+        let id = test_identity();
+        let hlc = jig_core::HlcTimestamp::now_wall(id.did().clone());
+        let yes = crate::blocks::build_text_render(&id, "#hello", "yes", hlc.clone());
+        let no = crate::blocks::build_text_render(&id, "#hello", "no", hlc);
+        let refused = no.cid();
+        let (url, _) = start_test_server(move |env| {
+            let refused = refused.clone();
+            async move {
+                let Frame::Submit { bundle_b64, .. } = env.frame else {
+                    return vec![];
+                };
+                let block_cid = block_cid_of(&bundle_b64).unwrap();
+                if block_cid == refused {
+                    vec![refusal("NOT_A_MEMBER", Some(block_cid))]
+                } else {
+                    vec![ack(&bundle_b64)]
+                }
+            }
+        })
+        .await;
+        let client = Client::connect(&url, id).await.unwrap();
+        let expected = yes.cid();
+        let (no, yes) = tokio::join!(client.submit(no), client.submit(yes));
+        assert_eq!(yes.unwrap(), expected);
+        match no {
+            Err(ClientError::ServerError { code, .. }) => assert_eq!(code, "NOT_A_MEMBER"),
+            other => panic!("expected the refusal, got {other:?}"),
+        }
     }
 
     #[tokio::test]

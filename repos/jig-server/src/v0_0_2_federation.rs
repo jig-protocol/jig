@@ -24,7 +24,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use ed25519_dalek::Signer;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
-use jig_core::BlockManifest;
+use jig_core::{BlockKind, BlockManifest};
 use jig_pipeline::{
     Envelope, Frame, Scope,
     envelope::ReceiptRef,
@@ -611,6 +611,40 @@ pub async fn ingest_peer_block(
         .block_cid()
         .map(|c| c.to_string())
         .unwrap_or_default();
+    // A share and the contract's records are the sequencer's business, asked
+    // of it and written by it: from a peer, a share would have this server
+    // act as owner of its relayed copy, offering a channel it does not own.
+    if let Some(
+        kind @ (BlockKind::ChannelShare
+        | BlockKind::ChannelUnshare
+        | BlockKind::ContractAccept
+        | BlockKind::ContractRefuse
+        | BlockKind::ContractEnd),
+    ) = manifest.kind
+    {
+        warn!(peer_url = %peer.url, %delivery_cid, kind = kind.as_str(), "rejecting peer block: shares and contract records are the channel's sequencer's own");
+        return Ok(());
+    }
+    // A channel this server carries by contract takes its blocks from the
+    // owner's stream only: the relay would make it a copy of its own again.
+    if let Some(kind) = manifest.kind
+        && let Some(named) = jig_pipeline::ingest::channel_id_of(
+            &state.ingest_ctx.store,
+            kind,
+            &manifest,
+            &block_cid,
+        )?
+        && let Some(id) = named.id.as_deref().or_else(|| {
+            manifest
+                .metadata
+                .get(jig_pipeline::ingest::CHANNEL_ID_KEY)
+                .and_then(|v| v.as_str())
+        })
+        && state.ingest_ctx.store.is_followed(id)?
+    {
+        debug!(peer_url = %peer.url, %delivery_cid, channel_id = id, "dropping peer block: the channel is carried by contract");
+        return Ok(());
+    }
     if let Some(kind) = manifest.kind
         && let Some(named) = jig_pipeline::ingest::channel_id_of(
             &state.ingest_ctx.store,
