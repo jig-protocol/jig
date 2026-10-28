@@ -606,7 +606,12 @@ impl Relay {
             Ok(cid) => Answer::accepted(id, cid),
             // Taken by a concurrent copy of the same request.
             Err(IngestError::DuplicateBlock { cid }) => Answer::accepted(id, cid),
-            Err(e) => refused_by(id, &e),
+            // An author refused for its rate here is told this server's wait,
+            // not the follower's.
+            Err(e) => Answer {
+                retry_after_ms: refusal_of(&self.ctx, &e).retry_after_ms.unwrap_or(0),
+                ..refused_by(id, &e)
+            },
         }
     }
 }
