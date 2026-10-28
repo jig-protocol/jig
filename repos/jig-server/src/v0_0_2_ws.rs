@@ -361,7 +361,18 @@ async fn handle_socket(
                     Message::Text(_) if ip.is_some_and(|ip| !state.auth.charge_ip(ip)) => {
                         let outcome = crate::auth::GateOutcome::RateLimited;
                         let (status, code, message) = state.auth.disclosure.disclose(&outcome);
-                        let _ = send_error(&mut socket, Some(status), code, None, &message).await;
+                        let wait = (code == "RATE_LIMITED")
+                            .then(|| state.auth.ip_retry_after_ms())
+                            .flatten();
+                        let _ = send_error_after(
+                            &mut socket,
+                            Some(status),
+                            code,
+                            None,
+                            &message,
+                            wait,
+                        )
+                        .await;
                     }
                     Message::Text(text) => {
                         if let Err(e) = handle_client_frame(
@@ -774,7 +785,9 @@ async fn handle_client_frame(
                         "ws subscribe refused"
                     );
                     let (status, code, message) = state.auth.disclosure.disclose(&outcome);
-                    let _ = send_error(socket, Some(status), code, None, &message).await;
+                    let wait = rate_wait(state, code);
+                    let _ =
+                        send_error_after(socket, Some(status), code, None, &message, wait).await;
                     return Ok(());
                 }
             }
@@ -800,7 +813,9 @@ async fn handle_client_frame(
                         "ws subscribe refused"
                     );
                     let (status, code, message) = state.auth.disclosure.disclose(&outcome);
-                    let _ = send_error(socket, Some(status), code, None, &message).await;
+                    let wait = rate_wait(state, code);
+                    let _ =
+                        send_error_after(socket, Some(status), code, None, &message, wait).await;
                     return Ok(());
                 }
             };
@@ -845,7 +860,9 @@ async fn handle_client_frame(
                             "ws subscribe refused"
                         );
                         let (status, code, message) = state.auth.disclosure.disclose(&outcome);
-                        let _ = send_error(socket, Some(status), code, None, &message).await;
+                        let wait = rate_wait(state, code);
+                        let _ = send_error_after(socket, Some(status), code, None, &message, wait)
+                            .await;
                         return Ok(());
                     }
                     Err(SubscribeRefusal::Store(detail)) => {
@@ -985,12 +1002,13 @@ async fn handle_client_frame(
                     .block_cid()
                     .ok()
                     .map(|cid| cid.to_string());
-                    let _ = send_error(
+                    let _ = send_error_after(
                         socket,
                         Some(refusal.status.as_u16()),
                         &refusal.code,
                         ref_cid,
                         &refusal.message,
+                        refusal.retry_after_ms,
                     )
                     .await;
                 }
@@ -1236,11 +1254,32 @@ async fn send_error(
     ref_cid: Option<String>,
     message: &str,
 ) -> Result<(), axum::Error> {
+    send_error_after(socket, status, code, ref_cid, message, None).await
+}
+
+/// When a caller refused at a gate as `code` may try again: a DID over its
+/// rate, after one token's refill. Nothing for any other refusal.
+fn rate_wait(state: &AppState, code: &str) -> Option<u64> {
+    (code == "RATE_LIMITED")
+        .then(|| state.auth.did_retry_after_ms())
+        .flatten()
+}
+
+/// [`send_error`], saying when to send again (`retry_after_ms`).
+async fn send_error_after(
+    socket: &mut WebSocket,
+    status: Option<u16>,
+    code: &str,
+    ref_cid: Option<String>,
+    message: &str,
+    retry_after_ms: Option<u64>,
+) -> Result<(), axum::Error> {
     let frame = Envelope::new(Frame::Error {
         status,
         code: code.to_string(),
         ref_cid,
         message: message.to_string(),
+        retry_after_ms,
     });
     let json = serde_json::to_string(&frame).map_err(axum::Error::new)?;
     socket.send(Message::Text(json.into())).await
@@ -1510,6 +1549,7 @@ mod tests {
                 code,
                 message,
                 ref_cid,
+                ..
             } => {
                 assert_eq!(code, "UNKNOWN_CHANNEL");
                 assert_eq!(status, Some(404));
@@ -2132,8 +2172,15 @@ mod tests {
                 .await
                 .unwrap();
             match next_frame(&mut ws).await.frame {
-                Frame::Error { status, code, .. } if code == "RATE_LIMITED" => {
+                Frame::Error {
+                    status,
+                    code,
+                    retry_after_ms,
+                    ..
+                } if code == "RATE_LIMITED" => {
                     assert_eq!(status, Some(429));
+                    // One token's refill at 1 a second.
+                    assert_eq!(retry_after_ms, Some(1_000));
                     break;
                 }
                 Frame::Error { .. } => processed += 1,

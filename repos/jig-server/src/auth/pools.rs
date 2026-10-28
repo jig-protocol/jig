@@ -132,6 +132,14 @@ impl WritePools {
         }))
     }
 
+    /// One token's refill in `pool`'s own bucket. `None` when its share is
+    /// 0: it never refills, and writes from it only borrow.
+    pub fn refill_interval(&self, pool: Pool) -> Option<Duration> {
+        let buckets = self.buckets.lock().expect("write pools lock poisoned");
+        let rate = buckets[pool.index()].per_second;
+        (rate > 0.0).then(|| Duration::from_secs_f64(1.0 / rate))
+    }
+
     /// Take one write's worth for `pool` at `now`: from its own bucket, or
     /// else from an idle pool. False when neither has it.
     pub fn try_take(&self, pool: Pool, now: Instant) -> bool {
@@ -182,6 +190,31 @@ mod tests {
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
+    }
+
+    /// A refused writer is told its own pool's refill: members' 70 a second,
+    /// strangers' 20. A share of 0 never refills, and gives no time.
+    #[test]
+    fn the_retry_wait_is_the_writers_pools_refill() {
+        let now = Instant::now();
+        let pools = pools(now);
+        assert_eq!(
+            pools.refill_interval(Pool::Member),
+            Some(Duration::from_secs_f64(1.0 / 70.0))
+        );
+        assert_eq!(pools.refill_interval(Pool::Stranger), Some(ms(50)));
+        let no_invited = WritePools::new(
+            &PoolsSection {
+                writes_per_second: 100,
+                writes_burst: 100,
+                invited_share_pct: 0,
+                ..PoolsSection::default()
+            },
+            now,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(no_invited.refill_interval(Pool::Invited), None);
     }
 
     /// The plan's flood test, on injected time: while members are writing, a

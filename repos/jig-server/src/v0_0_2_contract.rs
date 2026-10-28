@@ -3577,6 +3577,28 @@ mod tests {
         assert_eq!(Pair::head(&p.owner, &channel), Some(head), "it landed once");
     }
 
+    /// An author over the owner's rate is told the owner's wait, which the
+    /// follower passes on rather than its own.
+    #[tokio::test]
+    async fn an_author_over_the_owners_rate_is_told_the_owners_wait() {
+        let p = pair_tuned(OfferPolicy::Accept, None, |config| {
+            // The owner's user creates and shares; the author gets two.
+            config.auth.rate_limit.per_did_burst = 2;
+            config.auth.rate_limit.per_did_per_second = 1;
+        })
+        .await;
+        let channel = p.carried("write").await;
+        let author = SigningKey::from_bytes(&rand::random());
+        for body in ["one", "two"] {
+            let parts = signed(&author, BlockKind::TextRender, text_in(&channel, body));
+            client_post(&p.follower, &parts).await.unwrap();
+        }
+        let third = signed(&author, BlockKind::TextRender, text_in(&channel, "three"));
+        let refused = client_post(&p.follower, &third).await.unwrap_err();
+        assert_eq!(refused.code, "RATE_LIMITED", "{refused:?}");
+        assert_eq!(refused.retry_after_ms, Some(1_000), "{refused:?}");
+    }
+
     #[tokio::test]
     async fn a_read_follower_relays_no_content_and_the_owner_refuses_it_too() {
         let p = pair(OfferPolicy::Accept).await;
@@ -3728,6 +3750,10 @@ mod tests {
         let refused = client_post(&p.follower, &parts).await.unwrap_err();
         assert_eq!(refused.code, "RELAY_RATE_LIMITED", "{refused:?}");
         assert!(
+            refused.retry_after_ms.is_some_and(|ms| ms > 0),
+            "{refused:?}"
+        );
+        assert!(
             refused.message.contains("retry_after_ms="),
             "{}",
             refused.message
@@ -3832,6 +3858,7 @@ mod tests {
         let parts = signed(&author, BlockKind::TextRender, text_in(&channel, "hello"));
         let refused = client_post(&follower, &parts).await.unwrap_err();
         assert_eq!(refused.code, "OWNER_UNREACHABLE", "{refused:?}");
+        assert_eq!(refused.retry_after_ms, Some(5_000));
         assert!(
             refused.message.contains("retry_after_ms=5000"),
             "{}",

@@ -66,6 +66,12 @@ pub trait Admission: Send + Sync {
     fn admit_relayed(&self, sender_did: &str) -> Result<(), AdmissionRefusal> {
         self.admit(sender_did)
     }
+
+    /// When `sender_did`, refused as [`AdmissionRefusal::RateLimited`], may
+    /// write again, in milliseconds. `None` when this server cannot say.
+    fn retry_after_ms(&self, _sender_did: &str) -> Option<u64> {
+        None
+    }
 }
 
 /// Why admission said no. Mirrors the server's admission outcomes without
