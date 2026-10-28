@@ -123,6 +123,11 @@ struct Groups {
     /// old block again on purpose: neither may act twice.
     #[serde(default)]
     seen: HashMap<String, Seen>,
+    /// `server|slug` → CID of the newest block of the channel's history this
+    /// member has processed, every block before it included. A catch-up
+    /// starts after it.
+    #[serde(default)]
+    heads: HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -144,6 +149,9 @@ pub struct Session {
     /// Plaintext already read, by block CID. A cache of `plaintext.jsonl`,
     /// re-read from disk on a miss in case another process wrote it.
     read: Mutex<HashMap<String, (String, String)>>,
+    /// How much of `plaintext.jsonl` the cache holds: bytes and lines. The
+    /// file is only appended to, so a miss reads just what was added since.
+    read_upto: Mutex<(u64, usize)>,
     /// This directory has been sealed: content in clear is refused.
     sealed_only: bool,
 }
@@ -219,6 +227,7 @@ impl Session {
             did,
             dir,
             read: Mutex::new(HashMap::new()),
+            read_upto: Mutex::new((0, 0)),
             sealed_only: false,
         };
         session.sealed_only = session.seal_clear_files()?;
@@ -504,6 +513,23 @@ impl Session {
         Ok(())
     }
 
+    /// The CID of the newest block of `slug`'s history this member has
+    /// processed, every older one included; `None` before its first catch-up.
+    pub fn head(&self, server: &str, slug: &str) -> Result<Option<String>> {
+        let key = group_key(server, slug);
+        self.with_member(|_, g| Ok(g.heads.get(&key).cloned()))
+    }
+
+    /// Record that everything in `slug`'s history up to and including the
+    /// block `cid` has been processed.
+    pub fn set_head(&self, server: &str, slug: &str, cid: &str) -> Result<()> {
+        let key = group_key(server, slug);
+        self.with_member(|_, g| {
+            g.heads.insert(key, cid.to_string());
+            Ok(())
+        })
+    }
+
     /// Apply a delivered block to this member's state and say what it meant.
     ///
     /// Blocks must come in the channel's order — history first, sorted with
@@ -717,17 +743,29 @@ impl Session {
             .cloned())
     }
 
+    /// Read into the cache what `plaintext.jsonl` holds past what it has
+    /// read already. Re-reading the whole file on every miss made a catch-up
+    /// over n new messages cost n² record opens.
     fn reload_read(&self) -> Result<()> {
+        use std::io::{Read as _, Seek as _};
         let path = self.dir.join(PLAINTEXT);
         let io = |source| SecureError::Io {
             path: path.clone(),
             source,
         };
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => zeroize::Zeroizing::new(bytes),
+        let mut upto = self.read_upto.lock().expect("plaintext cache poisoned");
+        let mut file = match std::fs::File::open(&path) {
+            Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(io(e)),
         };
+        // Shorter than what was read: rewritten, so read it all again.
+        if file.metadata().map_err(io)?.len() < upto.0 {
+            *upto = (0, 0);
+        }
+        file.seek(std::io::SeekFrom::Start(upto.0)).map_err(io)?;
+        let mut bytes = zeroize::Zeroizing::new(Vec::new());
+        file.read_to_end(&mut bytes).map_err(io)?;
         let text = std::str::from_utf8(&bytes).map_err(|e| SecureError::Sealed {
             path: path.clone(),
             reason: e.to_string(),
@@ -741,8 +779,14 @@ impl Session {
         if complete.len() < text.len() {
             tracing::warn!("{}: ignoring a record that was cut short", path.display());
         }
+        let first_line = upto.1;
         let mut read = self.read.lock().expect("plaintext cache poisoned");
-        for (index, line) in complete.lines().enumerate().filter(|(_, l)| !l.is_empty()) {
+        for (index, line) in complete
+            .lines()
+            .enumerate()
+            .map(|(i, l)| (first_line + i, l))
+            .filter(|(_, l)| !l.is_empty())
+        {
             // A sealed record that does not open is an error, never skipped:
             // skipping would hide tampering, and the next write would bury it.
             let line = match line.strip_prefix(SEALED_LINE) {
@@ -771,6 +815,10 @@ impl Session {
                 read.insert(r.cid, (r.sender, r.text));
             }
         }
+        *upto = (
+            upto.0 + complete.len() as u64,
+            first_line + complete.matches('\n').count(),
+        );
         Ok(())
     }
 
@@ -1360,6 +1408,34 @@ mod tests {
             ))
         );
         assert!(again.has_group(SERVER, "#sealed-at-rest").unwrap());
+    }
+
+    /// Another process's records, appended after this one read the file, are
+    /// found on a miss; reading only what was added must not lose any.
+    #[test]
+    fn a_miss_reads_what_another_process_appended() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let other = Session::open(root.path(), alice.identity.duplicate()).unwrap();
+        alice.remember("cid-1", "did:jig:zs", "one").unwrap();
+        assert_eq!(other.recall("cid-1").unwrap().unwrap().1, "one");
+        for i in 2..=5 {
+            alice
+                .remember(&format!("cid-{i}"), "did:jig:zs", &format!("n{i}"))
+                .unwrap();
+        }
+        for i in 2..=5 {
+            assert_eq!(
+                other.recall(&format!("cid-{i}")).unwrap().unwrap().1,
+                format!("n{i}")
+            );
+        }
+        assert_eq!(other.recall("cid-nope").unwrap(), None);
+        assert_eq!(
+            other.read_upto.lock().unwrap().1,
+            5,
+            "five records read, each once"
+        );
     }
 
     #[test]
