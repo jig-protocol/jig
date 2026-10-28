@@ -101,6 +101,7 @@ impl Device {
                     suite: "none".into(),
                     owner_did: String::new(),
                     chain_head: None,
+                    sequencer: None,
                 },
             )
             .expect("the channel this device pinned");
