@@ -346,7 +346,7 @@ impl Relay {
             sequencer,
         } = &refused
         else {
-            return Err(Refusal::of(&refused));
+            return Err(refusal_of(&self.ctx, &refused));
         };
         let canonical = serde_json::to_vec(&(manifest_bytes, code_bytes))
             .map_err(|e| Refusal::of(&IngestError::BundleMalformed(e.to_string())))?;
@@ -374,7 +374,7 @@ impl Relay {
             .pop();
         // No live share: the channel is carried, nothing more.
         let Some(share) = share else {
-            return Err(Refusal::of(refused));
+            return Err(refusal_of(&self.ctx, refused));
         };
         let relays = kind
             .parse::<BlockKind>()
@@ -611,6 +611,20 @@ impl Relay {
     }
 }
 
+/// [`Refusal::of`] for a refusal on this server, saying when an author
+/// refused for its rate or its pool may post again.
+fn refusal_of(ctx: &IngestContext, e: &IngestError) -> Refusal {
+    let mut refusal = Refusal::of(e);
+    if let IngestError::NotAdmitted {
+        sender,
+        refusal: jig_pipeline::ingest::AdmissionRefusal::RateLimited,
+    } = e
+    {
+        refusal.retry_after_ms = ctx.admission.retry_after_ms(sender);
+    }
+    refusal
+}
+
 /// Post a client's block on `state`'s server: through its [`Relay`], once
 /// the contract runs ([`crate::v0_0_2_contract`]), or straight to ingest.
 /// `conn` names the client's connection for the in-flight cap.
@@ -641,14 +655,14 @@ pub async fn post(
                 IngestSource::LocalClient { conn_id },
             )
             .await
-            .map_err(|e| Refusal::of(&e))
+            .map_err(|e| refusal_of(&state.ingest_ctx, &e))
         }
     };
-    // An author refused for its rate or its pool (here, or at an owner that
-    // gave no time) gets a token back within one refill of this server's.
+    // An author an owner refused for its rate, with no time given, gets a
+    // token back within one refill of this server's rate.
     posted.map_err(|mut refusal| {
         if refusal.code == "RATE_LIMITED" && refusal.retry_after_ms.is_none() {
-            refusal.retry_after_ms = state.auth.write_retry_after_ms();
+            refusal.retry_after_ms = state.auth.did_retry_after_ms();
         }
         refusal
     })

@@ -208,19 +208,6 @@ impl AuthState {
         self.did_rate.as_ref().map(|r| millis(r.refill_interval()))
     }
 
-    /// [`Self::did_retry_after_ms`], for a write. A write is also refused
-    /// as `RATE_LIMITED` when its capacity pool is spent, so the wait is the
-    /// longer of the DID's refill and the slowest pool's. `None` when both
-    /// are off.
-    pub fn write_retry_after_ms(&self) -> Option<u64> {
-        let pool = self
-            .write_pools
-            .as_ref()
-            .and_then(WritePools::slowest_refill)
-            .map(millis);
-        self.did_retry_after_ms().max(pool)
-    }
-
     /// [`Self::did_retry_after_ms`], for an address's rate.
     pub fn ip_retry_after_ms(&self) -> Option<u64> {
         self.ip_rate.as_ref().map(|r| millis(r.refill_interval()))
@@ -341,6 +328,16 @@ impl jig_pipeline::ingest::Admission for AuthState {
             chrono::Utc::now().timestamp(),
         )
         .map_err(admission_refusal)
+    }
+
+    /// A write is refused as `RATE_LIMITED` for the DID's rate or for its
+    /// pool's share, and the refusal does not say which: wait for the longer
+    /// of the two refills. Lending from idle pools can only make it sooner.
+    fn retry_after_ms(&self, sender_did: &str) -> Option<u64> {
+        let pool = self.write_pools.as_ref().and_then(|pools| {
+            pools.refill_interval(self.pool_of(sender_did, chrono::Utc::now().timestamp()))
+        });
+        self.did_retry_after_ms().max(pool.map(millis))
     }
 
     fn admit_relayed(
@@ -528,6 +525,34 @@ mod tests {
         assert_eq!(state.pool_of(&fresh, proven_at + 1_000), Pool::Stranger);
         assert_eq!(state.pool_of(&proven, proven_at + 99), Pool::Stranger);
         assert_eq!(state.pool_of(&proven, proven_at + 100), Pool::Member);
+    }
+
+    /// A writer refused as `RATE_LIMITED` is told the longer of its DID's
+    /// refill and its own pool's: a member's pool refills faster than a
+    /// stranger's, so a member is not sent to wait out the strangers' share.
+    #[test]
+    fn a_refused_writer_waits_for_its_own_pool() {
+        use jig_config::v0_0_2_server::ReputationRecord;
+        use jig_pipeline::ingest::Admission;
+        let member = did_for(1);
+        let stranger = did_for(2);
+        let mut section = AuthSection::default();
+        section.rate_limit.per_did_per_second = 50;
+        section.pools.writes_per_second = 10;
+        section.pools.writes_burst = 10;
+        section.admission.records = vec![ReputationRecord {
+            did: member.clone(),
+            ruleset_key: "r".to_string(),
+            score: 1,
+        }];
+        let state = AuthState::from_config(&section).unwrap();
+        // Members' 7 a second, strangers' 2; the DID's 50 is faster than both.
+        assert_eq!(state.retry_after_ms(&member), Some(143));
+        assert_eq!(state.retry_after_ms(&stranger), Some(500));
+
+        section.pools.writes_per_second = 0;
+        let state = AuthState::from_config(&section).unwrap();
+        assert_eq!(state.retry_after_ms(&stranger), Some(20), "the DID's alone");
     }
 
     /// The flood test through the write gate, on injected time: a thousand

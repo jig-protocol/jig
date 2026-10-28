@@ -132,16 +132,12 @@ impl WritePools {
         }))
     }
 
-    /// One token's refill in the pool that refills slowest. `None` when
-    /// every share is 0.
-    pub fn slowest_refill(&self) -> Option<Duration> {
+    /// One token's refill in `pool`'s own bucket. `None` when its share is
+    /// 0: it never refills, and writes from it only borrow.
+    pub fn refill_interval(&self, pool: Pool) -> Option<Duration> {
         let buckets = self.buckets.lock().expect("write pools lock poisoned");
-        buckets
-            .iter()
-            .map(|b| b.per_second)
-            .filter(|rate| *rate > 0.0)
-            .min_by(f64::total_cmp)
-            .map(|rate| Duration::from_secs_f64(1.0 / rate))
+        let rate = buckets[pool.index()].per_second;
+        (rate > 0.0).then(|| Duration::from_secs_f64(1.0 / rate))
     }
 
     /// Take one write's worth for `pool` at `now`: from its own bucket, or
@@ -196,12 +192,17 @@ mod tests {
         Duration::from_millis(n)
     }
 
-    /// A refused writer is told the slowest share's refill: invited's 10 a
-    /// second here. A share of 0 never refills, and is not counted.
+    /// A refused writer is told its own pool's refill: members' 70 a second,
+    /// strangers' 20. A share of 0 never refills, and gives no time.
     #[test]
-    fn the_retry_wait_is_the_slowest_shares_refill() {
+    fn the_retry_wait_is_the_writers_pools_refill() {
         let now = Instant::now();
-        assert_eq!(pools(now).slowest_refill(), Some(ms(100)));
+        let pools = pools(now);
+        assert_eq!(
+            pools.refill_interval(Pool::Member),
+            Some(Duration::from_secs_f64(1.0 / 70.0))
+        );
+        assert_eq!(pools.refill_interval(Pool::Stranger), Some(ms(50)));
         let no_invited = WritePools::new(
             &PoolsSection {
                 writes_per_second: 100,
@@ -213,7 +214,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(no_invited.slowest_refill(), Some(ms(50)));
+        assert_eq!(no_invited.refill_interval(Pool::Invited), None);
     }
 
     /// The plan's flood test, on injected time: while members are writing, a
