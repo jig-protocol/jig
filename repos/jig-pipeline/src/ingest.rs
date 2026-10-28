@@ -284,7 +284,8 @@ pub enum IngestError {
     /// is a plaintext `open` channel, which a client that predates tiers
     /// cannot label (JEP-0014 rules 1 and 5).
     #[error(
-        "channel-create needs a `tier` of `private`, `server`, `shared` or `public` (got {tier});          a plaintext channel is `public`, and a client that predates tiers must upgrade to create one"
+        "channel-create needs a `tier` of `private`, `server`, `shared` or `public` (got {tier}); \
+         a plaintext channel is `public`, and a client that predates tiers must upgrade to create one"
     )]
     UnknownTier { tier: String },
     /// The tier and the suite disagree (JEP-0014 rule 3): `public` is
@@ -296,7 +297,8 @@ pub enum IngestError {
     /// A block that would change a channel's tier, which is fixed for its
     /// life (JEP-0014 rule 2).
     #[error(
-        "`{kind}` on `{slug}` refused: a channel's tier is fixed when it is created;          make a new channel instead"
+        "`{kind}` on `{slug}` refused: a channel's tier is fixed when it is created; \
+         make a new channel instead"
     )]
     TierFixed { kind: String, slug: String },
     /// The signer lacks the right the block needs as of its position in the
@@ -1604,7 +1606,9 @@ pub fn tier_terms(
             Some(other) => Err(invalid(key, format!("`{other}` is not a string"))),
         }
     };
-    let suite = crate::mls_gate::requested_suite(manifest).map_err(|r| suite_refusal(r, ""))?;
+    // A suite this build does not know is the suite gate's to refuse, with
+    // its own code; the tier checks below only judge suites it does know.
+    let suite = crate::mls_gate::requested_suite(manifest).ok();
     let visibility = text("visibility")?;
 
     let Some(raw_tier) = manifest.metadata.get(tier_keys::TIER) else {
@@ -1625,7 +1629,7 @@ pub fn tier_terms(
                 ));
             }
         }
-        if suite != jig_core::EncryptionSuite::Mls {
+        if suite != Some(jig_core::EncryptionSuite::Mls) {
             return Ok(None);
         }
         let tier = if crate::visibility::is_open(visibility.unwrap_or("open")) {
@@ -1648,7 +1652,9 @@ pub fn tier_terms(
                 .map(str::to_string)
                 .unwrap_or_else(|| raw_tier.to_string()),
         })?;
-    if !tier.admits_suite(suite) {
+    if let Some(suite) = suite
+        && !tier.admits_suite(suite)
+    {
         return Err(IngestError::TierSuiteMismatch {
             tier: tier.as_str(),
             suite: suite.as_str().to_string(),
@@ -4662,7 +4668,11 @@ mod tests {
 
     /// A block signed as a client that predates tiers signs it: no fixture
     /// fills in `tier`.
-    fn untiered(key: &SigningKey, kind: BlockKind, meta: serde_json::Value) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    fn untiered(
+        key: &SigningKey,
+        kind: BlockKind,
+        meta: serde_json::Value,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let did = Did::from_ed25519_pubkey(key.verifying_key().as_bytes());
         let mut manifest = BlockManifest::builder()
             .version(Version::new(0, 1, 0))
@@ -4713,7 +4723,8 @@ mod tests {
             serde_json::json!({"slug": "#old", "visibility": "open", "suite": "none"}),
         ] {
             let (mb, cb, sig) = untiered(&who.key, BlockKind::ChannelCreate, meta.clone());
-            let refused = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 }).await;
+            let refused =
+                do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 }).await;
             assert!(
                 matches!(refused, Err(IngestError::UnknownTier { .. })),
                 "{meta}: {refused:?}"
@@ -4772,8 +4783,10 @@ mod tests {
             .unwrap();
         assert_eq!(server.join, Some(JoinRole::Member));
         assert_eq!(server.join_servers, None);
-        let shared = terms(serde_json::json!({"slug": "#a", "tier": "shared", "suite": "mls",
-            "join": "guest", "join_servers": "granted", "history": "members-may-share"}))
+        let shared = terms(
+            serde_json::json!({"slug": "#a", "tier": "shared", "suite": "mls",
+            "join": "guest", "join_servers": "granted", "history": "members-may-share"}),
+        )
         .unwrap()
         .unwrap();
         assert_eq!(shared.join, Some(JoinRole::Guest));
@@ -4785,7 +4798,11 @@ mod tests {
         assert_eq!(public, crate::persist::ChannelTiering::of(Tier::Public));
 
         // An unknown tier, a tier that is not a string.
-        for bad in [serde_json::json!("secret"), serde_json::json!("Public"), serde_json::json!(1)] {
+        for bad in [
+            serde_json::json!("secret"),
+            serde_json::json!("Public"),
+            serde_json::json!(1),
+        ] {
             assert!(
                 matches!(
                     terms(serde_json::json!({"slug": "#a", "tier": bad})),
@@ -4795,7 +4812,12 @@ mod tests {
             );
         }
         // Rule 3: the suite fits the tier.
-        for (tier, suite) in [("public", "mls"), ("private", "none"), ("server", "none"), ("shared", "none")] {
+        for (tier, suite) in [
+            ("public", "mls"),
+            ("private", "none"),
+            ("server", "none"),
+            ("shared", "none"),
+        ] {
             assert!(
                 matches!(
                     terms(serde_json::json!({"slug": "#a", "tier": tier, "suite": suite})),
@@ -4811,41 +4833,59 @@ mod tests {
         ));
         // The terms belong to their tiers.
         assert_eq!(
-            field(terms(serde_json::json!({"slug": "#a", "tier": "private", "suite": "mls", "join": "guest"}))),
+            field(terms(
+                serde_json::json!({"slug": "#a", "tier": "private", "suite": "mls", "join": "guest"})
+            )),
             "join"
         );
         assert_eq!(
-            field(terms(serde_json::json!({"slug": "#a", "tier": "server", "suite": "mls", "join_servers": "owner"}))),
+            field(terms(
+                serde_json::json!({"slug": "#a", "tier": "server", "suite": "mls", "join_servers": "owner"})
+            )),
             "join_servers"
         );
         assert_eq!(
-            field(terms(serde_json::json!({"slug": "#a", "tier": "server", "suite": "mls", "join": "stranger"}))),
+            field(terms(
+                serde_json::json!({"slug": "#a", "tier": "server", "suite": "mls", "join": "stranger"})
+            )),
             "join"
         );
         assert_eq!(
-            field(terms(serde_json::json!({"slug": "#a", "tier": "public", "history": "members-may-share"}))),
+            field(terms(
+                serde_json::json!({"slug": "#a", "tier": "public", "history": "members-may-share"})
+            )),
             "history"
         );
         assert_eq!(
-            field(terms(serde_json::json!({"slug": "#a", "tier": "server", "suite": "mls", "from_dm": "bafy"}))),
+            field(terms(
+                serde_json::json!({"slug": "#a", "tier": "server", "suite": "mls", "from_dm": "bafy"})
+            )),
             "from_dm"
         );
         assert_eq!(
-            field(terms(serde_json::json!({"slug": "#a", "tier": "private", "suite": "mls", "successor_of": ""}))),
+            field(terms(
+                serde_json::json!({"slug": "#a", "tier": "private", "suite": "mls", "successor_of": ""})
+            )),
             "successor_of"
         );
         // `visibility`, when present, is the tier's.
         assert_eq!(
-            field(terms(serde_json::json!({"slug": "#a", "tier": "private", "suite": "mls", "visibility": "open"}))),
+            field(terms(
+                serde_json::json!({"slug": "#a", "tier": "private", "suite": "mls", "visibility": "open"})
+            )),
             "visibility"
         );
         assert_eq!(
-            field(terms(serde_json::json!({"slug": "#a", "tier": "public", "visibility": "restricted"}))),
+            field(terms(
+                serde_json::json!({"slug": "#a", "tier": "public", "visibility": "restricted"})
+            )),
             "visibility"
         );
         // No tier terms without a tier.
         assert_eq!(
-            field(terms(serde_json::json!({"slug": "#a", "suite": "mls", "join": "guest"}))),
+            field(terms(
+                serde_json::json!({"slug": "#a", "suite": "mls", "join": "guest"})
+            )),
             "join"
         );
     }
@@ -4856,11 +4896,19 @@ mod tests {
     async fn a_tiered_channel_is_stored_with_its_tier_and_its_tiers_visibility() {
         let ctx = tiers_ctx();
         let owner = person();
-        let cid = plain(&ctx, &owner, BlockKind::ChannelCreate, serde_json::json!({"slug": "#pub", "tier": "public"}))
-            .await
-            .unwrap();
+        let cid = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#pub", "tier": "public"}),
+        )
+        .await
+        .unwrap();
         let row = ctx.store.get_channel_by_id(&cid).unwrap().unwrap();
-        assert_eq!(row.tiering, crate::persist::ChannelTiering::of(jig_core::tier::Tier::Public));
+        assert_eq!(
+            row.tiering,
+            crate::persist::ChannelTiering::of(jig_core::tier::Tier::Public)
+        );
         assert_eq!(row.visibility, "open");
         assert_eq!(row.suite, "none");
     }
@@ -4871,9 +4919,14 @@ mod tests {
     async fn a_channel_is_never_promoted() {
         let ctx = tiers_ctx();
         let owner = person();
-        let cid = plain(&ctx, &owner, BlockKind::ChannelCreate, serde_json::json!({"slug": "#pub"}))
-            .await
-            .unwrap();
+        let cid = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#pub"}),
+        )
+        .await
+        .unwrap();
         let promote = plain(
             &ctx,
             &owner,
@@ -4881,7 +4934,10 @@ mod tests {
             serde_json::json!({"channel_id": cid}),
         )
         .await;
-        assert!(matches!(promote, Err(IngestError::TierFixed { .. })), "{promote:?}");
+        assert!(
+            matches!(promote, Err(IngestError::TierFixed { .. })),
+            "{promote:?}"
+        );
     }
 
     /// Rule 22: a frozen channel takes nothing new but its owner's archive.
@@ -4890,9 +4946,10 @@ mod tests {
         let ctx = tiers_ctx();
         let owner = person();
         let stranger = person();
+        let frozen = crate::ingest_record::label_cid("a frozen channel");
         ctx.store
             .upsert_channel(&crate::persist::StoredChannel {
-                id: "bafy_frozen".to_string(),
+                id: frozen.clone(),
                 slug: "#old".to_string(),
                 visibility: "open".to_string(),
                 created_at: 1,
@@ -4904,26 +4961,44 @@ mod tests {
             })
             .unwrap();
         for (who, kind, meta) in [
-            (&owner, BlockKind::TextRender, serde_json::json!({"channel_id": "bafy_frozen", "body": "hi"})),
-            (&owner, BlockKind::MemberAdd, serde_json::json!({"channel_id": "bafy_frozen", "member_did": stranger.did})),
-            (&stranger, BlockKind::TextRender, serde_json::json!({"channel_id": "bafy_frozen", "body": "hi"})),
+            (
+                &owner,
+                BlockKind::TextRender,
+                serde_json::json!({"channel_id": frozen, "body": "hi"}),
+            ),
+            (
+                &owner,
+                BlockKind::MemberAdd,
+                serde_json::json!({"channel_id": frozen, "member_did": stranger.did}),
+            ),
+            (
+                &stranger,
+                BlockKind::TextRender,
+                serde_json::json!({"channel_id": frozen, "body": "hi"}),
+            ),
         ] {
             let refused = plain(&ctx, who, kind, meta).await;
-            assert!(matches!(refused, Err(IngestError::ChannelFrozen { .. })), "{kind:?}: {refused:?}");
+            assert!(
+                matches!(refused, Err(IngestError::ChannelFrozen { .. })),
+                "{kind:?}: {refused:?}"
+            );
         }
         let not_owner = plain(
             &ctx,
             &stranger,
             BlockKind::ChannelArchive,
-            serde_json::json!({"channel_id": "bafy_frozen"}),
+            serde_json::json!({"channel_id": frozen}),
         )
         .await;
-        assert!(matches!(not_owner, Err(IngestError::NotChannelOwner { .. })), "{not_owner:?}");
+        assert!(
+            matches!(not_owner, Err(IngestError::NotChannelOwner { .. })),
+            "{not_owner:?}"
+        );
         plain(
             &ctx,
             &owner,
             BlockKind::ChannelArchive,
-            serde_json::json!({"channel_id": "bafy_frozen"}),
+            serde_json::json!({"channel_id": frozen}),
         )
         .await
         .expect("the owner archives a frozen channel");

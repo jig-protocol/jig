@@ -3488,7 +3488,12 @@ mod tests {
                 .unwrap()
         };
         let row = |id: &str, tier: &str, join: Option<&str>| {
-            (id.to_string(), tier.to_string(), join.map(str::to_string), "none".to_string())
+            (
+                id.to_string(),
+                tier.to_string(),
+                join.map(str::to_string),
+                "none".to_string(),
+            )
         };
         let mapped = tiers(&conn);
         assert_eq!(
@@ -3505,7 +3510,9 @@ mod tests {
         assert_eq!(tiers(&conn), mapped, "the backfill runs once per row");
         // Every row reads back as a channel.
         let stored = conn
-            .prepare(&format!("SELECT {CHANNEL_COLUMNS} FROM channels ORDER BY id"))
+            .prepare(&format!(
+                "SELECT {CHANNEL_COLUMNS} FROM channels ORDER BY id"
+            ))
             .unwrap()
             .query_map([], row_to_stored_channel)
             .unwrap()

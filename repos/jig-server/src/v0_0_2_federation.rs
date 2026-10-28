@@ -1095,7 +1095,7 @@ mod tests {
                     suite: suite.into(),
                     sequencer_did: String::new(),
                     co_owners: Vec::new(),
-                    tiering: jig_pipeline::persist::ChannelTiering::current(&visibility, &suite),
+                    tiering: jig_pipeline::persist::ChannelTiering::current(visibility, suite),
                 })
                 .unwrap();
             let secret: [u8; 32] = rand::random();

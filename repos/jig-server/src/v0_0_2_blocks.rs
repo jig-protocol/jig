@@ -275,6 +275,12 @@ pub struct ChannelView {
     pub created_at: i64,
     /// `none` or `mls`, fixed at creation.
     pub suite: String,
+    /// `private`, `server`, `shared`, `public`, or `frozen` for a plaintext
+    /// channel from before tiers (JEP-0014), fixed at creation.
+    pub tier: String,
+    /// The lowest server role that may join a `server` or `shared` channel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub join: Option<String>,
     /// The server that orders the channel: this one, or the owner of a
     /// channel this server carries (JEP-0005). Unsigned: a client takes
     /// another server's word only with `share`.
@@ -355,6 +361,8 @@ pub(crate) fn view_of(
         owner_did: c.owner_did,
         created_at: c.created_at,
         suite: c.suite,
+        tier: c.tiering.tier.as_str().to_string(),
+        join: c.tiering.join.map(|j| j.as_str().to_string()),
         sequencer,
         share,
     })
@@ -1081,6 +1089,11 @@ mod tests {
         assert_eq!(channels.len(), 1, "exactly one channel expected");
         assert_eq!(channels[0]["slug"], "#hello");
         assert_eq!(channels[0]["visibility"], "open");
+        assert_eq!(channels[0]["tier"], "public");
+        assert!(
+            channels[0].get("join").is_none(),
+            "only server and shared channels list a join role"
+        );
         assert_eq!(channels[0]["owner_did"], id.did_string());
         assert!(
             channels[0]["created_at"].as_i64().unwrap_or(0) >= 0,

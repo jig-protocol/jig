@@ -417,7 +417,7 @@ mod tests {
             suite: suite.to_string(),
             sequencer_did: String::new(),
             co_owners: Vec::new(),
-            tiering: crate::persist::ChannelTiering::current("restricted", &suite),
+            tiering: crate::persist::ChannelTiering::current("restricted", suite),
         }
     }
 

@@ -1298,7 +1298,7 @@ mod tests {
                 &self.owner,
                 &self.user,
                 BlockKind::ChannelCreate,
-                serde_json::json!({"slug": "#shared"}),
+                serde_json::json!({"slug": "#shared", "tier": "public"}),
             )
             .await
             .unwrap()
@@ -1857,7 +1857,7 @@ mod tests {
             &owner,
             &user,
             BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#c"}),
+            serde_json::json!({"slug": "#c", "tier": "public"}),
         )
         .await
         .unwrap();
@@ -2275,7 +2275,7 @@ mod tests {
             &owner,
             &user,
             BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#limited"}),
+            serde_json::json!({"slug": "#limited", "tier": "public"}),
         )
         .await
         .unwrap();
@@ -2490,7 +2490,7 @@ mod tests {
                 &self.b,
                 &self.user,
                 BlockKind::ChannelCreate,
-                serde_json::json!({"slug": slug}),
+                serde_json::json!({"slug": slug, "tier": "public"}),
             )
             .await
             .unwrap()
@@ -3056,7 +3056,7 @@ mod tests {
             &m.a,
             &m.user,
             BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#k"}),
+            serde_json::json!({"slug": "#k", "tier": "public"}),
         )
         .await
         .unwrap();
@@ -3227,7 +3227,7 @@ mod tests {
             &m.b,
             &m.user,
             BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#elsewhere"}),
+            serde_json::json!({"slug": "#elsewhere", "tier": "public"}),
         )
         .await
         .unwrap();
@@ -3253,7 +3253,7 @@ mod tests {
             &m.b,
             &SigningKey::from_bytes(&rand::random()),
             BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#general"}),
+            serde_json::json!({"slug": "#general", "tier": "public"}),
         )
         .await
         .unwrap();
@@ -3261,7 +3261,7 @@ mod tests {
             &m.a,
             &m.user,
             BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#general"}),
+            serde_json::json!({"slug": "#general", "tier": "public"}),
         )
         .await
         .unwrap();
@@ -3349,7 +3349,7 @@ mod tests {
             &m.a,
             &m.user,
             BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#k"}),
+            serde_json::json!({"slug": "#k", "tier": "public"}),
         )
         .await
         .unwrap();
@@ -3395,7 +3395,7 @@ mod tests {
             &m.a,
             &m.user,
             BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#k"}),
+            serde_json::json!({"slug": "#k", "tier": "public"}),
         )
         .await
         .unwrap();
@@ -3403,7 +3403,7 @@ mod tests {
             &m.a,
             &m.user,
             BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#other"}),
+            serde_json::json!({"slug": "#other", "tier": "public"}),
         )
         .await
         .unwrap();
@@ -3664,7 +3664,7 @@ mod tests {
             &p.owner,
             &p.user,
             BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#unshared"}),
+            serde_json::json!({"slug": "#unshared", "tier": "public"}),
         )
         .await
         .unwrap();
@@ -3687,7 +3687,7 @@ mod tests {
         let create = signed(
             &author,
             BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#new"}),
+            serde_json::json!({"slug": "#new", "tier": "public"}),
         );
         let answer = relay.accept(follower, submit_of(&channel, &create)).await;
         assert_eq!(answer.code, "RELAY_OUTSIDE_SHARE", "{answer:?}");
@@ -3816,7 +3816,7 @@ mod tests {
                 co_owners: vec![],
                 tiering: jig_pipeline::persist::ChannelTiering::current(
                     "open",
-                    &jig_core::EncryptionSuite::Unencrypted.as_str(),
+                    jig_core::EncryptionSuite::Unencrypted.as_str(),
                 ),
             })
             .unwrap();

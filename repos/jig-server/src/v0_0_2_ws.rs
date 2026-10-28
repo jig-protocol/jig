@@ -1932,7 +1932,7 @@ mod tests {
                     suite: "none".to_string(),
                     sequencer_did: String::new(),
                     co_owners: Vec::new(),
-                    tiering: jig_pipeline::persist::ChannelTiering::current(&visibility, "none"),
+                    tiering: jig_pipeline::persist::ChannelTiering::current(visibility, "none"),
                 })
                 .unwrap();
         }
