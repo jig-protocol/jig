@@ -166,6 +166,35 @@ post() {
   printf '%s\t%s\t%s\n' "$channel" "$text" "$readers" >> "$ledger"
 }
 
+# Channels created as plaintext open channels by a release before channel tiers
+# freeze on the first step that has them (JEP-0014 rule 21): their history stays
+# readable, and they take nothing new. A post to one is a post until then, and a
+# CHANNEL_FROZEN refusal from then on; a post that lands after the freeze fails.
+frozen=0
+post_legacy_plain() {
+  local who="$1" channel="$2" text="$3" readers="$4" out="$sandbox/post.out"
+  if as "$who" send --channel "$channel" "$text" > "$out" 2>&1; then
+    [ "$frozen" = 0 ] || fail "$channel took a post after it was frozen"
+    printf '%s\t%s\t%s\n' "$channel" "$text" "$readers" >> "$ledger"
+  elif grep -q CHANNEL_FROZEN "$out"; then
+    [ "$frozen" = 1 ] || note "plaintext open channels from before tiers are frozen from here on"
+    frozen=1
+  else
+    cat "$out" >&2; fail "$who could not post to $channel"
+  fi
+}
+
+# A `public` channel of this step's own, once the server has tiers, so the
+# plaintext path stays covered after the old channels freeze.
+create_public() {
+  local channel="$1"
+  if as alice channel create --help | grep -q -- '--tier'; then
+    as alice channel create "$channel" --tier public --yes >/dev/null
+  else
+    as alice channel create "$channel" >/dev/null
+  fi
+}
+
 # Every message so far, read back by every reader it was meant for.
 check_ledger() {
   local channel text readers reader out
@@ -390,8 +419,12 @@ seed() {
 # Messages written by STEP's release, and an encrypted channel of its own.
 write_step() {
   local n="$1" dm; dm="$(cat "$sandbox/dm.slug")"
-  post alice '#hello' "hello from step $n" "alice bob"
-  post alice '#open' "open from step $n" "alice bob carol"
+  post_legacy_plain alice '#hello' "hello from step $n" "alice bob"
+  post_legacy_plain alice '#open' "open from step $n" "alice bob carol"
+  if [ "$frozen" = 1 ]; then
+    create_public "#public-$n"
+    post alice "#public-$n" "public from step $n" "alice bob carol"
+  fi
   post alice '#sec' "sec from alice, step $n" "alice bob"
   post bob '#sec' "sec from bob, step $n" "alice bob"
   post alice '#enc' "enc from alice, step $n" "alice bob"
