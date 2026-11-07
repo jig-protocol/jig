@@ -187,6 +187,9 @@ pub async fn run(ctx: &CliContext, args: ChatArgs) -> Result<()> {
         backlog.lines,
         ctx.effective().contacts.clone(),
     );
+    // JEP-0014 rule 5: posting to an unencrypted channel (a `public` one)
+    // shows who can read it.
+    state.readable_by_operator = reader.secure().is_none();
 
     let result = event_loop(
         &mut terminal,

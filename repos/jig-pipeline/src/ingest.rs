@@ -5173,72 +5173,67 @@ mod tests {
     async fn an_untiered_plaintext_open_create_is_unknown_tier() {
         let ctx = tiers_ctx();
         let who = person();
-        for meta in [
-            serde_json::json!({"slug": "#old"}),
-            serde_json::json!({"slug": "#old", "visibility": "open"}),
-            serde_json::json!({"slug": "#old", "visibility": "open", "suite": "none"}),
-        ] {
-            let (mb, cb, sig) = untiered(&who.key, BlockKind::ChannelCreate, meta.clone());
+        // The same refusals whether or not the connection asked for tiers:
+        // `tiers` gates posting to `public`, not creating.
+        for tiers in [true, false] {
+            for meta in [
+                serde_json::json!({"slug": "#old"}),
+                serde_json::json!({"slug": "#old", "visibility": "open"}),
+                serde_json::json!({"slug": "#old", "visibility": "open", "suite": "none"}),
+            ] {
+                let (mb, cb, sig) = untiered(&who.key, BlockKind::ChannelCreate, meta.clone());
+                let refused = do_ingest(
+                    &ctx,
+                    mb,
+                    cb,
+                    sig,
+                    IngestSource::LocalClient { conn_id: 1, tiers },
+                )
+                .await;
+                assert!(
+                    matches!(refused, Err(IngestError::UnknownTier { .. })),
+                    "{meta}: {refused:?}"
+                );
+            }
+            assert!(ctx.store.get_channel_by_slug("#old").unwrap().is_none());
+            // A suite this build does not know is the suite gate's, with its own
+            // code, even on an `open` create without `tier`.
+            let (mb, cb, sig) = untiered(
+                &who.key,
+                BlockKind::ChannelCreate,
+                serde_json::json!({"slug": "#old", "visibility": "open", "suite": "rot13"}),
+            );
             let refused = do_ingest(
                 &ctx,
                 mb,
                 cb,
                 sig,
-                IngestSource::LocalClient {
-                    conn_id: 1,
-                    tiers: true,
-                },
+                IngestSource::LocalClient { conn_id: 1, tiers },
             )
             .await;
             assert!(
-                matches!(refused, Err(IngestError::UnknownTier { .. })),
-                "{meta}: {refused:?}"
+                matches!(refused, Err(IngestError::UnknownSuite { .. })),
+                "{refused:?}"
+            );
+            // A restricted one without `tier` is still the suite gate's (D25).
+            let (mb, cb, sig) = untiered(
+                &who.key,
+                BlockKind::ChannelCreate,
+                serde_json::json!({"slug": "#old", "visibility": "restricted"}),
+            );
+            let refused = do_ingest(
+                &ctx,
+                mb,
+                cb,
+                sig,
+                IngestSource::LocalClient { conn_id: 1, tiers },
+            )
+            .await;
+            assert!(
+                matches!(refused, Err(IngestError::RestrictedRequiresMls { .. })),
+                "{refused:?}"
             );
         }
-        assert!(ctx.store.get_channel_by_slug("#old").unwrap().is_none());
-        // A suite this build does not know is the suite gate's, with its own
-        // code, even on an `open` create without `tier`.
-        let (mb, cb, sig) = untiered(
-            &who.key,
-            BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#old", "visibility": "open", "suite": "rot13"}),
-        );
-        let refused = do_ingest(
-            &ctx,
-            mb,
-            cb,
-            sig,
-            IngestSource::LocalClient {
-                conn_id: 1,
-                tiers: true,
-            },
-        )
-        .await;
-        assert!(
-            matches!(refused, Err(IngestError::UnknownSuite { .. })),
-            "{refused:?}"
-        );
-        // A restricted one without `tier` is still the suite gate's (D25).
-        let (mb, cb, sig) = untiered(
-            &who.key,
-            BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#old", "visibility": "restricted"}),
-        );
-        let refused = do_ingest(
-            &ctx,
-            mb,
-            cb,
-            sig,
-            IngestSource::LocalClient {
-                conn_id: 1,
-                tiers: true,
-            },
-        )
-        .await;
-        assert!(
-            matches!(refused, Err(IngestError::RestrictedRequiresMls { .. })),
-            "{refused:?}"
-        );
     }
 
     /// Rule 1's mapping for an old client's encrypted creates: `restricted`

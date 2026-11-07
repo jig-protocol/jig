@@ -38,6 +38,10 @@ pub async fn run(ctx: &CliContext, channel: String, body: String) -> Result<()> 
         return Ok(());
     }
 
+    // JEP-0014 rule 5: an unencrypted channel (a `public` one) says who can
+    // read it. On stderr, so a script reading the CID from stdout is unaffected.
+    eprintln!("note: {channel} is unencrypted: anyone, including the server operator, can read it");
+
     let id = ctx.identity()?;
     let server_url = ctx.server_url()?;
 

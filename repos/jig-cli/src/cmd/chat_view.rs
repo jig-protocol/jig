@@ -35,6 +35,9 @@ pub struct ChatState {
     /// Local DID → display-name map from `[contacts]` in `cli.toml`.
     /// Read-side only; see `crate::cmd::display`.
     pub contacts: BTreeMap<String, String>,
+    /// The channel is unencrypted, so the server stores what is posted in
+    /// readable form. The pane says so in its title (JEP-0014 rule 5).
+    pub readable_by_operator: bool,
 }
 
 /// One decoded entry to display in the history pane.
@@ -67,6 +70,20 @@ impl ChatState {
             input_cursor: 0,
             status: None,
             contacts: BTreeMap::new(),
+            readable_by_operator: false,
+        }
+    }
+
+    /// The history pane's title: the channel, and for an unencrypted one,
+    /// who can read it.
+    pub fn title(&self) -> String {
+        if self.readable_by_operator {
+            format!(
+                "{} (anyone, including the server operator, can read it)",
+                self.channel
+            )
+        } else {
+            self.channel.clone()
         }
     }
 
@@ -180,11 +197,7 @@ pub fn render(f: &mut Frame, state: &ChatState) {
         .collect();
 
     f.render_widget(
-        List::new(history).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(state.channel.as_str()),
-        ),
+        List::new(history).block(Block::default().borders(Borders::ALL).title(state.title())),
         chunks[0],
     );
 
@@ -247,6 +260,7 @@ mod tests {
             input_cursor: 5,
             status: None,
             contacts: BTreeMap::new(),
+            readable_by_operator: false,
         };
         let buf = render_to_buffer(&state, 80, 24);
         let lines = buffer_to_lines(&buf);
@@ -282,6 +296,7 @@ mod tests {
             input_cursor: 0,
             status: None,
             contacts: BTreeMap::new(),
+            readable_by_operator: false,
         };
         let buf = render_to_buffer(&state, 80, 24);
         let lines = buffer_to_lines(&buf);
@@ -312,6 +327,7 @@ mod tests {
             input_cursor: 0,
             status: None,
             contacts: BTreeMap::new(),
+            readable_by_operator: false,
         };
         let buf = render_to_buffer(&state, 80, 24);
         let lines = buffer_to_lines(&buf);
@@ -345,6 +361,7 @@ mod tests {
             input_cursor: 0,
             status: None,
             contacts: BTreeMap::new(),
+            readable_by_operator: false,
         };
         let buf = render_to_buffer(&state, 80, 24);
         let lines = buffer_to_lines(&buf);
@@ -400,6 +417,17 @@ mod tests {
         assert!(
             lines.iter().any(|l| l.contains("did:jig:zmmmmm…")),
             "expected the short DID form: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn an_unencrypted_channel_says_who_can_read_it_in_the_title() {
+        let mut state = ChatState::new("#news".into());
+        assert_eq!(state.title(), "#news");
+        state.readable_by_operator = true;
+        assert_eq!(
+            state.title(),
+            "#news (anyone, including the server operator, can read it)"
         );
     }
 
