@@ -145,6 +145,29 @@ pub(crate) fn submit_failure_status(body: &str, err: &str) -> String {
     format!("⚠ not sent: \"{shown}\" — {err}")
 }
 
+/// How many rows `text` takes when word-wrapped to `width` columns, as
+/// `Wrap { trim: true }` lays it out; a word wider than the row is split.
+fn wrapped_rows(text: &str, width: u16) -> u16 {
+    let width = usize::from(width.max(1));
+    let mut rows = 1usize;
+    let mut used = 0usize;
+    for word in text.split_whitespace() {
+        let len = word.chars().count();
+        let need = if used == 0 { len } else { used + 1 + len };
+        if need <= width {
+            used = need;
+        } else {
+            rows += 1;
+            used = len;
+            while used > width {
+                rows += 1;
+                used -= width;
+            }
+        }
+    }
+    u16::try_from(rows).unwrap_or(u16::MAX)
+}
+
 /// Render the two-pane chat view.
 ///
 /// Auto-scroll strategy: rather than wiring a stateful `ListState`,
@@ -156,11 +179,10 @@ pub(crate) fn submit_failure_status(body: &str, err: &str) -> String {
 pub fn render(f: &mut Frame, state: &ChatState) {
     // An unencrypted channel says who can read it in a wrapped row of its
     // own, so a narrow terminal or a long slug cannot clip it.
-    let notice_rows = state.notice.as_deref().map_or(0, |n| {
-        let width = f.area().width.max(1) as usize;
-        // Word wrap can take a row more than the characters fill.
-        (n.chars().count().div_ceil(width) + 1).clamp(1, 5) as u16
-    });
+    let notice_rows = state
+        .notice
+        .as_deref()
+        .map_or(0, |n| wrapped_rows(n, f.area().width));
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(notice_rows), Constraint::Min(0)])
@@ -437,6 +459,16 @@ mod tests {
             let words: Vec<&str> = text.split_whitespace().collect();
             for w in ["public:", "anyone,", "including", "operator,", "read"] {
                 assert!(words.contains(&w), "{w} missing at width {width}: {text}");
+            }
+        }
+        // Every word of both warnings, at a narrow width.
+        for tier in ["public", "frozen"] {
+            let notice = crate::cmd::reader::readability_notice(false, Some(tier)).unwrap();
+            state.notice = Some(notice.clone());
+            let text = buffer_to_lines(&render_to_buffer(&state, 24, 20)).join(" ");
+            let shown: Vec<&str> = text.split_whitespace().collect();
+            for w in notice.split_whitespace() {
+                assert!(shown.contains(&w), "{tier}: {w} missing: {text}");
             }
         }
         assert!(crate::cmd::reader::readability_notice(true, Some("public")).is_none());
