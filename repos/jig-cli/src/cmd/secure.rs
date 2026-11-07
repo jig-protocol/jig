@@ -13,7 +13,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use jig_client::blocks::BuiltBlock;
 use jig_client::limits;
 use jig_client::open::open;
-use jig_client::pins::{ChannelPin, Pins, names_another_server, prove_carried, prove_channel};
+use jig_client::pins::{
+    ChannelPin, Pins, names_another_server, prove_carried, prove_channel_ordered_by,
+};
 use jig_client::read_auth::{ReadProof, signable_path};
 use jig_client::secure::{CommitLock, Seen, Session, history_reaches, replay_order};
 use jig_client::{Client, ClientError, DeliveredBlock, Identity};
@@ -400,7 +402,20 @@ impl Secure {
         let sig = served.sig_b64.with_context(|| {
             format!("the server serves {}'s creation block unsigned", info.slug)
         })?;
-        let proven = prove_channel(&info.slug, &info.id, &served.bundle_b64, &sig)?;
+        // Who may order it: this server, under any DID its key links lead
+        // from, or the owner the listing names for a carried channel, which
+        // `anchor` then proves.
+        let ours = pins
+            .server(&self.server)
+            .map(|p| p.sequencers())
+            .unwrap_or_default();
+        let orders = if names_another_server(&ours, &info.sequencer) {
+            vec![info.sequencer.clone()]
+        } else {
+            ours
+        };
+        let proven =
+            prove_channel_ordered_by(&info.slug, &info.id, &served.bundle_b64, &sig, &orders)?;
         Ok(pins.check_channel(&self.server, &info.slug, proven)?)
     }
 
