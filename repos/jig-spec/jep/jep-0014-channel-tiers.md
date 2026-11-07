@@ -147,9 +147,10 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
     strangers) decide how much capacity a caller gets. The roles here decide who may join a
     channel. A `member` is in JEP-0008's member pool. A `guest` is in whichever other pool
     JEP-0008 puts it: the invited pool if it was admitted on an invite, the stranger pool
-    otherwise (JEP-0008 rules 21 and 22). Either way it is a `guest` for joining. An `--anon`
-    session key is always in the stranger pool, and is a `guest` for joining once admitted. A
-    server MUST NOT admit to a join a DID its capacity pools refuse at that moment.
+    otherwise (JEP-0008 rules 21 and 22). Either way it is a `guest` for joining. A key the
+    server has no record of, which covers every `--anon` session key, starts in the stranger
+    pool until it meets JEP-0008's ageing or record rules (rule 21), and is a `guest` for
+    joining. A server MUST NOT admit to a join a DID its capacity pools refuse at that moment.
 
 ## 3. Joining
 
@@ -186,9 +187,11 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
       grant is signed by the owner per channel and per follower, and changes with a new offer,
       so the creation block lists no servers.
     - **When a contract ends**, the members whose clients reach the channel through that
-      follower are removed. Nothing yet records where a member's client lives, so the operator
-      names them with a manual `--via <follower>` hint (DJ, 2026-11-07). A member's recorded
-      home server replaces the hint once custodians land (JEP-0005 rule 21).
+      follower are removed. Nothing yet records where a member's client lives, so the owner's
+      operator finds them by hand (DJ, 2026-11-07):
+      `jig channel members <channel> --via <server-did>` lists the members whose latest block
+      that server relayed. A member's recorded home server replaces this once custodians land
+      (JEP-0005 rule 21).
 14. **`public`:** anyone the server admits reads it. Who may post is the existing write gate
     (membership and roles); nothing is encrypted.
 15. **Leaving and removal** are unchanged: a `member-remove` block, by the member or by a DID
