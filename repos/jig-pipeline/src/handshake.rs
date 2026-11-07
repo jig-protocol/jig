@@ -1076,6 +1076,11 @@ fn outside_offer(statement: &WelcomeStatement, offer: &ClientOffer) -> Option<&'
     {
         return Some("every advertised suite is outside what the client offered");
     }
+    // `tiers` is granted only on request (JEP-0014 rule 1); a grant this
+    // client did not ask for is outside its offer like any other.
+    if statement.capabilities.tiers && !offer.capabilities.tiers {
+        return Some("welcome grants tiers, which the client did not request");
+    }
     None
 }
 
@@ -1573,6 +1578,35 @@ mod tests {
             panic!("a stripped tiers flag must fail closed");
         };
         assert!(reason.contains("signature does not verify"), "{reason}");
+    }
+
+    /// A server that signs `tiers` into the welcome of a client that did not
+    /// ask for them is answering outside the offer, and the client refuses.
+    #[test]
+    fn an_unrequested_tiers_grant_is_outside_the_offer() {
+        let key = generate_signing_key();
+        let (hello, pending) = begin(&ClientOffer {
+            capabilities: Capabilities {
+                tiers: false,
+                ..Capabilities::default()
+            },
+            ..ClientOffer::default()
+        });
+        let Frame::Hello { nonce, .. } = hello.frame else {
+            panic!("hello");
+        };
+        // The server acts as though the hello had asked.
+        let mut view = hello_view(&nonce);
+        view.capabilities.tiers = true;
+        let mut server = offer_server();
+        server.capabilities.tiers = true;
+        let welcome = seal(&key, negotiate(&view, &server).unwrap());
+        let HandshakeResult::FailClosed { reason, .. } =
+            pending.interpret(&serde_json::to_string(&welcome).unwrap())
+        else {
+            panic!("an unrequested tiers grant must fail closed");
+        };
+        assert!(reason.contains("did not request"), "{reason}");
     }
 
     #[test]

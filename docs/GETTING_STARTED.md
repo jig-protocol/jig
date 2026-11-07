@@ -272,7 +272,9 @@ Read this before you type anything sensitive into it.
   proves who wrote it. That is a different thing. DMs (`jig dm`) and `private`, `server` and
   `shared` channels are end-to-end encrypted; a `public` channel is stored in readable form,
   and anyone who can read the server can read it. `jig channel list` marks each one. A
-  plaintext channel created before channel tiers is now read-only. Even in encrypted channels
+  plaintext channel created before channel tiers is now read-only, but its old messages are
+  still stored in readable form: freezing it stops new posts, it does not encrypt what is
+  already there. Even in encrypted channels
   the server sees who posts where and when.
 - **Permissions are per channel, and that is all.** Reads are signed with your key, so
   nobody can read as you; `restricted` channels really are members-only — for reading,
