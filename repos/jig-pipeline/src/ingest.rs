@@ -5203,7 +5203,17 @@ mod tests {
             BlockKind::ChannelCreate,
             serde_json::json!({"slug": "#old", "visibility": "open", "suite": "rot13"}),
         );
-        let refused = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 }).await;
+        let refused = do_ingest(
+            &ctx,
+            mb,
+            cb,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await;
         assert!(
             matches!(refused, Err(IngestError::UnknownSuite { .. })),
             "{refused:?}"
