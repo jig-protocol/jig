@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
 };
 use tokio::sync::mpsc;
 
@@ -35,9 +35,9 @@ pub struct ChatState {
     /// Local DID → display-name map from `[contacts]` in `cli.toml`.
     /// Read-side only; see `crate::cmd::display`.
     pub contacts: BTreeMap<String, String>,
-    /// The channel is unencrypted, so the server stores what is posted in
-    /// readable form. The pane says so in its title (JEP-0014 rule 5).
-    pub readable_by_operator: bool,
+    /// Who can read an unencrypted channel, shown in a row of its own above
+    /// the history (JEP-0014 rule 5). `None` for an encrypted channel.
+    pub notice: Option<String>,
 }
 
 /// One decoded entry to display in the history pane.
@@ -70,20 +70,7 @@ impl ChatState {
             input_cursor: 0,
             status: None,
             contacts: BTreeMap::new(),
-            readable_by_operator: false,
-        }
-    }
-
-    /// The history pane's title: the channel, and for an unencrypted one,
-    /// who can read it.
-    pub fn title(&self) -> String {
-        if self.readable_by_operator {
-            format!(
-                "{} (anyone, including the server operator, can read it)",
-                self.channel
-            )
-        } else {
-            self.channel.clone()
+            notice: None,
         }
     }
 
@@ -167,10 +154,27 @@ pub(crate) fn submit_failure_status(body: &str, err: &str) -> String {
 /// needs. Trade-off: no scroll-back, but v0.0.3 will add a proper
 /// history viewer (PageUp/PageDown bound to a `ListState`).
 pub fn render(f: &mut Frame, state: &ChatState) {
+    // An unencrypted channel says who can read it in a wrapped row of its
+    // own, so a narrow terminal or a long slug cannot clip it.
+    let notice_rows = state.notice.as_deref().map_or(0, |n| {
+        let width = f.area().width.max(1) as usize;
+        // Word wrap can take a row more than the characters fill.
+        (n.chars().count().div_ceil(width) + 1).clamp(1, 5) as u16
+    });
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(notice_rows), Constraint::Min(0)])
+        .split(f.area());
+    if let Some(notice) = &state.notice {
+        f.render_widget(
+            Paragraph::new(notice.as_str()).wrap(Wrap { trim: true }),
+            outer[0],
+        );
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(3)])
-        .split(f.area());
+        .split(outer[1]);
 
     // `f.area()` is whole-terminal; the history pane is `chunks[0]`.
     // Inner height = pane height minus the 2 rows of border. Saturating
@@ -197,7 +201,11 @@ pub fn render(f: &mut Frame, state: &ChatState) {
         .collect();
 
     f.render_widget(
-        List::new(history).block(Block::default().borders(Borders::ALL).title(state.title())),
+        List::new(history).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(state.channel.as_str()),
+        ),
         chunks[0],
     );
 
@@ -260,7 +268,7 @@ mod tests {
             input_cursor: 5,
             status: None,
             contacts: BTreeMap::new(),
-            readable_by_operator: false,
+            notice: None,
         };
         let buf = render_to_buffer(&state, 80, 24);
         let lines = buffer_to_lines(&buf);
@@ -296,7 +304,7 @@ mod tests {
             input_cursor: 0,
             status: None,
             contacts: BTreeMap::new(),
-            readable_by_operator: false,
+            notice: None,
         };
         let buf = render_to_buffer(&state, 80, 24);
         let lines = buffer_to_lines(&buf);
@@ -327,7 +335,7 @@ mod tests {
             input_cursor: 0,
             status: None,
             contacts: BTreeMap::new(),
-            readable_by_operator: false,
+            notice: None,
         };
         let buf = render_to_buffer(&state, 80, 24);
         let lines = buffer_to_lines(&buf);
@@ -361,7 +369,7 @@ mod tests {
             input_cursor: 0,
             status: None,
             contacts: BTreeMap::new(),
-            readable_by_operator: false,
+            notice: None,
         };
         let buf = render_to_buffer(&state, 80, 24);
         let lines = buffer_to_lines(&buf);
@@ -421,13 +429,21 @@ mod tests {
     }
 
     #[test]
-    fn an_unencrypted_channel_says_who_can_read_it_in_the_title() {
-        let mut state = ChatState::new("#news".into());
-        assert_eq!(state.title(), "#news");
-        state.readable_by_operator = true;
-        assert_eq!(
-            state.title(),
-            "#news (anyone, including the server operator, can read it)"
+    fn an_unencrypted_channel_says_who_can_read_it_above_the_history() {
+        let mut state = ChatState::new("#a-rather-long-channel-name".into());
+        state.notice = crate::cmd::reader::readability_notice(false, Some("public"));
+        for width in [24u16, 80] {
+            let text = buffer_to_lines(&render_to_buffer(&state, width, 12)).join(" ");
+            let words: Vec<&str> = text.split_whitespace().collect();
+            for w in ["public:", "anyone,", "including", "operator,", "read"] {
+                assert!(words.contains(&w), "{w} missing at width {width}: {text}");
+            }
+        }
+        assert!(crate::cmd::reader::readability_notice(true, Some("public")).is_none());
+        assert!(
+            crate::cmd::reader::readability_notice(false, Some("frozen"))
+                .unwrap()
+                .starts_with("frozen")
         );
     }
 
