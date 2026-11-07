@@ -240,14 +240,16 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
 
     | `visibility` | `suite` | Tier |
     | --- | --- | --- |
-    | any channel under the reserved `#jig/` prefix | `none` | `public` (rule 6) |
+    | `open`, under the reserved `#jig/` prefix | `none` | `public` (rule 6) |
     | `restricted` | `mls` | `private` |
     | `open` | `mls` | `server`, with `join = guest`, which matches today's rule that any caller the server admits may join an open channel |
     | `open` | `none` | **frozen** |
     | `restricted` | `none` | **frozen**, as D25 already does |
 
     The first row is checked first: a server's own system channels, such as `#jig/manifest`, are
-    `open` with `none` and would otherwise be frozen, which would stop the manifest log.
+    `open` with `none` and would otherwise be frozen, which would stop the manifest log. A
+    `restricted` plaintext channel under `#jig/` does not match it, and falls through to the
+    last row: frozen.
 22. **Frozen channels.** A frozen channel keeps its history readable to whoever could read it
     before. A server MUST refuse every new content or membership block in it (`CHANNEL_FROZEN`),
     except an archive by its owner.
