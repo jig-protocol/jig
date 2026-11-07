@@ -1101,6 +1101,62 @@ mod tests {
         );
     }
 
+    /// `server` and `shared` channels list their join role, and so does an
+    /// open `mls` channel from before tiers, which rule 21 maps to `server`
+    /// with `join = guest`.
+    #[tokio::test]
+    async fn the_listing_names_a_server_or_shared_channels_join_role() {
+        use jig_core::tier::{JoinRole, Tier};
+        use jig_pipeline::persist::{ChannelTiering, StoredChannel};
+        let state = Arc::new(unauthenticated_state());
+        let tiered = |tier, join| ChannelTiering {
+            join: Some(join),
+            ..ChannelTiering::of(tier)
+        };
+        for (slug, visibility, tiering) in [
+            ("#guests", "open", tiered(Tier::Server, JoinRole::Guest)),
+            ("#members", "open", tiered(Tier::Shared, JoinRole::Member)),
+            (
+                "#legacy",
+                "open",
+                ChannelTiering::legacy("#legacy", "open", "mls"),
+            ),
+        ] {
+            state
+                .ingest_ctx
+                .store
+                .upsert_channel(&StoredChannel {
+                    id: jig_pipeline::ingest_record::label_cid(slug),
+                    slug: slug.to_string(),
+                    visibility: visibility.to_string(),
+                    created_at: 0,
+                    owner_did: "did:jig:zSeedOwner".to_string(),
+                    suite: "mls".to_string(),
+                    sequencer_did: String::new(),
+                    co_owners: Vec::new(),
+                    tiering,
+                })
+                .unwrap();
+        }
+        let (status, body) = get_path(build_blocks_router(state), "/api/v1/channels").await;
+        assert_eq!(status, StatusCode::OK);
+        let listed = |slug: &str| {
+            body["channels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["slug"] == slug)
+                .unwrap_or_else(|| panic!("{slug} is not listed: {body}"))
+                .clone()
+        };
+        assert_eq!(listed("#guests")["tier"], "server");
+        assert_eq!(listed("#guests")["join"], "guest");
+        assert_eq!(listed("#members")["tier"], "shared");
+        assert_eq!(listed("#members")["join"], "member");
+        assert_eq!(listed("#legacy")["tier"], "server");
+        assert_eq!(listed("#legacy")["join"], "guest");
+    }
+
     #[tokio::test]
     async fn list_channels_returns_multiple_channels_sorted_by_slug() {
         // SqliteStore::list_channels ORDERs BY slug — confirm we surface

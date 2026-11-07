@@ -746,8 +746,10 @@ pub async fn ingest(
         // JEP-0014 rule 1: an `open` plaintext create without `tier` comes
         // from a client that cannot show the `public` label, so it is refused
         // rather than read as `public`. A restricted one without `tier` is
-        // left to the suite gate, which refuses it as before (D25).
+        // left to the suite gate, which refuses it as before (D25), and so is
+        // a suite this build does not know, which keeps its own code.
         if terms.tiering.is_none()
+            && crate::mls_gate::requested_suite(&manifest).is_ok()
             && crate::visibility::is_open(
                 manifest
                     .metadata
@@ -1713,8 +1715,13 @@ pub fn tier_terms(
         (tier_keys::SUCCESSOR_OF, &mut tiering.successor_of),
     ] {
         if let Some(id) = text(key)? {
-            if id.is_empty() {
-                return Err(invalid(key, "is empty; it names a channel by id".into()));
+            // Stored as given and looked up by id for the channel's life, so
+            // only a canonical channel id will ever resolve.
+            if !jig_core::canonical_cid::is_canonical_text(id) {
+                return Err(invalid(
+                    key,
+                    format!("`{id}` is not a channel id; it names a channel by its canonical CID"),
+                ));
             }
             *slot = Some(id.to_string());
         }
@@ -4731,6 +4738,18 @@ mod tests {
             );
         }
         assert!(ctx.store.get_channel_by_slug("#old").unwrap().is_none());
+        // A suite this build does not know is the suite gate's, with its own
+        // code, even on an `open` create without `tier`.
+        let (mb, cb, sig) = untiered(
+            &who.key,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#old", "visibility": "open", "suite": "rot13"}),
+        );
+        let refused = do_ingest(&ctx, mb, cb, sig, IngestSource::LocalClient { conn_id: 1 }).await;
+        assert!(
+            matches!(refused, Err(IngestError::UnknownSuite { .. })),
+            "{refused:?}"
+        );
         // A restricted one without `tier` is still the suite gate's (D25).
         let (mb, cb, sig) = untiered(
             &who.key,
@@ -4868,6 +4887,20 @@ mod tests {
             )),
             "successor_of"
         );
+        // A link names a channel by its canonical id, never by slug.
+        assert_eq!(
+            field(terms(
+                serde_json::json!({"slug": "#a", "tier": "private", "suite": "mls", "from_dm": "#dm/ab"})
+            )),
+            "from_dm"
+        );
+        let linked = jig_core::canonical_cid::of(b"a frozen channel").to_string();
+        let successor = terms(
+            serde_json::json!({"slug": "#a", "tier": "private", "suite": "mls", "successor_of": linked}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(successor.successor_of.as_deref(), Some(linked.as_str()));
         // `visibility`, when present, is the tier's.
         assert_eq!(
             field(terms(

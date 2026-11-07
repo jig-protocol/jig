@@ -170,11 +170,15 @@ post() {
 # freeze on the first step that has them (JEP-0014 rule 21): their history stays
 # readable, and they take nothing new. A post to one is a post until then, and a
 # CHANNEL_FROZEN refusal from then on; a post that lands after the freeze fails.
+# A release whose CLI offers `--tier` has tiers, so it must refuse the post: the
+# refusal is not the only sign of the freeze.
 frozen=0
+has_tiers() { as alice channel create --help | grep -q -- '--tier'; }
 post_legacy_plain() {
   local who="$1" channel="$2" text="$3" readers="$4" out="$sandbox/post.out"
   if as "$who" send --channel "$channel" "$text" > "$out" 2>&1; then
     [ "$frozen" = 0 ] || fail "$channel took a post after it was frozen"
+    ! has_tiers || fail "$channel took a post on a release with tiers, which freeze it (JEP-0014 rule 21)"
     printf '%s\t%s\t%s\n' "$channel" "$text" "$readers" >> "$ledger"
   elif grep -q CHANNEL_FROZEN "$out"; then
     [ "$frozen" = 1 ] || note "plaintext open channels from before tiers are frozen from here on"
@@ -188,7 +192,7 @@ post_legacy_plain() {
 # plaintext path stays covered after the old channels freeze.
 create_public() {
   local channel="$1"
-  if as alice channel create --help | grep -q -- '--tier'; then
+  if has_tiers; then
     as alice channel create "$channel" --tier public --yes >/dev/null
   else
     as alice channel create "$channel" >/dev/null
