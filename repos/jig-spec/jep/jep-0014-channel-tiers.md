@@ -106,6 +106,8 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
    channel, with words to the effect of "anyone, including the server operator, can read
    this". A client MUST ask the creator to confirm before it signs a `public`
    `channel-create`. A server MAY refuse `public` channels by policy.
+   - A client that creates a channel without its user naming a tier creates a `private` one
+     (DJ, 2026-11-07).
    - A server MUST refuse a content block in a `public` channel from a connection whose
      `hello` did not request `tiers` (rule 1; `TIER_UNSUPPORTED`). The one request serves both
      rules. An older client cannot show the label, so it
@@ -130,17 +132,24 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
 8. **Every authenticated caller has one server role** on a given server:
    - **`member`**: a DID the server's admission policy records as a member. Until JEP-0009,
      that is local policy: admission `records`, or JEP-0008 rule 21's member pool.
-   - **`guest`**: a DID that has proven possession of its key (JEP-0002 request proofs) and
+   - **`guest`**: a key that has proven possession of itself (JEP-0002 request proofs) and
      that admission lets through, but that is not a member.
-   - **`stranger`**: everyone else, including every `--anon` session key (D20).
+   - **`stranger`**: everyone else: a caller that admission refuses, or that has not proven
+     its key.
+
+   A server cannot tell an `--anon` session key from a freshly admitted DID: both are new keys
+   that prove possession (D20). So `join = guest` admits any admitted key, `--anon` session
+   keys included (DJ, 2026-11-07). A creator who wants only the server's members keeps the
+   default, `join = member`.
 9. **The role is the server's local judgement,** made on its own clock and records, at the
    moment the join is checked. It is not carried to other servers.
 10. **Join roles are not capacity pools.** JEP-0008 rule 21's pools (members, invited and
     strangers) decide how much capacity a caller gets. The roles here decide who may join a
     channel. A `member` is in JEP-0008's member pool. A `guest` is in whichever other pool
     JEP-0008 puts it: the invited pool if it was admitted on an invite, the stranger pool
-    otherwise (JEP-0008 rules 21 and 22). Either way it is a `guest` for joining. A server MUST
-    NOT admit to a join a DID its capacity pools refuse at that moment.
+    otherwise (JEP-0008 rules 21 and 22). Either way it is a `guest` for joining. An `--anon`
+    session key is always in the stranger pool, and is a `guest` for joining once admitted. A
+    server MUST NOT admit to a join a DID its capacity pools refuse at that moment.
 
 ## 3. Joining
 
@@ -176,6 +185,10 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
     - The servers whose members may self-join are exactly those holding a `member` grant. The
       grant is signed by the owner per channel and per follower, and changes with a new offer,
       so the creation block lists no servers.
+    - **When a contract ends**, the members whose clients reach the channel through that
+      follower are removed. Nothing yet records where a member's client lives, so the operator
+      names them with a manual `--via <follower>` hint (DJ, 2026-11-07). A member's recorded
+      home server replaces the hint once custodians land (JEP-0005 rule 21).
 14. **`public`:** anyone the server admits reads it. Who may post is the existing write gate
     (membership and roles); nothing is encrypted.
 15. **Leaving and removal** are unchanged: a `member-remove` block, by the member or by a DID
