@@ -501,6 +501,34 @@ mod tests {
         assert_eq!(members[0].role, "owner");
     }
 
+    /// A tiered channel stores its tier's visibility, which is what the read
+    /// gate and clients that predate tiers go by: a `private` channel is
+    /// `restricted` though its block says nothing about visibility.
+    #[tokio::test]
+    async fn a_private_channel_is_stored_restricted_without_a_visibility() {
+        let s = store();
+        let m = manifest_with(
+            BlockKind::ChannelCreate,
+            "did:jig:zOwner",
+            json!({"slug": "#sec", "tier": "private", "suite": "mls"}),
+        );
+        let (mb, cb) = as_bundle(m);
+        let bundle = BlockBundle {
+            manifest_bytes: &mb,
+            code_bytes: &cb,
+            resources: vec![],
+        };
+        apply_effect(&s, &bundle, &[], "bafy_private")
+            .await
+            .unwrap();
+        let ch = s.get_channel_by_slug("#sec").unwrap().unwrap();
+        assert_eq!(ch.visibility, "restricted");
+        assert_eq!(
+            ch.tiering,
+            crate::persist::ChannelTiering::of(jig_core::tier::Tier::Private)
+        );
+    }
+
     #[tokio::test]
     async fn member_add_inserts_membership_for_existing_channel() {
         let s = store();

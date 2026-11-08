@@ -976,9 +976,15 @@ pub async fn list(ctx: &CliContext) -> Result<()> {
 /// Empty list prints `(no channels yet)` so operators don't see silence and
 /// wonder whether their `list` even ran.
 fn print_channels(channels: &[ChannelView]) {
+    for line in channel_lines(channels) {
+        println!("{line}");
+    }
+}
+
+/// The lines [`print_channels`] prints.
+fn channel_lines(channels: &[ChannelView]) -> Vec<String> {
     if channels.is_empty() {
-        println!("(no channels yet)");
-        return;
+        return vec!["(no channels yet)".to_string()];
     }
     // Pad slug + visibility to the widest entry so the DID column lines up.
     let slug_w = channels
@@ -993,27 +999,30 @@ fn print_channels(channels: &[ChannelView]) {
         .max()
         .unwrap_or(0)
         .max(10);
-    for c in channels {
-        let sealed = if !matches!(c.suite.as_str(), "" | "none") {
-            "🔒"
-        } else {
-            "  "
-        };
-        // JEP-0014 rule 5: a public channel says so wherever it is shown.
-        let note = match c.tier.as_deref() {
-            Some("public") => "  (anyone, including the server operator, can read it)",
-            Some("frozen") => "  (read-only: created unencrypted before channel tiers)",
-            _ => "",
-        };
-        println!(
-            "{:<slug_w$}  {:<vis_w$}  {sealed}  {}{note}",
-            c.slug,
-            c.kind(),
-            c.owner_did,
-            slug_w = slug_w,
-            vis_w = vis_w,
-        );
-    }
+    channels
+        .iter()
+        .map(|c| {
+            let sealed = if !matches!(c.suite.as_str(), "" | "none") {
+                "🔒"
+            } else {
+                "  "
+            };
+            // JEP-0014 rule 5: a public channel says so wherever it is shown.
+            let note = match c.tier.as_deref() {
+                Some("public") => "  (anyone, including the server operator, can read it)",
+                Some("frozen") => "  (read-only: created unencrypted before channel tiers)",
+                _ => "",
+            };
+            format!(
+                "{:<slug_w$}  {:<vis_w$}  {sealed}  {}{note}",
+                c.slug,
+                c.kind(),
+                c.owner_did,
+                slug_w = slug_w,
+                vis_w = vis_w,
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1115,6 +1124,13 @@ mod tests {
             tier: tier.map(str::to_string),
         };
         assert_eq!(view(Some("public")).kind(), "public");
+        let lines = channel_lines(&[view(Some("public")), view(Some("frozen")), view(None)]);
+        assert!(
+            lines[0].contains("anyone, including the server operator, can read it"),
+            "{lines:?}"
+        );
+        assert!(lines[1].contains("read-only"), "{lines:?}");
+        assert!(!lines[2].contains("anyone"), "{lines:?}");
         assert_eq!(
             view(None).kind(),
             "open",
