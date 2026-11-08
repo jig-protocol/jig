@@ -245,6 +245,13 @@ if [ "$MODE" = local ]; then
   [ -x "$BIN/jig-server" ] || fail "no jig-server in $BIN"
   log "booting two local servers"
   local_init a; local_init b
+  # The legacy path has B copy the channel A creates, which a server does
+  # only when it opts in to copying a peer's channel-create.
+  if [ "$FED_PATH" = legacy ]; then
+    for side in a b; do
+      printf '\n[federation]\nnaively_accept_peer_relayed_creates = true\n' >> "$(local_dir "$side")/config.toml"
+    done
+  fi
   printf '\n[[federation.peers]]\nurl = "wss://127.0.0.1:%s"\nexpected_did = "%s"\n' \
     "$(local_port b)" "$(cat "$(local_dir b)/did")" >> "$(local_dir a)/config.toml"
   printf '\n[[federation.peers]]\nurl = "wss://127.0.0.1:%s"\nexpected_did = "%s"\n' \
