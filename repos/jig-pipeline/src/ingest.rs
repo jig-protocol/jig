@@ -648,7 +648,11 @@ pub async fn ingest(
                 .map(crate::effect::canonical_did_string)
                 .unwrap_or_default();
             let owner = crate::effect::canonical_did_string(&chan.owner_did);
-            if member != owner && jig_core::dm::dm_slug(&owner, &member) != chan.slug {
+            // A legacy `#dm/` channel that already holds three or more takes
+            // no further adds, not even of the pair.
+            let oversized = ctx.store.list_members(&chan.id)?.len() > 2;
+            if oversized || (member != owner && jig_core::dm::dm_slug(&owner, &member) != chan.slug)
+            {
                 return Err(IngestError::DmIsAPair {
                     slug: chan.slug.clone(),
                     member,
@@ -1659,6 +1663,8 @@ pub fn check_linked_channels(
             .filter(|c| {
                 jig_core::slug::reserved_class(&c.slug) == Some(jig_core::slug::SlugClass::Dm)
             })
+            // A legacy `#dm/` channel of three or more is a group, not a 1:1.
+            .filter(|c| store.list_members(&c.id).is_ok_and(|m| m.len() <= 2))
             .ok_or_else(|| {
                 invalid(
                     tier_keys::FROM_DM,
@@ -1673,12 +1679,16 @@ pub fn check_linked_channels(
         }
     }
     if let Some(id) = &tiering.successor_of {
-        let old = store.get_channel_by_id(id)?.ok_or_else(|| {
-            invalid(
-                tier_keys::SUCCESSOR_OF,
-                format!("`{id}` is no channel on this server"),
-            )
-        })?;
+        // An owner may archive the frozen channel first; it still has a
+        // successor.
+        let old = store
+            .get_channel_by_id_including_archived(id)?
+            .ok_or_else(|| {
+                invalid(
+                    tier_keys::SUCCESSOR_OF,
+                    format!("`{id}` is no channel on this server"),
+                )
+            })?;
         if !old.tiering.tier.is_frozen() {
             return Err(invalid(
                 tier_keys::SUCCESSOR_OF,
@@ -5644,6 +5654,13 @@ mod tests {
             other => panic!("expected DM_IS_A_PAIR, got {other:?}"),
         }
         add(&b.did).await.expect("the other of the pair is added");
+        // A legacy `#dm/` channel already holding three takes no further
+        // adds, not even of the pair.
+        member_of(&ctx, &dm, &c.did);
+        assert!(matches!(
+            add(&b.did).await,
+            Err(IngestError::DmIsAPair { .. })
+        ));
     }
 
     /// Rule 19: `from_dm` names a 1:1 here that the creator is in.
@@ -5678,8 +5695,22 @@ mod tests {
             ..ChannelTiering::of(Tier::Private)
         };
         check_linked_channels(&ctx.store, &group(&dm), &a.did).expect("a's 1:1");
+        // A legacy `#dm/` channel of three is a group, not a 1:1.
+        let grown = crate::ingest_record::label_cid("a grown dm");
+        ctx.store
+            .upsert_channel(&tiered_row(
+                &grown,
+                &jig_core::dm::dm_slug(&a.did, &c.did),
+                &a.did,
+                ChannelTiering::of(Tier::Private),
+            ))
+            .unwrap();
+        for who in [&a.did, &b.did, &c.did] {
+            member_of(&ctx, &grown, who);
+        }
         for (from, who) in [
             (dm.as_str(), &c.did),
+            (grown.as_str(), &a.did),
             (room.as_str(), &a.did),
             ("bafy_nowhere", &a.did),
         ] {
@@ -5726,6 +5757,10 @@ mod tests {
             check_linked_channels(&ctx.store, &successor(&frozen, tier), &owner.did)
                 .unwrap_or_else(|e| panic!("{tier}: {e}"));
         }
+        // Archived first, it still has a successor.
+        ctx.store.archive_channel_by_id(&frozen, 2).unwrap();
+        check_linked_channels(&ctx.store, &successor(&frozen, Tier::Private), &owner.did)
+            .expect("an archived frozen channel");
         for (of, tier, who) in [
             (frozen.as_str(), Tier::Public, &owner.did),
             (frozen.as_str(), Tier::Private, &other.did),
@@ -5739,6 +5774,52 @@ mod tests {
                 ),
                 "{of} as {tier} for {who}"
             );
+        }
+    }
+
+    /// Rules 19 and 23 through ingest: a create naming a 1:1 that is not
+    /// there, or another owner's frozen channel, is refused and not stored.
+    #[tokio::test]
+    async fn ingest_refuses_a_create_linked_to_the_wrong_channel() {
+        use crate::persist::ChannelTiering;
+        let ctx = tiers_ctx();
+        let (owner, other) = (person(), person());
+        let frozen = crate::ingest_record::label_cid("frozen");
+        ctx.store
+            .upsert_channel(&tiered_row(
+                &frozen,
+                "#old",
+                &owner.did,
+                ChannelTiering::legacy("#old", "open", "none"),
+            ))
+            .unwrap();
+        let nowhere = crate::ingest_record::label_cid("no such dm");
+        for (key, field, id) in [
+            ("from_dm", "from_dm", nowhere.as_str()),
+            ("successor_of", "successor_of", frozen.as_str()),
+        ] {
+            let (mb, cb, sig) = signed_parts(
+                &other.key,
+                BlockKind::ChannelCreate,
+                jig_core::EncryptionSuite::Mls,
+                serde_json::json!({"slug": "#linked", "suite": "mls", "tier": "private", key: id}),
+            );
+            let refused = do_ingest(
+                &ctx,
+                mb,
+                cb,
+                sig,
+                IngestSource::LocalClient {
+                    conn_id: 1,
+                    tiers: true,
+                },
+            )
+            .await;
+            assert!(
+                matches!(refused, Err(IngestError::InvalidTerms { field: ref f, .. }) if f == field),
+                "{key}: {refused:?}"
+            );
+            assert!(ctx.store.get_channel_by_slug("#linked").unwrap().is_none());
         }
     }
 

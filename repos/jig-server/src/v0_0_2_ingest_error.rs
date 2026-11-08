@@ -390,6 +390,16 @@ mod tests {
         ]
     }
 
+    #[test]
+    fn a_dm_that_would_grow_is_a_conflict() {
+        let (status, code, _) = classify_ingest_error(&IngestError::DmIsAPair {
+            slug: "#dm/0123456789abcdef".to_string(),
+            member: "did:jig:zThird".to_string(),
+        });
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(code, "DM_IS_A_PAIR");
+    }
+
     /// The property this module exists to guarantee: the REST (`v0_0_2_blocks`)
     /// and admin (`v0_0_2_admin`) wrappers must classify every `IngestError`
     /// identically — same status, same error code — differing only in which

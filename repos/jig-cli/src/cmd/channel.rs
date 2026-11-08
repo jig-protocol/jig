@@ -279,10 +279,13 @@ async fn server_has_tiers(ctx: &CliContext) -> Result<bool> {
     Ok(client.welcome().is_some_and(|w| w.capabilities.tiers))
 }
 
-/// JEP-0014 rule 18: a 1:1 stays a pair. Adding someone means a new group
+/// JEP-0014 rule 18: a 1:1 stays a pair. It takes the other of its two
+/// people (`jig dm` adds them on first use); anyone else means a new group
 /// linked to it, which the server would require anyway.
-fn refuse_growing_a_dm(slug: &str) -> Result<()> {
-    if jig_core::slug::reserved_class(slug) == Some(jig_core::slug::SlugClass::Dm) {
+fn refuse_growing_a_dm(slug: &str, me: &str, who: &str) -> Result<()> {
+    if jig_core::slug::reserved_class(slug) == Some(jig_core::slug::SlugClass::Dm)
+        && jig_core::dm::dm_slug(me, who) != slug
+    {
         anyhow::bail!(
             "{slug} is a 1:1 and stays one. To talk as a group, make a new channel linked to it: \
              `jig channel create '#group' --from-dm {slug}`, then `jig channel add '#group'` \
@@ -564,8 +567,8 @@ async fn visible_channel(secure: &Secure, slug: &str) -> Result<ChannelInfo> {
 /// this fetches one of the member's key packages and commits their addition;
 /// the welcome rides the same block.
 pub async fn add(ctx: &CliContext, slug: String, who: String) -> Result<()> {
-    refuse_growing_a_dm(&slug)?;
     let did = resolve_who(ctx, &who).await?;
+    refuse_growing_a_dm(&slug, &ctx.identity()?.did_string(), &did)?;
     let secure = Secure::open(ctx)?;
     let info = visible_channel(&secure, &slug).await?;
     let id = secure.identity();
@@ -1062,11 +1065,16 @@ mod tests {
 
     #[test]
     fn a_dm_is_not_grown_in_place() {
-        let err = refuse_growing_a_dm("#dm/0123456789abcdef")
+        let did = |n: u8| jig_core::Did::from_ed25519_pubkey(&[n; 32]).to_did_jig_string();
+        let (me, peer, third) = (did(1), did(2), did(3));
+        let dm = jig_core::dm::dm_slug(&me, &peer);
+        // `jig dm` adds the other of the pair on first use.
+        refuse_growing_a_dm(&dm, &me, &peer).unwrap();
+        let err = refuse_growing_a_dm(&dm, &me, &third)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("--from-dm #dm/0123456789abcdef"), "{err}");
-        refuse_growing_a_dm("#team").unwrap();
+        assert!(err.contains(&format!("--from-dm {dm}")), "{err}");
+        refuse_growing_a_dm("#team", &me, &third).unwrap();
     }
 
     #[test]
