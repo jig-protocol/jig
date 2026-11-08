@@ -17,7 +17,7 @@ use jig_client::pins::{
     ChannelPin, Pins, names_another_server, prove_carried, prove_channel_ordered_by,
 };
 use jig_client::read_auth::{ReadProof, signable_path};
-use jig_client::secure::{CommitLock, Seen, Session, history_reaches, replay_order};
+use jig_client::secure::{CommitLock, ReadIn, Seen, Session, history_reaches, replay_order};
 use jig_client::{Client, ClientError, DeliveredBlock, Identity};
 use jig_mls::member::Commit;
 use serde::Deserialize;
@@ -541,7 +541,7 @@ impl Secure {
             Some(head) => self.since(slug, &head).await?,
             None => self.newest_to_epoch(slug).await?,
         };
-        let synced = self.replay(&delivered);
+        let synced = self.replay(slug, &delivered);
         if let Some(newest) = delivered.iter().rev().find_map(|d| open(d).ok()) {
             self.session.set_head(&self.server, slug, &newest.cid)?;
         }
@@ -659,7 +659,7 @@ impl Secure {
             older.append(&mut delivered);
             delivered = older;
         }
-        let shown = self.replay(&delivered);
+        let shown = self.replay(slug, &delivered);
         Ok(Synced {
             tidy: synced.tidy,
             ..shown
@@ -688,8 +688,39 @@ impl Secure {
         parse_history(&body.to_string())
     }
 
+    /// The id and slug of the channel this device names `reference`, from
+    /// what it pinned ([`Self::channel`] pins a channel before it is read);
+    /// else `reference` itself, as an id or a slug. Blocks of the channel
+    /// name it by one of the two ([`Session::observe_in`]).
+    fn names(&self, reference: &str) -> (String, String) {
+        let pinned = Pins::load(&Pins::default_path()).ok().and_then(|pins| {
+            pins.channel_by_ref(&self.server, reference)
+                .map(|(slug, pin)| (pin.create_cid.clone(), slug.to_string()))
+        });
+        pinned.unwrap_or_else(|| {
+            if jig_core::canonical_cid::is_canonical_text(reference) {
+                (reference.to_string(), String::new())
+            } else {
+                (String::new(), reference.to_string())
+            }
+        })
+    }
+
+    /// What one block of `reference`'s live stream means, read through the
+    /// group state filed under `reference`, as [`Self::replay`] reads its
+    /// history.
+    pub fn observe(&self, reference: &str, block: &jig_client::open::OpenedBlock) -> Seen {
+        let (id, slug) = self.names(reference);
+        let channel = ReadIn {
+            key: reference,
+            id: &id,
+            slug: &slug,
+        };
+        self.session.observe_in(&self.server, Some(&channel), block)
+    }
+
     /// [`Secure::sync`] over blocks already fetched.
-    pub fn replay(&self, delivered: &[DeliveredBlock]) -> Synced {
+    pub fn replay(&self, reference: &str, delivered: &[DeliveredBlock]) -> Synced {
         let mut opened = Vec::with_capacity(delivered.len());
         let mut receipts = std::collections::HashMap::new();
         for d in delivered {
@@ -704,15 +735,14 @@ impl Secure {
         let cids = opened.iter().map(|o| o.cid.clone()).collect();
         let mut lines = Vec::new();
         let mut left = Vec::new();
-        let mut slug = None;
+        let (id, slug) = self.names(reference);
+        let channel = ReadIn {
+            key: reference,
+            id: &id,
+            slug: &slug,
+        };
         for o in replay_order(opened) {
-            if slug.is_none() {
-                slug = o
-                    .manifest
-                    .kind
-                    .and_then(|k| jig_pipeline_slug(k, &o.manifest));
-            }
-            let seen = self.session.observe(&self.server, &o);
+            let seen = self.session.observe_in(&self.server, Some(&channel), &o);
             match &seen {
                 Seen::Left { member, tidy: true } => left.push(member.clone()),
                 // Back again since they left: nothing to tidy.
@@ -726,16 +756,11 @@ impl Secure {
         }
         // Only those still in the tree once everything has been replayed: a
         // later block in the same history may already have removed them.
-        let tidy = match slug {
-            Some(slug) => {
-                let still = self
-                    .session
-                    .group_members(&self.server, &slug)
-                    .unwrap_or_default();
-                left.into_iter().filter(|d| still.contains(d)).collect()
-            }
-            None => Vec::new(),
-        };
+        let still = self
+            .session
+            .group_members(&self.server, reference)
+            .unwrap_or_default();
+        let tidy = left.into_iter().filter(|d| still.contains(d)).collect();
         let deliveries = delivered.iter().map(|d| d.delivery_cid.clone()).collect();
         Synced {
             lines,
@@ -902,18 +927,6 @@ fn pick(
         ),
         (None, None) => Ok(None),
     }
-}
-
-fn jig_pipeline_slug(kind: jig_core::BlockKind, m: &jig_core::BlockManifest) -> Option<String> {
-    let key = if kind == jig_core::BlockKind::ChannelCreate {
-        "slug"
-    } else {
-        "channel"
-    };
-    m.metadata
-        .get(key)
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
 }
 
 #[cfg(test)]

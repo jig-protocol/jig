@@ -134,7 +134,7 @@ impl Reader {
                 .filter_map(|d| self.read(d).map(|r| r.line).transpose())
                 .collect();
         };
-        let synced = secure.replay(blocks);
+        let synced = secure.replay(&self.slug, blocks);
         self.tidy(synced.tidy);
         synced.lines.into_iter().map(Ok).collect()
     }
@@ -147,7 +147,7 @@ impl Reader {
             });
         };
         let opened = open(d)?;
-        let seen = secure.session.observe(secure.server(), &opened);
+        let seen = secure.observe(&self.slug, &opened);
         let tidy = match &seen {
             jig_client::secure::Seen::Left { member, tidy: true } => Some(member.clone()),
             _ => None,

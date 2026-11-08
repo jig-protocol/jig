@@ -65,6 +65,8 @@ pub enum SecureError {
     NoGroup(String),
     #[error("malformed MLS field `{0}` in block")]
     Field(&'static str),
+    #[error("the block names another channel than {0}")]
+    OtherChannel(String),
     #[error("MLS state at {path:?} does not open: {reason}")]
     Sealed { path: PathBuf, reason: String },
     #[error(
@@ -112,6 +114,36 @@ pub enum Seen {
     Gone,
     /// A membership change this member could not follow.
     Broken { reason: String },
+}
+
+/// The channel whose history a block is read in ([`Session::observe_in`]):
+/// the key its group state is filed under, which is the name the caller uses
+/// for every other [`Session`] call on it, and the channel's id and slug, one
+/// of which a block of it names. Either may be empty when unknown.
+#[derive(Debug, Clone, Copy)]
+pub struct ReadIn<'a> {
+    pub key: &'a str,
+    /// The CID of the channel's `channel-create`.
+    pub id: &'a str,
+    pub slug: &'a str,
+}
+
+impl ReadIn<'_> {
+    /// Whether `block` names this channel: by id under `channel_id`, by slug
+    /// under `channel`, or as the block that created it.
+    fn names(&self, kind: BlockKind, block: &OpenedBlock) -> bool {
+        if !self.id.is_empty()
+            && (block.meta_str(jig_pipeline::ingest::CHANNEL_ID_KEY) == Some(self.id)
+                || (kind == BlockKind::ChannelCreate && block.cid == self.id))
+        {
+            return true;
+        }
+        !self.slug.is_empty()
+            && block
+                .meta_str(jig_pipeline::ingest::CHANNEL_ID_KEY)
+                .is_none()
+            && jig_pipeline::ingest::channel_slug_of(kind, &block.manifest) == Some(self.slug)
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -537,7 +569,22 @@ impl Session {
     /// member has no group for is not an error: it reads as [`Seen::Sealed`]
     /// or [`Seen::Control`].
     pub fn observe(&self, server: &str, block: &OpenedBlock) -> Seen {
-        match self.try_observe(server, block) {
+        self.observe_in(server, None, block)
+    }
+
+    /// [`Self::observe`] for a block read in `channel`'s history: its group
+    /// state is the one filed under `channel.key`, whatever name the block
+    /// gives the channel. A channel this server carries for its owner is
+    /// filed under its id, while the owner's blocks name it by slug and its
+    /// members here name it by id. A block that names neither the channel's
+    /// id nor its slug moves no group state.
+    pub fn observe_in(
+        &self,
+        server: &str,
+        channel: Option<&ReadIn<'_>>,
+        block: &OpenedBlock,
+    ) -> Seen {
+        match self.try_observe(server, channel, block) {
             Ok(seen) => seen,
             Err(e) => match block.manifest.kind {
                 Some(BlockKind::MemberAdd | BlockKind::MemberRemove) => Seen::Broken {
@@ -550,7 +597,12 @@ impl Session {
         }
     }
 
-    fn try_observe(&self, server: &str, block: &OpenedBlock) -> Result<Seen> {
+    fn try_observe(
+        &self,
+        server: &str,
+        channel: Option<&ReadIn<'_>>,
+        block: &OpenedBlock,
+    ) -> Result<Seen> {
         let Some(kind) = block.manifest.kind else {
             return Ok(Seen::Plain);
         };
@@ -566,9 +618,19 @@ impl Session {
                 return Ok(Seen::Sealed { reason });
             }
         }
-        let slug = jig_pipeline::ingest::channel_slug_of(kind, &block.manifest)
-            .unwrap_or_default()
-            .to_string();
+        let named =
+            jig_pipeline::ingest::channel_slug_of(kind, &block.manifest).unwrap_or_default();
+        let slug = match channel {
+            None => named.to_string(),
+            Some(c) => {
+                let moves_group = matches!(kind, BlockKind::MemberAdd | BlockKind::MemberRemove)
+                    || block.manifest.content_suite().is_encrypted();
+                if moves_group && !c.names(kind, block) {
+                    return Err(SecureError::OtherChannel(c.key.to_string()));
+                }
+                c.key.to_string()
+            }
+        };
         let key = group_key(server, &slug);
         let me = self.did.clone();
         let commit = block.meta_str("mls_commit");
@@ -1216,6 +1278,98 @@ mod tests {
         let bob_again = Session::open(root.path(), bob.identity.duplicate()).unwrap();
         assert_eq!(bob_again.observe(SERVER, &msg), read);
         assert!(bob_again.has_group(SERVER, "#sealed").unwrap());
+    }
+
+    /// A channel a follower carries for its owner: the owner's blocks name
+    /// it by slug, its members on the follower post to it by id, and both
+    /// sides read each other's blocks through the group state they file it
+    /// under (the slug at the owner, the id at the follower).
+    #[test]
+    fn a_carried_channel_is_read_under_the_key_its_caller_files_it_by() {
+        const FOLLOWER: &str = "http://127.0.0.1:7118";
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let bob = session(root.path());
+        let id = crate::blocks::build_channel_create(
+            identity_of(&alice),
+            "#shared",
+            "open",
+            "did:jig:zowner",
+            hlc(&alice),
+        )
+        .cid();
+        let at_owner = ReadIn {
+            key: "#shared",
+            id: &id,
+            slug: "#shared",
+        };
+        let at_follower = ReadIn {
+            key: &id,
+            id: &id,
+            slug: "#shared",
+        };
+        alice.create_group(SERVER, "#shared").unwrap();
+
+        // The owner's add names the slug; bob, on the follower, files the
+        // group under the id he names the channel by there.
+        let add = deliver(&add_block(&alice, "#shared", &bob));
+        assert_eq!(
+            bob.observe_in(FOLLOWER, Some(&at_follower), &add),
+            Seen::Joined
+        );
+        assert!(bob.has_group(FOLLOWER, &id).unwrap());
+        assert!(!bob.has_group(FOLLOWER, "#shared").unwrap());
+
+        // Bob posts by id; the block names the id, and alice reads it under
+        // the slug.
+        let (msg, epoch) = bob.encrypt(FOLLOWER, &id, "hi from the follower").unwrap();
+        let sent = build_sealed_text(identity_of(&bob), &id, &msg, epoch, hlc(&bob));
+        let sent = deliver(&sent);
+        assert_eq!(sent.meta_str("channel_id"), Some(id.as_str()));
+        assert_eq!(
+            alice.observe_in(SERVER, Some(&at_owner), &sent),
+            Seen::Text {
+                sender: bob.did().to_string(),
+                text: "hi from the follower".to_string(),
+            }
+        );
+
+        // And alice's reply, named by slug, reads at the follower.
+        let reply = deliver(&say(&alice, "#shared", "hi back"));
+        assert_eq!(
+            bob.observe_in(FOLLOWER, Some(&at_follower), &reply),
+            Seen::Text {
+                sender: alice.did().to_string(),
+                text: "hi back".to_string(),
+            }
+        );
+    }
+
+    /// A block that names another channel than the one whose history it is
+    /// read in moves no group state there: a server cannot file one
+    /// channel's welcome under another.
+    #[test]
+    fn a_block_naming_another_channel_moves_no_group_state() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let bob = session(root.path());
+        alice.create_group(SERVER, "#other").unwrap();
+        let add = deliver(&add_block(&alice, "#other", &bob));
+        let here = ReadIn {
+            key: "#here",
+            id: "",
+            slug: "#here",
+        };
+        assert!(
+            matches!(
+                bob.observe_in(SERVER, Some(&here), &add),
+                Seen::Broken { ref reason } if reason.contains("another channel")
+            ),
+            "{:?}",
+            bob.observe_in(SERVER, Some(&here), &add)
+        );
+        assert!(!bob.has_group(SERVER, "#here").unwrap());
+        assert!(!bob.has_group(SERVER, "#other").unwrap());
     }
 
     #[test]
