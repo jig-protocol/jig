@@ -813,6 +813,7 @@ mod tests {
             fanout: Arc::new(Fanout::new()),
             server_url: "ws://127.0.0.1:7117".to_string(),
             naively_allow_unknown_handles_fallback: false,
+            naively_accept_peer_relayed_creates: false,
             executor: Some(crate::executor::BlockExecutor::shared()),
         }
     }
@@ -925,7 +926,10 @@ mod tests {
         }
 
         /// Post through the owner's own gate, and keep what it would send.
-        async fn post(&mut self, kind: BlockKind, meta: serde_json::Value) -> String {
+        async fn post(&mut self, kind: BlockKind, mut meta: serde_json::Value) -> String {
+            if kind == BlockKind::ChannelCreate {
+                meta[crate::ingest::SEQUENCER_KEY] = serde_json::json!(self.did());
+            }
             let parts = signed(&self.user, kind, meta);
             self.post_parts(kind, parts).await
         }

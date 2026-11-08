@@ -734,7 +734,7 @@ pub async fn get_channel_history(
             StatusCode::NOT_FOUND,
             "CARRIED_CHANNEL",
             format!(
-                "{channel_ref} here is carried for {}, which orders it; read it by its id: {}",
+                "{channel_ref} here is carried for {}, which orders it; name it by its id: {}",
                 carried.sequencer_did, carried.id
             ),
         ));
@@ -1124,7 +1124,13 @@ mod tests {
 
         let id = test_identity();
         let hlc = test_hlc(&id);
-        let block = build_channel_create(&id, "#hello", "open", hlc);
+        let block = build_channel_create(
+            &id,
+            "#hello",
+            "open",
+            &state.server_did.to_did_jig_string(),
+            hlc,
+        );
         let submission = serde_json::json!({
             "bundle_b64": base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
             "sig_b64": base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
@@ -1221,7 +1227,13 @@ mod tests {
         // Create channels in a non-sorted order; expect sorted output.
         for slug in ["#zulu", "#alpha", "#mike"] {
             let hlc = test_hlc(&id);
-            let block = build_channel_create(&id, slug, "open", hlc);
+            let block = build_channel_create(
+                &id,
+                slug,
+                "open",
+                &state.server_did.to_did_jig_string(),
+                hlc,
+            );
             let submission = serde_json::json!({
                 "bundle_b64": base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
                 "sig_b64":    base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
@@ -1252,7 +1264,13 @@ mod tests {
         let router = crate::v0_0_2_ws::build_v0_0_2_router(state.clone());
 
         let id = test_identity();
-        let block = build_channel_create(&id, "#hello", "open", test_hlc(&id));
+        let block = build_channel_create(
+            &id,
+            "#hello",
+            "open",
+            &state.server_did.to_did_jig_string(),
+            test_hlc(&id),
+        );
         let submission = serde_json::json!({
             "bundle_b64": base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
             "sig_b64":    base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
@@ -1284,7 +1302,13 @@ mod tests {
 
         let mut hlc = test_hlc(&id);
         hlc.logical = 1;
-        let again = build_channel_create(&id, "#hello", "open", hlc);
+        let again = build_channel_create(
+            &id,
+            "#hello",
+            "open",
+            &state.server_did.to_did_jig_string(),
+            hlc,
+        );
         let submission = serde_json::json!({
             "bundle_b64": base64::engine::general_purpose::STANDARD.encode(again.canonical_bytes()),
             "sig_b64":    base64::engine::general_purpose::STANDARD.encode(&again.sender_sig),

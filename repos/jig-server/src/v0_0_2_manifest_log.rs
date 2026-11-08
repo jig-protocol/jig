@@ -201,6 +201,10 @@ fn log_create(state: &AppState) -> anyhow::Result<Vec<u8>> {
                 "tier",
                 serde_json::json!(jig_core::tier::Tier::Public.as_str()),
             )
+            .metadata_entry(
+                jig_pipeline::ingest::SEQUENCER_KEY,
+                serde_json::json!(state.server_did.to_did_jig_string()),
+            )
     })
 }
 

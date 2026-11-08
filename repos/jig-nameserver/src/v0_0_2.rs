@@ -169,6 +169,8 @@ impl AppState {
             fanout,
             server_url: format!("ws://{}", config.server.listen),
             naively_allow_unknown_handles_fallback,
+            // The nameserver takes no peer's channels.
+            naively_accept_peer_relayed_creates: false,
             // `allowed_block_kinds` above never includes `text-render`, so this
             // nameserver has no use for a text-render Wasm module and shouldn't
             // pay to compile one. `None` means "does not execute Wasm kinds",
@@ -267,6 +269,7 @@ impl AppState {
             fanout,
             server_url: format!("ws://{}", config.server.listen),
             naively_allow_unknown_handles_fallback: false,
+            naively_accept_peer_relayed_creates: false,
             // Same rationale as the `new()` constructor above: nameservers never
             // allow `text-render`, so there's no Wasm module for this server to
             // execute. `None` is a hard "won't execute", not a fallback.
