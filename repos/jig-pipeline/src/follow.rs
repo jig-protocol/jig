@@ -616,7 +616,14 @@ pub async fn ingest_sequenced(
         Landing::EffectFailed(e) => return Err(FollowError::Other(e)),
         Landing::Landed => {}
     }
-    deliver(ctx, &stored, &channel_id).await;
+    // A removed member still receives its own removal, as from the owner
+    // (`ingest`): on an MLS channel it carries the commit that tells its
+    // client the group is gone.
+    let removed = (kind == BlockKind::MemberRemove)
+        .then(|| manifest.metadata.get("member_did").and_then(|v| v.as_str()))
+        .flatten()
+        .map(crate::effect::canonical_did_string);
+    deliver(ctx, &stored, &channel_id, removed).await;
     Ok(Followed::Landed { block_cid, seq })
 }
 
@@ -746,14 +753,20 @@ fn advance_mirror(
 /// Hand a carried block to this server's own subscribers, under the
 /// channel's policy as it now stands. Never to peers: the owner sends its
 /// blocks to each follower itself.
-async fn deliver(ctx: &IngestContext, block: &StoredBlock, channel_id: &str) {
+async fn deliver(
+    ctx: &IngestContext,
+    block: &StoredBlock,
+    channel_id: &str,
+    removed: Option<String>,
+) {
     let policy = match ctx.store.get_channel_by_id_including_archived(channel_id) {
         Ok(Some(chan)) => {
-            let members = ctx
+            let mut members: Vec<String> = ctx
                 .store
                 .list_members(&chan.id)
                 .map(|ms| ms.into_iter().map(|m| m.member_did).collect())
                 .unwrap_or_default();
+            members.extend(removed);
             // Not to this server's federation subscribers either: a peer of
             // this one would take the channel as a copy of its own, and a
             // channel has one sequencer (JEP-0005 rule 1).
@@ -805,9 +818,14 @@ mod tests {
             admission: Arc::new(AdmitEveryone),
             identity: Arc::new(crate::identity::TofuResolver::new(store)),
             hlc_clock: Arc::new(HlcClock::new(server_did.clone())),
-            allowed_block_kinds: ["text-render", "channel-create", "member-add"]
-                .map(String::from)
-                .to_vec(),
+            allowed_block_kinds: [
+                "text-render",
+                "channel-create",
+                "member-add",
+                "member-remove",
+            ]
+            .map(String::from)
+            .to_vec(),
             server_did,
             server_key,
             fanout: Arc::new(Fanout::new()),
@@ -1732,6 +1750,30 @@ mod tests {
 
         /// The creator adds a fresh member; its commit, as posted.
         async fn add(&mut self) -> Vec<u8> {
+            self.add_did().await.0
+        }
+
+        /// The creator removes `did`, as posted.
+        async fn remove(&mut self, did: &str) {
+            use base64::Engine as _;
+            let commit = self.creator.remove(&self.group_id, did).unwrap();
+            let channel = self.owner.channel.clone();
+            self.owner
+                .post(
+                    BlockKind::MemberRemove,
+                    serde_json::json!({
+                        "channel_id": channel,
+                        "member_did": did,
+                        "mls_commit": base64::engine::general_purpose::STANDARD
+                            .encode(&commit.commit),
+                    }),
+                )
+                .await;
+            self.creator.confirm(&self.group_id).unwrap();
+        }
+
+        /// [`Self::add`], with the added member's DID.
+        async fn add_did(&mut self) -> (Vec<u8>, String) {
             use base64::Engine as _;
             let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
             let seed: [u8; 32] = rand::random();
@@ -1755,7 +1797,7 @@ mod tests {
                 )
                 .await;
             self.creator.confirm(&self.group_id).unwrap();
-            commit.commit
+            (commit.commit, did.to_did_jig_string())
         }
 
         /// A message the creator seals for the group, as posted.
@@ -1832,6 +1874,35 @@ mod tests {
         assert!(
             !String::from_utf8_lossy(&block.bundle_bytes).contains("only the group"),
             "stored as ciphertext"
+        );
+    }
+
+    /// A removed member's client gets its own removal from the follower, as
+    /// from the owner: on an MLS channel that block carries the commit that
+    /// tells the client the group is gone.
+    #[tokio::test]
+    async fn a_removed_member_receives_its_removal_from_the_follower() {
+        let mut o = MlsOwner::new().await;
+        let (_, member) = o.add_did().await;
+        let follower = o.owner.follower();
+        for sent in &o.owner.sent {
+            take(&follower, &o.owner, sent).await.unwrap();
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        follower
+            .fanout
+            .subscribe_local(
+                crate::fanout::SubscriptionScope::Channel(o.owner.channel.clone()),
+                crate::fanout::SubscriberIdentity::Did(member.clone()),
+                tx,
+            )
+            .await;
+        o.remove(&member).await;
+        let removal = o.owner.sent.last().unwrap();
+        take(&follower, &o.owner, removal).await.unwrap();
+        assert!(
+            rx.try_recv().is_ok(),
+            "the removed member receives its removal"
         );
     }
 
