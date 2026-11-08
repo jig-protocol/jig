@@ -288,7 +288,7 @@ pub struct LegacyTier {
 ///
 /// | slug / `visibility` | `suite` | tier |
 /// | --- | --- | --- |
-/// | under `#jig/` | `none` | `public` |
+/// | `open`, under `#jig/` | `none` | `public` |
 /// | `restricted` | `mls` | `private` |
 /// | `open` | `mls` | `server`, `join = guest` |
 /// | `open` | `none` | frozen |
@@ -296,17 +296,23 @@ pub struct LegacyTier {
 ///
 /// It fails closed like the rest of the channel code: a visibility other than
 /// exactly `open` is `restricted`, and a suite that is neither `none` nor `mls`
-/// is frozen rather than guessed.
+/// is frozen rather than guessed. The `#jig/` row is for the server's own
+/// system channels, which are `open`. A `restricted` plaintext one, which only
+/// a client could have made before the slug grammar reserved the prefix, is
+/// frozen like any other: read as `public` it would take posts from anyone
+/// while its stored visibility still hid them from readers.
 pub fn legacy_tier(slug: &str, visibility: &str, suite: &str) -> LegacyTier {
     let frozen = LegacyTier {
         tier: StoredTier::Frozen,
         join: None,
     };
     match suite {
-        "none" if reserved_class(slug) == Some(SlugClass::Server) => LegacyTier {
-            tier: Tier::Public.into(),
-            join: None,
-        },
+        "none" if visibility == "open" && reserved_class(slug) == Some(SlugClass::Server) => {
+            LegacyTier {
+                tier: Tier::Public.into(),
+                join: None,
+            }
+        }
         "mls" if visibility == "open" => LegacyTier {
             tier: Tier::Server.into(),
             join: Some(JoinRole::Guest),
@@ -418,7 +424,11 @@ mod tests {
         // The manifest log is open and plaintext, and must not freeze.
         assert_eq!(legacy_tier("#jig/manifest", "open", "none"), public);
         assert_eq!(legacy_tier("#JIG/manifest", "open", "none"), public);
-        assert_eq!(legacy_tier("#jig/other", "restricted", "none"), public);
+        // A restricted plaintext `#jig/` channel is no system channel.
+        assert_eq!(
+            legacy_tier("#jig/other", "restricted", "none").tier,
+            StoredTier::Frozen
+        );
         assert_eq!(
             legacy_tier("#team", "restricted", "mls"),
             LegacyTier {

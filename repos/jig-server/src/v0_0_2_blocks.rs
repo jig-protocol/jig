@@ -734,7 +734,7 @@ pub async fn get_channel_history(
             StatusCode::NOT_FOUND,
             "CARRIED_CHANNEL",
             format!(
-                "{channel_ref} here is carried for {}, which orders it; read it by its id: {}",
+                "{channel_ref} here is carried for {}, which orders it; name it by its id: {}",
                 carried.sequencer_did, carried.id
             ),
         ));
@@ -1124,7 +1124,13 @@ mod tests {
 
         let id = test_identity();
         let hlc = test_hlc(&id);
-        let block = build_channel_create(&id, "#hello", "open", hlc);
+        let block = build_channel_create(
+            &id,
+            "#hello",
+            "open",
+            &state.server_did.to_did_jig_string(),
+            hlc,
+        );
         let submission = serde_json::json!({
             "bundle_b64": base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
             "sig_b64": base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
@@ -1151,6 +1157,62 @@ mod tests {
         );
     }
 
+    /// `server` and `shared` channels list their join role, and so does an
+    /// open `mls` channel from before tiers, which rule 21 maps to `server`
+    /// with `join = guest`.
+    #[tokio::test]
+    async fn the_listing_names_a_server_or_shared_channels_join_role() {
+        use jig_core::tier::{JoinRole, Tier};
+        use jig_pipeline::persist::{ChannelTiering, StoredChannel};
+        let state = Arc::new(unauthenticated_state());
+        let tiered = |tier, join| ChannelTiering {
+            join: Some(join),
+            ..ChannelTiering::of(tier)
+        };
+        for (slug, visibility, tiering) in [
+            ("#guests", "open", tiered(Tier::Server, JoinRole::Guest)),
+            ("#members", "open", tiered(Tier::Shared, JoinRole::Member)),
+            (
+                "#legacy",
+                "open",
+                ChannelTiering::legacy("#legacy", "open", "mls"),
+            ),
+        ] {
+            state
+                .ingest_ctx
+                .store
+                .upsert_channel(&StoredChannel {
+                    id: jig_pipeline::ingest_record::label_cid(slug),
+                    slug: slug.to_string(),
+                    visibility: visibility.to_string(),
+                    created_at: 0,
+                    owner_did: "did:jig:zSeedOwner".to_string(),
+                    suite: "mls".to_string(),
+                    sequencer_did: String::new(),
+                    co_owners: Vec::new(),
+                    tiering,
+                })
+                .unwrap();
+        }
+        let (status, body) = get_path(build_blocks_router(state), "/api/v1/channels").await;
+        assert_eq!(status, StatusCode::OK);
+        let listed = |slug: &str| {
+            body["channels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["slug"] == slug)
+                .unwrap_or_else(|| panic!("{slug} is not listed: {body}"))
+                .clone()
+        };
+        assert_eq!(listed("#guests")["tier"], "server");
+        assert_eq!(listed("#guests")["join"], "guest");
+        assert_eq!(listed("#members")["tier"], "shared");
+        assert_eq!(listed("#members")["join"], "member");
+        assert_eq!(listed("#legacy")["tier"], "server");
+        assert_eq!(listed("#legacy")["join"], "guest");
+    }
+
     #[tokio::test]
     async fn list_channels_returns_multiple_channels_sorted_by_slug() {
         // SqliteStore::list_channels ORDERs BY slug — confirm we surface
@@ -1165,7 +1227,13 @@ mod tests {
         // Create channels in a non-sorted order; expect sorted output.
         for slug in ["#zulu", "#alpha", "#mike"] {
             let hlc = test_hlc(&id);
-            let block = build_channel_create(&id, slug, "open", hlc);
+            let block = build_channel_create(
+                &id,
+                slug,
+                "open",
+                &state.server_did.to_did_jig_string(),
+                hlc,
+            );
             let submission = serde_json::json!({
                 "bundle_b64": base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
                 "sig_b64":    base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
@@ -1196,7 +1264,13 @@ mod tests {
         let router = crate::v0_0_2_ws::build_v0_0_2_router(state.clone());
 
         let id = test_identity();
-        let block = build_channel_create(&id, "#hello", "open", test_hlc(&id));
+        let block = build_channel_create(
+            &id,
+            "#hello",
+            "open",
+            &state.server_did.to_did_jig_string(),
+            test_hlc(&id),
+        );
         let submission = serde_json::json!({
             "bundle_b64": base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
             "sig_b64":    base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
@@ -1228,7 +1302,13 @@ mod tests {
 
         let mut hlc = test_hlc(&id);
         hlc.logical = 1;
-        let again = build_channel_create(&id, "#hello", "open", hlc);
+        let again = build_channel_create(
+            &id,
+            "#hello",
+            "open",
+            &state.server_did.to_did_jig_string(),
+            hlc,
+        );
         let submission = serde_json::json!({
             "bundle_b64": base64::engine::general_purpose::STANDARD.encode(again.canonical_bytes()),
             "sig_b64":    base64::engine::general_purpose::STANDARD.encode(&again.sender_sig),

@@ -260,6 +260,7 @@ async fn open_dm(server: &TestJigServer, bob: &Person, peer: &Person) -> String 
         json!({
             "slug": slug,
             "visibility": "restricted",
+            "sequencer": server.server_did_string,
             "suite": "mls",
             "dm": true,
             "dm_peer": peer.did(),

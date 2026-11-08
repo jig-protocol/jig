@@ -311,6 +311,20 @@ pub async fn create(
     Ok(())
 }
 
+/// The DID the configured server proved at the handshake, now: a connection
+/// checks it against the pin and follows the server's key links, so a
+/// rotated key is the current one.
+async fn verified_server_did(ctx: &CliContext) -> Result<String> {
+    let server = ctx.server_url()?;
+    let client = crate::cmd::secure::connect_pinned(&server, ctx.identity()?)
+        .await
+        .with_context(|| format!("connecting to {server}"))?;
+    client
+        .welcome()
+        .map(|w| w.server_did.clone())
+        .with_context(|| format!("{server} sent no welcome to name its DID"))
+}
+
 /// Create a channel; `extra` is merged into the creation block's metadata.
 /// Returns whether this call created it (`false`: it already existed and
 /// `exist_ok` was set).
@@ -339,8 +353,15 @@ pub(crate) async fn create_with(
     }
 
     let id = ctx.identity()?;
+    // The block names the server it is created on, and is valid there only:
+    // its DID as this device verified it at the handshake.
+    let sequencer = verified_server_did(ctx).await?;
     let hlc = HlcTimestamp::now_wall(id.did().clone());
-    let mut meta = json!({"slug": slug, "visibility": visibility});
+    let mut meta = json!({
+        "slug": slug,
+        "visibility": visibility,
+        "sequencer": sequencer,
+    });
     merge(&mut meta, tier);
     merge(&mut meta, extra);
 
@@ -976,9 +997,15 @@ pub async fn list(ctx: &CliContext) -> Result<()> {
 /// Empty list prints `(no channels yet)` so operators don't see silence and
 /// wonder whether their `list` even ran.
 fn print_channels(channels: &[ChannelView]) {
+    for line in channel_lines(channels) {
+        println!("{line}");
+    }
+}
+
+/// The lines [`print_channels`] prints.
+fn channel_lines(channels: &[ChannelView]) -> Vec<String> {
     if channels.is_empty() {
-        println!("(no channels yet)");
-        return;
+        return vec!["(no channels yet)".to_string()];
     }
     // Pad slug + visibility to the widest entry so the DID column lines up.
     let slug_w = channels
@@ -993,27 +1020,30 @@ fn print_channels(channels: &[ChannelView]) {
         .max()
         .unwrap_or(0)
         .max(10);
-    for c in channels {
-        let sealed = if !matches!(c.suite.as_str(), "" | "none") {
-            "🔒"
-        } else {
-            "  "
-        };
-        // JEP-0014 rule 5: a public channel says so wherever it is shown.
-        let note = match c.tier.as_deref() {
-            Some("public") => "  (anyone, including the server operator, can read it)",
-            Some("frozen") => "  (read-only: created unencrypted before channel tiers)",
-            _ => "",
-        };
-        println!(
-            "{:<slug_w$}  {:<vis_w$}  {sealed}  {}{note}",
-            c.slug,
-            c.kind(),
-            c.owner_did,
-            slug_w = slug_w,
-            vis_w = vis_w,
-        );
-    }
+    channels
+        .iter()
+        .map(|c| {
+            let sealed = if !matches!(c.suite.as_str(), "" | "none") {
+                "🔒"
+            } else {
+                "  "
+            };
+            // JEP-0014 rule 5: a public channel says so wherever it is shown.
+            let note = match c.tier.as_deref() {
+                Some("public") => "  (anyone, including the server operator, can read it)",
+                Some("frozen") => "  (read-only: created unencrypted before channel tiers)",
+                _ => "",
+            };
+            format!(
+                "{:<slug_w$}  {:<vis_w$}  {sealed}  {}{note}",
+                c.slug,
+                c.kind(),
+                c.owner_did,
+                slug_w = slug_w,
+                vis_w = vis_w,
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1115,6 +1145,13 @@ mod tests {
             tier: tier.map(str::to_string),
         };
         assert_eq!(view(Some("public")).kind(), "public");
+        let lines = channel_lines(&[view(Some("public")), view(Some("frozen")), view(None)]);
+        assert!(
+            lines[0].contains("anyone, including the server operator, can read it"),
+            "{lines:?}"
+        );
+        assert!(lines[1].contains("read-only"), "{lines:?}");
+        assert!(!lines[2].contains("anyone"), "{lines:?}");
         assert_eq!(
             view(None).kind(),
             "open",

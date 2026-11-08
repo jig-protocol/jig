@@ -645,7 +645,7 @@ const CHANNEL_COLUMNS: &str = "id, slug, visibility, created_at, owner_did, suit
      co_owners, tier, join_role, join_servers, history, from_dm, successor_of";
 
 /// Add the tier columns (JEP-0014) and give every row without a tier the one
-/// rule 21 maps it to: `#jig/` plaintext channels are `public`, `restricted`
+/// rule 21 maps it to: `open` `#jig/` plaintext channels are `public`, `restricted`
 /// `mls` ones `private`, `open` `mls` ones `server` with `join = guest`, and
 /// plaintext channels otherwise `frozen`.
 ///

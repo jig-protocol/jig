@@ -681,6 +681,17 @@ impl Contracts {
         if cid != offer.channel_id || manifest.kind != Some(BlockKind::ChannelCreate) {
             return Err(RefuseCode::PolicyRefused);
         }
+        // The creator names the server that orders the channel; a creation
+        // block from before sequencers names none, and binds to no server,
+        // so no client could prove the carried channel either.
+        if manifest
+            .metadata
+            .get(jig_pipeline::ingest::SEQUENCER_KEY)
+            .and_then(|v| v.as_str())
+            .is_none()
+        {
+            return Err(RefuseCode::PolicyRefused);
+        }
         let terms = jig_pipeline::ingest::channel_terms(&manifest, &offer.owner)
             .map_err(|_| RefuseCode::PolicyRefused)?;
         if terms.sequencer != offer.owner {
@@ -1295,10 +1306,17 @@ mod tests {
         state: &AppState,
         key: &SigningKey,
         kind: BlockKind,
-        meta: serde_json::Value,
+        mut meta: serde_json::Value,
         hlc: Option<jig_core::HlcTimestamp>,
     ) -> Result<String, IngestError> {
         use ed25519_dalek::Signer as _;
+        // A channel-create names the server it is created on.
+        if kind == BlockKind::ChannelCreate
+            && meta.get(jig_pipeline::ingest::SEQUENCER_KEY).is_none()
+        {
+            meta[jig_pipeline::ingest::SEQUENCER_KEY] =
+                serde_json::json!(state.server_did.to_did_jig_string());
+        }
         let mut builder = BlockManifest::builder()
             .version(semver::Version::new(0, 1, 0))
             .author(Author {
@@ -1809,6 +1827,18 @@ mod tests {
         assert_eq!(answer_to(&contracts, &owner, &good), None);
         assert_eq!(answer_to(&contracts, &owner, &good), None, "answered again");
 
+        // A creation block naming no sequencer binds to no server: no client
+        // could prove the channel carried.
+        let unbound = creation(&owner, serde_json::json!({"sequencer": null}));
+        assert_eq!(
+            answer_to(
+                &contracts,
+                &owner,
+                &offer_to(&follower, &owner, unbound, &[])
+            )
+            .as_deref(),
+            Some("POLICY_REFUSED")
+        );
         // Rule 9: a suite this server does not carry, with no fallback.
         let suite = creation(&owner, serde_json::json!({"suite": "pq-mls-2"}));
         assert_eq!(
@@ -2555,7 +2585,11 @@ mod tests {
     }
 
     async fn legacy() -> Legacy {
-        let mut a = state_with(vec![], &[]);
+        // A peer's channel-create reaches `a` over the relay only when its
+        // operator opts in to copying them.
+        let mut a = state_tuned(vec![], &[], |config| {
+            config.federation.naively_accept_peer_relayed_creates = true;
+        });
         let b = state_with(
             vec![peer(
                 "ws://127.0.0.1:1",
@@ -3043,6 +3077,8 @@ mod tests {
             let mut config = JigServerConfig::default();
             config.federation.dangerously_allow_plaintext_federation = true;
             config.federation.peers = vec![peer("ws://127.0.0.1:1", did_of(other), offers)];
+            // The relay's copies this guards are made only on opting in.
+            config.federation.naively_accept_peer_relayed_creates = true;
             AppState::for_test_from(
                 config,
                 Arc::new(jig_pipeline::persist::SqliteStore::open_in_memory().unwrap()),
@@ -3945,6 +3981,135 @@ mod tests {
         }
     }
 
+    /// The client's side of the test above: jig-client's own builders and
+    /// MLS sessions, as `jig` runs them. The owner's member names the
+    /// channel by slug on its server; the member on the follower names it by
+    /// id, the only name it has there, and files its group under the id. Its
+    /// `send` reaches the owner, and the owner's member reads it.
+    #[tokio::test]
+    async fn a_member_on_the_follower_sends_to_a_shared_mls_channel_by_its_id() {
+        use jig_client::Identity;
+        use jig_client::blocks::{BuiltBlock, build_sealed_text, build_with_metadata};
+        use jig_client::secure::{ReadIn, Seen, Session};
+        const OWNER: &str = "wss://owner";
+        const FOLLOWER: &str = "wss://follower";
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let parts = |b: &BuiltBlock| {
+            (
+                b.manifest_bytes.clone(),
+                b.code_bytes.clone(),
+                b.sender_sig.clone(),
+            )
+        };
+        // A block as a server serves it to a client, from what it stored.
+        let served = |state: &AppState, cid: &str| {
+            let block = state.ingest_ctx.store.get_block(cid).unwrap().unwrap();
+            jig_client::open::open(&jig_client::DeliveredBlock {
+                bundle_b64: b64(&block.bundle_bytes),
+                sig_b64: Some(b64(&block.sender_sig)),
+                receipts: vec![],
+                delivery_cid: format!("delivery:{cid}"),
+                ingest: None,
+            })
+            .unwrap()
+        };
+        let homes = tempfile::tempdir().unwrap();
+        let p = pair(OfferPolicy::Accept).await;
+
+        // The owner's member creates the channel on the owner.
+        let alice = Identity::from_signing_key(p.user.clone());
+        let alice_mls = Session::open(
+            &homes.path().join("alice"),
+            Identity::from_signing_key(p.user.clone()),
+        )
+        .unwrap();
+        let created = alice_mls.create_group(OWNER, "#across").unwrap();
+        let channel = post(
+            &p.owner,
+            &p.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({
+                "slug": "#across",
+                "tier": "shared",
+                "suite": "mls",
+                "mls_group_info": b64(&created.group_info),
+                "mls_ratchet_tree": b64(&created.ratchet_tree),
+            }),
+        )
+        .await
+        .unwrap();
+        p.share(&channel, "write").await;
+        p.both(&channel, OfferState::Accepted).await;
+
+        // She adds bob, whose client is on the follower, by slug.
+        let bob_key = SigningKey::from_bytes(&rand::random());
+        let bob = Identity::from_signing_key(bob_key.clone());
+        let bob_mls = Session::open(
+            &homes.path().join("bob"),
+            Identity::from_signing_key(bob_key),
+        )
+        .unwrap();
+        let kp = bob_mls.key_packages(1, false).unwrap().remove(0);
+        let commit = alice_mls
+            .prepare_add(OWNER, "#across", &kp, bob_mls.did())
+            .unwrap();
+        let add = build_with_metadata(
+            &alice,
+            BlockKind::MemberAdd,
+            jig_core::HlcTimestamp::now_wall(alice.did().clone()),
+            serde_json::json!({
+                "channel": "#across",
+                "member_did": bob_mls.did(),
+                "mls_commit": b64(&commit.commit),
+                "mls_welcome": b64(commit.welcome.as_ref().unwrap()),
+                "mls_epoch": commit.epoch,
+            }),
+        );
+        let add = client_post(&p.owner, &parts(&add)).await.unwrap();
+        alice_mls.confirm(OWNER, "#across").unwrap();
+        p.follows.stream.pull_all();
+        p.caught_up(&channel).await;
+
+        // Bob reads the add from the follower, under the id.
+        let at_follower = ReadIn {
+            key: &channel,
+            id: &channel,
+            slug: "#across",
+        };
+        assert_eq!(
+            bob_mls.observe_in(FOLLOWER, Some(&at_follower), &served(&p.follower, &add)),
+            Seen::Joined
+        );
+
+        // `jig send <id>` on the follower.
+        let secret = "the meeting moved to thursday";
+        let (message, epoch) = bob_mls.encrypt(FOLLOWER, &channel, secret).unwrap();
+        let sent = build_sealed_text(
+            &bob,
+            &channel,
+            &message,
+            epoch,
+            jig_core::HlcTimestamp::now_wall(bob.did().clone()),
+        );
+        let cid = client_post(&p.follower, &parts(&sent))
+            .await
+            .expect("the follower takes a post to the channel by its id");
+
+        // The owner's member reads it from what the owner stored.
+        let at_owner = ReadIn {
+            key: "#across",
+            id: &channel,
+            slug: "#across",
+        };
+        assert_eq!(
+            alice_mls.observe_in(OWNER, Some(&at_owner), &served(&p.owner, &cid)),
+            Seen::Text {
+                sender: bob_mls.did().to_string(),
+                text: secret.to_string(),
+            }
+        );
+    }
+
     #[tokio::test]
     async fn a_write_through_a_write_follower_lands_at_the_owner_and_comes_back() {
         let p = pair(OfferPolicy::Accept).await;
@@ -3976,6 +4141,48 @@ mod tests {
         // The same signed block again is the block already taken.
         assert_eq!(client_post(&p.follower, &parts).await.unwrap(), cid);
         assert_eq!(Pair::head(&p.owner, &channel), Some(head), "it landed once");
+    }
+
+    /// `jig send` on a follower: the client's own block builder names the
+    /// carried channel by the id it was given, and the write lands at the
+    /// owner. A slug names the channel only at its owner.
+    #[tokio::test]
+    async fn a_client_on_a_follower_posts_to_a_carried_channel_by_its_id() {
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.carried("write").await;
+        let user = jig_client::identity::Identity::from_signing_key(SigningKey::from_bytes(
+            &rand::random(),
+        ));
+        let hlc = jig_core::HlcTimestamp {
+            wall_ms: 1_747_680_000_000,
+            logical: 0,
+            server_did: user.did().clone(),
+        };
+        let parts = |block: jig_client::blocks::BuiltBlock| {
+            (block.manifest_bytes, block.code_bytes, block.sender_sig)
+        };
+
+        let by_slug = parts(jig_client::blocks::build_text_render(
+            &user,
+            "#shared",
+            "by slug",
+            hlc.clone(),
+        ));
+        let refused = client_post(&p.follower, &by_slug).await.unwrap_err();
+        assert_eq!(refused.code, "UNKNOWN_CHANNEL", "{refused:?}");
+
+        let by_id = parts(jig_client::blocks::build_text_render(
+            &user, &channel, "by id", hlc,
+        ));
+        let cid = client_post(&p.follower, &by_id).await.unwrap();
+        let block = p
+            .owner
+            .ingest_ctx
+            .store
+            .get_block(&cid)
+            .unwrap()
+            .expect("the owner records it");
+        assert_eq!(block.channel_id.as_deref(), Some(channel.as_str()));
     }
 
     #[tokio::test]
