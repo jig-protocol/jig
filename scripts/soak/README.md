@@ -29,7 +29,9 @@ Every setting is listed at the top of the script.
 `SOAK_PATH` picks how the channel reaches B:
 
 - **`legacy`** (the default): the relay every pair of peers runs for open
-  channels. Both sides post.
+  channels. Both sides post. A server copies a channel its peer creates only
+  with `[federation] naively_accept_peer_relayed_creates = true`: local mode
+  sets it on both, and in remote mode you set it.
 - **`contract`**: A shares the channel with B (JEP-0005, `jig channel
   share`), and B follows A's ordered records, pulling what it missed after
   any outage. Only A posts, because B does not relay writes back yet, and B
