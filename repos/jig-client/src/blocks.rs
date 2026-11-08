@@ -256,16 +256,13 @@ pub fn build_with_metadata(
 /// under `channel`, or the channel's id, the canonical text of its CID,
 /// under `channel_id`. A slug resolves only on the server that orders the
 /// channel, so a channel this server carries for another is named by id.
-///
-/// Plaintext blocks only: an MLS block's group is found by its slug
-/// ([`crate::secure`]), and no server carries an MLS channel yet.
+/// That holds for MLS blocks too: a server carries a `shared` MLS channel
+/// (JEP-0014), and its members on the carrying server post to it by id.
 fn name_channel_by_id(metadata: &mut serde_json::Map<String, Value>) {
-    let mls = metadata.keys().any(|k| k.starts_with("mls_"));
-    let by_id = !mls
-        && metadata
-            .get("channel")
-            .and_then(Value::as_str)
-            .is_some_and(jig_core::canonical_cid::is_canonical_text);
+    let by_id = metadata
+        .get("channel")
+        .and_then(Value::as_str)
+        .is_some_and(jig_core::canonical_cid::is_canonical_text);
     if by_id && let Some(id) = metadata.remove("channel") {
         metadata.insert(jig_pipeline::ingest::CHANNEL_ID_KEY.to_string(), id);
     }
@@ -296,9 +293,7 @@ pub fn build_with_suite(
         });
     }
     if let Value::Object(mut map) = metadata {
-        if suite == jig_core::EncryptionSuite::Unencrypted {
-            name_channel_by_id(&mut map);
-        }
+        name_channel_by_id(&mut map);
         for (k, v) in map {
             builder = builder.metadata_entry(&k, v);
         }
@@ -367,9 +362,30 @@ mod tests {
             Some("#hello")
         );
         assert!(!by_slug.contains_key("channel_id"), "{by_slug:?}");
-        // An MLS block keeps its slug key: the client finds its group by it.
+        // An MLS block names a channel by id the same way: a server carries
+        // a shared MLS channel too.
         let sealed = meta(&build_sealed_text(&id, &channel, b"ct", 1, test_hlc(&id)));
-        assert!(!sealed.contains_key("channel_id"), "{sealed:?}");
+        assert_eq!(
+            sealed.get("channel_id").and_then(|v| v.as_str()),
+            Some(channel.as_str())
+        );
+        assert!(!sealed.contains_key("channel"), "{sealed:?}");
+        let remove = meta(&build_member_remove(
+            &id,
+            &channel,
+            "did:jig:zmember",
+            serde_json::json!({ "mls_commit": "AA==", "mls_epoch": 2 }),
+            test_hlc(&id),
+        ));
+        assert_eq!(
+            remove.get("channel_id").and_then(|v| v.as_str()),
+            Some(channel.as_str())
+        );
+        let sealed_by_slug = meta(&build_sealed_text(&id, "#hello", b"ct", 1, test_hlc(&id)));
+        assert!(
+            !sealed_by_slug.contains_key("channel_id"),
+            "{sealed_by_slug:?}"
+        );
     }
 
     #[test]
