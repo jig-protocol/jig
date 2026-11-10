@@ -142,7 +142,11 @@ pub fn present(opened: &OpenedBlock, receipts: &[ReceiptRef], seen: &Seen) -> Op
         Some(d)
     };
     match seen {
-        Seen::Plain => Some(plain(opened, receipts)),
+        // A contract-end is plaintext in any channel, so the session reads
+        // it as such; its notice shows either way.
+        Seen::Plain => contract_end_notice(opened)
+            .and_then(system)
+            .or_else(|| Some(plain(opened, receipts))),
         Seen::Control => contract_end_notice(opened).and_then(system),
         Seen::Text { sender, text } => {
             let mut d = plain(opened, receipts);
@@ -283,6 +287,23 @@ mod tests {
             decoded.body.contains("--via did:jig:zfollower"),
             "{}",
             decoded.body
+        );
+        // In an encrypted channel's history, as the MLS session reads it.
+        let keys = tempfile::tempdir().unwrap();
+        let mls = jig_client::secure::Session::open(
+            keys.path(),
+            Identity::generate_for_tests(&keys.path().join("id")),
+        )
+        .unwrap();
+        let opened = open(&signed(&block, vec![])).unwrap();
+        let seen = mls.observe("https://server.test", &opened);
+        assert_eq!(seen, Seen::Plain);
+        let shown = present(&opened, &[], &seen).unwrap();
+        assert_eq!(shown.sender, SYSTEM);
+        assert!(
+            shown.body.contains("--via did:jig:zfollower"),
+            "{}",
+            shown.body
         );
         // Unsigned, it says nothing.
         let unsigned = decode(&delivered_for(

@@ -130,8 +130,13 @@ pub struct ReadIn<'a> {
 
 impl ReadIn<'_> {
     /// Whether `block` names this channel: by id under `channel_id`, by slug
-    /// under `channel`, or as the block that created it.
+    /// under `channel`, or as the block that created it, and gives no
+    /// other slug.
     fn names(&self, kind: BlockKind, block: &OpenedBlock) -> bool {
+        let named_slug = jig_pipeline::ingest::channel_slug_of(kind, &block.manifest);
+        if !self.slug.is_empty() && named_slug.is_some_and(|s| s != self.slug) {
+            return false;
+        }
         if !self.id.is_empty()
             && (block.meta_str(jig_pipeline::ingest::CHANNEL_ID_KEY) == Some(self.id)
                 || (kind == BlockKind::ChannelCreate && block.cid == self.id))
@@ -142,7 +147,7 @@ impl ReadIn<'_> {
             && block
                 .meta_str(jig_pipeline::ingest::CHANNEL_ID_KEY)
                 .is_none()
-            && jig_pipeline::ingest::channel_slug_of(kind, &block.manifest) == Some(self.slug)
+            && named_slug == Some(self.slug)
     }
 }
 
@@ -621,7 +626,13 @@ impl Session {
         let named =
             jig_pipeline::ingest::channel_slug_of(kind, &block.manifest).unwrap_or_default();
         let slug = match channel {
-            None => named.to_string(),
+            // Without the caller's name for the channel, a block naming it by
+            // id is filed under the id, as one naming it by slug is under
+            // the slug.
+            None => block
+                .meta_str(jig_pipeline::ingest::CHANNEL_ID_KEY)
+                .unwrap_or(named)
+                .to_string(),
             Some(c) => {
                 let moves_group = matches!(kind, BlockKind::MemberAdd | BlockKind::MemberRemove)
                     || block.manifest.content_suite().is_encrypted();
@@ -1370,6 +1381,70 @@ mod tests {
         );
         assert!(!bob.has_group(SERVER, "#here").unwrap());
         assert!(!bob.has_group(SERVER, "#other").unwrap());
+
+        // The right id with another slug is not this channel either.
+        let id = crate::blocks::build_channel_create(
+            identity_of(&alice),
+            "#other",
+            "open",
+            "did:jig:zowner",
+            hlc(&alice),
+        )
+        .cid();
+        let by_id_elsewhere = ReadIn {
+            key: &id,
+            id: &id,
+            slug: "#here",
+        };
+        let both = deliver(&build_with_metadata(
+            identity_of(&alice),
+            BlockKind::MemberAdd,
+            hlc(&alice),
+            json!({"channel": "#other", "channel_id": id, "member_did": bob.did()}),
+        ));
+        assert!(!by_id_elsewhere.names(BlockKind::MemberAdd, &both));
+    }
+
+    /// Without the caller's name for a channel, a block naming it by id is
+    /// read under the id.
+    #[test]
+    fn a_block_named_by_id_is_filed_under_the_id_without_a_read_context() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let bob = session(root.path());
+        let id = crate::blocks::build_channel_create(
+            identity_of(&alice),
+            "#c",
+            "open",
+            "did:jig:zowner",
+            hlc(&alice),
+        )
+        .cid();
+        alice.create_group(SERVER, &id).unwrap();
+        let kp = bob.key_packages(1, false).unwrap().remove(0);
+        let c = alice.prepare_add(SERVER, &id, &kp, bob.did()).unwrap();
+        alice.confirm(SERVER, &id).unwrap();
+        let add = build_with_metadata(
+            identity_of(&alice),
+            BlockKind::MemberAdd,
+            hlc(&alice),
+            json!({"channel": id, "member_did": bob.did(),
+                "mls_commit": STANDARD.encode(&c.commit),
+                "mls_welcome": STANDARD.encode(c.welcome.unwrap()),
+                "mls_epoch": c.epoch}),
+        );
+        let add = deliver(&add);
+        assert_eq!(add.meta_str("channel_id"), Some(id.as_str()));
+        assert_eq!(bob.observe(SERVER, &add), Seen::Joined);
+        assert!(bob.has_group(SERVER, &id).unwrap());
+        let said = deliver(&say(&alice, &id, "by id"));
+        assert_eq!(
+            bob.observe(SERVER, &said),
+            Seen::Text {
+                sender: alice.did().to_string(),
+                text: "by id".to_string(),
+            }
+        );
     }
 
     #[test]

@@ -483,12 +483,14 @@ pub struct FederationSection {
     /// still checked by the signed welcome, but nothing after the welcome is
     /// protected on a plaintext link. Surfaces in `unsafe_options_active`.
     pub dangerously_allow_plaintext_federation: bool,
-    /// Antipattern flag: a `channel-create` a configured peer relays, which
-    /// names another server as its sequencer (or none), is taken as a copy
+    /// For tests only: a `channel-create` a configured peer relays, which
+    /// names another server as its sequencer (or none), is stored as a copy
     /// this server sequences, as the legacy relay did before creates named
-    /// their sequencer. Off, such a create is refused, and a channel reaches
-    /// a peer only once it is shared (JEP-0005). For networks whose servers
-    /// fully trust each other. Surfaces in `unsafe_options_active`.
+    /// their sequencer. Clients refuse to read such a copy, because its
+    /// creation block names another server. Off, such a create is refused,
+    /// and a channel reaches a peer only once it is shared (JEP-0005):
+    /// servers that trust each other set `offers = "accept"` and use
+    /// `jig channel share`. Surfaces in `unsafe_options_active`.
     pub naively_accept_peer_relayed_creates: bool,
     /// The quota for every peer without its own `quota`, published in the
     /// server manifest (JEP-0005 rule 16). Defaults to

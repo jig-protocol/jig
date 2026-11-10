@@ -2188,10 +2188,11 @@ impl SqliteStore {
     ) -> Result<std::collections::HashMap<String, Option<String>>> {
         let conn = self.conn.lock().expect("poisoned");
         let mut stmt = conn.prepare(
-            "SELECT b.sender_did, b.federated_from FROM blocks b
-              WHERE b.channel_id = ?1
-                AND b.rowid = (SELECT MAX(rowid) FROM blocks
-                                WHERE channel_id = ?1 AND sender_did = b.sender_did)",
+            // One pass over the channel's blocks: each sender's latest row,
+            // then its relay. A subquery per block would be quadratic.
+            "SELECT sender_did, federated_from FROM blocks
+              WHERE rowid IN (SELECT MAX(rowid) FROM blocks
+                               WHERE channel_id = ?1 GROUP BY sender_did)",
         )?;
         let rows = stmt
             .query_map([channel_id], |r| Ok((r.get(0)?, r.get(1)?)))?
