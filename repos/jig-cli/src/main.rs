@@ -265,8 +265,9 @@ enum ChannelAction {
     /// slug names a channel only on the server that orders it): its users
     /// read it with `jig read <channel-id>`, the id this command prints.
     ///
-    /// Only open, unencrypted channels can be shared for now. Writes made on
-    /// the other server are not relayed back yet: its users write here.
+    /// The server decides which channels may be shared: one whose tier keeps
+    /// it on one server is refused (JEP-0014). Writes made on the other
+    /// server are not relayed back yet: its users write here.
     Share {
         #[arg()]
         slug: String,

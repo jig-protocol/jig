@@ -794,8 +794,9 @@ there in this server's order:
 <offer-id>` on either server) ends the share. This server stops sending at
 once. The other server keeps the copy it holds and lands nothing after.
 
-Today, only open, unencrypted channels can be shared, and the other server
-does not yet relay writes back: its users post on this server.
+The server decides which channels may be shared: a channel whose tier keeps it
+on one server is refused (JEP-0014). The other server does not yet relay writes
+back: its users post on this server.
 
 > **Known issue: sharing does not deliver yet.** Peers also relay every open
 > channel to each other the older way, within seconds of its creation, and

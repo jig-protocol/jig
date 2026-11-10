@@ -672,16 +672,9 @@ pub async fn share(ctx: &CliContext, slug: String, to: String, grant: String) ->
     let grant = jig_core::contract::Grant::parse(&grant)
         .map_err(|_| anyhow::anyhow!("--grant is read, write or member, not `{grant}`"))?;
     let secure = Secure::open(ctx)?;
+    // Which channels may cross servers is the server's call (JEP-0014 rules
+    // 12, 13): it refuses a share of one whose tier keeps it on one server.
     let info = visible_channel(&secure, &slug).await?;
-    if info.encrypted() {
-        // The server would take the share and the target would accept it,
-        // but a follower carries no MLS channel yet (JEP-0005 rule 19): its
-        // stream refuses the first block, so nothing would ever reach it.
-        anyhow::bail!(
-            "{slug} is end-to-end encrypted, and servers cannot carry an encrypted channel \
-             for each other yet: only open, unencrypted channels can be shared"
-        );
-    }
     let id = secure.identity();
     let cid = secure
         .submit(&jig_client::blocks::build_channel_share(
