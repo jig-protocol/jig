@@ -145,6 +145,31 @@ pub(crate) fn submit_failure_status(body: &str, err: &str) -> String {
     format!("⚠ not sent: \"{shown}\" — {err}")
 }
 
+/// What the pane says when Enter is refused because the channel's tier
+/// label cannot be shown (JEP-0014 rule 5).
+pub const TOO_SMALL_TO_SEND: &str =
+    "terminal too small to show this channel's tier; enlarge it to send";
+
+/// Whether the channel's tier label fits a `width` × `height` terminal. An
+/// encrypted channel has none, so it always fits.
+pub fn label_fits(state: &ChatState, width: u16, height: u16) -> bool {
+    state
+        .notice
+        .as_deref()
+        .is_none_or(|n| wrapped_rows(n, width) <= height)
+}
+
+/// Whether Enter may send: only while the tier label of a `public`, frozen
+/// or unencrypted channel is on screen. Otherwise the draft stays in the
+/// input and the pane says why.
+pub fn may_send(state: &mut ChatState, width: u16, height: u16) -> bool {
+    if label_fits(state, width, height) {
+        return true;
+    }
+    state.status = Some(TOO_SMALL_TO_SEND.to_string());
+    false
+}
+
 /// How many rows `text` takes when word-wrapped to `width` columns, as
 /// `Wrap { trim: true }` lays it out; a word wider than the row is split.
 fn wrapped_rows(text: &str, width: u16) -> u16 {
@@ -188,10 +213,18 @@ pub fn render(f: &mut Frame, state: &ChatState) {
         .constraints([Constraint::Length(notice_rows), Constraint::Min(0)])
         .split(f.area());
     if let Some(notice) = &state.notice {
-        f.render_widget(
-            Paragraph::new(notice.as_str()).wrap(Wrap { trim: true }),
-            outer[0],
-        );
+        // A label too big for the terminal gives way to the reason sending
+        // is refused, once Enter has been pressed.
+        let area = f.area();
+        let shown = match &state.status {
+            Some(why)
+                if why == TOO_SMALL_TO_SEND && !label_fits(state, area.width, area.height) =>
+            {
+                why.as_str()
+            }
+            _ => notice.as_str(),
+        };
+        f.render_widget(Paragraph::new(shown).wrap(Wrap { trim: true }), outer[0]);
     }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -447,6 +480,31 @@ mod tests {
         assert!(
             lines.iter().any(|l| l.contains("did:jig:zmmmmm…")),
             "expected the short DID form: {lines:#?}"
+        );
+    }
+
+    /// DJ's rule for JEP-0014 rule 5: while the tier label cannot be shown,
+    /// Enter does not send in an unencrypted channel; the draft stays and
+    /// the reason shows. An encrypted channel is unaffected.
+    #[test]
+    fn a_terminal_too_small_for_the_label_does_not_send() {
+        for tier in [Some("public"), Some("frozen"), None] {
+            let mut state = ChatState::new("#news".into());
+            state.notice = crate::cmd::reader::readability_notice(false, tier);
+            state.input = "hello".into();
+            assert!(!may_send(&mut state, 8, 5), "{tier:?}");
+            assert_eq!(state.input, "hello", "the draft stays");
+            assert_eq!(state.status.as_deref(), Some(TOO_SMALL_TO_SEND));
+            let text = buffer_to_lines(&render_to_buffer(&state, 8, 5)).join("");
+            assert!(text.contains("terminal"), "the reason shows: {text}");
+            // Big enough, it sends.
+            assert!(may_send(&mut state, 80, 24), "{tier:?}");
+        }
+        let mut sealed = ChatState::new("#sealed".into());
+        sealed.notice = crate::cmd::reader::readability_notice(true, Some("private"));
+        assert!(
+            may_send(&mut sealed, 8, 5),
+            "an encrypted channel is unaffected"
         );
     }
 

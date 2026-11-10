@@ -3486,6 +3486,107 @@ mod tests {
         );
     }
 
+    /// Once `b` follows `a`'s `#general`, `a`'s relay of a post that names
+    /// it by slug is dropped: the slug here names only `b`'s own channel, so
+    /// taking it would land `a`'s post there. The same slug from a peer that
+    /// does not sequence the carried channel still names `b`'s own.
+    #[tokio::test]
+    async fn a_slug_named_relay_of_a_carried_channel_is_dropped() {
+        let m = mutual().await;
+        let ours = post(
+            &m.b,
+            &SigningKey::from_bytes(&rand::random()),
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#general", "tier": "public"}),
+        )
+        .await
+        .unwrap();
+        let channel = post(
+            &m.a,
+            &m.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#general", "tier": "public"}),
+        )
+        .await
+        .unwrap();
+        post(
+            &m.a,
+            &m.user,
+            BlockKind::ChannelShare,
+            serde_json::json!({
+                "channel_id": channel,
+                "to": m.b.server_did.to_did_jig_string(),
+                "grant": "read",
+            }),
+        )
+        .await
+        .unwrap();
+        let a_did = m.a.server_did.to_did_jig_string();
+        let b_store = &m.b.ingest_ctx.store;
+        eventually("the share accepted", || {
+            b_store
+                .has_accepted_share(&channel, &a_did)
+                .unwrap()
+                .then_some(())
+        })
+        .await;
+        assert!(b_store.is_followed(&channel).unwrap());
+        // The carried channel's row comes with the owner's stream.
+        m.b_follows.stream.pull_all();
+        eventually("the carried channel on b", || {
+            b_store.carried_channel_by_slug("#general").unwrap()
+        })
+        .await;
+
+        let relay = |from: &FederationPeer, body: &str| {
+            let (manifest, code, sig) = signed(
+                &m.user,
+                BlockKind::TextRender,
+                serde_json::json!({"channel": "#general", "body": body}),
+            );
+            let bundle = serde_json::to_vec(&(&manifest, &code)).unwrap();
+            let cid = crate::v0_0_2_federation::peer_block_cid(&bundle).unwrap();
+            let (state, from) = (m.b.clone(), from.clone());
+            async move {
+                let b64 = base64::engine::general_purpose::STANDARD;
+                crate::v0_0_2_federation::ingest_peer_block(
+                    &state,
+                    &from,
+                    &b64.encode(&bundle),
+                    Some(&b64.encode(&sig)),
+                    "d:slug",
+                )
+                .await
+                .unwrap();
+                cid
+            }
+        };
+
+        let sequencer = peer("ws://127.0.0.1:1", a_did.clone(), OfferPolicy::Hold);
+        let dropped = relay(&sequencer, "from the owner, by slug").await;
+        assert!(
+            b_store.get_block(&dropped).unwrap().is_none(),
+            "the owner's slug-named relay is dropped, not landed in b's own #general"
+        );
+
+        let other = peer(
+            "ws://127.0.0.1:2",
+            did_of(&SigningKey::from_bytes(&rand::random())),
+            OfferPolicy::Hold,
+        );
+        let landed = relay(&other, "from another peer, by slug").await;
+        assert_eq!(
+            b_store
+                .get_block(&landed)
+                .unwrap()
+                .unwrap()
+                .channel_id
+                .as_deref(),
+            Some(ours.as_str()),
+            "the same slug from a non-sequencer peer names b's own channel"
+        );
+    }
+
     /// A share the relay brings is refused: it is a request to the channel's
     /// sequencer, and this server would act on it as owner of its copy.
     #[tokio::test]
