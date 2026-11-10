@@ -126,9 +126,11 @@ jig server set https://jig-vps.<tailnet>.ts.net:7117
 server set: https://jig-vps.<tailnet>.ts.net:7117
 ```
 
-Now join the room:
+Now join the room. `#gigue` is end-to-end encrypted, so join it once first; after that,
+`jig chat` is all you need:
 
 ```bash
+jig channel join '#gigue'
 jig chat '#gigue'
 ```
 
@@ -218,7 +220,7 @@ jig channel list
 ```
 
 ```
-#gigue    open        did:jig:zbvz24e3dyq76m5pndn6o3y4uu4lbltfvmkbelegvnrrmn72ltkdq
+#gigue    server      🔒  did:jig:zbvz24e3dyq76m5pndn6o3y4uu4lbltfvmkbelegvnrrmn72ltkdq
 ```
 
 The third column is the DID of whoever created the channel — currently the easiest way to
@@ -231,10 +233,14 @@ Make a new channel (this also makes it your default channel, so later commands w
 jig channel create '#my-project'
 ```
 
-Add yourself to a channel's member list:
+A new channel is `private` unless you say otherwise: end-to-end encrypted, and people join
+when you add them. `--tier public` makes one anyone can read, the server operator included,
+and asks you to confirm; `--tier server` makes an encrypted one anyone on the server can join.
+
+Join a `server` channel someone else made (a `private` one needs them to add you):
 
 ```bash
-jig channel join '#gigue'
+jig channel join '#their-channel'
 ```
 
 **`jig read` does not work.** It asks the server for a route that is switched off, and you
@@ -264,12 +270,15 @@ Errors I reproduced while writing this guide, unless marked otherwise.
 
 Read this before you type anything sensitive into it.
 
-- **Open channels are not encrypted unless you ask.** Every message is *signed*, which
-  proves who wrote it. That is a different thing. DMs (`jig dm`), every `restricted`
-  channel, and open channels created with `jig channel create --encrypted` are end-to-end
-  encrypted; the server stores every other open channel in readable form, and anyone who can
-  read the server can read it. Even in encrypted channels the server sees who posts where
-  and when.
+- **Only `public` channels, and the old messages of frozen ones, are readable by the
+  server.** Every message is *signed*, which
+  proves who wrote it. That is a different thing. DMs (`jig dm`) and `private`, `server` and
+  `shared` channels are end-to-end encrypted; a `public` channel is stored in readable form,
+  and anyone who can read the server can read it. `jig channel list` marks each one. A
+  plaintext channel created before channel tiers is now read-only, but its old messages are
+  still stored in readable form: freezing it stops new posts, it does not encrypt what is
+  already there. Even in encrypted channels
+  the server sees who posts where and when.
 - **Permissions are per channel, and that is all.** Reads are signed with your key, so
   nobody can read as you; `restricted` channels really are members-only — for reading,
   listing and posting — and only the owner can add members. But any key can reach the

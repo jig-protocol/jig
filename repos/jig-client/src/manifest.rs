@@ -262,6 +262,7 @@ mod tests {
                     execution: true,
                     federation: true,
                     max_future_skew_ms: 300_000,
+                    tiers: false,
                 },
                 reputation: Reputation::none(),
                 nonce: String::new(),
@@ -284,6 +285,7 @@ mod tests {
                 execution: true,
                 federation: true,
                 max_future_skew_ms: 300_000,
+                tiers: false,
             },
             peer_policy: PeerPolicy::default(),
         }

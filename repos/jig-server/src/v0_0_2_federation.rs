@@ -1006,6 +1006,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
         state
@@ -1111,6 +1112,7 @@ mod tests {
                     suite: suite.into(),
                     sequencer_did: String::new(),
                     co_owners: Vec::new(),
+                    tiering: jig_pipeline::persist::ChannelTiering::current(visibility, suite),
                 })
                 .unwrap();
             let secret: [u8; 32] = rand::random();
@@ -1392,6 +1394,7 @@ mod tests {
                 suite: "none".into(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
         let stranger = ed25519_dalek::SigningKey::from_bytes(&rand::random());
@@ -1441,6 +1444,7 @@ mod tests {
                 suite: "none".into(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
 

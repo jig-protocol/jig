@@ -91,6 +91,7 @@ pub(crate) fn map_ingest_error(
 /// base64-encoded). Returns `{ "block_cid": "bafy..." }` on success.
 pub async fn submit_block(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<SubmitBody>,
 ) -> Result<Json<SubmitResult>, (StatusCode, Json<ErrorBody>)> {
     let bundle_bytes = base64::engine::general_purpose::STANDARD
@@ -136,11 +137,28 @@ pub async fn submit_block(
         sig,
         0,
         &format!("rest:{author}"),
+        declares_feature(&headers, jig_core::tier::TIERS_FEATURE),
     )
     .await
     .map_err(refusal_response)?;
 
     Ok(Json(SubmitResult { block_cid: cid }))
+}
+
+/// The header a request outside a connection names the features its client
+/// implements in, comma-separated: what a hello's capabilities say on a
+/// connection (JEP-0014 rule 5).
+pub const CAPABILITIES_HEADER: &str = "jig-capabilities";
+
+/// Whether `headers` declare `feature` in [`CAPABILITIES_HEADER`]. Every
+/// occurrence of the header counts; names match exactly, after trimming.
+pub fn declares_feature(headers: &axum::http::HeaderMap, feature: &str) -> bool {
+    headers
+        .get_all(CAPABILITIES_HEADER)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|name| name.trim() == feature)
 }
 
 #[derive(Debug, Serialize)]
@@ -275,6 +293,12 @@ pub struct ChannelView {
     pub created_at: i64,
     /// `none` or `mls`, fixed at creation.
     pub suite: String,
+    /// `private`, `server`, `shared`, `public`, or `frozen` for a plaintext
+    /// channel from before tiers (JEP-0014), fixed at creation.
+    pub tier: String,
+    /// The lowest server role that may join a `server` or `shared` channel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub join: Option<String>,
     /// The server that orders the channel: this one, or the owner of a
     /// channel this server carries (JEP-0005). Unsigned: a client takes
     /// another server's word only with `share`.
@@ -355,6 +379,8 @@ pub(crate) fn view_of(
         owner_did: c.owner_did,
         created_at: c.created_at,
         suite: c.suite,
+        tier: c.tiering.tier.as_str().to_string(),
+        join: c.tiering.join.map(|j| j.as_str().to_string()),
         sequencer,
         share,
     })
@@ -845,6 +871,28 @@ pub fn build_blocks_router(state: Arc<AppState>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_declares_its_features_in_one_header() {
+        use axum::http::{HeaderMap, HeaderValue};
+        let mut headers = HeaderMap::new();
+        assert!(!declares_feature(&headers, "tiers"));
+        headers.insert(
+            CAPABILITIES_HEADER,
+            HeaderValue::from_static("other, tiers"),
+        );
+        assert!(declares_feature(&headers, "tiers"));
+        headers.insert(
+            CAPABILITIES_HEADER,
+            HeaderValue::from_static("tiersx,Tiers"),
+        );
+        assert!(!declares_feature(&headers, "tiers"), "names match exactly");
+        headers.append(CAPABILITIES_HEADER, HeaderValue::from_static("tiers"));
+        assert!(
+            declares_feature(&headers, "tiers"),
+            "every occurrence counts"
+        );
+    }
     use axum::{Router, body::Body, http::Request};
     use jig_client::{Identity, blocks::build_text_render};
     use jig_core::HlcTimestamp;
@@ -895,6 +943,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
     }
@@ -908,6 +957,7 @@ mod tests {
             .method("POST")
             .uri(path)
             .header("Content-Type", "application/json")
+            .header(CAPABILITIES_HEADER, jig_core::tier::TIERS_FEATURE)
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
@@ -1086,11 +1136,72 @@ mod tests {
         assert_eq!(channels.len(), 1, "exactly one channel expected");
         assert_eq!(channels[0]["slug"], "#hello");
         assert_eq!(channels[0]["visibility"], "open");
+        assert_eq!(channels[0]["tier"], "public");
+        assert!(
+            channels[0].get("join").is_none(),
+            "only server and shared channels list a join role"
+        );
         assert_eq!(channels[0]["owner_did"], id.did_string());
         assert!(
             channels[0]["created_at"].as_i64().unwrap_or(0) >= 0,
             "created_at must be present as an integer"
         );
+    }
+
+    /// `server` and `shared` channels list their join role, and so does an
+    /// open `mls` channel from before tiers, which rule 21 maps to `server`
+    /// with `join = guest`.
+    #[tokio::test]
+    async fn the_listing_names_a_server_or_shared_channels_join_role() {
+        use jig_core::tier::{JoinRole, Tier};
+        use jig_pipeline::persist::{ChannelTiering, StoredChannel};
+        let state = Arc::new(unauthenticated_state());
+        let tiered = |tier, join| ChannelTiering {
+            join: Some(join),
+            ..ChannelTiering::of(tier)
+        };
+        for (slug, visibility, tiering) in [
+            ("#guests", "open", tiered(Tier::Server, JoinRole::Guest)),
+            ("#members", "open", tiered(Tier::Shared, JoinRole::Member)),
+            (
+                "#legacy",
+                "open",
+                ChannelTiering::legacy("#legacy", "open", "mls"),
+            ),
+        ] {
+            state
+                .ingest_ctx
+                .store
+                .upsert_channel(&StoredChannel {
+                    id: jig_pipeline::ingest_record::label_cid(slug),
+                    slug: slug.to_string(),
+                    visibility: visibility.to_string(),
+                    created_at: 0,
+                    owner_did: "did:jig:zSeedOwner".to_string(),
+                    suite: "mls".to_string(),
+                    sequencer_did: String::new(),
+                    co_owners: Vec::new(),
+                    tiering,
+                })
+                .unwrap();
+        }
+        let (status, body) = get_path(build_blocks_router(state), "/api/v1/channels").await;
+        assert_eq!(status, StatusCode::OK);
+        let listed = |slug: &str| {
+            body["channels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["slug"] == slug)
+                .unwrap_or_else(|| panic!("{slug} is not listed: {body}"))
+                .clone()
+        };
+        assert_eq!(listed("#guests")["tier"], "server");
+        assert_eq!(listed("#guests")["join"], "guest");
+        assert_eq!(listed("#members")["tier"], "shared");
+        assert_eq!(listed("#members")["join"], "member");
+        assert_eq!(listed("#legacy")["tier"], "server");
+        assert_eq!(listed("#legacy")["join"], "guest");
     }
 
     #[tokio::test]
@@ -1506,6 +1617,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: "did:jig:zowner".to_string(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
         let router = build_blocks_router(state);

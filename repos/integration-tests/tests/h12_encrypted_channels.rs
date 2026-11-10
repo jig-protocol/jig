@@ -69,6 +69,7 @@ impl Api<'_> {
     async fn post(&self, path: &str, body: &Value) -> (u16, Value) {
         let resp = reqwest::Client::new()
             .post(self.url(path))
+            .header("jig-capabilities", "tiers")
             .json(body)
             .send()
             .await
@@ -777,7 +778,7 @@ async fn a_restricted_channel_cannot_be_plaintext() {
         &alice.id,
         BlockKind::ChannelCreate,
         alice.hlc(),
-        json!({"slug": "#lobby", "visibility": "open",
+        json!({"slug": "#lobby", "visibility": "open", "tier": "public",
                "sequencer": api.server.server_did_string}),
     );
     let (status, body) = api.post("/api/v1/channels", &submission(&open)).await;

@@ -91,6 +91,10 @@ pub struct ChannelInfo {
     /// The owner's signed offer, for a channel the server carries.
     #[serde(default)]
     pub share: Option<String>,
+    /// The channel's tier (JEP-0014), or `frozen`, as the listing says.
+    /// Absent from servers before tiers. Unsigned: shown, never trusted.
+    #[serde(default)]
+    pub tier: Option<String>,
 }
 
 fn none_suite() -> String {
@@ -280,6 +284,9 @@ impl Secure {
             .http()
             .await?
             .post(&url)
+            // Outside a connection, the features a hello would ask for
+            // (JEP-0014 rule 5): this client labels `public` channels.
+            .header("jig-capabilities", jig_core::tier::TIERS_FEATURE)
             .json(&body)
             .send()
             .await
@@ -424,19 +431,22 @@ impl Secure {
     /// listing's suite is the owner's signed one ([`Self::channel`]). A
     /// channel no longer listed to us is still what this device pinned.
     /// Failing to find out is an error, never a reason to send in the clear.
-    pub async fn encrypted(&self, slug: &str) -> Result<bool> {
+    /// Also returns the tier the server lists, for a label (JEP-0014 rule 5).
+    pub async fn encrypted_with_tier(&self, slug: &str) -> Result<(bool, Option<String>)> {
         let held = self.session.has_group(&self.server, slug)?;
         let pinned = Pins::load(&Pins::default_path())?
             .channel(&self.server, slug)
             .map(ChannelPin::encrypted);
-        let listed = self.channel(slug).await?.map(|c| c.encrypted()).or(pinned);
+        let info = self.channel(slug).await?;
+        let tier = info.as_ref().and_then(|c| c.tier.clone());
+        let listed = info.map(|c| c.encrypted()).or(pinned);
         if held && listed == Some(false) {
             eprintln!(
                 "warning: the server lists {slug} as unencrypted, but this device holds its \
                  MLS group; treating it as encrypted"
             );
         }
-        Ok(must_encrypt(held, listed))
+        Ok((must_encrypt(held, listed), tier))
     }
 
     /// Keep enough key packages published that others can add us while we
@@ -917,6 +927,7 @@ mod tests {
             suite: "none".to_string(),
             sequencer: sequencer.to_string(),
             share: None,
+            tier: None,
         }
     }
 

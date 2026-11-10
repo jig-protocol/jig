@@ -292,6 +292,7 @@ impl TestJigServer {
                 suite: "none".to_string(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })?;
         Ok(id)
     }
@@ -316,6 +317,7 @@ impl TestJigServer {
             suite: "none".to_string(),
             sequencer_did: String::new(),
             co_owners: Vec::new(),
+            tiering: jig_pipeline::persist::ChannelTiering::current("restricted", "none"),
         })?;
         store.upsert_membership(&jig_pipeline::persist::StoredMembership {
             channel_id: id.clone(),
@@ -485,6 +487,8 @@ impl TestJigServer {
         let client = reqwest::Client::new();
         let resp = client
             .post(format!("{}/api/v1/blocks", self.http_url()))
+            // As a current client: it labels `public` channels (JEP-0014).
+            .header("jig-capabilities", "tiers")
             .json(&submission_payload(block))
             .send()
             .await

@@ -195,6 +195,12 @@ fn log_create(state: &AppState) -> anyhow::Result<Vec<u8>> {
     block(state, BlockKind::ChannelCreate, |m| {
         m.metadata_entry("slug", serde_json::json!(LOG_SLUG))
             .metadata_entry("visibility", serde_json::json!("open"))
+            // A system channel is `public`: anyone must be able to verify it
+            // (JEP-0014 rule 6).
+            .metadata_entry(
+                "tier",
+                serde_json::json!(jig_core::tier::Tier::Public.as_str()),
+            )
             .metadata_entry(
                 jig_pipeline::ingest::SEQUENCER_KEY,
                 serde_json::json!(state.server_did.to_did_jig_string()),
@@ -407,6 +413,7 @@ pub(crate) mod tests {
                 suite: "none".into(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
 
@@ -581,7 +588,10 @@ pub(crate) mod tests {
                     resources: vec![],
                 },
                 sig,
-                IngestSource::LocalClient { conn_id: 1 },
+                IngestSource::LocalClient {
+                    conn_id: 1,
+                    tiers: true,
+                },
             )
             .await
             .unwrap_err();
