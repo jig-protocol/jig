@@ -495,8 +495,9 @@ Three smaller sharp edges:
 - `jig tail` prints the raw 61-char DID and raw epoch-millis per line. Nicer rendering
   (`HH:MM`, a `[contacts]` name map, an inbound bell) is **in flight in this same batch**
   — check whether `jig-cli/src/cmd/display.rs` is wired up before promising it.
-- From v0.2.0-alpha.3 on, `jig --version`, `jig-server --version` and
-  `jig-nameserver --version` print the release version (`jig 0.2.0-alpha.3`).
+- From v0.2.0-alpha.4, the first published release that prints its version,
+  `jig --version`, `jig-server --version` and `jig-nameserver --version` print the
+  release version (`jig 0.2.0-alpha.4`).
   v0.2.0-alpha.2 and earlier print `0.0.1` whatever the release: identify those
   by file hash, against that release's `SHA256SUMS`.
 - `--server`, `--config`, and `--did` are honoured by every subcommand,
