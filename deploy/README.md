@@ -795,8 +795,9 @@ there in this server's order:
 once. The other server keeps the copy it holds and lands nothing after.
 
 The server decides which channels may be shared: a channel whose tier keeps it
-on one server is refused (JEP-0014). The other server does not yet relay writes
-back: its users post on this server.
+on one server is refused (JEP-0014). Under a `write` or `member` grant, the other
+server relays its users' posts back to this one; under `read`, they post on
+this server.
 
 > **Known issue: sharing does not deliver yet.** Peers also relay every open
 > channel to each other the older way, within seconds of its creation, and
