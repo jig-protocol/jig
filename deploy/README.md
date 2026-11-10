@@ -798,11 +798,13 @@ The server decides which channels may be shared: a channel whose tier keeps it
 on one server is refused (JEP-0014). The other server does not yet relay writes
 back: its users post on this server.
 
-> **Known issue: sharing does not deliver yet.** Peers also relay every open
-> channel to each other the older way, within seconds of its creation, and
-> the other server takes a channel that reaches it like that as its own. The
-> share is then accepted, but nothing it carries lands there. Until that is
-> fixed, the steps above set a share up without delivering it.
+A channel reaches another server only once it is shared. Its creation block
+names the server that orders it, so a peer no longer takes a channel this
+server creates as one of its own. `naively_accept_peer_relayed_creates` (see
+`config.example.toml`) is for tests only: a server with it stores a copy of a
+peer's new channel, but clients refuse to read the copy, because its creation
+block names another server. Servers that trust each other set
+`offers = "accept"` and use `jig channel share`.
 
 ---
 
