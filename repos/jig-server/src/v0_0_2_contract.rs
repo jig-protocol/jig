@@ -3804,7 +3804,14 @@ mod tests {
                             .owner_relay()
                             .accept(&p.follower.server_did, submit_of(&channel, &parts))
                             .await;
-                        assert!(!answer.code.is_empty(), "{answer:?}");
+                        let (_, expected, _) = crate::v0_0_2_ingest_error::classify_ingest_error(
+                            &IngestError::NotChannelOwner {
+                                kind: "member-add".into(),
+                                slug: String::new(),
+                                sender: did.clone(),
+                            },
+                        );
+                        assert_eq!(answer.code, expected, "{answer:?}");
                         assert!(
                             !p.owner
                                 .ingest_ctx

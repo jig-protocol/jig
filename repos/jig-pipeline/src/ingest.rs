@@ -1385,7 +1385,9 @@ fn self_join_admitted(
         return false;
     }
     match source {
-        IngestSource::LocalClient { .. } => tiering
+        // A client of this server, over its connection or the REST member
+        // route: both are admitted here, so its role here decides.
+        IngestSource::LocalClient { .. } | IngestSource::AdminEndpoint => tiering
             .join
             .is_some_and(|join| ctx.admission.server_role(&sender).may_join(join)),
         IngestSource::Relayed { .. } => {
@@ -4815,6 +4817,54 @@ mod tests {
         );
         assert!(!ctx.store.is_member_by_id(&chan, &guest.did).unwrap());
         join_sealed(&ctx, &member).await.unwrap();
+        assert!(ctx.store.is_member_by_id(&chan, &member.did).unwrap());
+    }
+
+    /// The REST member route is a client of this server too: a self-join
+    /// through it is held to the same server role as one over a connection.
+    #[tokio::test]
+    async fn a_self_join_through_the_member_route_meets_the_join_role() {
+        let mut ctx = all_channel_kinds();
+        let owner = person();
+        let (guest, member) = (person(), person());
+        ctx.admission = Arc::new(Recorded {
+            members: vec![member.did.clone()],
+        });
+        create_sealed_as(&ctx, &owner, Some("server")).await;
+        let chan = ctx
+            .store
+            .get_channel_by_slug("#sealed")
+            .unwrap()
+            .unwrap()
+            .id;
+        let join = |who: &Person| {
+            let group = ctx.store.get_mls_group("#sealed").unwrap().unwrap();
+            let (_, commit) = who.mls.join_external(&group.group_info.unwrap()).unwrap();
+            signed_parts(
+                &who.key,
+                BlockKind::MemberAdd,
+                jig_core::EncryptionSuite::Unencrypted,
+                serde_json::json!({
+                    "channel": "#sealed",
+                    "member_did": who.did,
+                    "mls_commit": b64(&commit.commit),
+                }),
+            )
+        };
+
+        let (mb, cb, sig) = join(&guest);
+        assert!(
+            matches!(
+                do_ingest(&ctx, mb, cb, sig, IngestSource::AdminEndpoint).await,
+                Err(IngestError::NotChannelOwner { .. })
+            ),
+            "a guest is below `member`"
+        );
+        assert!(!ctx.store.is_member_by_id(&chan, &guest.did).unwrap());
+        let (mb, cb, sig) = join(&member);
+        do_ingest(&ctx, mb, cb, sig, IngestSource::AdminEndpoint)
+            .await
+            .unwrap();
         assert!(ctx.store.is_member_by_id(&chan, &member.did).unwrap());
     }
 
