@@ -244,6 +244,29 @@ pub fn tier_label(tier: &str) -> String {
     }
 }
 
+/// The channels a new one links to (JEP-0014): the 1:1 a group grows from
+/// (rule 19), or the frozen channel it succeeds (rule 23). Each is a slug this
+/// server lists, or a channel id.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChannelLinks {
+    pub from_dm: Option<String>,
+    pub successor_of: Option<String>,
+}
+
+/// The channel id `channel` names: a channel id as given, or the id of the
+/// channel this server lists under the slug.
+async fn channel_id_of(secure: &Secure, channel: &str) -> Result<String> {
+    if !channel.starts_with('#') {
+        return Ok(channel.to_string());
+    }
+    secure
+        .channel(channel)
+        .await?
+        .map(|info| info.id)
+        .filter(|id| !id.is_empty())
+        .with_context(|| format!("{channel} is not a channel this server lists to you"))
+}
+
 /// Whether the server granted `tiers` in the welcome of a connection that
 /// asked for them (JEP-0014 rule 1).
 async fn server_has_tiers(ctx: &CliContext) -> Result<bool> {
@@ -254,6 +277,22 @@ async fn server_has_tiers(ctx: &CliContext) -> Result<bool> {
             format!("connecting to {server} to see whether it supports channel tiers")
         })?;
     Ok(client.welcome().is_some_and(|w| w.capabilities.tiers))
+}
+
+/// JEP-0014 rule 18: a 1:1 stays a pair. It takes the other of its two
+/// people (`jig dm` adds them on first use); anyone else means a new group
+/// linked to it, which the server would require anyway.
+fn refuse_growing_a_dm(slug: &str, me: &str, who: &str) -> Result<()> {
+    if jig_core::slug::reserved_class(slug) == Some(jig_core::slug::SlugClass::Dm)
+        && jig_core::dm::dm_slug(me, who) != slug
+    {
+        anyhow::bail!(
+            "{slug} is a 1:1 and stays one. To talk as a group, make a new channel linked to it: \
+             `jig channel create '#group' --from-dm {slug}`, then `jig channel add '#group'` \
+             each of you"
+        );
+    }
+    Ok(())
 }
 
 /// Rule 5: the creator confirms a `public` channel before it is signed.
@@ -291,6 +330,7 @@ pub async fn create(
     choice: TierChoice,
     exist_ok: bool,
     yes: bool,
+    links: ChannelLinks,
 ) -> Result<()> {
     if choice.tier == Tier::Public {
         use std::io::IsTerminal;
@@ -298,7 +338,17 @@ pub async fn create(
             anyhow::bail!("not created: {slug} was not confirmed as public");
         }
     }
-    create_with(ctx, &slug, choice, exist_ok, json!({})).await?;
+    let mut extra = json!({});
+    if links.from_dm.is_some() || links.successor_of.is_some() {
+        let secure = Secure::open(ctx)?;
+        if let Some(dm) = &links.from_dm {
+            extra["from_dm"] = json!(channel_id_of(&secure, dm).await?);
+        }
+        if let Some(old) = &links.successor_of {
+            extra["successor_of"] = json!(channel_id_of(&secure, old).await?);
+        }
+    }
+    create_with(ctx, &slug, choice, exist_ok, extra).await?;
 
     // A freshly created channel is almost always the one the operator wants
     // to talk in next; without this, a bare `jig send hi` still goes to
@@ -539,6 +589,7 @@ async fn visible_channel(secure: &Secure, slug: &str) -> Result<ChannelInfo> {
 /// the welcome rides the same block.
 pub async fn add(ctx: &CliContext, slug: String, who: String) -> Result<()> {
     let did = resolve_who(ctx, &who).await?;
+    refuse_growing_a_dm(&slug, &ctx.identity()?.did_string(), &did)?;
     let secure = Secure::open(ctx)?;
     let info = visible_channel(&secure, &slug).await?;
     let id = secure.identity();
@@ -623,6 +674,66 @@ pub async fn promote(ctx: &CliContext, slug: String) -> Result<()> {
         .submit(&build_channel_promote(id, &slug, now(id)))
         .await?;
     println!("{slug} is now open");
+    println!("  block_cid: {cid}");
+    Ok(())
+}
+
+/// The step left to the target server's operator, unless its peer entry for
+/// this server accepts offers by itself (`offers = "accept"`).
+const ACCEPT_STEP: &str = "its operator accepts with `jig-server contracts list`, then \
+                           `jig-server contracts accept <offer-id>`, unless its \
+                           [[federation.peers]] entry for this server says offers = \"accept\"";
+
+/// Apply `jig channel share <slug> <server-did> --grant <grant>` (JEP-0005
+/// rule 7). The server decides whether the caller may share, and offers the
+/// channel only to one of its configured peers; a share naming any other
+/// server is refused in the channel's log (`NOT_A_PEER`).
+pub async fn share(ctx: &CliContext, slug: String, to: String, grant: String) -> Result<()> {
+    let to = canonical_did(&to)?;
+    let grant = jig_core::contract::Grant::parse(&grant)
+        .map_err(|_| anyhow::anyhow!("--grant is read, write or member, not `{grant}`"))?;
+    let secure = Secure::open(ctx)?;
+    // Which channels may cross servers is the server's call (JEP-0014 rules
+    // 12, 13): it refuses a share of one whose tier keeps it on one server.
+    let info = visible_channel(&secure, &slug).await?;
+    let id = secure.identity();
+    let cid = secure
+        .submit(&jig_client::blocks::build_channel_share(
+            id,
+            &slug,
+            &to,
+            grant,
+            now(id),
+        ))
+        .await?;
+    println!("asked to share {slug} with {to} ({} grant)", grant.as_str());
+    println!("  block_cid: {cid}");
+    println!(
+        "  this server offers it if {to} is one of its [[federation.peers]], and records \
+         NOT_A_PEER in the channel otherwise; {ACCEPT_STEP}"
+    );
+    if !info.id.is_empty() {
+        // A slug names a channel only on the server that sequences it
+        // (JEP-0005 rule 1): there, the channel is known by its id.
+        println!("  on that server, read it by its id: jig read {}", info.id);
+    }
+    Ok(())
+}
+
+/// Apply `jig channel unshare <slug> <server-did>` (JEP-0005 rule 11).
+pub async fn unshare(ctx: &CliContext, slug: String, to: String) -> Result<()> {
+    let to = canonical_did(&to)?;
+    let secure = Secure::open(ctx)?;
+    let id = secure.identity();
+    let cid = secure
+        .submit(&jig_client::blocks::build_channel_unshare(
+            id,
+            &slug,
+            &to,
+            now(id),
+        ))
+        .await?;
+    println!("asked to stop sharing {slug} with {to}");
     println!("  block_cid: {cid}");
     Ok(())
 }
@@ -1049,6 +1160,20 @@ fn channel_lines(channels: &[ChannelView]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dm_is_not_grown_in_place() {
+        let did = |n: u8| jig_core::Did::from_ed25519_pubkey(&[n; 32]).to_did_jig_string();
+        let (me, peer, third) = (did(1), did(2), did(3));
+        let dm = jig_core::dm::dm_slug(&me, &peer);
+        // `jig dm` adds the other of the pair on first use.
+        refuse_growing_a_dm(&dm, &me, &peer).unwrap();
+        let err = refuse_growing_a_dm(&dm, &me, &third)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&format!("--from-dm {dm}")), "{err}");
+        refuse_growing_a_dm("#team", &me, &third).unwrap();
+    }
 
     #[test]
     fn a_bare_create_is_private_and_tier_names_the_rest() {

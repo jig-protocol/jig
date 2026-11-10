@@ -366,6 +366,20 @@ fn check_dm_create(
     if suite != EncryptionSuite::Mls || !restricted {
         return refuse("a direct message is restricted and encrypted");
     }
+    // JEP-0014 rule 18: a co-owner of a 1:1 is one of its two people.
+    let co_owners = manifest
+        .metadata
+        .get(crate::ingest::CO_OWNERS_KEY)
+        .and_then(|v| v.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if co_owners.iter().any(|c| {
+        c.as_str()
+            .map(crate::effect::canonical_did_string)
+            .is_none_or(|c| c != peer && c != sender)
+    }) {
+        return refuse("a co-owner of a 1:1 is one of its two people");
+    }
     Ok(())
 }
 
@@ -739,6 +753,12 @@ mod tests {
         ));
         tiered["tier"] = "server".into();
         assert!(refused(create(&a, tiered)));
+        // A co-owner of a 1:1 is one of its two people (rule 18).
+        let mut co = with_peer(&b.did);
+        co["co_owners"] = json!([b.did]);
+        assert!(matches!(create(&a, co.clone()), Ok(MlsPlan::Genesis(_))));
+        co["co_owners"] = json!([m.did]);
+        assert!(refused(create(&a, co)));
         // A plaintext squat naming no peer, on the pair's slug or any other.
         let squat = |slug: &str| {
             let man = manifest(

@@ -12,11 +12,12 @@
 #   SOAK_MODE          local (default): boot two servers on this machine,
 #                      peered over loopback. remote: use two servers that are
 #                      already running and list each other as peers.
-#   SOAK_PATH          legacy (default): the channel crosses by the peers'
-#                      open-channel relay, and both sides post. contract: A
-#                      shares the channel with B (JEP-0005, `jig channel
-#                      share`), B follows A's records, and only A posts:
-#                      B does not relay writes back yet.
+#   SOAK_PATH          contract (default): A shares the channel with B
+#                      (JEP-0005, `jig channel share`), B follows A's
+#                      records, and only A posts. legacy: the channel crosses
+#                      by the peers' open-channel relay, and both sides post;
+#                      only between servers that predate a channel-create
+#                      naming its sequencer (v0.2.0-alpha.4 and earlier).
 #   SOAK_CONTRACT_SETUP isolated (default): create and share the channel
 #                      while B is down, so only the contract can bring it to
 #                      B. steady: with both up, where the legacy relay gets
@@ -78,7 +79,7 @@ SETTLE="${SOAK_SETTLE:-$DEADLINE}"
 HEALTH_EVERY="${SOAK_HEALTH_EVERY:-60}"
 RESTART_EVERY="${SOAK_RESTART_EVERY:-0}"
 RESTART_SIDE="${SOAK_RESTART_SIDE:-b}"
-FED_PATH="${SOAK_PATH:-legacy}"
+FED_PATH="${SOAK_PATH:-contract}"
 SETUP="${SOAK_CONTRACT_SETUP:-isolated}"
 INGEST="${SOAK_INGEST:-paced}"
 WRITERS="${SOAK_WRITERS:-16}"
@@ -245,13 +246,6 @@ if [ "$MODE" = local ]; then
   [ -x "$BIN/jig-server" ] || fail "no jig-server in $BIN"
   log "booting two local servers"
   local_init a; local_init b
-  # The legacy path has B copy the channel A creates, which a server does
-  # only when it opts in to copying a peer's channel-create.
-  if [ "$FED_PATH" = legacy ]; then
-    for side in a b; do
-      printf '\n[federation]\nnaively_accept_peer_relayed_creates = true\n' >> "$(local_dir "$side")/config.toml"
-    done
-  fi
   printf '\n[[federation.peers]]\nurl = "wss://127.0.0.1:%s"\nexpected_did = "%s"\n' \
     "$(local_port b)" "$(cat "$(local_dir b)/did")" >> "$(local_dir a)/config.toml"
   printf '\n[[federation.peers]]\nurl = "wss://127.0.0.1:%s"\nexpected_did = "%s"\n' \
