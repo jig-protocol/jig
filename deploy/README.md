@@ -439,10 +439,14 @@ a timezone. Send the invites before anyone builds anything.
 | 9 | Them | **Back up `~/.jig/keys/*.key`** | copy into a password manager |
 | 10 | Them | Chat | `./jig chat '#gigue'` |
 
-You create `#gigue` once, from any machine: `jig channel create '#gigue'`.
-Teammates do **not** need `jig channel join` for an `open` channel — v0.0.2
-stores membership as derived state for bridge dispatch and does not gate reads
-or sends on it. Run `jig channel join` only for a `restricted` channel.
+You create `#gigue` once, from any machine:
+`jig channel create '#gigue' --tier server --join guest`. That makes an
+end-to-end encrypted channel that anyone the server lets in can join, whether or
+not its admission records list them as a member (drop `--join guest` to allow
+only recorded members). Each teammate then runs
+`jig channel join '#gigue'` once, before their first `jig chat`. A bare
+`jig channel create` makes a `private` channel instead, which people join only
+when you add them (`jig channel add`).
 
 ### Step 5 — macOS Gatekeeper
 

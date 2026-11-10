@@ -1287,7 +1287,10 @@ mod tests {
             &state.ingest_ctx,
             bundle,
             sig,
-            IngestSource::LocalClient { conn_id: 1 },
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
         )
         .await
     }
@@ -1298,7 +1301,7 @@ mod tests {
                 &self.owner,
                 &self.user,
                 BlockKind::ChannelCreate,
-                serde_json::json!({"slug": "#shared"}),
+                serde_json::json!({"slug": "#shared", "tier": "public"}),
             )
             .await
             .unwrap()
@@ -1857,7 +1860,7 @@ mod tests {
             &owner,
             &user,
             BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#c"}),
+            serde_json::json!({"slug": "#c", "tier": "public"}),
         )
         .await
         .unwrap();
@@ -2275,7 +2278,7 @@ mod tests {
             &owner,
             &user,
             BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#limited"}),
+            serde_json::json!({"slug": "#limited", "tier": "public"}),
         )
         .await
         .unwrap();
@@ -2490,7 +2493,7 @@ mod tests {
                 &self.b,
                 &self.user,
                 BlockKind::ChannelCreate,
-                serde_json::json!({"slug": slug}),
+                serde_json::json!({"slug": slug, "tier": "public"}),
             )
             .await
             .unwrap()
@@ -2512,6 +2515,7 @@ mod tests {
                     suite: "none".into(),
                     sequencer_did: String::new(),
                     co_owners: Vec::new(),
+                    tiering: jig_pipeline::persist::ChannelTiering::current("restricted", "none"),
                 })
                 .unwrap();
             id
@@ -3055,7 +3059,7 @@ mod tests {
             &m.a,
             &m.user,
             BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#k"}),
+            serde_json::json!({"slug": "#k", "tier": "public"}),
         )
         .await
         .unwrap();
@@ -3226,7 +3230,7 @@ mod tests {
             &m.b,
             &m.user,
             BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#elsewhere"}),
+            serde_json::json!({"slug": "#elsewhere", "tier": "public"}),
         )
         .await
         .unwrap();
@@ -3252,7 +3256,7 @@ mod tests {
             &m.b,
             &SigningKey::from_bytes(&rand::random()),
             BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#general"}),
+            serde_json::json!({"slug": "#general", "tier": "public"}),
         )
         .await
         .unwrap();
@@ -3260,7 +3264,7 @@ mod tests {
             &m.a,
             &m.user,
             BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#general"}),
+            serde_json::json!({"slug": "#general", "tier": "public"}),
         )
         .await
         .unwrap();
@@ -3348,7 +3352,7 @@ mod tests {
             &m.a,
             &m.user,
             BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#k"}),
+            serde_json::json!({"slug": "#k", "tier": "public"}),
         )
         .await
         .unwrap();
@@ -3394,7 +3398,7 @@ mod tests {
             &m.a,
             &m.user,
             BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#k"}),
+            serde_json::json!({"slug": "#k", "tier": "public"}),
         )
         .await
         .unwrap();
@@ -3402,7 +3406,7 @@ mod tests {
             &m.a,
             &m.user,
             BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#other"}),
+            serde_json::json!({"slug": "#other", "tier": "public"}),
         )
         .await
         .unwrap();
@@ -3510,7 +3514,7 @@ mod tests {
         state: &AppState,
         parts: &(Vec<u8>, Vec<u8>, Vec<u8>),
     ) -> Result<String, Refusal> {
-        crate::v0_0_2_relay::post(state, &parts.0, &parts.1, parts.2.clone(), 7, "ws:7").await
+        crate::v0_0_2_relay::post(state, &parts.0, &parts.1, parts.2.clone(), 7, "ws:7", true).await
     }
 
     /// The submit a follower would send for `parts`, into `channel`.
@@ -3663,7 +3667,7 @@ mod tests {
             &p.owner,
             &p.user,
             BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#unshared"}),
+            serde_json::json!({"slug": "#unshared", "tier": "public"}),
         )
         .await
         .unwrap();
@@ -3686,7 +3690,7 @@ mod tests {
         let create = signed(
             &author,
             BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#new"}),
+            serde_json::json!({"slug": "#new", "tier": "public"}),
         );
         let answer = relay.accept(follower, submit_of(&channel, &create)).await;
         assert_eq!(answer.code, "RELAY_OUTSIDE_SHARE", "{answer:?}");
@@ -3772,7 +3776,8 @@ mod tests {
         let gone = {
             let follower = follower.clone();
             tokio::spawn(async move {
-                crate::v0_0_2_relay::post(&follower, &parts.0, &parts.1, parts.2, 8, "ws:8").await
+                crate::v0_0_2_relay::post(&follower, &parts.0, &parts.1, parts.2, 8, "ws:8", true)
+                    .await
             })
         };
         swallowed.recv().await.expect("its relay sent");
@@ -3813,6 +3818,10 @@ mod tests {
                 suite: jig_core::EncryptionSuite::Unencrypted.as_str().to_string(),
                 sequencer_did: owner.clone(),
                 co_owners: vec![],
+                tiering: jig_pipeline::persist::ChannelTiering::current(
+                    "open",
+                    jig_core::EncryptionSuite::Unencrypted.as_str(),
+                ),
             })
             .unwrap();
         store

@@ -95,23 +95,24 @@ pub fn build_text_render_with_nickname(
 /// channel-create a real Wasm block submitted via `submit`.
 ///
 /// The block names no suite, so it is plaintext: servers refuse it unless
-/// `visibility` is `open` (restricted channels are always MLS). An encrypted
-/// channel is created with [`build_with_metadata`] and its MLS fields.
+/// `visibility` is `open` (restricted channels are always MLS). An `open` one
+/// is the `public` tier, and says so (JEP-0014): anyone, the server operator
+/// included, can read it. An encrypted channel is created with
+/// [`build_with_metadata`] and its MLS fields.
 pub fn build_channel_create(
     sender: &Identity,
     slug: &str,
     visibility: &str,
     hlc: HlcTimestamp,
 ) -> BuiltBlock {
-    build_with_metadata(
-        sender,
-        BlockKind::ChannelCreate,
-        hlc,
-        json!({
-            "slug": slug,
-            "visibility": visibility,
-        }),
-    )
+    let mut metadata = json!({
+        "slug": slug,
+        "visibility": visibility,
+    });
+    if visibility == "open" {
+        metadata["tier"] = json!(jig_core::tier::Tier::Public.as_str());
+    }
+    build_with_metadata(sender, BlockKind::ChannelCreate, hlc, metadata)
 }
 
 /// Build a signed `member-add` block.

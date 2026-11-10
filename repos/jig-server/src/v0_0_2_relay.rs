@@ -316,6 +316,7 @@ impl Relay {
         sig: Vec<u8>,
         conn_id: u64,
         conn: &str,
+        tiers: bool,
     ) -> Result<String, Refusal> {
         let bundle = BlockBundle {
             manifest_bytes,
@@ -326,7 +327,7 @@ impl Relay {
             &self.ctx,
             bundle,
             sig.clone(),
-            IngestSource::LocalClient { conn_id },
+            IngestSource::LocalClient { conn_id, tiers },
         )
         .await
         {
@@ -614,10 +615,11 @@ pub async fn post(
     sig: Vec<u8>,
     conn_id: u64,
     conn: &str,
+    tiers: bool,
 ) -> Result<String, Refusal> {
     if let Some(relay) = state.relay.get() {
         return relay
-            .submit(manifest_bytes, code_bytes, sig, conn_id, conn)
+            .submit(manifest_bytes, code_bytes, sig, conn_id, conn, tiers)
             .await;
     }
     let bundle = BlockBundle {
@@ -629,7 +631,7 @@ pub async fn post(
         &state.ingest_ctx,
         bundle,
         sig,
-        IngestSource::LocalClient { conn_id },
+        IngestSource::LocalClient { conn_id, tiers },
     )
     .await
     .map_err(|e| Refusal::of(&e))
