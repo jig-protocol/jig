@@ -266,8 +266,8 @@ enum ChannelAction {
     /// read it with `jig read <channel-id>`, the id this command prints.
     ///
     /// The server decides which channels may be shared: one whose tier keeps
-    /// it on one server is refused (JEP-0014). Writes made on the other
-    /// server are not relayed back yet: its users write here.
+    /// it on one server is refused (JEP-0014). Under a `write` or `member`
+    /// grant, the other server relays its users' writes back here.
     Share {
         #[arg()]
         slug: String,
@@ -276,9 +276,9 @@ enum ChannelAction {
         server_did: String,
         /// The grant recorded with the share (JEP-0005 rule 7a). Under any
         /// grant the other server carries the whole channel; the grant says
-        /// what it may later relay back here: `read`, only protocol
-        /// traffic; `write`, also its users' posts; `member`, also
-        /// membership changes. It relays nothing back yet.
+        /// what it may relay back here: `read`, only protocol traffic;
+        /// `write`, also its users' posts; `member`, also membership
+        /// changes.
         #[arg(long, value_parser = ["read", "write", "member"])]
         grant: String,
     },
