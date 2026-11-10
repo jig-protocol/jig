@@ -19,6 +19,8 @@ use crate::cmd::secure::Secure;
 pub struct Reader {
     slug: String,
     secure: Option<Arc<Secure>>,
+    /// Who can read the channel, for an unencrypted one (JEP-0014 rule 5).
+    notice: Option<String>,
 }
 
 /// A channel's recent history, as a pane opens with it.
@@ -46,6 +48,7 @@ impl Reader {
         Self {
             slug: slug.to_string(),
             secure: None,
+            notice: None,
         }
     }
 
@@ -64,11 +67,17 @@ impl Reader {
         {
             eprintln!("warning: MLS key packages not published: {e:#}");
         }
-        let encrypted = secure.encrypted(slug).await?;
+        let (encrypted, tier) = secure.encrypted_with_tier(slug).await?;
         Ok(Self {
             slug: slug.to_string(),
+            notice: readability_notice(encrypted, tier.as_deref()),
             secure: encrypted.then(|| Arc::new(secure)),
         })
+    }
+
+    /// Who can read the channel, when it is unencrypted.
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
     }
 
     pub fn secure(&self) -> Option<&Arc<Secure>> {
@@ -166,4 +175,20 @@ impl Reader {
             }
         });
     }
+}
+
+/// What a client says about who can read a channel (JEP-0014 rule 5), or
+/// `None` for an encrypted one. Keyed on `encrypted`, which the CLI proves
+/// against the creation block; the server's unsigned `tier` only names it.
+pub fn readability_notice(encrypted: bool, tier: Option<&str>) -> Option<String> {
+    if encrypted {
+        return None;
+    }
+    Some(match tier {
+        Some("frozen") => "frozen: read-only, created unencrypted before channel tiers; \
+                           anyone, including the server operator, can read its history"
+            .to_string(),
+        Some("public") => "public: anyone, including the server operator, can read it".to_string(),
+        _ => "unencrypted: anyone, including the server operator, can read it".to_string(),
+    })
 }

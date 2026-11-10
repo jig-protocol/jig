@@ -95,10 +95,11 @@ pub fn build_text_render_with_nickname(
 /// channel-create a real Wasm block submitted via `submit`.
 ///
 /// The block names no suite, so it is plaintext: servers refuse it unless
-/// `visibility` is `open` (restricted channels are always MLS). An encrypted
-/// channel is created with [`build_with_metadata`] and its MLS fields.
-/// `sequencer` is the DID of the server the channel is created on: the
-/// signed block is valid there only.
+/// `visibility` is `open` (restricted channels are always MLS). An `open` one
+/// is the `public` tier, and says so (JEP-0014): anyone, the server operator
+/// included, can read it. An encrypted channel is created with
+/// [`build_with_metadata`] and its MLS fields. `sequencer` is the DID of the
+/// server the channel is created on: the signed block is valid there only.
 pub fn build_channel_create(
     sender: &Identity,
     slug: &str,
@@ -106,16 +107,15 @@ pub fn build_channel_create(
     sequencer: &str,
     hlc: HlcTimestamp,
 ) -> BuiltBlock {
-    build_with_metadata(
-        sender,
-        BlockKind::ChannelCreate,
-        hlc,
-        json!({
-            "slug": slug,
-            "visibility": visibility,
-            "sequencer": sequencer,
-        }),
-    )
+    let mut metadata = json!({
+        "slug": slug,
+        "visibility": visibility,
+        "sequencer": sequencer,
+    });
+    if visibility == "open" {
+        metadata["tier"] = json!(jig_core::tier::Tier::Public.as_str());
+    }
+    build_with_metadata(sender, BlockKind::ChannelCreate, hlc, metadata)
 }
 
 /// Build a signed `member-add` block.
@@ -165,6 +165,49 @@ pub fn build_channel_promote(
         BlockKind::ChannelPromote,
         hlc,
         json!({ "channel": channel_slug }),
+    )
+}
+
+/// Build a signed `channel-share` block: ask the channel's server to offer
+/// the channel to the server `to` under `grant` (JEP-0005 rules 7, 7a).
+/// `to` is the target server's DID in canonical form. The owner, or a DID
+/// holding the `share` right, signs it; the server checks which.
+pub fn build_channel_share(
+    sender: &Identity,
+    channel_slug: &str,
+    to: &str,
+    grant: jig_core::contract::Grant,
+    hlc: HlcTimestamp,
+) -> BuiltBlock {
+    build_with_metadata(
+        sender,
+        BlockKind::ChannelShare,
+        hlc,
+        json!({
+            "channel": channel_slug,
+            "to": to,
+            "grant": grant.as_str(),
+        }),
+    )
+}
+
+/// Build a signed `channel-unshare` block: ask the channel's server to end
+/// its share with the server `to`, or withdraw an offer not yet answered
+/// (JEP-0005 rule 11). Signed as a `channel-share` must be.
+pub fn build_channel_unshare(
+    sender: &Identity,
+    channel_slug: &str,
+    to: &str,
+    hlc: HlcTimestamp,
+) -> BuiltBlock {
+    build_with_metadata(
+        sender,
+        BlockKind::ChannelUnshare,
+        hlc,
+        json!({
+            "channel": channel_slug,
+            "to": to,
+        }),
     )
 }
 
