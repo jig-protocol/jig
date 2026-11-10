@@ -84,6 +84,18 @@ impl HlcClock {
         new
     }
 
+    /// Move the clock up to `wall_ms`/`logical` if it is behind it, without
+    /// producing a timestamp: for a reading something else settled on, such
+    /// as an ingest record signed later than the clock was read, so later
+    /// ticks come after it.
+    pub fn witness(&self, wall_ms: u64, logical: u32) {
+        let mut state = self.state.lock().expect("HlcClock mutex poisoned");
+        if (wall_ms, logical) > (state.wall_ms, state.logical) {
+            state.wall_ms = wall_ms;
+            state.logical = logical;
+        }
+    }
+
     /// Read the current clock state without mutating.
     pub fn current(&self) -> HlcTimestamp {
         self.state.lock().expect("HlcClock mutex poisoned").clone()

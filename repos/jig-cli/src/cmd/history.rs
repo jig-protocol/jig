@@ -71,7 +71,22 @@ pub async fn fetch_history(
     channel: &str,
     limit: usize,
 ) -> Result<Vec<DeliveredBlock>> {
-    let url = history_url(base_url, channel, limit);
+    fetch_history_page(who, base_url, channel, limit, None).await
+}
+
+/// One page of a channel's history, oldest first: the newest `limit` blocks,
+/// or those just older than the block whose CID is `before`.
+pub async fn fetch_history_page(
+    who: &Identity,
+    base_url: &str,
+    channel: &str,
+    limit: usize,
+    before: Option<&str>,
+) -> Result<Vec<DeliveredBlock>> {
+    let mut url = history_url(base_url, channel, limit);
+    if let Some(cid) = before {
+        url.push_str(&format!("&before={cid}"));
+    }
     let proof = ReadProof::sign(who, "GET", signable_path(&url));
     // Short timeout: this runs on the critical path to the first frame, and
     // a slow server should cost a warning, not a hung terminal.
@@ -82,17 +97,17 @@ pub async fn fetch_history(
     }
     let resp = req.send().await.with_context(|| format!("GET {url}"))?;
     let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .with_context(|| format!("reading body of GET {url}"))?;
     if !status.is_success() {
         // Read the body rather than reporting a bare status: a 404 here is
         // most likely a server that predates the history endpoint, and the
         // body is what says so.
+        let body = jig_client::limits::error_text(resp).await;
         anyhow::bail!("GET {url} returned {status}: {body}");
     }
-    parse_history(&body)
+    let body = jig_client::limits::read_capped(resp, jig_client::limits::history_page_bytes(limit))
+        .await
+        .with_context(|| format!("reading GET {url}"))?;
+    parse_history(&String::from_utf8_lossy(&body))
 }
 
 /// Fetch + decode a backlog, degrading to an empty one on a failed fetch.
@@ -103,21 +118,25 @@ pub async fn fetch_history(
 ///
 /// Call this before entering raw mode: the warning goes to stderr as plain
 /// text.
+///
+/// Also returns the delivery CID of every block fetched, so a live stream
+/// opened before this can skip what the backlog already showed.
 pub async fn backfill(
     who: &Identity,
     base_url: &str,
     channel: &str,
     limit: usize,
-) -> Result<Vec<DecodedBlock>> {
+) -> Result<(Vec<DecodedBlock>, Vec<String>)> {
     match fetch_history(who, base_url, channel, limit).await {
         Ok(blocks) => {
             crate::cmd::trust::check_history(who, base_url, channel, &blocks).await?;
-            Ok(decode_history(&blocks))
+            let deliveries = blocks.iter().map(|b| b.delivery_cid.clone()).collect();
+            Ok((decode_history(&blocks), deliveries))
         }
         Err(e) => {
             eprintln!("warning: could not load history for {channel}: {e:#}");
             eprintln!("warning: opening with an empty pane.");
-            Ok(Vec::new())
+            Ok((Vec::new(), Vec::new()))
         }
     }
 }
@@ -236,11 +255,11 @@ mod tests {
         // answers 404 here instead; either way the pane must still open.
         let dir = tempdir().unwrap();
         let id = Identity::generate_for_tests(&dir.keep());
-        let backlog = backfill(&id, "http://127.0.0.1:1", "#hello", 10)
+        let (backlog, deliveries) = backfill(&id, "http://127.0.0.1:1", "#hello", 10)
             .await
             .unwrap();
         assert!(
-            backlog.is_empty(),
+            backlog.is_empty() && deliveries.is_empty(),
             "unreachable server must yield no backlog"
         );
     }

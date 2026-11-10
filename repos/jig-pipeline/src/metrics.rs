@@ -17,7 +17,8 @@ static BRIDGE: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn block_ingested(source: &IngestSource) {
     let counter = match source {
         IngestSource::LocalClient { .. } => &LOCAL,
-        IngestSource::FederatedPeer { .. } => &FEDERATION,
+        // A write a follower relayed arrived over federation too.
+        IngestSource::FederatedPeer { .. } | IngestSource::Relayed { .. } => &FEDERATION,
         IngestSource::AdminEndpoint => &ADMIN,
         IngestSource::Bridge => &BRIDGE,
     };

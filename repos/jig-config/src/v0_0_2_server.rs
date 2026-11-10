@@ -288,6 +288,10 @@ pub struct AuthSection {
     /// How fast one identity, or one address, may use this server. See
     /// [`RateLimitSection`].
     pub rate_limit: RateLimitSection,
+
+    /// How the server's write capacity is shared between members, invited
+    /// and strangers. See [`PoolsSection`].
+    pub pools: PoolsSection,
 }
 
 impl Default for AuthSection {
@@ -298,6 +302,7 @@ impl Default for AuthSection {
             replay_capacity: 100_000,
             admission: AdmissionSection::default(),
             rate_limit: RateLimitSection::default(),
+            pools: PoolsSection::default(),
         }
     }
 }
@@ -340,6 +345,54 @@ impl Default for RateLimitSection {
             per_ip_per_second: 100,
             replay_per_did: 2_000,
             max_tracked: 100_000,
+        }
+    }
+}
+
+/// `[auth.pools]`: the capacity pools of JEP-0008 rules 21–23. The server's
+/// accepted local writes per second are shared between members, invited and
+/// strangers, so a flood of fresh identities cannot take the capacity members
+/// write with, however many identities it brings.
+///
+/// - **Members** are DIDs with a nonempty `[auth.admission] records` entry
+///   holding no negative score, and DIDs whose admission proof of work is at
+///   least `local_member_age_secs` old.
+/// - **Invited** is empty until invites exist (JEP-0009).
+/// - **Strangers** are everyone else.
+///
+/// The stranger pool gets `stranger_share_pct` of the capacity and the invited
+/// pool `invited_share_pct`; members get the rest. A pool that has had no
+/// demand for a second lends what it holds above half its burst; its first
+/// request takes it back. So members never wait on a flood of strangers, and
+/// a server with no members yet lends their share out.
+///
+/// Blocks a federated peer relays or a bridge submits are not charged here:
+/// the peer pays at its own ingress (JEP-0008 rule 30).
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PoolsSection {
+    /// Accepted local writes per second, all pools together. `0` turns the
+    /// pools off.
+    pub writes_per_second: u32,
+    /// The most writes the pools hold for a burst, all pools together.
+    pub writes_burst: u32,
+    /// Percent of capacity the stranger pool gets (rule 23: 20).
+    pub stranger_share_pct: u8,
+    /// Percent of capacity the invited pool gets (rule 23: 10).
+    pub invited_share_pct: u8,
+    /// How long ago a DID must have done this server's admission proof of
+    /// work to count as a member (rule 21's `local_member_age`).
+    pub local_member_age_secs: u64,
+}
+
+impl Default for PoolsSection {
+    fn default() -> Self {
+        Self {
+            writes_per_second: 1_000,
+            writes_burst: 2_000,
+            stranger_share_pct: 20,
+            invited_share_pct: 10,
+            local_member_age_secs: 7 * 24 * 60 * 60,
         }
     }
 }
@@ -441,7 +494,12 @@ pub struct FederationSection {
     /// How often a follower may ask this server for one channel's records
     /// (`records-from`). Defaults to a burst of [`DEFAULT_RECORDS_FROM_BURST`]
     /// and [`DEFAULT_RECORDS_FROM_PER_MIN`] a minute.
-    pub records_from: RecordsFromLimit,
+    pub records_from: RateLimit,
+    /// How often a follower may relay its clients' writes into one channel
+    /// this server owns (`relay-submit`, JEP-0005 rule 15). Defaults to a
+    /// burst of [`DEFAULT_RELAYED_WRITES_BURST`] and
+    /// [`DEFAULT_RELAYED_WRITES_PER_MIN`] a minute.
+    pub relayed_writes: RateLimit,
 }
 
 /// Blocks a peer may relay to this server per minute, unless it has its own
@@ -458,6 +516,12 @@ pub const DEFAULT_RECORDS_FROM_BURST: u32 = 8;
 /// catching up at the default peer quota takes about 10 full frames a minute.
 pub const DEFAULT_RECORDS_FROM_PER_MIN: u32 = 20;
 
+/// Writes one follower may relay into one channel back to back.
+pub const DEFAULT_RELAYED_WRITES_BURST: u32 = 30;
+/// Writes one follower may relay into one channel per minute, once its burst
+/// is spent: two a second, for all of that follower's clients together.
+pub const DEFAULT_RELAYED_WRITES_PER_MIN: u32 = 120;
+
 impl Default for FederationSection {
     fn default() -> Self {
         Self {
@@ -469,9 +533,13 @@ impl Default for FederationSection {
                 bytes_per_min: DEFAULT_PEER_BYTES_PER_MIN,
             },
             attested_suffixes: Vec::new(),
-            records_from: RecordsFromLimit {
+            records_from: RateLimit {
                 burst: DEFAULT_RECORDS_FROM_BURST,
                 per_min: DEFAULT_RECORDS_FROM_PER_MIN,
+            },
+            relayed_writes: RateLimit {
+                burst: DEFAULT_RELAYED_WRITES_BURST,
+                per_min: DEFAULT_RELAYED_WRITES_PER_MIN,
             },
         }
     }
@@ -522,12 +590,13 @@ pub struct PeerQuotaConfig {
     pub bytes_per_min: u64,
 }
 
-/// How often one peer may ask this server for one channel's records: a token
-/// bucket per peer and channel, holding `burst` requests and refilled at
-/// `per_min` a minute. A request past it is refused with the time to retry.
+/// How often one peer may send this server one kind of request for one
+/// channel (`records_from`, `relayed_writes`): a token bucket per peer and
+/// channel, holding `burst` requests and refilled at `per_min` a minute. A
+/// request past it is refused with the time to retry.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RecordsFromLimit {
+pub struct RateLimit {
     pub burst: u32,
     pub per_min: u32,
 }
@@ -556,11 +625,16 @@ impl FederationSection {
             Ok(())
         };
         check_quota(&self.default_peer_quota, "default_peer_quota")?;
-        if self.records_from.burst == 0 || self.records_from.per_min == 0 {
-            // Zero would refuse every follower, the first request included.
-            return Err(
-                "[federation] records_from: burst and per_min must both be at least 1".to_string(),
-            );
+        for (name, limit) in [
+            ("records_from", self.records_from),
+            ("relayed_writes", self.relayed_writes),
+        ] {
+            if limit.burst == 0 || limit.per_min == 0 {
+                // Zero would refuse every follower, the first request included.
+                return Err(format!(
+                    "[federation] {name}: burst and per_min must both be at least 1"
+                ));
+            }
         }
         let mut quotas: BTreeMap<&str, Option<PeerQuotaConfig>> = BTreeMap::new();
         for (i, peer) in self.peers.iter().enumerate() {
@@ -1486,6 +1560,10 @@ mod tests {
             (
                 "[federation.records_from]\nburst = 8\nper_min = 0\n".to_string(),
                 "records_from",
+            ),
+            (
+                "[federation.relayed_writes]\nburst = 0\nper_min = 120\n".to_string(),
+                "relayed_writes",
             ),
             (
                 peer(

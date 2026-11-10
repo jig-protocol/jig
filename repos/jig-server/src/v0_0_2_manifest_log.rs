@@ -97,7 +97,6 @@ pub async fn publish(state: &Arc<AppState>) -> anyhow::Result<ManifestRef> {
     let document = current(state)
         .encode()
         .context("encoding this server's manifest")?;
-    let server_did = state.server_did.to_did_jig_string();
     match store.get_channel_by_slug_including_archived(LOG_SLUG)? {
         None => {
             submit(state, log_create(state)?)
@@ -107,7 +106,10 @@ pub async fn publish(state: &Arc<AppState>) -> anyhow::Result<ManifestRef> {
         // A channel created at the slug before it was reserved: move it,
         // with everything in it, under the reserved prefix, where only the
         // server writes, and start the log. Nothing anyone signed is lost.
-        Some(channel) if channel.owner_did != server_did => {
+        // The log this server created under an earlier DID of its own is
+        // still its log: the key link moved the ownership (JEP-0012), and
+        // every client pinned that channel, so it goes on in it.
+        Some(channel) if !is_own(state, &channel.owner_did) => {
             let quarantine = quarantine_slug(&channel.id);
             tracing::warn!(
                 owner = %jig_core::did::log_tag(&channel.owner_did),
@@ -130,8 +132,16 @@ pub async fn publish(state: &Arc<AppState>) -> anyhow::Result<ManifestRef> {
         .list_blocks_by_channel(LOG_SLUG, 1, None)?
         .pop()
         .filter(|b| b.block_kind == BlockKind::ServerManifest.as_str());
+    // The newest says what this server advertises now, and was written by
+    // the DID it signs as now: a welcome cites only its own DID's entry, so
+    // after a key change the same document is published again.
     let cid = match newest {
-        Some(block) if document_of(&block.bundle_bytes).as_deref() == Some(&document[..]) => {
+        Some(block)
+            if document_of(&block.bundle_bytes).as_deref() == Some(&document[..])
+                && author_of(&block.bundle_bytes).is_some_and(|a| {
+                    jig_pipeline::handshake::same_did(&a, &state.server_did.to_did_jig_string())
+                }) =>
+        {
             block.cid
         }
         _ => {
@@ -158,6 +168,14 @@ pub async fn publish(state: &Arc<AppState>) -> anyhow::Result<ManifestRef> {
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(current.clone());
     Ok(current)
+}
+
+/// Whether `owner` is this server: its DID now, or one it signed as before
+/// and linked to it ([`AppState::prior_dids`]).
+fn is_own(state: &AppState, owner: &str) -> bool {
+    use jig_pipeline::handshake::same_did;
+    same_did(owner, &state.server_did.to_did_jig_string())
+        || state.prior_dids.iter().any(|did| same_did(owner, did))
 }
 
 /// Where a channel that held [`LOG_SLUG`] before it was reserved is moved.
@@ -215,6 +233,13 @@ async fn submit(state: &AppState, manifest_bytes: Vec<u8>) -> anyhow::Result<Str
         resources: vec![],
     };
     Ok(ingest(&state.ingest_ctx, bundle, sig, IngestSource::AdminEndpoint).await?)
+}
+
+/// The DID that wrote a stored block.
+fn author_of(bundle_bytes: &[u8]) -> Option<String> {
+    let (manifest_bytes, _code): (Vec<u8>, Vec<u8>) = serde_json::from_slice(bundle_bytes).ok()?;
+    let manifest: BlockManifest = serde_json::from_slice(&manifest_bytes).ok()?;
+    Some(manifest.authors.first()?.did.to_did_jig_string())
 }
 
 /// The document a stored `server-manifest` block carries.
@@ -407,6 +432,85 @@ pub(crate) mod tests {
             store.channel_archived_at(&moved.slug).unwrap().is_some(),
             "frozen"
         );
+    }
+
+    /// After a key change the log goes on in the channel the earlier DID
+    /// created, written by the new one: every client pinned that channel.
+    #[tokio::test]
+    async fn after_a_key_change_the_log_goes_on_where_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = JigServerConfig::default();
+        let keyfile = dir.path().join("server.key");
+        config.server.server_did_keyfile = keyfile.to_string_lossy().into_owned();
+        config.keys.unlock = Some(jig_client::server_key::credential_for_tests(dir.path()));
+        let db = dir.path().join("jig.db");
+        let boot = |config: &JigServerConfig| {
+            Arc::new(AppState::new(config.clone(), db.clone(), Default::default()).unwrap())
+        };
+        let before = boot(&config);
+        let first = publish(&before).await.unwrap();
+        let log = before
+            .ingest_ctx
+            .store
+            .get_channel_by_slug(LOG_SLUG)
+            .unwrap()
+            .unwrap();
+        let old_did = before.server_did.to_did_jig_string();
+        drop(before);
+
+        let next_dir = dir.path().join("next");
+        std::fs::create_dir_all(&next_dir).unwrap();
+        let next = jig_client::server_key::credential_for_tests(&next_dir);
+        jig_client::server_key::rotate(
+            &keyfile,
+            std::slice::from_ref(&next),
+            false,
+            &crate::v0_0_2::key_options(&config.keys),
+            1,
+        )
+        .unwrap();
+        config.keys.unlock = Some(next);
+        // Nothing it advertises changed, but a welcome cites only an entry
+        // its own DID wrote.
+        let after = boot(&config);
+        let new_did = after.server_did.to_did_jig_string();
+        assert_ne!(new_did, old_did);
+        assert_eq!(after.prior_dids, vec![old_did.clone()]);
+
+        let next = publish(&after).await.unwrap();
+        assert_eq!(publish(&after).await.unwrap(), next, "once");
+        let store = &after.ingest_ctx.store;
+        let block = store.get_block(&next.cid).unwrap().unwrap();
+        assert_eq!(author_of(&block.bundle_bytes), Some(new_did.clone()));
+        assert_eq!(
+            document_of(&block.bundle_bytes),
+            document_of(&store.get_block(&first.cid).unwrap().unwrap().bundle_bytes),
+            "the same document"
+        );
+        let kept = store.get_channel_by_slug(LOG_SLUG).unwrap().unwrap();
+        assert_eq!(kept.id, log.id, "the same channel, not a new one");
+        assert_eq!(kept.owner_did, old_did);
+        assert_eq!(kept.sequencer_did, new_did, "the role moved");
+        assert_eq!(next.seq, first.seq + 1, "the chain goes on");
+        let record = store.get_ingest_record(&next.cid).unwrap().unwrap();
+        record.verify(&new_did).unwrap();
+        let before_it = store.get_ingest_record(&first.cid).unwrap().unwrap();
+        assert_eq!(record.prev, hex::encode(before_it.hash()));
+        assert!(
+            !store
+                .list_channels_including_archived()
+                .unwrap()
+                .iter()
+                .any(|c| c.slug.starts_with(QUARANTINE_PREFIX)),
+            "nothing quarantined"
+        );
+
+        // A DID the server never linked from is still a stranger.
+        let mut unlinked = AppState::for_test().unwrap();
+        unlinked.prior_dids =
+            vec![jig_core::Did::from_ed25519_pubkey(&[9u8; 32]).to_did_jig_string()];
+        assert!(!is_own(&unlinked, &old_did));
+        assert!(is_own(&after, &old_did));
     }
 
     #[tokio::test]

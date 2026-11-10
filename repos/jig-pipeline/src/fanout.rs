@@ -77,7 +77,12 @@ impl DeliveryPolicy {
             open,
             owner_did: channel.owner_did.clone(),
             member_dids,
-            federates: open && channel.suite == jig_core::EncryptionSuite::Unencrypted.as_str(),
+            // A server's own `#jig/` channels (its manifest log) are its own:
+            // a peer refuses them, and never sequences a copy.
+            federates: open
+                && channel.suite == jig_core::EncryptionSuite::Unencrypted.as_str()
+                && jig_core::slug::classify_slug(&channel.slug)
+                    != Ok(jig_core::slug::SlugClass::Server),
         }
     }
 
@@ -673,6 +678,14 @@ mod tests {
         assert!(DeliveryPolicy::for_channel(&row("open", "none"), vec![]).federates);
         assert!(!DeliveryPolicy::for_channel(&row("restricted", "none"), vec![]).federates);
         assert!(!DeliveryPolicy::for_channel(&row("open", "mls"), vec![]).federates);
+        let manifest_log = StoredChannel {
+            slug: "#jig/manifest".to_string(),
+            ..row("open", "none")
+        };
+        assert!(
+            !DeliveryPolicy::for_channel(&manifest_log, vec![]).federates,
+            "a server's own channels stay home"
+        );
     }
 
     // ---- scope matching ----------------------------------------------------

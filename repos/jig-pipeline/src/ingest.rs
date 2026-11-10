@@ -31,6 +31,20 @@ pub enum IngestSource {
     /// inbound mail). Behaves like a local submission for fanout + origin
     /// tagging.
     Bridge,
+    /// A client's block a follower relayed to this server, the channel's
+    /// owner, under its share of `channel_id` with `grant` (JEP-0005 rule 15).
+    /// `via` is the follower's proven DID, recorded with the block.
+    ///
+    /// Admission is the relayed one ([`Admission::admit_relayed`]): the
+    /// follower ran its own admission and proof of work on the client, and
+    /// is answerable for it through the share. This server still refuses a
+    /// banned author or one below its floors, checks the author's signature,
+    /// and runs its full write gate, plus the grant.
+    Relayed {
+        via: Did,
+        channel_id: String,
+        grant: jig_core::contract::Grant,
+    },
 }
 
 /// All resources the ingest pipeline needs. Constructed once at server
@@ -244,6 +258,25 @@ pub enum IngestError {
         channel_id: String,
         sequencer: String,
     },
+    /// A relayed block for a channel the relaying server's share does not
+    /// cover (JEP-0005 rule 15).
+    #[error("`{kind}` refused: `{via}` relayed it outside its share of channel {channel_id}")]
+    RelayedOutsideShare {
+        kind: String,
+        channel_id: String,
+        via: String,
+    },
+    /// A relayed block of a kind the share's grant does not carry (JEP-0005
+    /// rule 7a). The author can post it to the owner directly.
+    #[error(
+        "`{kind}` refused: `{via}` holds a `{grant}` share, which does not relay it; \
+         post it to the channel's owner directly"
+    )]
+    GrantRefused {
+        kind: String,
+        grant: &'static str,
+        via: String,
+    },
     /// A channel term (`sequencer`, `co_owners`) is malformed.
     #[error("channel-create term `{field}` is invalid: {detail}")]
     InvalidTerms { field: String, detail: String },
@@ -381,9 +414,9 @@ pub async fn ingest(
     let own = sender.to_did_jig_string() == ctx.server_did.to_did_jig_string();
     let admitted = match source {
         _ if own => Ok(()),
-        IngestSource::FederatedPeer { .. } | IngestSource::Bridge => {
-            ctx.admission.admit_relayed(sender.as_str())
-        }
+        IngestSource::FederatedPeer { .. }
+        | IngestSource::Bridge
+        | IngestSource::Relayed { .. } => ctx.admission.admit_relayed(sender.as_str()),
         IngestSource::LocalClient { .. } | IngestSource::AdminEndpoint => {
             ctx.admission.admit(sender.as_str())
         }
@@ -489,6 +522,30 @@ pub async fn ingest(
         return Err(IngestError::UnknownChannel {
             slug: named.to_string(),
         });
+    }
+    // A relayed block goes only into the channel its share covers, and only
+    // as a kind its grant carries (JEP-0005 rules 7a, 15). A channel-create
+    // resolves to no live channel, so it is outside every share.
+    if let IngestSource::Relayed {
+        via,
+        channel_id: shared,
+        grant,
+    } = &source
+    {
+        if resolved_channel.as_ref().map(|c| c.id.as_str()) != Some(shared.as_str()) {
+            return Err(IngestError::RelayedOutsideShare {
+                kind: kind_str.to_string(),
+                channel_id: shared.clone(),
+                via: via.to_did_jig_string(),
+            });
+        }
+        if !jig_core::contract::grant_allows(*grant, kind) {
+            return Err(IngestError::GrantRefused {
+                kind: kind_str.to_string(),
+                grant: grant.as_str(),
+                via: via.to_did_jig_string(),
+            });
+        }
     }
     // A channel another server sequences takes its blocks only from that
     // server, with that server's records (`crate::follow`): this server never
@@ -786,6 +843,8 @@ pub async fn ingest(
         },
         federated_from: match &source {
             IngestSource::FederatedPeer { peer_url, .. } => Some(peer_url.clone()),
+            // The relaying server's DID (JEP-0005 rule 15).
+            IngestSource::Relayed { via, .. } => Some(via.to_did_jig_string()),
             _ => None,
         },
     };
@@ -874,6 +933,9 @@ pub async fn ingest(
                     got: from_epoch,
                 });
             }
+            if let crate::persist::Landing::Landed(record) = &landing {
+                witness_record(ctx, record.as_ref());
+            }
         }
         // A membership or share block whose authority rests on a role: its
         // effect, block and record land in one transaction, and only if the
@@ -901,6 +963,7 @@ pub async fn ingest(
                 crate::persist::Landing::Landed(record) => record,
                 _ => return Err(refused_at_landing(guard_refusal, kind_str)),
             };
+            witness_record(ctx, record.as_ref());
             if let Some(input) = render_input.take() {
                 stored_receipt = receipt_after_landing(ctx, input, &block_cid, record).await;
             }
@@ -932,6 +995,7 @@ pub async fn ingest(
                     None
                 }
             };
+            witness_record(ctx, record.as_ref());
             // The receipt is written before fanout below, so no subscriber or peer sees the
             // block without it.
             if let Some(input) = render_input.take() {
@@ -1024,7 +1088,10 @@ pub async fn ingest(
                 .dispatch_to_bridges_public(&stored_block, &stored_receipt, policy.as_ref())
                 .await;
         }
-        IngestSource::LocalClient { .. } | IngestSource::AdminEndpoint | IngestSource::Bridge => {
+        IngestSource::LocalClient { .. }
+        | IngestSource::AdminEndpoint
+        | IngestSource::Bridge
+        | IngestSource::Relayed { .. } => {
             ctx.fanout
                 .broadcast_with_members(&stored_block, &stored_receipt, policy.as_ref())
                 .await
@@ -1156,6 +1223,16 @@ pub fn channel_slug_of(kind: BlockKind, manifest: &jig_core::BlockManifest) -> O
         .metadata
         .get(channel_metadata_key(kind))
         .and_then(|v| v.as_str())
+}
+
+/// Keep this server's clock at or after the clock its newest record was
+/// signed with: the store may have moved it past the reading ingest took
+/// ([`crate::persist`]'s `sequence_on`).
+fn witness_record(ctx: &IngestContext, record: Option<&crate::ingest_record::IngestRecord>) {
+    if let Some(record) = record {
+        ctx.hlc_clock
+            .witness(record.ingest_wall_ms, record.ingest_logical);
+    }
 }
 
 /// The metadata key under which a block of `kind` names its channel. See
@@ -2090,6 +2167,74 @@ mod tests {
             resources: vec![],
         };
         ingest(ctx, bundle, sig, source).await
+    }
+
+    /// Many writers into one channel at once: every record the server signs
+    /// comes after the one before it in clock order as well as in `seq`,
+    /// though each reads the clock before it takes its place in the chain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_writers_never_sign_a_clock_that_runs_backwards() {
+        let ctx = Arc::new(test_ctx());
+        let channel = seed_channel(&ctx, "#busy");
+        const WRITERS: usize = 8;
+        const EACH: usize = 40;
+        let mut tasks = Vec::new();
+        for w in 0..WRITERS {
+            let ctx = ctx.clone();
+            tasks.push(tokio::spawn(async move {
+                let key = random_signing_key();
+                for i in 0..EACH {
+                    let body = format!("writer {w} message {i}");
+                    let (m, c, sig) = build_bundle_parts_with_meta(
+                        &key,
+                        BlockKind::TextRender,
+                        &[("channel", "#busy"), ("body", &body)],
+                    );
+                    do_ingest(
+                        &ctx,
+                        m,
+                        c,
+                        sig,
+                        IngestSource::LocalClient { conn_id: w as u64 },
+                    )
+                    .await
+                    .unwrap();
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let mut records = Vec::new();
+        loop {
+            let page = ctx
+                .store
+                .list_ingest_records_by_id(&channel, records.len() as u64, 200)
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            records.extend(page);
+        }
+        assert_eq!(records.len(), WRITERS * EACH);
+        for pair in records.windows(2) {
+            assert!(pair[1].follows(&pair[0]));
+            assert!(
+                (pair[1].ingest_wall_ms, pair[1].ingest_logical)
+                    > (pair[0].ingest_wall_ms, pair[0].ingest_logical),
+                "record {} at {}/{} after record {} at {}/{}",
+                pair[1].seq,
+                pair[1].ingest_wall_ms,
+                pair[1].ingest_logical,
+                pair[0].seq,
+                pair[0].ingest_wall_ms,
+                pair[0].ingest_logical
+            );
+        }
+        // The server's clock is past the last record it signed.
+        let last = records.last().unwrap();
+        let now = ctx.hlc_clock.current();
+        assert!((now.wall_ms, now.logical) >= (last.ingest_wall_ms, last.ingest_logical));
     }
 
     #[tokio::test]

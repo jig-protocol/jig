@@ -133,6 +133,12 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
         IngestError::CarriedChannel { .. } => {
             (StatusCode::FORBIDDEN, "CARRIED_CHANNEL", e.to_string())
         }
+        // 403: a follower relayed past its share, or past its grant
+        // (JEP-0005 rules 7a, 15).
+        IngestError::RelayedOutsideShare { .. } => {
+            (StatusCode::FORBIDDEN, "RELAY_OUTSIDE_SHARE", e.to_string())
+        }
+        IngestError::GrantRefused { .. } => (StatusCode::FORBIDDEN, "GRANT_REFUSED", e.to_string()),
         IngestError::InvalidTerms { .. } => {
             (StatusCode::BAD_REQUEST, "INVALID_TERMS", e.to_string())
         }
@@ -304,6 +310,16 @@ mod tests {
                 kind: "text-render".to_string(),
                 channel_id: "bafy-carried".to_string(),
                 sequencer: "did:jig:zElsewhere".to_string(),
+            },
+            IngestError::RelayedOutsideShare {
+                kind: "text-render".to_string(),
+                channel_id: "bafy-other".to_string(),
+                via: "did:jig:zFollower".to_string(),
+            },
+            IngestError::GrantRefused {
+                kind: "member-add".to_string(),
+                grant: "write",
+                via: "did:jig:zFollower".to_string(),
             },
             IngestError::InvalidTerms {
                 field: "co_owners".to_string(),

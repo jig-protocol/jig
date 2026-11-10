@@ -411,8 +411,10 @@ mod tests {
             manifest: Default::default(),
             key_link: None,
             prior_key_links: Vec::new(),
+            prior_dids: Vec::new(),
             peer_frames: Default::default(),
             peers: Default::default(),
+            relay: Default::default(),
         })
     }
 
