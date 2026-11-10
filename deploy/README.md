@@ -791,12 +791,15 @@ there in this server's order:
    server that orders it, so `jig read '#team'` there finds nothing.
 
 `jig channel unshare '#team' did:jig:<other server>` (or `contracts end
-<offer-id>` on either server) ends the share. This server stops sending at
-once. The other server keeps the copy it holds and lands nothing after.
+<offer-id>` on either server) ends the share. This server stops streaming the
+channel's records at once. The other server keeps the copy it holds and lands
+nothing of the channel after, including any block of it the older peer relay
+still forwards.
 
 The server decides which channels may be shared: a channel whose tier keeps it
-on one server is refused (JEP-0014). The other server does not yet relay writes
-back: its users post on this server.
+on one server is refused (JEP-0014). Under a `write` or `member` grant, the other
+server relays its users' posts back to this one; under `read`, they post on
+this server.
 
 A channel reaches another server only once it is shared. Its creation block
 names the server that orders it, so a peer no longer takes a channel this
