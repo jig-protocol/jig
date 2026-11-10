@@ -801,12 +801,6 @@ on one server is refused (JEP-0014). Under a `write` or `member` grant, the othe
 server relays its users' posts back to this one; under `read`, they post on
 this server.
 
-> **Known issue: sharing does not deliver yet.** Peers also relay every open
-> channel to each other the older way, within seconds of its creation, and
-> the other server takes a channel that reaches it like that as its own. The
-> share is then accepted, but nothing it carries lands there. Until that is
-> fixed, the steps above set a share up without delivering it.
-
 ---
 
 ## The nameserver
