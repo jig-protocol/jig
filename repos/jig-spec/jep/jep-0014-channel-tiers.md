@@ -348,8 +348,10 @@ reads no encrypted tier.
       does: rule 1 refuses its relayed `channel-create`, and the next bullet refuses relayed
       posts into it.
     - **A server refuses a relayed post into a channel it sequences** (DJ, 2026-11-10; #357).
-      A block that a configured peer relays over the legacy relay into a channel this server
-      sequences MUST be refused, whether the block names the channel by slug or by id.
+      A block (other than the `channel-create` that makes it) that a configured peer relays
+      over the legacy relay into a channel this server sequences MUST be refused, whether the
+      block names the channel by slug or by id. Rule 1 and the sequencer binding judge a
+      relayed `channel-create`.
       - A write relayed under a share's grant (JEP-0005 rule 15) is not a legacy-relay block,
         and this rule does not apply to it.
       - The refusal is logged with the reason `relayed-into-sequenced-channel`. It is not a
