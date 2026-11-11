@@ -868,6 +868,14 @@ planned for after v0.2.0-alpha.3.
 
 ## Gotchas worth knowing before they cost you an evening
 
+- **Which release is running.** From v0.2.0-alpha.4, the first published release
+  that prints its version, `jig --version`, `jig-server --version` and
+  `jig-nameserver --version` print the release version (`jig 0.2.0-alpha.4`).
+  v0.2.0-alpha.2 and earlier print `0.0.1` whatever the release: identify those
+  by file hash, against that release's `SHA256SUMS`.
+- **`--server`, `--config` and `--did` are honoured by every `jig` subcommand,**
+  including `init`, `keys`, `server` and `channel`. `--config <path>` requires
+  the file to exist.
 - **`jig-nameserver serve --bind/--port` ARE honoured**, and they win over both
   the config file and `JIG_NS_BIND`/`JIG_NS_PORT`. The shipped unit sets the env
   vars instead, which is still correct and still applied after any TOML load.

@@ -166,13 +166,14 @@ jig channel leave '#ops'                          # anyone but the owner
 jig channel members '#ops'
 jig dm <did-or-contact-name> "just us"            # a locked, encrypted channel for two
 
-jig channel create '#team' --tier server --join guest   # a team channel members join themselves
+jig channel create '#team' --tier server         # members of this server join it themselves
 jig channel join '#team'                          # once, before the first `jig chat`
 jig channel create '#news' --tier public          # readable by anyone; asks you to confirm
 ```
 
-A `server` or `shared` channel is joined with `jig channel join`, by MLS external commit;
-history from before you joined stays sealed.
+`--join guest` lowers the bar to guests, which admits any key the server admits, `--anon`
+session keys included. A `server` or `shared` channel is joined with `jig channel join`, by
+MLS external commit; history from before you joined stays sealed.
 [`scripts/demo-e2ee.sh`](scripts/demo-e2ee.sh) runs all of this against a throwaway server
 with three users and then searches the server's files for what they said.
 
