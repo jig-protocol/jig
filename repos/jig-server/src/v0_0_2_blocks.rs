@@ -91,6 +91,7 @@ pub(crate) fn map_ingest_error(
 /// base64-encoded). Returns `{ "block_cid": "bafy..." }` on success.
 pub async fn submit_block(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<SubmitBody>,
 ) -> Result<Json<SubmitResult>, (StatusCode, Json<ErrorBody>)> {
     let bundle_bytes = base64::engine::general_purpose::STANDARD
@@ -136,11 +137,28 @@ pub async fn submit_block(
         sig,
         0,
         &format!("rest:{author}"),
+        declares_feature(&headers, jig_core::tier::TIERS_FEATURE),
     )
     .await
     .map_err(refusal_response)?;
 
     Ok(Json(SubmitResult { block_cid: cid }))
+}
+
+/// The header a request outside a connection names the features its client
+/// implements in, comma-separated: what a hello's capabilities say on a
+/// connection (JEP-0014 rule 5).
+pub const CAPABILITIES_HEADER: &str = "jig-capabilities";
+
+/// Whether `headers` declare `feature` in [`CAPABILITIES_HEADER`]. Every
+/// occurrence of the header counts; names match exactly, after trimming.
+pub fn declares_feature(headers: &axum::http::HeaderMap, feature: &str) -> bool {
+    headers
+        .get_all(CAPABILITIES_HEADER)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|name| name.trim() == feature)
 }
 
 #[derive(Debug, Serialize)]
@@ -396,6 +414,11 @@ pub struct MemberView {
     pub did: String,
     pub role: String,
     pub joined_at: i64,
+    /// The server that relayed this member's latest write here, if one did
+    /// (JEP-0005 rule 15): a hint at where its client is, for pruning the
+    /// members a follower took with it when its contract ended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_via: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -431,11 +454,15 @@ pub async fn list_members(
             format!("no live channel '{channel_ref}' on this server"),
         ));
     };
+    let mut via = store
+        .last_relay_by_sender(&channel.id)
+        .map_err(persist_err)?;
     let members = store
         .list_members(&channel.id)
         .map_err(persist_err)?
         .into_iter()
         .map(|m| MemberView {
+            last_via: via.remove(&m.member_did).flatten(),
             did: m.member_did,
             role: m.role,
             joined_at: m.joined_at,
@@ -707,7 +734,7 @@ pub async fn get_channel_history(
             StatusCode::NOT_FOUND,
             "CARRIED_CHANNEL",
             format!(
-                "{channel_ref} here is carried for {}, which orders it; read it by its id: {}",
+                "{channel_ref} here is carried for {}, which orders it; name it by its id: {}",
                 carried.sequencer_did, carried.id
             ),
         ));
@@ -853,6 +880,28 @@ pub fn build_blocks_router(state: Arc<AppState>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_declares_its_features_in_one_header() {
+        use axum::http::{HeaderMap, HeaderValue};
+        let mut headers = HeaderMap::new();
+        assert!(!declares_feature(&headers, "tiers"));
+        headers.insert(
+            CAPABILITIES_HEADER,
+            HeaderValue::from_static("other, tiers"),
+        );
+        assert!(declares_feature(&headers, "tiers"));
+        headers.insert(
+            CAPABILITIES_HEADER,
+            HeaderValue::from_static("tiersx,Tiers"),
+        );
+        assert!(!declares_feature(&headers, "tiers"), "names match exactly");
+        headers.append(CAPABILITIES_HEADER, HeaderValue::from_static("tiers"));
+        assert!(
+            declares_feature(&headers, "tiers"),
+            "every occurrence counts"
+        );
+    }
     use axum::{Router, body::Body, http::Request};
     use jig_client::{Identity, blocks::build_text_render};
     use jig_core::HlcTimestamp;
@@ -917,6 +966,7 @@ mod tests {
             .method("POST")
             .uri(path)
             .header("Content-Type", "application/json")
+            .header(CAPABILITIES_HEADER, jig_core::tier::TIERS_FEATURE)
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
@@ -1074,7 +1124,13 @@ mod tests {
 
         let id = test_identity();
         let hlc = test_hlc(&id);
-        let block = build_channel_create(&id, "#hello", "open", hlc);
+        let block = build_channel_create(
+            &id,
+            "#hello",
+            "open",
+            &state.server_did.to_did_jig_string(),
+            hlc,
+        );
         let submission = serde_json::json!({
             "bundle_b64": base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
             "sig_b64": base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
@@ -1171,7 +1227,13 @@ mod tests {
         // Create channels in a non-sorted order; expect sorted output.
         for slug in ["#zulu", "#alpha", "#mike"] {
             let hlc = test_hlc(&id);
-            let block = build_channel_create(&id, slug, "open", hlc);
+            let block = build_channel_create(
+                &id,
+                slug,
+                "open",
+                &state.server_did.to_did_jig_string(),
+                hlc,
+            );
             let submission = serde_json::json!({
                 "bundle_b64": base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
                 "sig_b64":    base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
@@ -1202,7 +1264,13 @@ mod tests {
         let router = crate::v0_0_2_ws::build_v0_0_2_router(state.clone());
 
         let id = test_identity();
-        let block = build_channel_create(&id, "#hello", "open", test_hlc(&id));
+        let block = build_channel_create(
+            &id,
+            "#hello",
+            "open",
+            &state.server_did.to_did_jig_string(),
+            test_hlc(&id),
+        );
         let submission = serde_json::json!({
             "bundle_b64": base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
             "sig_b64":    base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
@@ -1234,7 +1302,13 @@ mod tests {
 
         let mut hlc = test_hlc(&id);
         hlc.logical = 1;
-        let again = build_channel_create(&id, "#hello", "open", hlc);
+        let again = build_channel_create(
+            &id,
+            "#hello",
+            "open",
+            &state.server_did.to_did_jig_string(),
+            hlc,
+        );
         let submission = serde_json::json!({
             "bundle_b64": base64::engine::general_purpose::STANDARD.encode(again.canonical_bytes()),
             "sig_b64":    base64::engine::general_purpose::STANDARD.encode(&again.sender_sig),

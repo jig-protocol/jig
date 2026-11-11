@@ -173,19 +173,46 @@ enum ChannelAction {
         #[arg()]
         slug: String,
 
-        /// Channel visibility — `open` (anyone can read; default) or
-        /// `restricted` (members only, and always end-to-end encrypted).
-        #[arg(long, default_value = "open")]
-        visibility: String,
+        /// Who joins and whether it is encrypted, fixed for the channel's
+        /// life: `private` (the default: members are added, end-to-end
+        /// encrypted), `server` (anyone holding the `--join` role on this
+        /// server joins, encrypted), `shared` (as `server`, across servers
+        /// under a share) or `public` (anyone, including the server operator,
+        /// can read it; asks you to confirm).
+        #[arg(long)]
+        tier: Option<String>,
+
+        /// For `server` and `shared`: the lowest server role that may join,
+        /// `member` (default) or `guest`.
+        #[arg(long)]
+        join: Option<String>,
+
+        /// Confirm a `public` channel without being asked (needed when stdin
+        /// is not a terminal).
+        #[arg(long)]
+        yes: bool,
+
+        /// Grow a group from a 1:1: link the new channel to that DM (a slug or
+        /// channel id). The group is `private`; the 1:1 goes on unchanged.
+        #[arg(long)]
+        from_dm: Option<String>,
+
+        /// Continue a frozen channel you own (a slug or channel id) in this
+        /// new, encrypted one. No history moves.
+        #[arg(long)]
+        successor_of: Option<String>,
 
         /// Succeed (exit 0) if the channel already exists instead of failing.
         #[arg(long)]
         exist_ok: bool,
 
-        /// End-to-end encrypt the channel with MLS: the server stores and
-        /// relays ciphertext it cannot read. Fixed at creation. Restricted
-        /// channels are always encrypted, so this only changes open ones.
-        #[arg(long)]
+        /// Older form of `--tier`: `restricted` is `private`, `open` is
+        /// `public` (or `server` with `--encrypted`).
+        #[arg(long, hide = true)]
+        visibility: Option<String>,
+
+        /// Older form of `--tier server --join guest`.
+        #[arg(long, hide = true)]
         encrypted: bool,
     },
 
@@ -223,10 +250,64 @@ enum ChannelAction {
         slug: String,
     },
 
+    /// Share a channel with another server (JEP-0005): its users then read
+    /// it there, as it lands here, in this server's order.
+    ///
+    /// The owner, or an admin holding the `share` right, may share; the
+    /// server checks. It offers the channel only to a server listed in its
+    /// own `[[federation.peers]]`, and records `NOT_A_PEER` in the channel
+    /// otherwise. The other server's operator then accepts with
+    /// `jig-server contracts list` and `jig-server contracts accept
+    /// <offer-id>`, unless its peer entry for this server says
+    /// `offers = "accept"`.
+    ///
+    /// On the other server the channel is known by its id, not its slug (a
+    /// slug names a channel only on the server that orders it): its users
+    /// read it with `jig read <channel-id>`, the id this command prints.
+    ///
+    /// The server decides which channels may be shared: one whose tier keeps
+    /// it on one server is refused (JEP-0014). Under a `write` or `member`
+    /// grant, the other server relays its users' writes back here.
+    Share {
+        #[arg()]
+        slug: String,
+        /// The other server's DID, as its `/.well-known/jig` gives it.
+        #[arg()]
+        server_did: String,
+        /// The grant recorded with the share (JEP-0005 rule 7a). Under any
+        /// grant the other server carries the whole channel; the grant says
+        /// what it may relay back here: `read`, only protocol traffic;
+        /// `write`, also its users' posts; `member`, also membership
+        /// changes.
+        #[arg(long, value_parser = ["read", "write", "member"])]
+        grant: String,
+    },
+
+    /// Stop sharing a channel with another server.
+    ///
+    /// An offer not yet answered is withdrawn. A live share ends at once
+    /// here: this server sends that server nothing more of the channel, and
+    /// tells it the share is over once they are connected. That server
+    /// keeps the copy it holds, up to the last block it landed, and lands
+    /// nothing after; the end is recorded in the channel as a
+    /// `contract-end`. Same rights as `share`.
+    Unshare {
+        #[arg()]
+        slug: String,
+        /// The other server's DID.
+        #[arg()]
+        server_did: String,
+    },
+
     /// List a channel's members.
     Members {
         #[arg()]
         slug: String,
+        /// Only the members whose latest write the server with this DID
+        /// relayed: after its contract ended, those a member may want to
+        /// remove with `jig channel kick`.
+        #[arg(long, value_name = "SERVER_DID")]
+        via: Option<String>,
     },
 
     /// Join an existing channel by adding the caller's DID as a member.
@@ -855,17 +936,47 @@ async fn run() -> Result<()> {
         match action {
             ChannelAction::Create {
                 slug,
-                visibility,
+                tier,
+                join,
+                yes,
+                from_dm,
+                successor_of,
                 exist_ok,
+                visibility,
                 encrypted,
             } => {
-                cmd::channel::create(&ctx, slug, visibility, exist_ok, encrypted).await?;
+                let choice = cmd::channel::choose_tier(
+                    tier.as_deref(),
+                    join.as_deref(),
+                    visibility.as_deref(),
+                    encrypted,
+                )?;
+                cmd::channel::create(
+                    &ctx,
+                    slug,
+                    choice,
+                    exist_ok,
+                    yes,
+                    cmd::channel::ChannelLinks {
+                        from_dm,
+                        successor_of,
+                    },
+                )
+                .await?;
             }
             ChannelAction::Add { slug, who } => cmd::channel::add(&ctx, slug, who).await?,
             ChannelAction::Kick { slug, who } => cmd::channel::kick(&ctx, slug, who).await?,
             ChannelAction::Leave { slug } => cmd::channel::leave(&ctx, slug).await?,
             ChannelAction::Promote { slug } => cmd::channel::promote(&ctx, slug).await?,
-            ChannelAction::Members { slug } => cmd::channel::members(&ctx, slug).await?,
+            ChannelAction::Share {
+                slug,
+                server_did,
+                grant,
+            } => cmd::channel::share(&ctx, slug, server_did, grant).await?,
+            ChannelAction::Unshare { slug, server_did } => {
+                cmd::channel::unshare(&ctx, slug, server_did).await?
+            }
+            ChannelAction::Members { slug, via } => cmd::channel::members(&ctx, slug, via).await?,
             ChannelAction::Join { slug } => {
                 cmd::channel::join(&ctx, slug).await?;
             }

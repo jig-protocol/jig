@@ -74,19 +74,34 @@ pub enum PeerSendError {
 #[derive(Debug, Clone)]
 pub struct PeerSender {
     peer: Did,
+    /// Whether the peer implements channel tiers (JEP-0014), as its handshake
+    /// on this connection said.
+    tiers: bool,
     tx: mpsc::Sender<Envelope>,
 }
 
 impl PeerSender {
     /// A sender for `peer`, and the receiving end its connection loop drains.
+    /// The peer is not known to implement tiers.
     pub fn new(peer: Did) -> (Self, mpsc::Receiver<Envelope>) {
+        Self::with_tiers(peer, false)
+    }
+
+    /// [`Self::new`], for a peer whose handshake said whether it implements
+    /// tiers.
+    pub fn with_tiers(peer: Did, tiers: bool) -> (Self, mpsc::Receiver<Envelope>) {
         let (tx, rx) = mpsc::channel(PEER_QUEUE);
-        (Self { peer, tx }, rx)
+        (Self { peer, tiers, tx }, rx)
     }
 
     /// The DID this connection's peer proved.
     pub fn peer(&self) -> &Did {
         &self.peer
+    }
+
+    /// Whether the peer implements channel tiers.
+    pub fn tiers(&self) -> bool {
+        self.tiers
     }
 
     /// Queue a peer frame of `kind`, without waiting.

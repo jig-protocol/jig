@@ -119,6 +119,13 @@ pub struct ChannelTiering {
 }
 
 impl ChannelTiering {
+    /// Whether the channel's tier takes self-joins on a join rule: `server`
+    /// and `shared` (JEP-0014 rules 12 and 13).
+    pub fn takes_self_join(&self) -> bool {
+        use jig_core::tier::{StoredTier, Tier};
+        matches!(self.tier, StoredTier::Tier(Tier::Server | Tier::Shared))
+    }
+
     /// `tier`, with the defaults its creation block would carry: `join =
     /// member` for `server` and `shared`, `join_servers = owner` for `shared`.
     pub fn of(tier: Tier) -> Self {
@@ -2168,6 +2175,28 @@ impl SqliteStore {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The server that relayed each sender's latest block in `channel_id`
+    /// (`federated_from`), by sender DID: `None` for one that wrote here
+    /// directly. A hint at where a member's client is, no more: a member who
+    /// only reads, or writes from two servers, is not told apart.
+    pub fn last_relay_by_sender(
+        &self,
+        channel_id: &str,
+    ) -> Result<std::collections::HashMap<String, Option<String>>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(
+            // One pass over the channel's blocks: each sender's latest row,
+            // then its relay. A subquery per block would be quadratic.
+            "SELECT sender_did, federated_from FROM blocks
+              WHERE rowid IN (SELECT MAX(rowid) FROM blocks
+                               WHERE channel_id = ?1 GROUP BY sender_did)",
+        )?;
+        let rows = stmt
+            .query_map([channel_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
 
