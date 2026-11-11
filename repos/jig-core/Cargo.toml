@@ -39,9 +39,9 @@ argon2 = { version = "0.5", optional = true, default-features = false, features 
 [dev-dependencies]
 proptest = "1.0"
 wat = "1.0"
-# Parses the jig:block WIT package in tests/wit_package.rs. 0.258 matches the wasm-tools
-# release wasmtime 49 already pulls in, so it adds no new crates to the lockfile.
-wit-parser = "0.258"
+# Parses the jig:block WIT package in tests/wit_package.rs. 0.261 matches the wasm-tools
+# release wasmtime 50 already pulls in, so it adds no new crates to the lockfile.
+wit-parser = "0.261"
 
 [[bench]]
 name = "pow"
