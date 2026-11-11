@@ -141,7 +141,11 @@ pub async fn probe_at(
     if !resp.status().is_success() {
         return Err(fetch(format!("HTTP {}", resp.status())));
     }
-    let well_known: serde_json::Value = resp.json().await.map_err(|e| fetch(e.to_string()))?;
+    // Read before anything is pinned, from a server not yet trusted.
+    let well_known: serde_json::Value =
+        crate::limits::json_capped(resp, crate::limits::MAX_DOCUMENT_BYTES)
+            .await
+            .map_err(|e| fetch(e.to_string()))?;
 
     #[derive(Deserialize)]
     struct Advertised {
@@ -296,7 +300,11 @@ async fn probe_bound_to(
     if !resp.status().is_success() {
         return Err(fetch(format!("HTTP {}", resp.status())));
     }
-    let well_known: serde_json::Value = resp.json().await.map_err(|e| fetch(e.to_string()))?;
+    // Read before anything is pinned, from a server not yet trusted.
+    let well_known: serde_json::Value =
+        crate::limits::json_capped(resp, crate::limits::MAX_DOCUMENT_BYTES)
+            .await
+            .map_err(|e| fetch(e.to_string()))?;
 
     #[derive(Deserialize)]
     struct Advertised {

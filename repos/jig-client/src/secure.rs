@@ -65,6 +65,8 @@ pub enum SecureError {
     NoGroup(String),
     #[error("malformed MLS field `{0}` in block")]
     Field(&'static str),
+    #[error("the block names another channel than {0}")]
+    OtherChannel(String),
     #[error("MLS state at {path:?} does not open: {reason}")]
     Sealed { path: PathBuf, reason: String },
     #[error(
@@ -114,6 +116,41 @@ pub enum Seen {
     Broken { reason: String },
 }
 
+/// The channel whose history a block is read in ([`Session::observe_in`]):
+/// the key its group state is filed under, which is the name the caller uses
+/// for every other [`Session`] call on it, and the channel's id and slug, one
+/// of which a block of it names. Either may be empty when unknown.
+#[derive(Debug, Clone, Copy)]
+pub struct ReadIn<'a> {
+    pub key: &'a str,
+    /// The CID of the channel's `channel-create`.
+    pub id: &'a str,
+    pub slug: &'a str,
+}
+
+impl ReadIn<'_> {
+    /// Whether `block` names this channel: by id under `channel_id`, by slug
+    /// under `channel`, or as the block that created it, and gives no
+    /// other slug.
+    fn names(&self, kind: BlockKind, block: &OpenedBlock) -> bool {
+        let named_slug = jig_pipeline::ingest::channel_slug_of(kind, &block.manifest);
+        if !self.slug.is_empty() && named_slug.is_some_and(|s| s != self.slug) {
+            return false;
+        }
+        if !self.id.is_empty()
+            && (block.meta_str(jig_pipeline::ingest::CHANNEL_ID_KEY) == Some(self.id)
+                || (kind == BlockKind::ChannelCreate && block.cid == self.id))
+        {
+            return true;
+        }
+        !self.slug.is_empty()
+            && block
+                .meta_str(jig_pipeline::ingest::CHANNEL_ID_KEY)
+                .is_none()
+            && named_slug == Some(self.slug)
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Groups {
     /// `server|slug` → hex group id.
@@ -123,6 +160,11 @@ struct Groups {
     /// old block again on purpose: neither may act twice.
     #[serde(default)]
     seen: HashMap<String, Seen>,
+    /// `server|slug` → CID of the newest block of the channel's history this
+    /// member has processed, every block before it included. A catch-up
+    /// starts after it.
+    #[serde(default)]
+    heads: HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -144,6 +186,9 @@ pub struct Session {
     /// Plaintext already read, by block CID. A cache of `plaintext.jsonl`,
     /// re-read from disk on a miss in case another process wrote it.
     read: Mutex<HashMap<String, (String, String)>>,
+    /// How much of `plaintext.jsonl` the cache holds: bytes and lines. The
+    /// file is only appended to, so a miss reads just what was added since.
+    read_upto: Mutex<(u64, usize)>,
     /// This directory has been sealed: content in clear is refused.
     sealed_only: bool,
 }
@@ -219,6 +264,7 @@ impl Session {
             did,
             dir,
             read: Mutex::new(HashMap::new()),
+            read_upto: Mutex::new((0, 0)),
             sealed_only: false,
         };
         session.sealed_only = session.seal_clear_files()?;
@@ -504,6 +550,23 @@ impl Session {
         Ok(())
     }
 
+    /// The CID of the newest block of `slug`'s history this member has
+    /// processed, every older one included; `None` before its first catch-up.
+    pub fn head(&self, server: &str, slug: &str) -> Result<Option<String>> {
+        let key = group_key(server, slug);
+        self.with_member(|_, g| Ok(g.heads.get(&key).cloned()))
+    }
+
+    /// Record that everything in `slug`'s history up to and including the
+    /// block `cid` has been processed.
+    pub fn set_head(&self, server: &str, slug: &str, cid: &str) -> Result<()> {
+        let key = group_key(server, slug);
+        self.with_member(|_, g| {
+            g.heads.insert(key, cid.to_string());
+            Ok(())
+        })
+    }
+
     /// Apply a delivered block to this member's state and say what it meant.
     ///
     /// Blocks must come in the channel's order — history first, sorted with
@@ -511,7 +574,22 @@ impl Session {
     /// member has no group for is not an error: it reads as [`Seen::Sealed`]
     /// or [`Seen::Control`].
     pub fn observe(&self, server: &str, block: &OpenedBlock) -> Seen {
-        match self.try_observe(server, block) {
+        self.observe_in(server, None, block)
+    }
+
+    /// [`Self::observe`] for a block read in `channel`'s history: its group
+    /// state is the one filed under `channel.key`, whatever name the block
+    /// gives the channel. A channel this server carries for its owner is
+    /// filed under its id, while the owner's blocks name it by slug and its
+    /// members here name it by id. A block that names neither the channel's
+    /// id nor its slug moves no group state.
+    pub fn observe_in(
+        &self,
+        server: &str,
+        channel: Option<&ReadIn<'_>>,
+        block: &OpenedBlock,
+    ) -> Seen {
+        match self.try_observe(server, channel, block) {
             Ok(seen) => seen,
             Err(e) => match block.manifest.kind {
                 Some(BlockKind::MemberAdd | BlockKind::MemberRemove) => Seen::Broken {
@@ -524,7 +602,12 @@ impl Session {
         }
     }
 
-    fn try_observe(&self, server: &str, block: &OpenedBlock) -> Result<Seen> {
+    fn try_observe(
+        &self,
+        server: &str,
+        channel: Option<&ReadIn<'_>>,
+        block: &OpenedBlock,
+    ) -> Result<Seen> {
         let Some(kind) = block.manifest.kind else {
             return Ok(Seen::Plain);
         };
@@ -540,9 +623,25 @@ impl Session {
                 return Ok(Seen::Sealed { reason });
             }
         }
-        let slug = jig_pipeline::ingest::channel_slug_of(kind, &block.manifest)
-            .unwrap_or_default()
-            .to_string();
+        let named =
+            jig_pipeline::ingest::channel_slug_of(kind, &block.manifest).unwrap_or_default();
+        let slug = match channel {
+            // Without the caller's name for the channel, a block naming it by
+            // id is filed under the id, as one naming it by slug is under
+            // the slug.
+            None => block
+                .meta_str(jig_pipeline::ingest::CHANNEL_ID_KEY)
+                .unwrap_or(named)
+                .to_string(),
+            Some(c) => {
+                let moves_group = matches!(kind, BlockKind::MemberAdd | BlockKind::MemberRemove)
+                    || block.manifest.content_suite().is_encrypted();
+                if moves_group && !c.names(kind, block) {
+                    return Err(SecureError::OtherChannel(c.key.to_string()));
+                }
+                c.key.to_string()
+            }
+        };
         let key = group_key(server, &slug);
         let me = self.did.clone();
         let commit = block.meta_str("mls_commit");
@@ -717,17 +816,29 @@ impl Session {
             .cloned())
     }
 
+    /// Read into the cache what `plaintext.jsonl` holds past what it has
+    /// read already. Re-reading the whole file on every miss made a catch-up
+    /// over n new messages cost n² record opens.
     fn reload_read(&self) -> Result<()> {
+        use std::io::{Read as _, Seek as _};
         let path = self.dir.join(PLAINTEXT);
         let io = |source| SecureError::Io {
             path: path.clone(),
             source,
         };
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => zeroize::Zeroizing::new(bytes),
+        let mut upto = self.read_upto.lock().expect("plaintext cache poisoned");
+        let mut file = match std::fs::File::open(&path) {
+            Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(io(e)),
         };
+        // Shorter than what was read: rewritten, so read it all again.
+        if file.metadata().map_err(io)?.len() < upto.0 {
+            *upto = (0, 0);
+        }
+        file.seek(std::io::SeekFrom::Start(upto.0)).map_err(io)?;
+        let mut bytes = zeroize::Zeroizing::new(Vec::new());
+        file.read_to_end(&mut bytes).map_err(io)?;
         let text = std::str::from_utf8(&bytes).map_err(|e| SecureError::Sealed {
             path: path.clone(),
             reason: e.to_string(),
@@ -741,8 +852,14 @@ impl Session {
         if complete.len() < text.len() {
             tracing::warn!("{}: ignoring a record that was cut short", path.display());
         }
+        let first_line = upto.1;
         let mut read = self.read.lock().expect("plaintext cache poisoned");
-        for (index, line) in complete.lines().enumerate().filter(|(_, l)| !l.is_empty()) {
+        for (index, line) in complete
+            .lines()
+            .enumerate()
+            .map(|(i, l)| (first_line + i, l))
+            .filter(|(_, l)| !l.is_empty())
+        {
             // A sealed record that does not open is an error, never skipped:
             // skipping would hide tampering, and the next write would bury it.
             let line = match line.strip_prefix(SEALED_LINE) {
@@ -771,6 +888,10 @@ impl Session {
                 read.insert(r.cid, (r.sender, r.text));
             }
         }
+        *upto = (
+            upto.0 + complete.len() as u64,
+            first_line + complete.matches('\n').count(),
+        );
         Ok(())
     }
 
@@ -1170,6 +1291,162 @@ mod tests {
         assert!(bob_again.has_group(SERVER, "#sealed").unwrap());
     }
 
+    /// A channel a follower carries for its owner: the owner's blocks name
+    /// it by slug, its members on the follower post to it by id, and both
+    /// sides read each other's blocks through the group state they file it
+    /// under (the slug at the owner, the id at the follower).
+    #[test]
+    fn a_carried_channel_is_read_under_the_key_its_caller_files_it_by() {
+        const FOLLOWER: &str = "http://127.0.0.1:7118";
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let bob = session(root.path());
+        let id = crate::blocks::build_channel_create(
+            identity_of(&alice),
+            "#shared",
+            "open",
+            "did:jig:zowner",
+            hlc(&alice),
+        )
+        .cid();
+        let at_owner = ReadIn {
+            key: "#shared",
+            id: &id,
+            slug: "#shared",
+        };
+        let at_follower = ReadIn {
+            key: &id,
+            id: &id,
+            slug: "#shared",
+        };
+        alice.create_group(SERVER, "#shared").unwrap();
+
+        // The owner's add names the slug; bob, on the follower, files the
+        // group under the id he names the channel by there.
+        let add = deliver(&add_block(&alice, "#shared", &bob));
+        assert_eq!(
+            bob.observe_in(FOLLOWER, Some(&at_follower), &add),
+            Seen::Joined
+        );
+        assert!(bob.has_group(FOLLOWER, &id).unwrap());
+        assert!(!bob.has_group(FOLLOWER, "#shared").unwrap());
+
+        // Bob posts by id; the block names the id, and alice reads it under
+        // the slug.
+        let (msg, epoch) = bob.encrypt(FOLLOWER, &id, "hi from the follower").unwrap();
+        let sent = build_sealed_text(identity_of(&bob), &id, &msg, epoch, hlc(&bob));
+        let sent = deliver(&sent);
+        assert_eq!(sent.meta_str("channel_id"), Some(id.as_str()));
+        assert_eq!(
+            alice.observe_in(SERVER, Some(&at_owner), &sent),
+            Seen::Text {
+                sender: bob.did().to_string(),
+                text: "hi from the follower".to_string(),
+            }
+        );
+
+        // And alice's reply, named by slug, reads at the follower.
+        let reply = deliver(&say(&alice, "#shared", "hi back"));
+        assert_eq!(
+            bob.observe_in(FOLLOWER, Some(&at_follower), &reply),
+            Seen::Text {
+                sender: alice.did().to_string(),
+                text: "hi back".to_string(),
+            }
+        );
+    }
+
+    /// A block that names another channel than the one whose history it is
+    /// read in moves no group state there: a server cannot file one
+    /// channel's welcome under another.
+    #[test]
+    fn a_block_naming_another_channel_moves_no_group_state() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let bob = session(root.path());
+        alice.create_group(SERVER, "#other").unwrap();
+        let add = deliver(&add_block(&alice, "#other", &bob));
+        let here = ReadIn {
+            key: "#here",
+            id: "",
+            slug: "#here",
+        };
+        assert!(
+            matches!(
+                bob.observe_in(SERVER, Some(&here), &add),
+                Seen::Broken { ref reason } if reason.contains("another channel")
+            ),
+            "{:?}",
+            bob.observe_in(SERVER, Some(&here), &add)
+        );
+        assert!(!bob.has_group(SERVER, "#here").unwrap());
+        assert!(!bob.has_group(SERVER, "#other").unwrap());
+
+        // The right id with another slug is not this channel either.
+        let id = crate::blocks::build_channel_create(
+            identity_of(&alice),
+            "#other",
+            "open",
+            "did:jig:zowner",
+            hlc(&alice),
+        )
+        .cid();
+        let by_id_elsewhere = ReadIn {
+            key: &id,
+            id: &id,
+            slug: "#here",
+        };
+        let both = deliver(&build_with_metadata(
+            identity_of(&alice),
+            BlockKind::MemberAdd,
+            hlc(&alice),
+            json!({"channel": "#other", "channel_id": id, "member_did": bob.did()}),
+        ));
+        assert!(!by_id_elsewhere.names(BlockKind::MemberAdd, &both));
+    }
+
+    /// Without the caller's name for a channel, a block naming it by id is
+    /// read under the id.
+    #[test]
+    fn a_block_named_by_id_is_filed_under_the_id_without_a_read_context() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let bob = session(root.path());
+        let id = crate::blocks::build_channel_create(
+            identity_of(&alice),
+            "#c",
+            "open",
+            "did:jig:zowner",
+            hlc(&alice),
+        )
+        .cid();
+        alice.create_group(SERVER, &id).unwrap();
+        let kp = bob.key_packages(1, false).unwrap().remove(0);
+        let c = alice.prepare_add(SERVER, &id, &kp, bob.did()).unwrap();
+        alice.confirm(SERVER, &id).unwrap();
+        let add = build_with_metadata(
+            identity_of(&alice),
+            BlockKind::MemberAdd,
+            hlc(&alice),
+            json!({"channel": id, "member_did": bob.did(),
+                "mls_commit": STANDARD.encode(&c.commit),
+                "mls_welcome": STANDARD.encode(c.welcome.unwrap()),
+                "mls_epoch": c.epoch}),
+        );
+        let add = deliver(&add);
+        assert_eq!(add.meta_str("channel_id"), Some(id.as_str()));
+        assert_eq!(bob.observe(SERVER, &add), Seen::Joined);
+        assert!(bob.has_group(SERVER, &id).unwrap());
+        let said = deliver(&say(&alice, &id, "by id"));
+        assert_eq!(
+            bob.observe(SERVER, &said),
+            Seen::Text {
+                sender: alice.did().to_string(),
+                text: "by id".to_string(),
+            }
+        );
+    }
+
     #[test]
     fn a_non_member_sees_sealed_text() {
         let root = tempfile::tempdir().unwrap();
@@ -1360,6 +1637,34 @@ mod tests {
             ))
         );
         assert!(again.has_group(SERVER, "#sealed-at-rest").unwrap());
+    }
+
+    /// Another process's records, appended after this one read the file, are
+    /// found on a miss; reading only what was added must not lose any.
+    #[test]
+    fn a_miss_reads_what_another_process_appended() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let other = Session::open(root.path(), alice.identity.duplicate()).unwrap();
+        alice.remember("cid-1", "did:jig:zs", "one").unwrap();
+        assert_eq!(other.recall("cid-1").unwrap().unwrap().1, "one");
+        for i in 2..=5 {
+            alice
+                .remember(&format!("cid-{i}"), "did:jig:zs", &format!("n{i}"))
+                .unwrap();
+        }
+        for i in 2..=5 {
+            assert_eq!(
+                other.recall(&format!("cid-{i}")).unwrap().unwrap().1,
+                format!("n{i}")
+            );
+        }
+        assert_eq!(other.recall("cid-nope").unwrap(), None);
+        assert_eq!(
+            other.read_upto.lock().unwrap().1,
+            5,
+            "five records read, each once"
+        );
     }
 
     #[test]

@@ -263,6 +263,18 @@ Non-goals for v0.2:
       submission (OP-09).
     - A relayed block MUST stay attributable to its author, and the owner SHOULD record
       the relaying server's DID.
+    - Admission is delegated to the follower. The owner MUST NOT ask a relayed author for
+      proof of work: any the author did answered the follower's challenge, not the
+      owner's. The owner MUST still refuse an author it bans or that falls below its
+      ruleset floors, and MUST check the author's signature and the grant (7a) on every
+      relayed block. The follower answers for what it relays: the owner records its DID
+      with each block, limits what it relays into each channel, and can end its share
+      (11) (AB-07).
+    - A relayed block MUST be for the channel the follower's share covers. A
+      `channel-create` is outside every share.
+    - The owner MUST take a relayed block it already holds as accepted, before any effect,
+      so a client that did not learn a relay's outcome can submit the same signed block
+      again.
 
 ## Peer policy
 
@@ -332,6 +344,12 @@ Non-goals for v0.2:
 
 - **A hostile follower** can censor its own users, which it can already do. It cannot
   wedge others (19).
+- **Delegated admission.** A follower admits the authors whose writes it relays, and the
+  owner does not ask them for its own proof of work (15). A hostile follower can relay
+  authors the owner would have charged, but not one the owner bans or rates below its
+  floors. It can relay only into the channels it shares, only the kinds its grant
+  carries, and only as fast as the owner's limit for it. Each block names it, and ending
+  its share stops it (AB-07).
 - **Metadata.** The owner and every follower see routing metadata for the channel. There
   is no metadata-privacy claim (OP-04, PV-01).
 - **Shares are visible to the servers.** `channel-share`, `channel-unshare` and the
@@ -343,8 +361,8 @@ Non-goals for v0.2:
   content, which stays MLS ciphertext. A share sent encrypted is refused, not carried
   unread (PV-05).
 
-**Threat register rows:** OP-06, OP-09, AB-03, PV-01 and PV-05 are updated in implementation
-PRs.
+**Threat register rows:** OP-06, OP-09, AB-03, AB-07, PV-01 and PV-05 are updated in
+implementation PRs.
 
 # Backwards Compatibility
 

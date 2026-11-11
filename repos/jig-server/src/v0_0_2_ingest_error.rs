@@ -124,6 +124,10 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
         // rule 5). Policy, not a malformed request: the same block is fine
         // on the server it names.
         IngestError::NotSequencer { .. } => (StatusCode::FORBIDDEN, "NOT_SEQUENCER", e.to_string()),
+        // 400: the block itself lacks a field this server requires.
+        IngestError::SequencerRequired { .. } => {
+            (StatusCode::BAD_REQUEST, "SEQUENCER_REQUIRED", e.to_string())
+        }
         IngestError::BundleTooLarge { .. } => (
             StatusCode::PAYLOAD_TOO_LARGE,
             "BUNDLE_TOO_LARGE",
@@ -133,6 +137,12 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
         IngestError::CarriedChannel { .. } => {
             (StatusCode::FORBIDDEN, "CARRIED_CHANNEL", e.to_string())
         }
+        // 403: a follower relayed past its share, or past its grant
+        // (JEP-0005 rules 7a, 15).
+        IngestError::RelayedOutsideShare { .. } => {
+            (StatusCode::FORBIDDEN, "RELAY_OUTSIDE_SHARE", e.to_string())
+        }
+        IngestError::GrantRefused { .. } => (StatusCode::FORBIDDEN, "GRANT_REFUSED", e.to_string()),
         IngestError::InvalidTerms { .. } => {
             (StatusCode::BAD_REQUEST, "INVALID_TERMS", e.to_string())
         }
@@ -173,9 +183,27 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
         ),
         // 409: the block is fine, the channel's state refuses it, and no
         // retry will change that.
-        IngestError::PlaintextRestrictedFrozen { .. } => {
+        IngestError::ChannelFrozen { .. } => {
             (StatusCode::CONFLICT, "CHANNEL_FROZEN", e.to_string())
         }
+        // 400: the block names no tier this server knows, or an old client
+        // asked for a plaintext channel it cannot label (JEP-0014 rule 1).
+        IngestError::UnknownTier { .. } => (StatusCode::BAD_REQUEST, "UNKNOWN_TIER", e.to_string()),
+        // 400: the tier and the suite contradict each other (rule 3).
+        IngestError::TierSuiteMismatch { .. } => (
+            StatusCode::BAD_REQUEST,
+            "TIER_SUITE_MISMATCH",
+            e.to_string(),
+        ),
+        // 409: the block is well formed; the channel's tier is fixed (rule 2).
+        IngestError::TierFixed { .. } => (StatusCode::CONFLICT, "TIER_FIXED", e.to_string()),
+        // 403: the client may read the channel, not post to it, until it
+        // supports tiers (rule 5).
+        IngestError::TierUnsupported { .. } => {
+            (StatusCode::FORBIDDEN, "TIER_UNSUPPORTED", e.to_string())
+        }
+        // 409: the block is well formed; a 1:1 adds nobody (rule 18).
+        IngestError::DmIsAPair { .. } => (StatusCode::CONFLICT, "DM_IS_A_PAIR", e.to_string()),
         // 409: someone else committed first. The client catches up and
         // rebuilds; nothing about the request itself was wrong.
         IngestError::StaleEpoch { .. } => (StatusCode::CONFLICT, "STALE_EPOCH", e.to_string()),
@@ -283,8 +311,26 @@ mod tests {
             IngestError::RestrictedRequiresMls {
                 slug: "#private".to_string(),
             },
-            IngestError::PlaintextRestrictedFrozen {
+            IngestError::ChannelFrozen {
                 slug: "#old".to_string(),
+            },
+            IngestError::UnknownTier {
+                tier: "none".to_string(),
+            },
+            IngestError::TierSuiteMismatch {
+                tier: "public",
+                suite: "mls".to_string(),
+            },
+            IngestError::TierFixed {
+                kind: "channel-promote".to_string(),
+                slug: "#team".to_string(),
+            },
+            IngestError::TierUnsupported {
+                slug: "#news".to_string(),
+            },
+            IngestError::DmIsAPair {
+                slug: "#dm/0123456789abcdef".to_string(),
+                member: "did:jig:zThird".to_string(),
             },
             IngestError::StaleEpoch {
                 slug: "#sealed".to_string(),
@@ -300,10 +346,23 @@ mod tests {
                 sequencer: "did:jig:zElsewhere".to_string(),
                 server: "did:jig:zHere".to_string(),
             },
+            IngestError::SequencerRequired {
+                server: "did:jig:zHere".to_string(),
+            },
             IngestError::CarriedChannel {
                 kind: "text-render".to_string(),
                 channel_id: "bafy-carried".to_string(),
                 sequencer: "did:jig:zElsewhere".to_string(),
+            },
+            IngestError::RelayedOutsideShare {
+                kind: "text-render".to_string(),
+                channel_id: "bafy-other".to_string(),
+                via: "did:jig:zFollower".to_string(),
+            },
+            IngestError::GrantRefused {
+                kind: "member-add".to_string(),
+                grant: "write",
+                via: "did:jig:zFollower".to_string(),
             },
             IngestError::InvalidTerms {
                 field: "co_owners".to_string(),
@@ -336,6 +395,16 @@ mod tests {
                 reason: "uppercase".to_string(),
             },
         ]
+    }
+
+    #[test]
+    fn a_dm_that_would_grow_is_a_conflict() {
+        let (status, code, _) = classify_ingest_error(&IngestError::DmIsAPair {
+            slug: "#dm/0123456789abcdef".to_string(),
+            member: "did:jig:zThird".to_string(),
+        });
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(code, "DM_IS_A_PAIR");
     }
 
     /// The property this module exists to guarantee: the REST (`v0_0_2_blocks`)

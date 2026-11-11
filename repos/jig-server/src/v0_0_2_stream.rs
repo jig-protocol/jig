@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use jig_config::v0_0_2_server::{FederationSection, PeerQuotaConfig, RecordsFromLimit};
+use jig_config::v0_0_2_server::{FederationSection, PeerQuotaConfig, RateLimit};
 use jig_core::BlockBundle;
 use jig_core::dcbor::{self, Value};
 use jig_core::did::Did;
@@ -231,7 +231,7 @@ struct Bucket {
 }
 
 impl RequestLimit {
-    pub(crate) fn new(limit: RecordsFromLimit) -> Self {
+    pub(crate) fn new(limit: RateLimit) -> Self {
         RequestLimit {
             burst: f64::from(limit.burst),
             per_sec: f64::from(limit.per_min) / 60.0,
@@ -752,6 +752,37 @@ fn violation(why: &str) -> CloseReason {
     }
 }
 
+/// Decode `body` as the stream frame `kind` names, as [`Stream::on_peer_frame`]
+/// does, for the fuzz targets in `repos/fuzz`. Whatever decodes must survive
+/// its own encoding. Returns whether it decoded. CI checks that no release
+/// binary enables the `fuzzing` feature.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_decode_frame(kind: &str, body: &[u8]) -> bool {
+    fn round_trip<T: PartialEq + std::fmt::Debug>(
+        decoded: Option<T>,
+        encode: impl Fn(&T) -> Vec<u8>,
+        decode: impl Fn(&[u8]) -> Option<T>,
+    ) -> bool {
+        let Some(decoded) = decoded else { return false };
+        assert_eq!(decode(&encode(&decoded)).as_ref(), Some(&decoded));
+        true
+    }
+    match kind {
+        RECORDS_FRAME => round_trip(Records::decode(body), Records::encode, Records::decode),
+        RECORDS_FROM_FRAME => round_trip(
+            RecordsFrom::decode(body),
+            RecordsFrom::encode,
+            RecordsFrom::decode,
+        ),
+        RECORDS_LATER_FRAME => round_trip(
+            RecordsLater::decode(body),
+            RecordsLater::encode,
+            RecordsLater::decode,
+        ),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -824,7 +855,7 @@ mod tests {
     #[test]
     fn the_limit_is_a_bucket_per_peer_and_channel() {
         // Two at once, then one every 10 s.
-        let limit = RequestLimit::new(RecordsFromLimit {
+        let limit = RequestLimit::new(RateLimit {
             burst: 2,
             per_min: 6,
         });

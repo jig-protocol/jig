@@ -18,7 +18,10 @@
 
 use std::collections::BTreeMap;
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
+#[cfg(test)]
 use jig_client::DeliveredBlock;
 
 use crate::cmd::blocks_decode::DecodedBlock;
@@ -27,7 +30,8 @@ use crate::cmd::blocks_decode::decode;
 #[cfg(test)]
 use crate::cmd::blocks_decode::distinct_render_hashes;
 use crate::cmd::common::CliContext;
-use crate::cmd::display::{bell_on_inbound, connection_lost, display_sender, format_hhmm};
+use crate::cmd::display::{bell_on_inbound, display_sender, format_hhmm};
+use crate::cmd::follow::{Event, Feed, Follower, Live};
 use crate::cmd::history;
 use crate::cmd::reader::Reader;
 
@@ -38,29 +42,33 @@ pub async fn run(ctx: &CliContext, channel: String) -> Result<()> {
 
     let contacts = ctx.effective().contacts.clone();
 
-    // Backfill first: a fresh tail on a busy channel used to sit silent
-    // until the next live message. Failures here degrade to "no backlog"
-    // (see `history::backfill`) rather than aborting the tail. An encrypted
-    // channel replays through the MLS session.
-    let reader = Reader::open(ctx, &channel).await?;
-    let (backlog, tidy) = reader.backlog(&id, &server_url).await?;
-    reader.tidy(tidy);
-
+    // Subscribe before reading the backlog: anything posted meanwhile queues
+    // on the stream, and the follower skips what the backlog already showed.
+    // The backlog used to come first, and a block posted between the two was
+    // never shown. An encrypted channel replays through the MLS session.
+    let reader = Arc::new(Reader::open(ctx, &channel).await?);
     let client = crate::cmd::secure::connect_pinned(&server_url, id)
         .await
         .with_context(|| format!("connecting to {server_url}"))?;
+    let client = Arc::new(client);
+    let feed = Live {
+        client: client.clone(),
+        server_url: server_url.clone(),
+        slug: channel.clone(),
+    };
+    let stream = feed.subscribe().await?;
 
-    let mut stream = client
-        .subscribe_channel(&channel)
-        .await
-        .with_context(|| format!("subscribing to {channel}"))?;
-
-    for line in backfill_lines(&backlog, &contacts) {
+    // Failures here degrade to "no backlog" (see `history::backfill`) rather
+    // than aborting the tail.
+    let backlog = reader.backlog(client.identity(), &server_url).await?;
+    reader.tidy(backlog.tidy);
+    for line in backfill_lines(&backlog.lines, &contacts) {
         println!("{line}");
     }
     // No bell for replayed history — the operator was not present for it.
     println!("Tailing {channel} on {server_url}... (Ctrl-C to exit)");
-    let ended = pump(&mut stream, &channel, &contacts, &reader).await;
+    let mut follower = Follower::new(feed, stream, reader, &channel, backlog.deliveries);
+    let ended = pump(&mut follower, &contacts).await;
     match crate::cmd::trust::live_contradiction(&client, &server_url) {
         Some(e) => Err(e),
         None => ended,
@@ -75,7 +83,7 @@ pub async fn read(ctx: &CliContext, channel: String, limit: usize, json: bool) -
     // Unlike chat and tail, a failed fetch is this command's failure, not
     // something to degrade around.
     let lines = if let Some(secure) = reader.secure() {
-        let synced = secure.sync(&channel).await?;
+        let synced = secure.recent(&channel, limit).await?;
         // Awaited, not spawned: this process exits as soon as it has printed.
         for did in &synced.tidy {
             let _ = secure.tidy(&channel, did).await;
@@ -110,51 +118,30 @@ pub async fn read(ctx: &CliContext, channel: String, limit: usize, json: bool) -
     Ok(())
 }
 
-/// Anything that yields delivered blocks until it ends.
+/// Print everything the follower yields, until it ends.
 ///
-/// Exists so the "stream ended" branch — the one that used to return
-/// `Ok(())` and exit 0 on a dead connection — is unit-testable without a
-/// live socket. `jig_client::BlockStream` is the only production impl.
-pub trait BlockSource {
-    fn next_block(&mut self) -> impl std::future::Future<Output = Option<DeliveredBlock>> + Send;
-}
-
-impl BlockSource for jig_client::BlockStream {
-    fn next_block(&mut self) -> impl std::future::Future<Output = Option<DeliveredBlock>> + Send {
-        self.next()
-    }
-}
-
-/// Print every block the source yields, then report the disconnect.
-///
-/// Always terminates in an `Err`: a source that has stopped yielding is a
-/// closed connection, and `jig tail` exiting 0 on one is precisely the
-/// silent-success bug this replaces.
-async fn pump(
-    source: &mut impl BlockSource,
-    channel: &str,
+/// Always terminates in an `Err`: a follower only ends on a closed
+/// connection, or on falling behind with no way to catch up, and `jig tail`
+/// exiting 0 on either is precisely the silent-success bug this replaces.
+async fn pump<F: Feed>(
+    follower: &mut Follower<F>,
     contacts: &BTreeMap<String, String>,
-    reader: &Reader,
 ) -> Result<()> {
-    while let Some(delivered) = source.next_block().await {
-        match reader.read(&delivered) {
-            Ok(read) => {
-                if let Some(did) = read.tidy {
-                    reader.tidy(vec![did]);
-                }
-                let Some(decoded) = read.line else {
-                    continue;
-                };
+    loop {
+        match follower.next().await? {
+            Event::Line(decoded) => {
                 println!("{}", format_decoded(&decoded, contacts));
                 bell_on_inbound(1, &mut std::io::stderr());
             }
             // Best-effort: skip blocks we can't decode rather than panicking
             // the whole tail. Operators get a one-line diagnostic so they
             // know data was dropped.
-            Err(e) => eprintln!("[skip block: {e}]"),
+            Event::Unreadable(e) => eprintln!("[skip block: {e}]"),
+            Event::CaughtUp { blocks } => {
+                eprintln!("[fell behind; caught up {blocks} blocks from history]")
+            }
         }
     }
-    Err(connection_lost(channel))
 }
 
 /// Decode a delivered block bundle and format the one-line summary.
@@ -346,35 +333,6 @@ mod tests {
         }
     }
 
-    /// Stand-in for a `BlockStream` that yields a fixed backlog and then
-    /// ends — exactly what a dropped connection looks like to the caller.
-    struct FiniteSource {
-        items: std::collections::VecDeque<DeliveredBlock>,
-    }
-
-    impl BlockSource for FiniteSource {
-        fn next_block(
-            &mut self,
-        ) -> impl std::future::Future<Output = Option<DeliveredBlock>> + Send {
-            let next = self.items.pop_front();
-            async move { next }
-        }
-    }
-
-    fn one_text_block() -> DeliveredBlock {
-        let id = test_identity();
-        let hlc = HlcTimestamp {
-            wall_ms: 1_747_680_000_000,
-            logical: 0,
-            server_did: id.did().clone(),
-        };
-        let block = build_text_render(&id, "#hello", "hi", hlc);
-        delivered_for(
-            base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
-            vec![],
-        )
-    }
-
     #[test]
     fn backfill_lines_render_oldest_first() {
         // `jig tail` on a busy channel used to sit silent until someone
@@ -401,59 +359,6 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].ends_with("first"), "got {}", lines[0]);
         assert!(lines[1].ends_with("second"), "got {}", lines[1]);
-    }
-
-    #[tokio::test]
-    async fn pump_reports_connection_lost_once_the_stream_ends() {
-        // The whole point of Task 4: an ended stream is a dead connection,
-        // not a successful tail. Returning Ok here is what made `jig tail`
-        // exit 0 on a server restart.
-        let mut source = FiniteSource {
-            items: [one_text_block()].into(),
-        };
-        let err = pump(
-            &mut source,
-            "#hello",
-            &BTreeMap::new(),
-            &Reader::plain("#hello"),
-        )
-        .await
-        .unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("connection lost"),
-            "operator-facing message must say connection lost: {msg}"
-        );
-        assert!(
-            msg.contains("#hello"),
-            "message must name the channel: {msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn pump_keeps_going_past_an_undecodable_block() {
-        // One bad block must not end the tail early — it should be skipped
-        // and the stream drained to its real end.
-        let mut source = FiniteSource {
-            items: [
-                delivered_for("not_base64_!!!".into(), vec![]),
-                one_text_block(),
-            ]
-            .into(),
-        };
-        let err = pump(
-            &mut source,
-            "#hello",
-            &BTreeMap::new(),
-            &Reader::plain("#hello"),
-        )
-        .await
-        .unwrap_err();
-        assert!(format!("{err:#}").contains("connection lost"));
-        assert!(
-            source.items.is_empty(),
-            "the whole backlog must be consumed"
-        );
     }
 
     #[test]

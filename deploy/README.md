@@ -144,7 +144,11 @@ private network:
   `unknown_dids = "admit"`, anyone who can reach the port can create channels
   and post to open ones, within `[auth.rate_limit]`. `unknown_dids =
   "proof-of-work"` makes each new key do some hashing first, which slows an
-  identity flood but does not stop one.
+  identity flood but does not stop one. What bounds a flood is
+  `[auth.pools]`: strangers share `stranger_share_pct` (20 %) of the
+  server's write capacity, so however many keys a flood brings, members keep
+  the rest. Members are the DIDs in `records` with no negative score, plus
+  those whose admission proof is `local_member_age_secs` old.
 - **Federated peers vouch for their authors.** Blocks relayed from a peer run
   the same admission, write and suite gates as local ones, except that their
   authors are not asked for proof-of-work: they never spoke to this server.
@@ -664,6 +668,61 @@ new identity.
 
 ---
 
+## Federation: sharing a channel with another server
+
+Two servers federate only if each lists the other under `[[federation.peers]]`
+(see `config.example.toml`), with the other's `/.well-known/jig` `server_did`
+as `expected_did`. Restart both after editing.
+
+To carry a channel on the other server (JEP-0005), so its users can read it
+there in this server's order:
+
+1. **The channel's owner, or an admin with the `share` right**, on this
+   server:
+
+   ```sh
+   jig channel share '#team' did:jig:<other server> --grant read
+   ```
+
+   `--grant` is `read`, `write` or `member` (JEP-0005 rule 7a). The server
+   checks the signer's right, and refuses a share naming a server that is not
+   one of its peers: the refusal shows in the channel as `NOT_A_PEER`.
+2. **The other server's operator** accepts the offer:
+
+   ```sh
+   sudo -u jig /opt/jig/bin/jig-server --config /etc/jig/config.toml contracts list
+   sudo -u jig /opt/jig/bin/jig-server --config /etc/jig/config.toml contracts accept <offer-id>
+   ```
+
+   As `jig`, not root: the command writes to the server's database. The
+   running server acts on it within 5 seconds. Skip this step by setting
+   `offers = "accept"` in that server's peer entry for this one. `contracts
+   refuse <offer-id>` turns an offer down.
+3. **Users of the other server** read the channel by its id, which `jig channel
+   share` prints: `jig read <channel-id>`. A slug names a channel only on the
+   server that orders it, so `jig read '#team'` there finds nothing.
+
+`jig channel unshare '#team' did:jig:<other server>` (or `contracts end
+<offer-id>` on either server) ends the share. This server stops streaming the
+channel's records at once. The other server keeps the copy it holds and lands
+nothing of the channel after, including any block of it the older peer relay
+still forwards.
+
+The server decides which channels may be shared: a channel whose tier keeps it
+on one server is refused (JEP-0014). Under a `write` or `member` grant, the other
+server relays its users' posts back to this one; under `read`, they post on
+this server.
+
+A channel reaches another server only once it is shared. Its creation block
+names the server that orders it, so a peer no longer takes a channel this
+server creates as one of its own. `naively_accept_peer_relayed_creates` (see
+`config.example.toml`) is for tests only: a server with it stores a copy of a
+peer's new channel, but clients refuse to read the copy, because its creation
+block names another server. Servers that trust each other set
+`offers = "accept"` and use `jig channel share`.
+
+---
+
 ## The nameserver
 
 The binary serves the alias API and its discovery documents. The legacy routes
@@ -767,6 +826,46 @@ passthrough) without terminating it.
 
 ---
 
+## A stalled carried channel
+
+A channel this server follows for another server (an accepted share) can
+stall. That happens when the owner's chain names a block this server already
+holds in one of **its own** channels. One block belongs to one channel, so the
+owner's record for it cannot land. Nothing is moved and nothing is deleted:
+this server's channel keeps the block and its history, and the carried channel
+takes nothing past that record.
+
+**When it happens.** Both servers have a channel with the same name, say
+`#general`, and they were peered before the share. Clients post by channel
+name, so the federation relay lands each server's posts in the other's
+same-name channel. Share one of them, and the carried channel stalls at the
+first post the relay brought across. Two servers peered under v0.2.0-alpha.2
+that each have a `#general` will hit this on the first share of it.
+
+**How to confirm it.**
+
+- `jig-server contracts list` ends with one line per stalled channel:
+  `stalled: channel <id> stalled at seq <n>: block <cid> is held in channel <id>`.
+- The log has a WARN, `a carried channel is stalled`, with `channel_id`, `seq`,
+  `block_cid`, `holder` and the owner's DID as `sequencer`. It repeats each time
+  the owner sends that record again.
+
+**What to do.** There is no safe way to fix it in place yet. Moving the block
+into the carried channel breaks your own channel's chain, which still names
+it. Deleting it does the same. Your options:
+
+- **Leave it.** The carried channel shows everything up to the stall. Your own
+  channel is untouched.
+- **End the share** with `jig-server contracts end <offer>` (the offer id is in
+  `contracts list`). This server stops following the channel. What it already
+  carried stays readable.
+- **Avoid it.** Before sharing a channel, ask the peer's operator whether their
+  server has a channel of its own with the same name. If it has, don't share
+  that channel yet.
+
+A carried channel that can hold a block this server also holds elsewhere is
+planned for after v0.2.0-alpha.3.
+
 ## Gotchas worth knowing before they cost you an evening
 
 - **`jig-nameserver serve --bind/--port` ARE honoured**, and they win over both
@@ -808,6 +907,6 @@ passthrough) without terminating it.
   separate blast radius.
 - **Building on the VPS needs a toolchain first.** A fresh box has no rustup, no
   C compiler, and no pkg-config; `ring` needs a C compiler. The workspace MSRV
-  is **1.95** (`jig-runtime` and `jig-server` inherit it), set by wasmtime 48.
+  is **1.97** (`jig-runtime` and `jig-server` inherit it), set by wasmtime 50.
   A 1 vCPU box wants ~2 GB of swap and 45–90 minutes. Cross-building on your Mac
   and copying the binary over is usually the better trade.

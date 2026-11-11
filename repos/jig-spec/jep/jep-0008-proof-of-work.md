@@ -201,8 +201,12 @@ Non-goals:
 23. The stranger pool gets at most `stranger_share` of capacity, and the invited pool at most
     `invited_share`. Both are ruleset parameters. The reference values are 20 % and 10 %.
     - Members MUST NOT wait on the other pools.
-    - Capacity a pool leaves unused MAY be lent to another pool while it is idle, and MUST be
-      returned when its owner pool has demand.
+    - Capacity a pool leaves unused MAY be lent to another pool while it is idle, and lending MUST
+      stop at the owner pool's first request.
+    - A pool is idle after `idle_secs` (reference: 1 s) without a request of its own, and lends
+      at most what it holds above half its burst. So an owner pool that resumes has at least half
+      its burst at once, and all of its rate from then on: lent capacity is spent, not recalled,
+      and this reserve is what "MUST NOT wait" guarantees.
     - Within the stranger pool, requests pass per-DID and per-address rate limits first, then wait
       in a queue served highest effort first.
 24. A nameserver applies rules 21–23 to its binding endpoints. `ns-register` is always a stranger

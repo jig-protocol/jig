@@ -17,10 +17,16 @@ use axum::{
     routing::{get, post},
 };
 use base64::Engine as _;
-use jig_core::BlockBundle;
 use jig_pipeline::envelope::ReceiptRef;
-use jig_pipeline::ingest::{IngestError, IngestSource, ingest};
 use jig_pipeline::persist::MAX_HISTORY_LIMIT;
+
+/// The most a page of history carries, in bytes of its JSON entries, past
+/// its first block, for a client that asks (`budget=1`). A page that would
+/// pass it ends early, with fewer blocks than asked: the client pages on
+/// from the oldest block it got, and only an empty page ends the history.
+/// One block is always sent, so a page can be up to one block envelope
+/// (`jig_core::bundle::MAX_ENVELOPE_BYTES`) larger.
+pub const HISTORY_PAGE_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 use serde::{Deserialize, Serialize};
 
 use crate::v0_0_2::AppState;
@@ -56,13 +62,26 @@ pub(crate) fn err(
     )
 }
 
-/// Thin wrapper around the shared classifier (`v0_0_2_ingest_error`): decide
-/// the (status, code) here once, wrap it in this endpoint's `ErrorBody`.
-/// `pub(crate)` so the cross-wrapper agreement test in that module can call
-/// it directly.
-pub(crate) fn map_ingest_error(e: IngestError) -> (StatusCode, Json<ErrorBody>) {
-    let (status, code, message) = crate::v0_0_2_ingest_error::classify_ingest_error(&e);
-    err(status, code, message)
+/// This endpoint's answer to a refused write: the shared classifier's
+/// (status, code) (`v0_0_2_ingest_error`, through
+/// [`crate::v0_0_2_relay::Refusal`]) in this endpoint's `ErrorBody`.
+fn refusal_response(refusal: crate::v0_0_2_relay::Refusal) -> (StatusCode, Json<ErrorBody>) {
+    (
+        refusal.status,
+        Json(ErrorBody {
+            code: refusal.code,
+            message: refusal.message,
+        }),
+    )
+}
+
+/// [`refusal_response`] for an ingest error, for the cross-wrapper agreement
+/// test in `v0_0_2_ingest_error`.
+#[cfg(test)]
+pub(crate) fn map_ingest_error(
+    e: jig_pipeline::ingest::IngestError,
+) -> (StatusCode, Json<ErrorBody>) {
+    refusal_response(crate::v0_0_2_relay::Refusal::of(&e))
 }
 
 /// POST /api/v1/blocks — submit a signed block bundle (non-streaming alt to WSS).
@@ -72,6 +91,7 @@ pub(crate) fn map_ingest_error(e: IngestError) -> (StatusCode, Json<ErrorBody>) 
 /// base64-encoded). Returns `{ "block_cid": "bafy..." }` on success.
 pub async fn submit_block(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<SubmitBody>,
 ) -> Result<Json<SubmitResult>, (StatusCode, Json<ErrorBody>)> {
     let bundle_bytes = base64::engine::general_purpose::STANDARD
@@ -104,23 +124,41 @@ pub async fn submit_block(
             )
         })?;
 
-    let bundle = BlockBundle {
-        manifest_bytes: &manifest_bytes,
-        code_bytes: &code_bytes,
-        resources: vec![],
-    };
-
-    // conn_id 0 signals REST origin — no persistent WebSocket connection.
-    let cid = ingest(
-        &state.ingest_ctx,
-        bundle,
+    // conn_id 0 signals REST origin — no persistent WebSocket connection, so
+    // the relay's in-flight cap counts per author instead.
+    let author = serde_json::from_slice::<jig_core::BlockManifest>(&manifest_bytes)
+        .ok()
+        .and_then(|m| m.authors.first().map(|a| a.did.to_string()))
+        .unwrap_or_default();
+    let cid = crate::v0_0_2_relay::post(
+        &state,
+        &manifest_bytes,
+        &code_bytes,
         sig,
-        IngestSource::LocalClient { conn_id: 0 },
+        0,
+        &format!("rest:{author}"),
+        declares_feature(&headers, jig_core::tier::TIERS_FEATURE),
     )
     .await
-    .map_err(map_ingest_error)?;
+    .map_err(refusal_response)?;
 
     Ok(Json(SubmitResult { block_cid: cid }))
+}
+
+/// The header a request outside a connection names the features its client
+/// implements in, comma-separated: what a hello's capabilities say on a
+/// connection (JEP-0014 rule 5).
+pub const CAPABILITIES_HEADER: &str = "jig-capabilities";
+
+/// Whether `headers` declare `feature` in [`CAPABILITIES_HEADER`]. Every
+/// occurrence of the header counts; names match exactly, after trimming.
+pub fn declares_feature(headers: &axum::http::HeaderMap, feature: &str) -> bool {
+    headers
+        .get_all(CAPABILITIES_HEADER)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|name| name.trim() == feature)
 }
 
 #[derive(Debug, Serialize)]
@@ -255,6 +293,20 @@ pub struct ChannelView {
     pub created_at: i64,
     /// `none` or `mls`, fixed at creation.
     pub suite: String,
+    /// `private`, `server`, `shared`, `public`, or `frozen` for a plaintext
+    /// channel from before tiers (JEP-0014), fixed at creation.
+    pub tier: String,
+    /// The lowest server role that may join a `server` or `shared` channel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub join: Option<String>,
+    /// The server that orders the channel: this one, or the owner of a
+    /// channel this server carries (JEP-0005). Unsigned: a client takes
+    /// another server's word only with `share`.
+    pub sequencer: String,
+    /// For a channel this server carries, the offer its owner signed to this
+    /// server (base64): what proves `sequencer` to a client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub share: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -298,16 +350,63 @@ pub async fn list_channels(
                 continue;
             }
         }
-        channels.push(ChannelView {
-            id: c.id,
-            slug: c.slug,
-            visibility: c.visibility,
-            owner_did: c.owner_did,
-            created_at: c.created_at,
-            suite: c.suite,
-        });
+        channels.push(view_of(&state, c).map_err(persist_err)?);
     }
     Ok(Json(ChannelsResponse { channels }))
+}
+
+/// How `c` is listed: its unsigned fields, the server that orders it, and,
+/// for a channel this server carries, the offer that proves its owner.
+pub(crate) fn view_of(
+    state: &AppState,
+    c: jig_pipeline::persist::StoredChannel,
+) -> jig_pipeline::persist::Result<ChannelView> {
+    let local = state.server_did.to_did_jig_string();
+    let sequencer = if c.sequencer_did.is_empty() {
+        local.clone()
+    } else {
+        jig_pipeline::effect::canonical_did_string(&c.sequencer_did)
+    };
+    let share = if sequencer == local {
+        None
+    } else {
+        followed_offer(&state.ingest_ctx.store, &c.id, &sequencer)?
+    };
+    Ok(ChannelView {
+        id: c.id,
+        slug: c.slug,
+        visibility: c.visibility,
+        owner_did: c.owner_did,
+        created_at: c.created_at,
+        suite: c.suite,
+        tier: c.tiering.tier.as_str().to_string(),
+        join: c.tiering.join.map(|j| j.as_str().to_string()),
+        sequencer,
+        share,
+    })
+}
+
+/// The offer `owner` signed for `channel_id` that this server accepted
+/// (base64), live or since ended: it proves who orders the channel.
+fn followed_offer(
+    store: &jig_pipeline::persist::SqliteStore,
+    channel_id: &str,
+    owner: &str,
+) -> jig_pipeline::persist::Result<Option<String>> {
+    use base64::Engine as _;
+    use jig_pipeline::contracts::{OfferState, Side};
+    for state in [OfferState::Accepted, OfferState::Ending, OfferState::Ended] {
+        if let Some(kept) = store
+            .contract_offers_for(channel_id, owner, Side::Follower, state)?
+            .into_iter()
+            .next()
+        {
+            return Ok(Some(
+                base64::engine::general_purpose::STANDARD.encode(&kept.offer),
+            ));
+        }
+    }
+    Ok(None)
 }
 
 #[derive(Debug, Serialize)]
@@ -315,6 +414,11 @@ pub struct MemberView {
     pub did: String,
     pub role: String,
     pub joined_at: i64,
+    /// The server that relayed this member's latest write here, if one did
+    /// (JEP-0005 rule 15): a hint at where its client is, for pruning the
+    /// members a follower took with it when its contract ended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_via: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -350,11 +454,15 @@ pub async fn list_members(
             format!("no live channel '{channel_ref}' on this server"),
         ));
     };
+    let mut via = store
+        .last_relay_by_sender(&channel.id)
+        .map_err(persist_err)?;
     let members = store
         .list_members(&channel.id)
         .map_err(persist_err)?
         .into_iter()
         .map(|m| MemberView {
+            last_via: via.remove(&m.member_did).flatten(),
             did: m.member_did,
             role: m.role,
             joined_at: m.joined_at,
@@ -376,6 +484,18 @@ pub struct HistoryQuery {
     /// A block CID: return the page of blocks just older than it, for paging
     /// back through history. Omitted means the newest page.
     pub before: Option<String>,
+    /// `1`: cut the page at [`HISTORY_PAGE_BUDGET_BYTES`]. Only a client
+    /// that pages on until an empty page asks for it: one that takes a short
+    /// page for the start of the channel (every release through
+    /// v0.2.0-alpha.2) never sends it and gets the whole window.
+    pub budget: Option<u8>,
+}
+
+/// What one block's entry in a history page takes, in JSON, at most: its
+/// stored bytes (bundle, signature, receipts) in base64, and room for its
+/// record and field names.
+fn page_entry_bytes(stored: usize) -> usize {
+    stored.div_ceil(3) * 4 + 16 * 1024
 }
 
 /// One entry of a channel timeline.
@@ -578,6 +698,10 @@ pub(crate) fn refuse(
     err(status, code, message)
 }
 
+/// A channel's history page: see the comment above [`admit_caller`] for the
+/// shape. Asked with `budget=1`, a page stops early once its entries would
+/// pass [`HISTORY_PAGE_BUDGET_BYTES`], keeping the blocks nearest the cursor,
+/// and only those blocks are loaded.
 pub async fn get_channel_history(
     State(state): State<Arc<AppState>>,
     Path(channel_ref): Path<String>,
@@ -598,26 +722,73 @@ pub async fn get_channel_history(
             .map_err(persist_err)?,
     };
 
+    // A slug that names only a channel this server carries for another: a
+    // slug names a channel only where it is ordered, so this one is read by
+    // its id. Saying so beats an empty page that looks like an empty channel.
+    if channel.is_none()
+        && let Some(carried) = store
+            .carried_channel_by_slug(&channel_ref)
+            .map_err(persist_err)?
+    {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            "CARRIED_CHANNEL",
+            format!(
+                "{channel_ref} here is carried for {}, which orders it; name it by its id: {}",
+                carried.sequencer_did, carried.id
+            ),
+        ));
+    }
     // A reference that names no channel has no history, as the slug
     // wrappers answer: an empty page, or a cursor that is none of its blocks.
     let limit = query.limit.unwrap_or(MAX_HISTORY_LIMIT);
-    let blocks = match (query.before.as_deref(), channel.as_ref()) {
-        (None, None) => Vec::new(),
-        (None, Some(channel)) => store
-            .list_blocks_by_channel_id(&channel.id, limit, None)
-            .map_err(persist_err)?,
-        (Some(before), channel) => channel
-            .map(|c| store.list_blocks_before_by_channel_id(&c.id, limit, before))
-            .transpose()
-            .map_err(persist_err)?
-            .flatten()
-            .ok_or_else(|| {
-                err(
-                    StatusCode::BAD_REQUEST,
-                    "BAD_CURSOR",
-                    format!("`before` is not a block of {channel_ref}"),
-                )
-            })?,
+    let bad_cursor = || {
+        err(
+            StatusCode::BAD_REQUEST,
+            "BAD_CURSOR",
+            format!("`before` is not a block of {channel_ref}"),
+        )
+    };
+    let blocks = if query.budget == Some(1) {
+        // Choose the page from what each block stores, newest first, then
+        // load only those blocks: the server holds one page, not the window.
+        let sizes = match (query.before.as_deref(), channel.as_ref()) {
+            (None, None) => Vec::new(),
+            (before, Some(channel)) => store
+                .history_window_sizes(&channel.id, limit, before)
+                .map_err(persist_err)?
+                .ok_or_else(bad_cursor)?,
+            (Some(_), None) => return Err(bad_cursor()),
+        };
+        let mut newest_first = Vec::new();
+        let mut bytes = 0usize;
+        for (cid, stored) in sizes {
+            let entry = page_entry_bytes(stored as usize);
+            // Always one block, however large: a page that holds none would
+            // stop a client that pages on.
+            if !newest_first.is_empty() && bytes + entry > HISTORY_PAGE_BUDGET_BYTES {
+                break;
+            }
+            bytes += entry;
+            if let Some(block) = store.get_block(&cid).map_err(persist_err)? {
+                newest_first.push(block);
+            }
+        }
+        newest_first.reverse();
+        newest_first
+    } else {
+        match (query.before.as_deref(), channel.as_ref()) {
+            (None, None) => Vec::new(),
+            (None, Some(channel)) => store
+                .list_blocks_by_channel_id(&channel.id, limit, None)
+                .map_err(persist_err)?,
+            (Some(before), channel) => channel
+                .map(|c| store.list_blocks_before_by_channel_id(&c.id, limit, before))
+                .transpose()
+                .map_err(persist_err)?
+                .flatten()
+                .ok_or_else(bad_cursor)?,
+        }
     };
 
     let mut timeline = Vec::with_capacity(blocks.len());
@@ -709,6 +880,28 @@ pub fn build_blocks_router(state: Arc<AppState>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_declares_its_features_in_one_header() {
+        use axum::http::{HeaderMap, HeaderValue};
+        let mut headers = HeaderMap::new();
+        assert!(!declares_feature(&headers, "tiers"));
+        headers.insert(
+            CAPABILITIES_HEADER,
+            HeaderValue::from_static("other, tiers"),
+        );
+        assert!(declares_feature(&headers, "tiers"));
+        headers.insert(
+            CAPABILITIES_HEADER,
+            HeaderValue::from_static("tiersx,Tiers"),
+        );
+        assert!(!declares_feature(&headers, "tiers"), "names match exactly");
+        headers.append(CAPABILITIES_HEADER, HeaderValue::from_static("tiers"));
+        assert!(
+            declares_feature(&headers, "tiers"),
+            "every occurrence counts"
+        );
+    }
     use axum::{Router, body::Body, http::Request};
     use jig_client::{Identity, blocks::build_text_render};
     use jig_core::HlcTimestamp;
@@ -759,6 +952,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
     }
@@ -772,6 +966,7 @@ mod tests {
             .method("POST")
             .uri(path)
             .header("Content-Type", "application/json")
+            .header(CAPABILITIES_HEADER, jig_core::tier::TIERS_FEATURE)
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
@@ -929,7 +1124,13 @@ mod tests {
 
         let id = test_identity();
         let hlc = test_hlc(&id);
-        let block = build_channel_create(&id, "#hello", "open", hlc);
+        let block = build_channel_create(
+            &id,
+            "#hello",
+            "open",
+            &state.server_did.to_did_jig_string(),
+            hlc,
+        );
         let submission = serde_json::json!({
             "bundle_b64": base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
             "sig_b64": base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
@@ -944,11 +1145,72 @@ mod tests {
         assert_eq!(channels.len(), 1, "exactly one channel expected");
         assert_eq!(channels[0]["slug"], "#hello");
         assert_eq!(channels[0]["visibility"], "open");
+        assert_eq!(channels[0]["tier"], "public");
+        assert!(
+            channels[0].get("join").is_none(),
+            "only server and shared channels list a join role"
+        );
         assert_eq!(channels[0]["owner_did"], id.did_string());
         assert!(
             channels[0]["created_at"].as_i64().unwrap_or(0) >= 0,
             "created_at must be present as an integer"
         );
+    }
+
+    /// `server` and `shared` channels list their join role, and so does an
+    /// open `mls` channel from before tiers, which rule 21 maps to `server`
+    /// with `join = guest`.
+    #[tokio::test]
+    async fn the_listing_names_a_server_or_shared_channels_join_role() {
+        use jig_core::tier::{JoinRole, Tier};
+        use jig_pipeline::persist::{ChannelTiering, StoredChannel};
+        let state = Arc::new(unauthenticated_state());
+        let tiered = |tier, join| ChannelTiering {
+            join: Some(join),
+            ..ChannelTiering::of(tier)
+        };
+        for (slug, visibility, tiering) in [
+            ("#guests", "open", tiered(Tier::Server, JoinRole::Guest)),
+            ("#members", "open", tiered(Tier::Shared, JoinRole::Member)),
+            (
+                "#legacy",
+                "open",
+                ChannelTiering::legacy("#legacy", "open", "mls"),
+            ),
+        ] {
+            state
+                .ingest_ctx
+                .store
+                .upsert_channel(&StoredChannel {
+                    id: jig_pipeline::ingest_record::label_cid(slug),
+                    slug: slug.to_string(),
+                    visibility: visibility.to_string(),
+                    created_at: 0,
+                    owner_did: "did:jig:zSeedOwner".to_string(),
+                    suite: "mls".to_string(),
+                    sequencer_did: String::new(),
+                    co_owners: Vec::new(),
+                    tiering,
+                })
+                .unwrap();
+        }
+        let (status, body) = get_path(build_blocks_router(state), "/api/v1/channels").await;
+        assert_eq!(status, StatusCode::OK);
+        let listed = |slug: &str| {
+            body["channels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["slug"] == slug)
+                .unwrap_or_else(|| panic!("{slug} is not listed: {body}"))
+                .clone()
+        };
+        assert_eq!(listed("#guests")["tier"], "server");
+        assert_eq!(listed("#guests")["join"], "guest");
+        assert_eq!(listed("#members")["tier"], "shared");
+        assert_eq!(listed("#members")["join"], "member");
+        assert_eq!(listed("#legacy")["tier"], "server");
+        assert_eq!(listed("#legacy")["join"], "guest");
     }
 
     #[tokio::test]
@@ -965,7 +1227,13 @@ mod tests {
         // Create channels in a non-sorted order; expect sorted output.
         for slug in ["#zulu", "#alpha", "#mike"] {
             let hlc = test_hlc(&id);
-            let block = build_channel_create(&id, slug, "open", hlc);
+            let block = build_channel_create(
+                &id,
+                slug,
+                "open",
+                &state.server_did.to_did_jig_string(),
+                hlc,
+            );
             let submission = serde_json::json!({
                 "bundle_b64": base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
                 "sig_b64":    base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
@@ -996,7 +1264,13 @@ mod tests {
         let router = crate::v0_0_2_ws::build_v0_0_2_router(state.clone());
 
         let id = test_identity();
-        let block = build_channel_create(&id, "#hello", "open", test_hlc(&id));
+        let block = build_channel_create(
+            &id,
+            "#hello",
+            "open",
+            &state.server_did.to_did_jig_string(),
+            test_hlc(&id),
+        );
         let submission = serde_json::json!({
             "bundle_b64": base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
             "sig_b64":    base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
@@ -1028,7 +1302,13 @@ mod tests {
 
         let mut hlc = test_hlc(&id);
         hlc.logical = 1;
-        let again = build_channel_create(&id, "#hello", "open", hlc);
+        let again = build_channel_create(
+            &id,
+            "#hello",
+            "open",
+            &state.server_did.to_did_jig_string(),
+            hlc,
+        );
         let submission = serde_json::json!({
             "bundle_b64": base64::engine::general_purpose::STANDARD.encode(again.canonical_bytes()),
             "sig_b64":    base64::engine::general_purpose::STANDARD.encode(&again.sender_sig),
@@ -1112,6 +1392,91 @@ mod tests {
         assert_eq!(text_of(&history[0].bundle_b64), "one");
         assert_eq!(text_of(&history[1].bundle_b64), "two");
         assert!(!history[0].delivery_cid.is_empty());
+    }
+
+    /// Asked for (`budget=1`), a page past the byte budget ends early with
+    /// the newest blocks, and paging on from the oldest one returns every
+    /// block once, in order, ending on an empty page. A request that does not
+    /// ask, from a client that takes a short page for the start of the
+    /// channel, gets the whole window as before.
+    #[tokio::test]
+    async fn a_history_page_past_the_budget_ends_early_and_pages_on() {
+        let state = Arc::new(unauthenticated_state());
+        let router = build_blocks_router(state.clone());
+        let id = test_identity();
+        seed_channel(&state, "#big");
+        // About 1.5 MB of bundle each (the padding is stored, never
+        // rendered): eight of them are twice the budget.
+        let count = 8;
+        for i in 0..count {
+            let mut hlc = test_hlc(&id);
+            hlc.logical = i as u32;
+            let block = jig_client::blocks::build_with_metadata(
+                &id,
+                jig_core::BlockKind::TextRender,
+                hlc,
+                serde_json::json!({"channel": "#big", "body": format!("b{i}"), "pad": "x".repeat(380_000)}),
+            );
+            let submission = serde_json::json!({
+                "bundle_b64": base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
+                "sig_b64": base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
+            });
+            let (status, body) = post_json(router.clone(), "/api/v1/blocks", submission).await;
+            assert_eq!(status, StatusCode::OK, "submitting block {i}: {body}");
+        }
+
+        // Not asked: the whole window, however large.
+        let (status, body) =
+            get_path(router.clone(), "/api/v1/channels/%23big/blocks?limit=50").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.as_array().unwrap().len(),
+            count,
+            "a client that did not ask gets every block"
+        );
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut before: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let path = match &before {
+                None => "/api/v1/channels/%23big/blocks?limit=50&budget=1".to_string(),
+                Some(cid) => {
+                    format!("/api/v1/channels/%23big/blocks?limit=50&budget=1&before={cid}")
+                }
+            };
+            let (status, body) = get_path(router.clone(), &path).await;
+            assert_eq!(status, StatusCode::OK);
+            let page = body.as_array().unwrap().clone();
+            if page.is_empty() {
+                break;
+            }
+            pages += 1;
+            let size = serde_json::to_vec(&body).unwrap().len();
+            assert!(
+                size <= HISTORY_PAGE_BUDGET_BYTES + jig_core::bundle::MAX_ENVELOPE_BYTES,
+                "page {pages} is {size} bytes"
+            );
+            if pages == 1 {
+                assert!(page.len() < count, "the first page is cut at the budget");
+            }
+            let texts: Vec<String> = page
+                .iter()
+                .map(|b| text_of(b["bundle_b64"].as_str().unwrap()))
+                .collect();
+            // Older pages go in front: the history reads oldest-first.
+            seen.splice(0..0, texts);
+            before = Some(
+                page[0]["delivery_cid"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("delivery:")
+                    .to_string(),
+            );
+            assert!(pages <= count, "paging does not end");
+        }
+        let want: Vec<String> = (0..count).map(|i| format!("b{i}")).collect();
+        assert_eq!(seen, want, "every block once, in order, over {pages} pages");
     }
 
     /// History carries each block's signed record, and the records endpoint
@@ -1241,6 +1606,37 @@ mod tests {
         let (status, body) = get_path(router, "/api/v1/channels/%23nope/blocks").await;
         assert_eq!(status, StatusCode::OK, "an unread channel is not an error");
         assert_eq!(body.as_array().map(|a| a.len()), Some(0));
+    }
+
+    /// A slug that names only a channel this server carries for another is
+    /// no empty channel: the answer says to read it by its id.
+    #[tokio::test]
+    async fn channel_history_by_a_carried_channels_slug_names_its_id() {
+        let state = Arc::new(unauthenticated_state());
+        let id = jig_pipeline::ingest_record::label_cid("a carried channel");
+        state
+            .ingest_ctx
+            .store
+            .upsert_channel(&jig_pipeline::persist::StoredChannel {
+                id: id.clone(),
+                slug: "#team".to_string(),
+                visibility: "open".to_string(),
+                created_at: 0,
+                owner_did: "did:jig:zuser".to_string(),
+                suite: "none".to_string(),
+                sequencer_did: "did:jig:zowner".to_string(),
+                co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
+            })
+            .unwrap();
+        let router = build_blocks_router(state);
+
+        let (status, body) = get_path(router, "/api/v1/channels/%23team/blocks").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "CARRIED_CHANNEL");
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains(&id), "{message}");
+        assert!(message.contains("did:jig:zowner"), "{message}");
     }
 
     #[tokio::test]

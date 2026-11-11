@@ -6,10 +6,10 @@
 //! the block must agree on render_hash.
 //!
 //! v0.0.2 caveats observed while writing this test:
-//! 1. Federation handshake is synthetic (not a real Wasm block) — done
-//!    via Frame::Submit with a fed-hello bundle signed by the server's
-//!    own key. The test doesn't assert handshake completion; we just
-//!    wait a beat after add_peer.
+//! 1. Each server dials the other, proves its DID in the same hello/welcome
+//!    a client speaks, and subscribes to the federation stream. The test
+//!    doesn't assert the connection is up; we just wait a beat after
+//!    add_peer.
 //! 2. Each server signs receipts with its OWN server_key — receipt_bytes
 //!    differ across servers. We compare render_hash, the deterministic
 //!    output marker (None in v0.0.2 — see H1 for the explanation).
@@ -33,25 +33,26 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 #[tokio::test]
 async fn two_server_federation_chat_with_receipt_parity() {
     // Boot two TOFU-mode servers (federation handshake doesn't require NS).
-    let server_a = TestJigServer::start_with_full_kinds()
+    let server_a = TestJigServer::start_copying_peers_channels()
         .await
         .expect("start server_a");
-    let server_b = TestJigServer::start_with_full_kinds()
+    let server_b = TestJigServer::start_copying_peers_channels()
         .await
         .expect("start server_b");
 
     // Bidirectional peering.
     server_a.add_peer(&server_b).await.expect("a -> b");
     server_b.add_peer(&server_a).await.expect("b -> a");
-    // Give the fed-hello handshake + subscription dance time to settle.
+    // Give the handshake + subscription dance time to settle.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let (alice, _alice_dir) = test_identity_with_dir();
     let (_bob, _bob_dir) = test_identity_with_dir();
 
     // Alice creates the channel on server_a. The channel-create federates
-    // like any block of an open channel, and server_b ingests it, so #hello
-    // exists on both.
+    // like any block of an open channel, and server_b, which copies its
+    // peers' channels (`naively_accept_peer_relayed_creates`), ingests it,
+    // so #hello exists on both.
     server_a
         .create_channel(&alice, "#hello", "open")
         .await
@@ -267,10 +268,10 @@ fn inject_forged_block_into_a(
 #[tokio::test]
 async fn federated_block_with_forged_author_did_is_rejected() {
     // Two TOFU-mode servers, bidirectionally peered.
-    let srv_a = TestJigServer::start_with_full_kinds()
+    let srv_a = TestJigServer::start_copying_peers_channels()
         .await
         .expect("srv_a start");
-    let srv_b = TestJigServer::start_with_full_kinds()
+    let srv_b = TestJigServer::start_copying_peers_channels()
         .await
         .expect("srv_b start");
     srv_a.add_peer(&srv_b).await.expect("a -> b peer");

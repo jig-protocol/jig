@@ -14,6 +14,7 @@ pub mod chat_view;
 pub mod common;
 pub mod display;
 pub mod dm;
+pub mod follow;
 pub mod history;
 pub mod hub;
 pub mod init;

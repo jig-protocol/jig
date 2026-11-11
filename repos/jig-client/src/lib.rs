@@ -13,6 +13,7 @@ pub mod connection;
 pub mod evidence;
 pub mod identity;
 pub mod keychain;
+pub mod limits;
 pub mod manifest;
 pub mod naming;
 pub mod open;

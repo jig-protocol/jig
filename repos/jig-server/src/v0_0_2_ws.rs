@@ -31,13 +31,11 @@ use axum::{
     routing::get,
 };
 use base64::Engine as _;
-use jig_core::BlockBundle;
 use jig_pipeline::{
     Envelope, Frame, ReceiptRef, Scope, SubscriptionScope,
     envelope::EnvelopeParseError,
     fanout::SubscriberIdentity,
     handshake::{HelloRefusal, close},
-    ingest::{IngestSource, ingest},
 };
 use tokio::sync::mpsc;
 
@@ -482,6 +480,9 @@ struct ConnState {
     /// The other end of `peer_sender`, for the connection loop to take.
     peer_rx: Option<mpsc::Receiver<Envelope>>,
     peer_registration: Option<crate::v0_0_2_peer::Registration>,
+    /// Whether the hello asked for channel tiers (JEP-0014 rule 5): a client
+    /// that did not may read a `public` channel but not post to it.
+    tiers: bool,
 }
 
 /// A handshake that ends with the dialer's [`Frame::PeerProof`].
@@ -648,7 +649,8 @@ async fn handle_client_frame(
             Ok(()) => {
                 session.peer = jig_core::did::Did::from_did_jig_string(&awaiting.peer_did).ok();
                 if let Some(peer) = session.peer.clone() {
-                    let (sender, rx) = crate::v0_0_2_peer::PeerSender::new(peer);
+                    let (sender, rx) =
+                        crate::v0_0_2_peer::PeerSender::with_tiers(peer, session.tiers);
                     session.peer_registration = Some(state.peers.register(sender.clone()));
                     session.peer_sender = Some(sender);
                     session.peer_rx = Some(rx);
@@ -821,6 +823,20 @@ async fn handle_client_frame(
                     return Ok(());
                 }
             };
+            // A slug that names only a channel this server carries for its
+            // owner would wait for a creation that never comes here: a slug
+            // names a channel only where it is ordered. Name its id instead.
+            if channel.is_none()
+                && let Scope::Channel { slug } = &scope
+                && let Ok(Some(carried)) = state.ingest_ctx.store.carried_channel_by_slug(slug)
+            {
+                let message = format!(
+                    "{slug} here is carried for {}, which orders it; subscribe to it by its id: {}",
+                    carried.sequencer_did, carried.id
+                );
+                let _ = send_error(socket, Some(404), "CARRIED_CHANNEL", None, &message).await;
+                return Ok(());
+            }
             if let SubscriberIdentity::Did(did) = &who
                 && let Some(channel) = &channel
             {
@@ -935,20 +951,17 @@ async fn handle_client_frame(
                     }
                 };
 
-            // 3. Construct a BlockBundle borrowing from the local vecs.
-            //    Both vecs live for the duration of this block, so the lifetimes hold.
-            let bundle = BlockBundle {
-                manifest_bytes: &manifest_bytes,
-                code_bytes: &code_bytes,
-                resources: vec![],
-            };
-
-            // 4. Run ingest; reply Ack or a typed Error frame.
-            match ingest(
-                &state.ingest_ctx,
-                bundle,
+            // 3. Post it: ingest here, or relayed to the channel's owner when
+            //    this server carries the channel (JEP-0005 rule 15). Reply Ack
+            //    or a typed Error frame.
+            match crate::v0_0_2_relay::post(
+                state,
+                &manifest_bytes,
+                &code_bytes,
                 sig,
-                IngestSource::LocalClient { conn_id },
+                conn_id,
+                &format!("ws:{conn_id}"),
+                session.tiers,
             )
             .await
             {
@@ -960,13 +973,31 @@ async fn handle_client_frame(
                     };
                     let _ = socket.send(Message::Text(json.into())).await;
                 }
-                // One classifier for every surface. `v0_0_2_ingest_error.rs`
-                // exists because two HTTP surfaces once drifted apart on the
-                // same variant; a hand-copied table here was the third copy.
-                Err(e) => {
-                    let (status, code, message) =
-                        crate::v0_0_2_ingest_error::classify_ingest_error(&e);
-                    let _ = send_error(socket, Some(status.as_u16()), code, None, &message).await;
+                // One classifier for every surface (`Refusal::of`, over
+                // `v0_0_2_ingest_error.rs`): two HTTP surfaces once drifted
+                // apart on the same variant; a hand-copied table here was the
+                // third copy.
+                Err(refusal) => {
+                    // Name the block refused. A client can have a subscribe
+                    // and several submits in flight on one connection, and a
+                    // refused subscribe also answers with an `Error`; the CID
+                    // is what tells this refusal apart (`Ack` carries it too).
+                    let ref_cid = jig_core::BlockBundle {
+                        manifest_bytes: &manifest_bytes,
+                        code_bytes: &code_bytes,
+                        resources: vec![],
+                    }
+                    .block_cid()
+                    .ok()
+                    .map(|cid| cid.to_string());
+                    let _ = send_error(
+                        socket,
+                        Some(refusal.status.as_u16()),
+                        &refusal.code,
+                        ref_cid,
+                        &refusal.message,
+                    )
+                    .await;
                 }
             }
             Ok(())
@@ -1025,6 +1056,9 @@ pub(crate) fn handshake_capabilities(state: &AppState) -> jig_pipeline::handshak
         federation: true,
         // The bound ingest enforces, so the signed claim is the enforced one.
         max_future_skew_ms: state.ingest_ctx.hlc_clock.max_future_skew_ms(),
+        // Implemented; `negotiate` signs it only into a welcome whose hello
+        // asked for it.
+        tiers: true,
     }
 }
 
@@ -1090,6 +1124,7 @@ async fn complete_hello(
                 .await
                 .map_err(|err| err.to_string())?;
             session.handshaken = true;
+            session.tiers = hello.capabilities.tiers;
             if let Some(peer_did) = hello.peer_did {
                 session.awaiting_peer = Some(AwaitingPeer {
                     peer_did,
@@ -1198,6 +1233,11 @@ fn channel_label(state: &AppState, manifest_bytes: &[u8]) -> Option<String> {
 /// The shared metrics label for channels whose slug is not disclosed.
 pub const RESTRICTED_LABEL: &str = "(restricted)";
 
+/// Invariant: every Error answers exactly one client frame (Subscribe or
+/// Submit), and names it by `ref_cid` where it can. The client matches
+/// an unnamed Error to the oldest request still open, so a server-initiated
+/// Error would be taken as that request's answer. None exists today; adding
+/// one needs a code the client (`jig_client::connection::answer`) skips.
 async fn send_error(
     socket: &mut WebSocket,
     status: Option<u16>,
@@ -1349,6 +1389,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
     }
@@ -1386,7 +1427,9 @@ mod tests {
         let reply_env: Envelope = serde_json::from_str(&reply).unwrap();
         match reply_env.frame {
             Frame::Ack { block_cid } => {
-                assert!(!block_cid.is_empty(), "ack must carry a block_cid");
+                // The CID the sender computes: clients match an answer to
+                // its submit by it.
+                assert_eq!(block_cid, block.cid(), "ack must carry the block's CID");
             }
             other => panic!("expected Ack, got {other:?}"),
         }
@@ -1424,8 +1467,14 @@ mod tests {
         };
         let reply_env: Envelope = serde_json::from_str(&reply).unwrap();
         match reply_env.frame {
-            Frame::Error { status, code, .. } => {
+            Frame::Error {
+                status,
+                code,
+                ref_cid,
+                ..
+            } => {
                 assert_eq!(code, "INVALID_SIG");
+                assert_eq!(ref_cid.as_deref(), Some(block.cid().as_str()));
                 // Pins the number actually on the wire. Both Frame::Error
                 // consumers currently drop `status`, so without this nothing in
                 // the system would notice a wrong value.
@@ -1470,10 +1519,13 @@ mod tests {
                 status,
                 code,
                 message,
-                ..
+                ref_cid,
             } => {
                 assert_eq!(code, "UNKNOWN_CHANNEL");
                 assert_eq!(status, Some(404));
+                // Names the block it refuses, so a client can tell this
+                // answer from a refused subscribe's.
+                assert_eq!(ref_cid.as_deref(), Some(block.cid().as_str()));
                 assert!(message.contains("#gigeu"), "must name the slug: {message}");
                 assert!(
                     message.contains("jig channel create"),
@@ -1501,6 +1553,46 @@ mod tests {
             panic!("expected text, got {msg:?}");
         };
         serde_json::from_str(&text).expect("frame parses")
+    }
+
+    /// A subscription by the slug of a channel this server only carries for
+    /// its owner would never deliver: it is refused, naming the channel's id.
+    #[tokio::test]
+    async fn a_subscribe_by_a_carried_channels_slug_names_its_id() {
+        let (state, url) = start_test_server().await;
+        let id = jig_pipeline::ingest_record::label_cid("a carried channel");
+        state
+            .ingest_ctx
+            .store
+            .upsert_channel(&jig_pipeline::persist::StoredChannel {
+                id: id.clone(),
+                slug: "#team".to_string(),
+                visibility: "open".to_string(),
+                created_at: 0,
+                owner_did: "did:jig:zuser".to_string(),
+                suite: "none".to_string(),
+                sequencer_did: "did:jig:zowner".to_string(),
+                co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
+            })
+            .unwrap();
+        let mut ws = established(&url).await;
+        let sub = signed_subscribe_frame(
+            &test_identity(),
+            Scope::Channel {
+                slug: "#team".to_string(),
+            },
+        );
+        ws.send(TMessage::Text(serde_json::to_string(&sub).unwrap().into()))
+            .await
+            .unwrap();
+        match next_frame(&mut ws).await.frame {
+            Frame::Error { code, message, .. } => {
+                assert_eq!(code, "CARRIED_CHANNEL");
+                assert!(message.contains(&id), "{message}");
+            }
+            other => panic!("expected an error frame, got {other:?}"),
+        }
     }
 
     /// An unsigned subscribe must be refused. Before this, `Frame::Subscribe`
@@ -1849,6 +1941,7 @@ mod tests {
                     suite: "none".to_string(),
                     sequencer_did: String::new(),
                     co_owners: Vec::new(),
+                    tiering: jig_pipeline::persist::ChannelTiering::current(visibility, "none"),
                 })
                 .unwrap();
         }
@@ -1893,6 +1986,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
         let manifest = serde_json::to_vec(&serde_json::json!({
@@ -2413,8 +2507,11 @@ mod tests {
             ),
             "the dialer's handler sees the DID the welcome proved"
         );
+        // The dialer's catch-up ask comes first ([`crate::v0_0_2_catch_up`]).
+        let seen = dialed_seen.wait_for(2).await;
+        assert_eq!(seen[0].1, crate::v0_0_2_catch_up::CATCH_UP_FRAME);
         assert_eq!(
-            dialed_seen.wait_for(1).await[0],
+            seen[1],
             (
                 dialing_did.clone(),
                 "contract-answer".into(),
@@ -2429,7 +2526,7 @@ mod tests {
             .expect("the dialed peer is live on the dialer too")
             .send("note", b"from-dialing".to_vec())
             .unwrap();
-        assert_eq!(dialed_seen.wait_for(2).await[1].2, b"from-dialing");
+        assert_eq!(dialed_seen.wait_for(3).await[2].2, b"from-dialing");
 
         // The dialer's handler closes; the connection ends as a contract close.
         to_dialing.send("contract-end", vec![]).unwrap();

@@ -178,6 +178,13 @@ jobs:
           ! cargo tree --locked -e normal,features -i jig-nameserver \
             -p jig-server -p jig-cli -p jig-nameserver \
             | grep 'jig-nameserver feature "test-support"'
+      - name: No release binary enables jig-server's fuzzing
+        # fuzzing compiles v0_0_2_stream::fuzz_decode_frame, for repos/fuzz
+        # only (its own workspace, so not in this graph at all).
+        run: |
+          ! cargo tree --locked -e normal,features -i jig-server \
+            -p jig-server -p jig-cli -p jig-nameserver \
+            | grep 'jig-server feature "fuzzing"'
       - name: jig-nameserver links no Wasm engine
         # Its unit sets MemoryDenyWriteExecute, which a JIT cannot run under. It
         # takes jig-pipeline and jig-client without the `executor` feature;

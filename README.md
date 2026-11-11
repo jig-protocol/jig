@@ -99,7 +99,7 @@ from `curl` to "hello, world" accepted in `#hello`. CI fails above 60s; see
 
 ## Quickstart
 
-Requires Rust **1.95+** (MSRV is set by wasmtime); `rust-toolchain.toml` pins the exact toolchain CI uses, and rustup picks it up automatically. Build the two binaries:
+Requires Rust **1.97+** (MSRV is set by wasmtime); `rust-toolchain.toml` pins the exact toolchain CI uses, and rustup picks it up automatically. Build the two binaries:
 
 ```bash
 git clone https://github.com/jig-protocol/jig
@@ -121,7 +121,7 @@ In another shell, make an identity, point the client at the server, create a cha
 open the TUI:
 
 ```bash
-jig init <nickname>                 # writes ~/.jig/cli.toml + ~/.jig/keys/<did>.key
+jig init <nickname>                 # writes ~/.jig/cli.toml + ~/.jig/keys/<did>.jigkey
 jig server set https://127.0.0.1:7117   # pins the server's DID, which vouches for its certificate
 jig channel create '#hello'
 jig chat '#hello'                   # Enter sends; Ctrl+Q or Esc quits
@@ -137,23 +137,42 @@ slot is the message body. `jig server info` prints the server's advertised
 their own; [`scripts/jig-room.sh`](scripts/jig-room.sh) is the deliberate `until`-loop
 stand-in.
 
-### Encrypted channels and DMs
+### Channel tiers, encrypted channels and DMs
+
+Every channel has a tier, fixed when it is created:
+
+- `private`, the default: end-to-end encrypted, and people join only when its owner adds them.
+- `server`: end-to-end encrypted, and anyone holding the `--join` role on this server
+  (`member` by default, or `guest`) joins it themselves.
+- `shared`: as `server`, carried to other servers by a share (`jig channel share`).
+- `public`: stored in readable form, so anyone who can read the server, its operator
+  included, can read it. `jig` labels it wherever it shows it, and asks you to confirm when
+  you create one (`--yes` confirms without asking).
+
+`jig channel list` marks each channel's tier. A plaintext channel created before tiers is
+frozen: it takes no new posts, but its old messages are still stored in readable form.
+Every message is signed, which proves who wrote it; that is a different thing from
+encryption. Even in an encrypted channel the server sees who posts where and when.
 
 Each person runs `jig init` and `jig server set` once; `server set` publishes the MLS key
 packages others need to add you while you are offline.
 
 ```bash
-jig channel create '#ops' --visibility restricted --encrypted
+jig channel create '#ops'                         # private
 jig channel add '#ops' <did-or-contact-name>      # owner only; commits them into the MLS group
 jig send --channel '#ops' "rotate the keys"       # the server stores ciphertext
 jig channel kick '#ops' <did-or-contact-name>     # they cannot read what follows
 jig channel leave '#ops'                          # anyone but the owner
 jig channel members '#ops'
 jig dm <did-or-contact-name> "just us"            # a locked, encrypted channel for two
+
+jig channel create '#team' --tier server --join guest   # a team channel members join themselves
+jig channel join '#team'                          # once, before the first `jig chat`
+jig channel create '#news' --tier public          # readable by anyone; asks you to confirm
 ```
 
-An open encrypted channel (`--visibility open --encrypted`) can be joined with
-`jig channel join`, by MLS external commit; history from before you joined stays sealed.
+A `server` or `shared` channel is joined with `jig channel join`, by MLS external commit;
+history from before you joined stays sealed.
 [`scripts/demo-e2ee.sh`](scripts/demo-e2ee.sh) runs all of this against a throwaway server
 with three users and then searches the server's files for what they said.
 
@@ -236,7 +255,7 @@ required check. Jobs that build install the toolchain `rust-toolchain.toml` pins
 | Report a vulnerability | [`SECURITY.md`](SECURITY.md) (security@jig.onl) |
 | Know what a hostile server operator can and cannot do | the [threat register](repos/jig-spec/src/threat-register.md) and [`docs/security/`](docs/security/operator-threat-model.md) |
 
-Back up `server.key` before you do anything else. Losing it changes the server's DID, so
+Back up `server.jigkey`, and a way to open it, before you do anything else. Losing it changes the server's DID, so
 the server comes back as a different identity: its receipts are signed by a new key, and
 federation peers that list it by `expected_did` hold a stale value. The CLI pins each server's
 DID on first contact (JEP-0002, threat-register OP-08), so a lost key looks like a

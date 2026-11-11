@@ -2,8 +2,10 @@
 //!
 //! DIDs are the canonical identity anchor for authors, recipients, and servers.
 //! A canonical Jig DID is derived from an Ed25519 public key and encoded as
-//! `did:jig:z<base32-nopad-lowercase>`, where the `z` is the multibase prefix
-//! for base32upper (repurposed here as a versioning sigil for jig-native DIDs).
+//! `did:jig:z<base32-nopad-lowercase>`: a literal `z`, then the 32-byte key in
+//! RFC 4648 base32, lowercase and unpadded (52 characters). The `z` is a jig
+//! version sigil, not a multibase prefix: in multibase `z` means base58btc, so a
+//! generic multibase decoder misreads these DIDs.
 //!
 //! Legacy or test DIDs (e.g. `did:jig:alice123`) are accepted on input but
 //! cannot be decoded to bytes; they round-trip through their string form.

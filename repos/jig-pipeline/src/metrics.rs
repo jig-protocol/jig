@@ -17,7 +17,8 @@ static BRIDGE: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn block_ingested(source: &IngestSource) {
     let counter = match source {
         IngestSource::LocalClient { .. } => &LOCAL,
-        IngestSource::FederatedPeer { .. } => &FEDERATION,
+        // A write a follower relayed arrived over federation too.
+        IngestSource::FederatedPeer { .. } | IngestSource::Relayed { .. } => &FEDERATION,
         IngestSource::AdminEndpoint => &ADMIN,
         IngestSource::Bridge => &BRIDGE,
     };
@@ -53,7 +54,13 @@ mod tests {
         // Counters are process-wide and other tests ingest concurrently, so
         // assert on growth, not on exact values.
         let sources = [
-            (IngestSource::LocalClient { conn_id: 7 }, "local"),
+            (
+                IngestSource::LocalClient {
+                    conn_id: 7,
+                    tiers: true,
+                },
+                "local",
+            ),
             (
                 IngestSource::FederatedPeer {
                     peer_did: jig_core::Did::from_ed25519_pubkey(&[1; 32]),
