@@ -1380,6 +1380,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
     }
@@ -1563,6 +1564,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: "did:jig:zowner".to_string(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
         let mut ws = established(&url).await;
@@ -1930,6 +1932,7 @@ mod tests {
                     suite: "none".to_string(),
                     sequencer_did: String::new(),
                     co_owners: Vec::new(),
+                    tiering: jig_pipeline::persist::ChannelTiering::current(visibility, "none"),
                 })
                 .unwrap();
         }
@@ -1974,6 +1977,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
         let manifest = serde_json::to_vec(&serde_json::json!({

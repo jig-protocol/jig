@@ -121,13 +121,12 @@ pub fn plan(
         require_plaintext_block(manifest, block_suite)?;
         let suite = requested_suite(manifest)?;
         let slug = meta_str(manifest, "slug").unwrap_or_default().to_string();
+        let visibility = create_visibility(manifest);
         if slug.starts_with(jig_core::dm::DM_PREFIX) {
-            check_dm_create(sender, manifest, &slug, suite)?;
+            check_dm_create(sender, manifest, &slug, suite, visibility)?;
         }
         // A restricted channel needs a suite its operator cannot read (D25).
-        // Absent visibility is open, as the effect stores it; anything else
-        // that is not exactly `open` is restricted (fail closed).
-        let visibility = meta_str(manifest, "visibility").unwrap_or("open");
+        // Anything that is not exactly `open` is restricted (fail closed).
         if !suite.is_operator_confidential() && !crate::visibility::is_open(visibility) {
             return Err(SuiteRefusal::RestrictedNeedsMls { slug });
         }
@@ -162,6 +161,17 @@ pub fn plan(
             })
         };
     };
+    // A channel frozen because this build does not know its suite (JEP-0014
+    // rule 21) can still be archived by its owner (rule 22). The archive is
+    // plaintext control plane and touches no group; the write gate checks
+    // the owner.
+    if kind == BlockKind::ChannelArchive
+        && channel.tiering.tier.is_frozen()
+        && channel.suite.parse::<EncryptionSuite>().is_err()
+    {
+        require_plaintext_block(manifest, block_suite)?;
+        return Ok(MlsPlan::Nothing);
+    }
     // Fail closed on a suite string this build does not know.
     let channel_suite =
         channel
@@ -312,6 +322,19 @@ fn require_plaintext_block(
     }
 }
 
+/// The visibility a `channel-create` asks for: its `visibility`, or else its
+/// tier's (a `private` channel is `restricted` without saying so, JEP-0014),
+/// or else `open`, as the effect stores it.
+fn create_visibility(manifest: &BlockManifest) -> &str {
+    meta_str(manifest, "visibility")
+        .or_else(|| {
+            meta_str(manifest, crate::ingest::tier_keys::TIER)
+                .and_then(|t| t.parse::<jig_core::tier::Tier>().ok())
+                .map(jig_core::tier::Tier::legacy_visibility)
+        })
+        .unwrap_or("open")
+}
+
 /// A `#dm/` slug belongs to the pair whose DIDs derive it
 /// ([`jig_core::dm::dm_slug`]). Only one of the two may create it, and only as
 /// what a DM is: restricted and encrypted. Otherwise anyone could take a
@@ -324,11 +347,11 @@ fn check_dm_create(
     manifest: &BlockManifest,
     slug: &str,
     suite: EncryptionSuite,
+    visibility: &str,
 ) -> Result<(), SuiteRefusal> {
     let peer = meta_str(manifest, "dm_peer").ok_or(SuiteRefusal::Missing { field: "dm_peer" })?;
     let peer = crate::effect::canonical_did_string(peer);
-    let restricted =
-        !crate::visibility::is_open(meta_str(manifest, "visibility").unwrap_or("open"));
+    let restricted = !crate::visibility::is_open(visibility);
     let refuse = |why: &str| {
         Err(SuiteRefusal::Mls(jig_mls::MlsError::Rejected(format!(
             "{slug} is a direct-message slug: {why}"
@@ -417,6 +440,7 @@ mod tests {
             suite: suite.to_string(),
             sequencer_did: String::new(),
             co_owners: Vec::new(),
+            tiering: crate::persist::ChannelTiering::current("restricted", suite),
         }
     }
 
@@ -614,6 +638,43 @@ mod tests {
         );
     }
 
+    /// A channel frozen for a suite this build does not know can still be
+    /// archived in plaintext (JEP-0014 rule 22); nothing else gets past the
+    /// unknown suite.
+    #[test]
+    fn a_frozen_channel_with_an_unknown_suite_can_be_archived() {
+        let a = who(1);
+        let old = StoredChannel {
+            tiering: crate::persist::ChannelTiering::legacy("#sealed", "restricted", "rot13"),
+            ..chan("rot13", &a.did)
+        };
+        assert!(old.tiering.tier.is_frozen());
+        let block = |kind| {
+            manifest(
+                kind,
+                &a.did,
+                EncryptionSuite::Unencrypted,
+                json!({"channel": "#sealed"}),
+            )
+        };
+        let archive = block(BlockKind::ChannelArchive);
+        assert_eq!(
+            plan(
+                BlockKind::ChannelArchive,
+                &a.did,
+                &archive,
+                Some(&old),
+                None
+            ),
+            Ok(MlsPlan::Nothing)
+        );
+        let add = block(BlockKind::MemberAdd);
+        assert!(matches!(
+            plan(BlockKind::MemberAdd, &a.did, &add, Some(&old), None),
+            Err(SuiteRefusal::Mismatch { .. })
+        ));
+    }
+
     /// Only one of a pair may create the pair's `#dm/` slug, and only as a
     /// restricted, encrypted channel. Anyone else taking it first would leave
     /// the two unable to DM here (the client refuses a DM with a third member).
@@ -667,6 +728,17 @@ mod tests {
             create(&a, dm.clone()),
             Err(SuiteRefusal::Missing { field: "dm_peer" })
         );
+        // A `private` DM is restricted without saying so (JEP-0014); one
+        // whose tier says otherwise is still no DM.
+        let mut tiered = with_peer(&b.did);
+        tiered.as_object_mut().unwrap().remove("visibility");
+        tiered["tier"] = "private".into();
+        assert!(matches!(
+            create(&a, tiered.clone()),
+            Ok(MlsPlan::Genesis(_))
+        ));
+        tiered["tier"] = "server".into();
+        assert!(refused(create(&a, tiered)));
         // A plaintext squat naming no peer, on the pair's slug or any other.
         let squat = |slug: &str| {
             let man = manifest(

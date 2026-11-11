@@ -678,6 +678,7 @@ mod tests {
         if let serde_json::Value::Object(map) = meta {
             manifest.metadata.extend(map);
         }
+        crate::ingest::tier_as_a_current_client_would(kind, &mut manifest.metadata);
         manifest.hlc_ts = Some(jig_core::HlcTimestamp {
             wall_ms: rand::random::<u32>() as u64,
             logical: 0,

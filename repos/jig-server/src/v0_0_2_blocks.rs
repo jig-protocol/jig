@@ -275,6 +275,12 @@ pub struct ChannelView {
     pub created_at: i64,
     /// `none` or `mls`, fixed at creation.
     pub suite: String,
+    /// `private`, `server`, `shared`, `public`, or `frozen` for a plaintext
+    /// channel from before tiers (JEP-0014), fixed at creation.
+    pub tier: String,
+    /// The lowest server role that may join a `server` or `shared` channel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub join: Option<String>,
     /// The server that orders the channel: this one, or the owner of a
     /// channel this server carries (JEP-0005). Unsigned: a client takes
     /// another server's word only with `share`.
@@ -355,6 +361,8 @@ pub(crate) fn view_of(
         owner_did: c.owner_did,
         created_at: c.created_at,
         suite: c.suite,
+        tier: c.tiering.tier.as_str().to_string(),
+        join: c.tiering.join.map(|j| j.as_str().to_string()),
         sequencer,
         share,
     })
@@ -895,6 +903,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
     }
@@ -1080,11 +1089,72 @@ mod tests {
         assert_eq!(channels.len(), 1, "exactly one channel expected");
         assert_eq!(channels[0]["slug"], "#hello");
         assert_eq!(channels[0]["visibility"], "open");
+        assert_eq!(channels[0]["tier"], "public");
+        assert!(
+            channels[0].get("join").is_none(),
+            "only server and shared channels list a join role"
+        );
         assert_eq!(channels[0]["owner_did"], id.did_string());
         assert!(
             channels[0]["created_at"].as_i64().unwrap_or(0) >= 0,
             "created_at must be present as an integer"
         );
+    }
+
+    /// `server` and `shared` channels list their join role, and so does an
+    /// open `mls` channel from before tiers, which rule 21 maps to `server`
+    /// with `join = guest`.
+    #[tokio::test]
+    async fn the_listing_names_a_server_or_shared_channels_join_role() {
+        use jig_core::tier::{JoinRole, Tier};
+        use jig_pipeline::persist::{ChannelTiering, StoredChannel};
+        let state = Arc::new(unauthenticated_state());
+        let tiered = |tier, join| ChannelTiering {
+            join: Some(join),
+            ..ChannelTiering::of(tier)
+        };
+        for (slug, visibility, tiering) in [
+            ("#guests", "open", tiered(Tier::Server, JoinRole::Guest)),
+            ("#members", "open", tiered(Tier::Shared, JoinRole::Member)),
+            (
+                "#legacy",
+                "open",
+                ChannelTiering::legacy("#legacy", "open", "mls"),
+            ),
+        ] {
+            state
+                .ingest_ctx
+                .store
+                .upsert_channel(&StoredChannel {
+                    id: jig_pipeline::ingest_record::label_cid(slug),
+                    slug: slug.to_string(),
+                    visibility: visibility.to_string(),
+                    created_at: 0,
+                    owner_did: "did:jig:zSeedOwner".to_string(),
+                    suite: "mls".to_string(),
+                    sequencer_did: String::new(),
+                    co_owners: Vec::new(),
+                    tiering,
+                })
+                .unwrap();
+        }
+        let (status, body) = get_path(build_blocks_router(state), "/api/v1/channels").await;
+        assert_eq!(status, StatusCode::OK);
+        let listed = |slug: &str| {
+            body["channels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["slug"] == slug)
+                .unwrap_or_else(|| panic!("{slug} is not listed: {body}"))
+                .clone()
+        };
+        assert_eq!(listed("#guests")["tier"], "server");
+        assert_eq!(listed("#guests")["join"], "guest");
+        assert_eq!(listed("#members")["tier"], "shared");
+        assert_eq!(listed("#members")["join"], "member");
+        assert_eq!(listed("#legacy")["tier"], "server");
+        assert_eq!(listed("#legacy")["join"], "guest");
     }
 
     #[tokio::test]
@@ -1482,6 +1552,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: "did:jig:zowner".to_string(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
         let router = build_blocks_router(state);

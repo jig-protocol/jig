@@ -283,6 +283,7 @@ impl TestJigServer {
                 suite: "none".to_string(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })?;
         Ok(id)
     }
@@ -307,6 +308,7 @@ impl TestJigServer {
             suite: "none".to_string(),
             sequencer_did: String::new(),
             co_owners: Vec::new(),
+            tiering: jig_pipeline::persist::ChannelTiering::current("restricted", "none"),
         })?;
         store.upsert_membership(&jig_pipeline::persist::StoredMembership {
             channel_id: id.clone(),
