@@ -607,11 +607,11 @@ pub async fn ingest_peer_block(
     let (manifest_bytes, code_bytes): (Vec<u8>, Vec<u8>) = serde_json::from_slice(&bundle_bytes)?;
     let manifest: BlockManifest = serde_json::from_slice(&manifest_bytes)?;
 
-    // v0.2 federates only open, unencrypted channels (see
-    // `DeliveryPolicy::federates`): an encrypted channel's group lives on one
-    // server until the federation contract (D12) says how it spans two. So a
-    // block for a local channel that does not federate, or one claiming an
-    // encrypted suite, is dropped before the write gate sees it.
+    // A channel crosses servers by a share (JEP-0005): the owner's stream
+    // carries it, encrypted `shared` channels included. This legacy relay
+    // carries only open, unencrypted channels (`DeliveryPolicy::federates`),
+    // so a block for a local channel that does not federate, or one claiming
+    // an encrypted suite, is dropped before the write gate sees it.
     if manifest.content_suite() != jig_core::EncryptionSuite::Unencrypted {
         warn!(peer_url = %peer.url, %delivery_cid, "rejecting peer block: encrypted content does not federate");
         return Ok(());
@@ -1122,10 +1122,9 @@ mod tests {
         assert_eq!(got.0.sender_did, sender_did.to_did_jig_string());
     }
 
-    /// v0.2 federates only open, unencrypted channels. A peer block naming a
-    /// local restricted or encrypted channel is dropped before the write
-    /// gate: an encrypted channel's group lives on one server until the
-    /// federation contract says how it spans two.
+    /// The legacy relay carries only open, unencrypted channels; a share
+    /// carries the rest (JEP-0005). A peer block naming a local restricted or
+    /// encrypted channel is dropped before the write gate.
     #[tokio::test]
     async fn peer_blocks_for_channels_that_do_not_federate_are_dropped() {
         use ed25519_dalek::SigningKey;
