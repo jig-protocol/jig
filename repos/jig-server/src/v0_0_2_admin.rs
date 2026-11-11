@@ -233,15 +233,33 @@ pub async fn add_member(
         ));
     }
 
-    let bundle = BlockBundle {
-        manifest_bytes: &manifest_bytes,
-        code_bytes: &code_bytes,
-        resources: vec![],
-    };
-
-    let cid = ingest(&state.ingest_ctx, bundle, sig, IngestSource::AdminEndpoint)
-        .await
-        .map_err(map_ingest_error)?;
+    // A member-add for a channel this server carries goes on to its owner
+    // through the relay, under this server's share (JEP-0005 rules 7a and
+    // 15): a `member` grant relays it, `read` and `write` refuse it
+    // `GRANT_REFUSED`. Everywhere else it is ingested here, as before.
+    let author = manifest
+        .authors
+        .first()
+        .map(|a| a.did.to_string())
+        .unwrap_or_default();
+    let cid = crate::v0_0_2_relay::post_as(
+        &state,
+        IngestSource::AdminEndpoint,
+        &manifest_bytes,
+        &code_bytes,
+        sig,
+        &format!("rest:{author}"),
+    )
+    .await
+    .map_err(|refusal| {
+        (
+            refusal.status,
+            Json(AdminError {
+                code: refusal.code,
+                message: refusal.message,
+            }),
+        )
+    })?;
 
     Ok(Json(AdminResult { block_cid: cid }))
 }

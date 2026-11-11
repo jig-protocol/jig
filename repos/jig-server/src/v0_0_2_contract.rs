@@ -4350,6 +4350,103 @@ mod tests {
         );
     }
 
+    use axum::http::StatusCode;
+
+    /// `parts` posted to the channel-op route a client's `jig channel join`
+    /// and `jig channel add` use, `POST /api/v1/channels/:ref/members`.
+    async fn members_post(
+        state: &Arc<AppState>,
+        channel: &str,
+        parts: &(Vec<u8>, Vec<u8>, Vec<u8>),
+    ) -> Result<String, (StatusCode, String)> {
+        use axum::extract::{Path, State};
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let body = crate::v0_0_2_admin::BundleSubmission {
+            bundle_b64: b64(&serde_json::to_vec(&(&parts.0, &parts.1)).unwrap()),
+            sig_b64: b64(&parts.2),
+        };
+        crate::v0_0_2_admin::add_member(
+            State(state.clone()),
+            Path(channel.to_string()),
+            axum::Json(body),
+        )
+        .await
+        .map(|ok| ok.0.block_cid)
+        .map_err(|(status, body)| (status, body.0.code.clone()))
+    }
+
+    /// The members route relays a carried channel's membership like any
+    /// client write: under a `member` grant a join and an add land at the
+    /// owner; under `write` (or `read`) they are `GRANT_REFUSED`, not
+    /// `CARRIED_CHANNEL`. On the owner the route is unchanged.
+    #[tokio::test]
+    async fn the_members_route_relays_a_carried_channels_membership_under_its_grant() {
+        let joiner = SigningKey::from_bytes(&rand::random());
+        let joiner_did = did_of(&joiner);
+        let added = did_of(&SigningKey::from_bytes(&rand::random()));
+        let member = |channel: &str, did: &str| serde_json::json!({"channel_id": channel, "member_did": did});
+
+        for grant in ["write", "read"] {
+            let p = pair(OfferPolicy::Accept).await;
+            let channel = p.carried(grant).await;
+            let join = signed(&joiner, BlockKind::MemberAdd, member(&channel, &joiner_did));
+            assert_eq!(
+                members_post(&p.follower, &channel, &join)
+                    .await
+                    .unwrap_err(),
+                (StatusCode::FORBIDDEN, "GRANT_REFUSED".to_string()),
+                "a join under `{grant}`"
+            );
+            let add = signed(&p.user, BlockKind::MemberAdd, member(&channel, &added));
+            assert_eq!(
+                members_post(&p.follower, &channel, &add).await.unwrap_err(),
+                (StatusCode::FORBIDDEN, "GRANT_REFUSED".to_string()),
+                "an add under `{grant}`"
+            );
+            let at_owner = |did: &str| {
+                p.owner
+                    .ingest_ctx
+                    .store
+                    .is_member_by_id(&channel, did)
+                    .unwrap()
+            };
+            assert!(
+                !at_owner(&joiner_did) && !at_owner(&added),
+                "nothing landed"
+            );
+        }
+
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.carried("member").await;
+        let is_member = |did: &str| {
+            p.owner
+                .ingest_ctx
+                .store
+                .is_member_by_id(&channel, did)
+                .unwrap()
+        };
+        let join = signed(&joiner, BlockKind::MemberAdd, member(&channel, &joiner_did));
+        members_post(&p.follower, &channel, &join).await.unwrap();
+        assert!(is_member(&joiner_did), "the join landed at the owner");
+        let add = signed(&p.user, BlockKind::MemberAdd, member(&channel, &added));
+        members_post(&p.follower, &channel, &add).await.unwrap();
+        assert!(is_member(&added), "the add landed at the owner");
+
+        // On the owner, the route ingests directly, as before.
+        let local = did_of(&SigningKey::from_bytes(&rand::random()));
+        let add = signed(&p.user, BlockKind::MemberAdd, member(&channel, &local));
+        members_post(&p.owner, &channel, &add).await.unwrap();
+        assert!(is_member(&local), "an owner-side add");
+        // And the owner's own gate still decides: a stranger adding someone
+        // else is refused by it, not by the grant.
+        let stranger = SigningKey::from_bytes(&rand::random());
+        let other = did_of(&SigningKey::from_bytes(&rand::random()));
+        let add = signed(&stranger, BlockKind::MemberAdd, member(&channel, &other));
+        let (_, code) = members_post(&p.follower, &channel, &add).await.unwrap_err();
+        assert_ne!(code, "GRANT_REFUSED", "the owner's gate, not the grant");
+        assert!(!is_member(&other));
+    }
+
     #[tokio::test]
     async fn a_relayed_block_needs_its_authors_signature_whatever_the_grant() {
         let p = pair(OfferPolicy::Accept).await;
