@@ -46,6 +46,10 @@ pub struct SubmitResult {
 pub struct ErrorBody {
     pub code: String,
     pub message: String,
+    /// How long to wait before posting again, for a refusal waiting changes:
+    /// the REST counterpart of the `Error` frame's `retry_after_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
 }
 
 pub(crate) fn err(
@@ -58,6 +62,7 @@ pub(crate) fn err(
         Json(ErrorBody {
             code: code.to_string(),
             message: msg.into(),
+            retry_after_ms: None,
         }),
     )
 }
@@ -71,6 +76,7 @@ fn refusal_response(refusal: crate::v0_0_2_relay::Refusal) -> (StatusCode, Json<
         Json(ErrorBody {
             code: refusal.code,
             message: refusal.message,
+            retry_after_ms: refusal.retry_after_ms,
         }),
     )
 }

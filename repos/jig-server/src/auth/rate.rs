@@ -45,6 +45,11 @@ impl RateLimiter {
         })
     }
 
+    /// The longest a key with an empty bucket waits for its next token.
+    pub fn refill_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs_f64(1.0 / self.per_second)
+    }
+
     /// Take one token for `key` at `now`. False when its bucket is empty, or
     /// when `key` is new and the table is full of keys that are not idle.
     pub fn try_take(&self, key: &str, now: Instant) -> bool {
