@@ -95,23 +95,27 @@ pub fn build_text_render_with_nickname(
 /// channel-create a real Wasm block submitted via `submit`.
 ///
 /// The block names no suite, so it is plaintext: servers refuse it unless
-/// `visibility` is `open` (restricted channels are always MLS). An encrypted
-/// channel is created with [`build_with_metadata`] and its MLS fields.
+/// `visibility` is `open` (restricted channels are always MLS). An `open` one
+/// is the `public` tier, and says so (JEP-0014): anyone, the server operator
+/// included, can read it. An encrypted channel is created with
+/// [`build_with_metadata`] and its MLS fields. `sequencer` is the DID of the
+/// server the channel is created on: the signed block is valid there only.
 pub fn build_channel_create(
     sender: &Identity,
     slug: &str,
     visibility: &str,
+    sequencer: &str,
     hlc: HlcTimestamp,
 ) -> BuiltBlock {
-    build_with_metadata(
-        sender,
-        BlockKind::ChannelCreate,
-        hlc,
-        json!({
-            "slug": slug,
-            "visibility": visibility,
-        }),
-    )
+    let mut metadata = json!({
+        "slug": slug,
+        "visibility": visibility,
+        "sequencer": sequencer,
+    });
+    if visibility == "open" {
+        metadata["tier"] = json!(jig_core::tier::Tier::Public.as_str());
+    }
+    build_with_metadata(sender, BlockKind::ChannelCreate, hlc, metadata)
 }
 
 /// Build a signed `member-add` block.
@@ -161,6 +165,49 @@ pub fn build_channel_promote(
         BlockKind::ChannelPromote,
         hlc,
         json!({ "channel": channel_slug }),
+    )
+}
+
+/// Build a signed `channel-share` block: ask the channel's server to offer
+/// the channel to the server `to` under `grant` (JEP-0005 rules 7, 7a).
+/// `to` is the target server's DID in canonical form. The owner, or a DID
+/// holding the `share` right, signs it; the server checks which.
+pub fn build_channel_share(
+    sender: &Identity,
+    channel_slug: &str,
+    to: &str,
+    grant: jig_core::contract::Grant,
+    hlc: HlcTimestamp,
+) -> BuiltBlock {
+    build_with_metadata(
+        sender,
+        BlockKind::ChannelShare,
+        hlc,
+        json!({
+            "channel": channel_slug,
+            "to": to,
+            "grant": grant.as_str(),
+        }),
+    )
+}
+
+/// Build a signed `channel-unshare` block: ask the channel's server to end
+/// its share with the server `to`, or withdraw an offer not yet answered
+/// (JEP-0005 rule 11). Signed as a `channel-share` must be.
+pub fn build_channel_unshare(
+    sender: &Identity,
+    channel_slug: &str,
+    to: &str,
+    hlc: HlcTimestamp,
+) -> BuiltBlock {
+    build_with_metadata(
+        sender,
+        BlockKind::ChannelUnshare,
+        hlc,
+        json!({
+            "channel": channel_slug,
+            "to": to,
+        }),
     )
 }
 
@@ -248,6 +295,22 @@ pub fn build_with_metadata(
     )
 }
 
+/// A block names the channel it acts on as the caller gave it: a `#` slug
+/// under `channel`, or the channel's id, the canonical text of its CID,
+/// under `channel_id`. A slug resolves only on the server that orders the
+/// channel, so a channel this server carries for another is named by id.
+/// That holds for MLS blocks too: a server carries a `shared` MLS channel
+/// (JEP-0014), and its members on the carrying server post to it by id.
+fn name_channel_by_id(metadata: &mut serde_json::Map<String, Value>) {
+    let by_id = metadata
+        .get("channel")
+        .and_then(Value::as_str)
+        .is_some_and(jig_core::canonical_cid::is_canonical_text);
+    if by_id && let Some(id) = metadata.remove("channel") {
+        metadata.insert(jig_pipeline::ingest::CHANNEL_ID_KEY.to_string(), id);
+    }
+}
+
 /// [`build_with_metadata`] with the content suite declared in
 /// `privacy.encryption`. `none` leaves `privacy` out, so plaintext blocks
 /// keep the exact bytes (and CIDs) they always had.
@@ -272,7 +335,8 @@ pub fn build_with_suite(
             metadata_visibility: Default::default(),
         });
     }
-    if let Value::Object(map) = metadata {
+    if let Value::Object(mut map) = metadata {
+        name_channel_by_id(&mut map);
         for (k, v) in map {
             builder = builder.metadata_entry(&k, v);
         }
@@ -315,6 +379,56 @@ mod tests {
             logical: 0,
             server_did: id.did().clone(),
         }
+    }
+
+    /// A channel named by its id is named under `channel_id`, where a
+    /// server resolves it, carried or not; a slug stays under `channel`.
+    #[test]
+    fn a_channel_named_by_its_id_is_named_under_channel_id() {
+        let id = test_identity();
+        let channel =
+            build_channel_create(&id, "#hello", "open", "did:jig:zserver", test_hlc(&id)).cid();
+        let meta = |block: &BuiltBlock| {
+            serde_json::from_slice::<BlockManifest>(&block.manifest_bytes)
+                .unwrap()
+                .metadata
+        };
+        let by_id = meta(&build_text_render(&id, &channel, "hi", test_hlc(&id)));
+        assert_eq!(
+            by_id.get("channel_id").and_then(|v| v.as_str()),
+            Some(channel.as_str())
+        );
+        assert!(!by_id.contains_key("channel"), "{by_id:?}");
+        let by_slug = meta(&build_text_render(&id, "#hello", "hi", test_hlc(&id)));
+        assert_eq!(
+            by_slug.get("channel").and_then(|v| v.as_str()),
+            Some("#hello")
+        );
+        assert!(!by_slug.contains_key("channel_id"), "{by_slug:?}");
+        // An MLS block names a channel by id the same way: a server carries
+        // a shared MLS channel too.
+        let sealed = meta(&build_sealed_text(&id, &channel, b"ct", 1, test_hlc(&id)));
+        assert_eq!(
+            sealed.get("channel_id").and_then(|v| v.as_str()),
+            Some(channel.as_str())
+        );
+        assert!(!sealed.contains_key("channel"), "{sealed:?}");
+        let remove = meta(&build_member_remove(
+            &id,
+            &channel,
+            "did:jig:zmember",
+            serde_json::json!({ "mls_commit": "AA==", "mls_epoch": 2 }),
+            test_hlc(&id),
+        ));
+        assert_eq!(
+            remove.get("channel_id").and_then(|v| v.as_str()),
+            Some(channel.as_str())
+        );
+        let sealed_by_slug = meta(&build_sealed_text(&id, "#hello", b"ct", 1, test_hlc(&id)));
+        assert!(
+            !sealed_by_slug.contains_key("channel_id"),
+            "{sealed_by_slug:?}"
+        );
     }
 
     #[test]
@@ -398,9 +512,13 @@ mod tests {
     fn build_channel_create_metadata_includes_slug_and_visibility() {
         let id = test_identity();
         let hlc = test_hlc(&id);
-        let block = build_channel_create(&id, "#room", "restricted", hlc);
+        let block = build_channel_create(&id, "#room", "restricted", "did:jig:zserver", hlc);
         let manifest: BlockManifest = serde_json::from_slice(&block.manifest_bytes).unwrap();
         assert_eq!(manifest.kind, Some(BlockKind::ChannelCreate));
+        assert_eq!(
+            manifest.metadata.get("sequencer").and_then(|v| v.as_str()),
+            Some("did:jig:zserver")
+        );
         assert_eq!(
             manifest.metadata.get("slug").and_then(|v| v.as_str()),
             Some("#room")

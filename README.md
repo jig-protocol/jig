@@ -99,7 +99,7 @@ from `curl` to "hello, world" accepted in `#hello`. CI fails above 60s; see
 
 ## Quickstart
 
-Requires Rust **1.95+** (MSRV is set by wasmtime); `rust-toolchain.toml` pins the exact toolchain CI uses, and rustup picks it up automatically. Build the two binaries:
+Requires Rust **1.97+** (MSRV is set by wasmtime); `rust-toolchain.toml` pins the exact toolchain CI uses, and rustup picks it up automatically. Build the two binaries:
 
 ```bash
 git clone https://github.com/jig-protocol/jig

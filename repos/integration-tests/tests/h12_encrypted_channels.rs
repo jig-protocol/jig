@@ -69,6 +69,7 @@ impl Api<'_> {
     async fn post(&self, path: &str, body: &Value) -> (u16, Value) {
         let resp = reqwest::Client::new()
             .post(self.url(path))
+            .header("jig-capabilities", "tiers")
             .json(body)
             .send()
             .await
@@ -179,6 +180,7 @@ async fn try_create(api: &Api<'_>, owner: &Person, slug: &str, meta: Value) -> (
         owner.hlc(),
         with(
             json!({"slug": slug, "suite": "mls",
+                   "sequencer": api.server.server_did_string,
                    "mls_group_info": STANDARD.encode(&created.group_info),
                    "mls_ratchet_tree": STANDARD.encode(&created.ratchet_tree)}),
             meta,
@@ -739,10 +741,12 @@ async fn a_restricted_channel_cannot_be_plaintext() {
     let root = tempfile::tempdir().unwrap();
     let alice = Person::new(root.path());
 
+    let sequencer = &server.server_did_string;
     let asks = [
-        json!({"slug": "#quiet", "visibility": "restricted"}),
-        json!({"slug": "#quiet", "visibility": "restricted", "suite": "none"}),
-        json!({"slug": "#quiet", "visibility": "members-only"}),
+        json!({"slug": "#quiet", "visibility": "restricted", "sequencer": sequencer}),
+        json!({"slug": "#quiet", "visibility": "restricted", "suite": "none",
+               "sequencer": sequencer}),
+        json!({"slug": "#quiet", "visibility": "members-only", "sequencer": sequencer}),
     ];
     for meta in asks {
         let block = build_with_metadata(
@@ -774,7 +778,8 @@ async fn a_restricted_channel_cannot_be_plaintext() {
         &alice.id,
         BlockKind::ChannelCreate,
         alice.hlc(),
-        json!({"slug": "#lobby", "visibility": "open"}),
+        json!({"slug": "#lobby", "visibility": "open", "tier": "public",
+               "sequencer": api.server.server_did_string}),
     );
     let (status, body) = api.post("/api/v1/channels", &submission(&open)).await;
     assert_eq!(status, 200, "{body}");

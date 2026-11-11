@@ -31,11 +31,18 @@ pub async fn run(ctx: &CliContext, channel: String, body: String) -> Result<()> 
     // for the group as it is now. Deciding which kind of channel this is can
     // fail; that stops the send rather than falling back to plaintext.
     let secure = crate::cmd::secure::Secure::open(ctx)?;
-    if secure.encrypted(&channel).await? {
+    let (encrypted, tier) = secure.encrypted_with_tier(&channel).await?;
+    if encrypted {
         secure.sync(&channel).await?;
         let cid = secure.send(&channel, &body).await?;
         println!("{cid}");
         return Ok(());
+    }
+
+    // JEP-0014 rule 5: an unencrypted channel says its tier and who can read
+    // it. On stderr, so a script reading the CID from stdout is unaffected.
+    if let Some(notice) = crate::cmd::reader::readability_notice(false, tier.as_deref()) {
+        eprintln!("note: {channel} is {notice}");
     }
 
     let id = ctx.identity()?;
