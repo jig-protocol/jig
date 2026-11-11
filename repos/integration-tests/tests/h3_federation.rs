@@ -1,178 +1,22 @@
-//! H3: Two-server federation chat with cross-server receipt parity.
+//! H3: two federated servers.
 //!
-//! THIS IS THE V0.0.2 ACCEPTANCE TEST. Alice connects to server-a, Bob
-//! connects to server-b. Alice sends a text-render block. Bob must
-//! receive it via federation within 2s, and both servers' receipts for
-//! the block must agree on render_hash.
+//! The v0.0.2 acceptance test that lived here (Alice posts on one server, Bob
+//! reads it on the other, both servers' receipts agree) ran over the legacy
+//! relay. A channel now crosses servers only by a share (JEP-0014 rule 37,
+//! #357), and the follower executes nothing it carries (JEP-0005 rule 12), so
+//! it moved to `jig-server`'s contract tests as
+//! `a_post_crosses_by_a_share_and_runs_only_on_its_owner`, over two servers
+//! peered both ways. Cross-server render agreement is
+//! `federated_render_agrees.rs`.
 //!
-//! v0.0.2 caveats observed while writing this test:
-//! 1. Each server dials the other, proves its DID in the same hello/welcome
-//!    a client speaks, and subscribes to the federation stream. The test
-//!    doesn't assert the connection is up; we just wait a beat after
-//!    add_peer.
-//! 2. Each server signs receipts with its OWN server_key — receipt_bytes
-//!    differ across servers. We compare render_hash, the deterministic
-//!    output marker (None in v0.0.2 — see H1 for the explanation).
-//! 3. The receiving server ingests a relayed block like a local submission
-//!    (see v0_0_2_federation::ingest_peer_block): it re-verifies the author's
-//!    signature, runs the write gate, executes the block and signs its own
-//!    receipt.
+//! What stays: the relay re-verifies the author of every block it brings.
 
 use std::time::Duration;
 
 use ed25519_dalek::{Signer, SigningKey};
-use futures_util::{SinkExt, StreamExt};
 use integration_tests::harness::*;
 use jig_core::{Author, BlockKind, BlockManifest, Did, HlcTimestamp};
-use jig_pipeline::{
-    Envelope, Frame, Scope,
-    persist::{StoredBlock, StoredReceipt},
-};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
-
-#[tokio::test]
-async fn two_server_federation_chat_with_receipt_parity() {
-    // Boot two TOFU-mode servers (federation handshake doesn't require NS).
-    let server_a = TestJigServer::start_copying_peers_channels()
-        .await
-        .expect("start server_a");
-    let server_b = TestJigServer::start_copying_peers_channels()
-        .await
-        .expect("start server_b");
-
-    // Bidirectional peering.
-    server_a.add_peer(&server_b).await.expect("a -> b");
-    server_b.add_peer(&server_a).await.expect("b -> a");
-    // Give the handshake + subscription dance time to settle.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let (alice, _alice_dir) = test_identity_with_dir();
-    let (_bob, _bob_dir) = test_identity_with_dir();
-
-    // Alice creates the channel on server_a. The channel-create federates
-    // like any block of an open channel, and server_b, which copies its
-    // peers' channels (`naively_accept_peer_relayed_creates`), ingests it,
-    // so #hello exists on both.
-    server_a
-        .create_channel(&alice, "#hello", "open")
-        .await
-        .expect("create_channel");
-
-    // Bob subscribes to #hello on server_b via WSS. The federation stream is
-    // for listed peers only, so a client subscribes to the channel; its row
-    // reached server_b with alice's channel-create, relayed above.
-    let ws_url_b = format!("{}/api/v1/ws", server_b.ws_url());
-    let (mut bob_ws, _) = connect_async(&ws_url_b).await.expect("bob ws connect");
-    jig_server::v0_0_2_federation::complete_client_handshake(&mut bob_ws, None)
-        .await
-        .expect("bob handshake");
-    // Signed like any real caller: the server refuses an unsigned subscribe.
-    let sub = signed_subscribe(
-        &alice,
-        Scope::Channel {
-            slug: "#hello".to_string(),
-        },
-    );
-    bob_ws
-        .send(Message::Text(serde_json::to_string(&sub).unwrap().into()))
-        .await
-        .expect("bob subscribe send");
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // Alice submits a text-render block to server_a.
-    let cid_a = server_a
-        .send_text_render(&alice, "#hello", "hi from alice (federated)")
-        .await
-        .expect("alice send");
-    assert!(!cid_a.is_empty());
-
-    // Bob must receive the block on server_b within 3s.
-    let mut bob_received_cid: Option<String> = None;
-    for _ in 0..10 {
-        let timed = tokio::time::timeout(Duration::from_secs(3), bob_ws.next()).await;
-        let Ok(Some(Ok(Message::Text(text)))) = timed else {
-            continue;
-        };
-        let env: Envelope = match serde_json::from_str(&text) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        if let Frame::Block { bundle_b64, .. } = env.frame {
-            let bundle_bytes =
-                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &bundle_b64)
-                    .expect("bundle b64");
-            let derived_cid = jig_server::v0_0_2_federation::peer_block_cid(&bundle_bytes)
-                .expect("relayed bundle has a CID");
-            // Confirm the body content matches
-            let (manifest_bytes, _): (Vec<u8>, Vec<u8>) =
-                serde_json::from_slice(&bundle_bytes).expect("tuple");
-            let manifest: jig_core::BlockManifest =
-                serde_json::from_slice(&manifest_bytes).expect("manifest");
-            if manifest
-                .metadata
-                .get("body")
-                .and_then(|v| v.as_str())
-                .map(|s| s.contains("federated"))
-                .unwrap_or(false)
-            {
-                bob_received_cid = Some(derived_cid);
-                break;
-            }
-        }
-    }
-    assert!(
-        bob_received_cid.is_some(),
-        "Bob must receive alice's federated text-render block via server_b"
-    );
-
-    // Confirm BOTH servers have the block + a receipt for it, under ONE CID:
-    // the relay derives it the way ingest does, so the block server_b
-    // delivered is the block server_a accepted, by identity.
-    let receipts_a = server_a.receipts_for(&cid_a).expect("receipts on a");
-    assert!(!receipts_a.is_empty(), "server_a must have a receipt");
-    assert_eq!(
-        bob_received_cid.as_deref(),
-        Some(cid_a.as_str()),
-        "a federated block keeps its CID across servers"
-    );
-    let receipts_b = server_b.receipts_for(&cid_a).expect("receipts on b");
-    assert!(
-        !receipts_b.is_empty(),
-        "server_b must have a receipt for the federated block under `{cid_a}`"
-    );
-
-    // Cross-server receipt parity: render_hash agreement.
-    //
-    // This is the assertion issue #5 was filed about. Until text-render actually
-    // executed, both sides produced `None` and this compared nothing to nothing —
-    // it passed no matter what either server did. The `is_some()` checks below
-    // exist so it can never silently return to that state: an equality assertion
-    // over two absent values is indistinguishable from agreement.
-    let hash_a = receipts_a[0]
-        .render_hash
-        .as_deref()
-        .expect("server_a must have executed the block and recorded a render_hash");
-    let hash_b = receipts_b[0]
-        .render_hash
-        .as_deref()
-        .expect("server_b must have executed the federated block and recorded a render_hash");
-
-    assert_eq!(
-        hash_a, hash_b,
-        "cross-server render_hash parity must hold for federated text-render: \
-         two servers independently rendering the same body must derive the same hash"
-    );
-    // Independently: server_b's receipt is its own, not server_a's relayed.
-    // Until relayed blocks went through ingest, server_b stored server_a's
-    // receipt and this parity compared server_a with itself.
-    assert!(
-        receipts_b
-            .iter()
-            .all(|r| r.server_id == server_b.server_did_string),
-        "server_b keeps only receipts it signed: {receipts_b:?}"
-    );
-}
+use jig_pipeline::persist::{StoredBlock, StoredReceipt};
 
 // ---------------------------------------------------------------------------
 // Issue #2 / alpha.1c §1.1 — forged-author peer block must be rejected.
@@ -184,13 +28,15 @@ async fn two_server_federation_chat_with_receipt_parity() {
 // against the manifest's claimed sender_did and drops the block on mismatch.
 // ---------------------------------------------------------------------------
 
-/// Construct a block bundle whose manifest claims `claimed_did` as author
-/// but is signed with `actual_signing_key`. Returns (bundle_bytes, sig_bytes).
+/// Construct a `channel-create` of `slug` whose manifest claims `claimed_did`
+/// as author but is signed with `actual_signing_key`. Returns (bundle_bytes,
+/// sig_bytes). A create, because it is the one block the relay still lands
+/// (under the copying flag): a relayed post lands in no channel (#357), so a
+/// genuine post could not be the control.
 fn build_forged_block(
     actual_signing_key: &SigningKey,
     claimed_did: &Did,
-    channel_slug: &str,
-    body: &str,
+    slug: &str,
 ) -> (Vec<u8>, Vec<u8>) {
     let manifest = BlockManifest::builder()
         .version(semver::Version::new(0, 1, 0))
@@ -199,11 +45,11 @@ fn build_forged_block(
             public_key: None,
             roles: vec![],
         })
-        .metadata_entry("channel", serde_json::json!(channel_slug))
-        .metadata_entry("body", serde_json::json!(body))
+        .metadata_entry("slug", serde_json::json!(slug))
+        .metadata_entry("tier", serde_json::json!("public"))
         .build()
         .expect("forged manifest builds")
-        .with_kind(BlockKind::TextRender)
+        .with_kind(BlockKind::ChannelCreate)
         .with_hlc(HlcTimestamp {
             wall_ms: 1_747_680_000_000,
             logical: 0,
@@ -231,7 +77,7 @@ fn inject_forged_block_into_a(
     let stored_block = StoredBlock {
         cid: block_cid.clone(),
         channel_id: None,
-        block_kind: "text-render".to_string(),
+        block_kind: "channel-create".to_string(),
         sender_did: claimed_did_str.to_string(),
         sender_sig: forged_sig.to_vec(),
         bundle_bytes: bundle_bytes.to_vec(),
@@ -286,17 +132,8 @@ async fn federated_block_with_forged_author_did_is_rejected() {
     let bob_key = SigningKey::from_bytes(&bob_secret);
     let bob_did = Did::from_ed25519_pubkey(bob_key.verifying_key().as_bytes());
 
-    // #hello must exist on srv_b, or both relays are refused there as posts
-    // to an unknown channel and the forged one proves nothing. Its
-    // channel-create federates ahead of them on the same link.
-    let (owner, _owner_dir) = test_identity_with_dir();
-    srv_a
-        .create_channel(&owner, "#hello", "open")
-        .await
-        .expect("create_channel");
-
-    // #hello is open and unencrypted, so its blocks federate. A block with
-    // no channel policy never does.
+    // Both are creates of open, unencrypted channels, so they federate. A
+    // block with no channel policy never does.
     let open_policy = jig_pipeline::fanout::DeliveryPolicy {
         open: true,
         owner_did: String::new(),
@@ -305,8 +142,7 @@ async fn federated_block_with_forged_author_did_is_rejected() {
     };
 
     // Forged block: alice signs, manifest claims bob.
-    let (forged_bundle, forged_sig) =
-        build_forged_block(&alice_key, &bob_did, "#hello", "I am bob (forged)");
+    let (forged_bundle, forged_sig) = build_forged_block(&alice_key, &bob_did, "#forged");
     let forged_cid = jig_server::v0_0_2_federation::peer_block_cid(&forged_bundle).unwrap();
 
     // Inject straight into srv_a's store + receipt table, then broadcast through
@@ -331,8 +167,7 @@ async fn federated_block_with_forged_author_did_is_rejected() {
     // block has had its turn; without it, a broken link would pass the
     // assertion below.
     let alice_did = Did::from_ed25519_pubkey(alice_key.verifying_key().as_bytes());
-    let (genuine_bundle, genuine_sig) =
-        build_forged_block(&alice_key, &alice_did, "#hello", "I am alice");
+    let (genuine_bundle, genuine_sig) = build_forged_block(&alice_key, &alice_did, "#genuine");
     let genuine_cid = jig_server::v0_0_2_federation::peer_block_cid(&genuine_bundle).unwrap();
     let (genuine_block, genuine_receipt) = inject_forged_block_into_a(
         &srv_a.state,

@@ -3211,12 +3211,30 @@ mod tests {
         // never took it (stored as such, as a lost relay leaves it).
         let own = m.own_post(&channel);
         eventually("the relay's copy on b", || {
-            Mutual::held(&m.b, &first).then_some(())
+            Mutual::held(&m.b, &channel).then_some(())
         })
         .await;
-        assert_eq!(
-            m.b.ingest_ctx.store.relayed_copies().unwrap(),
-            std::slice::from_ref(&channel)
+        // The relay brings no post into the copy `b` sequences (#357): `a`'s
+        // first post comes by the contract or not at all.
+        let sentinel = post(
+            &m.a,
+            &m.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#k-sentinel", "tier": "public"}),
+        )
+        .await
+        .unwrap();
+        eventually("the relay past a's first post", || {
+            Mutual::held(&m.b, &sentinel).then_some(())
+        })
+        .await;
+        assert!(!Mutual::held(&m.b, &first));
+        assert!(
+            m.b.ingest_ctx
+                .store
+                .relayed_copies()
+                .unwrap()
+                .contains(&channel)
         );
 
         post(
@@ -3252,16 +3270,12 @@ mod tests {
         // `b` never acted as the owner, and its copy is set aside, whole,
         // under its own id: `a`'s chain lands under the channel's.
         let b_store = &m.b.ingest_ctx.store;
-        assert!(b_store.relayed_copies().unwrap().is_empty());
+        assert!(!b_store.relayed_copies().unwrap().contains(&channel));
         let copy_id = jig_pipeline::ingest_record::label_cid(&format!("relayed-copy:{channel}"));
         let copy = b_store.get_channel_by_id(&copy_id).unwrap().unwrap();
         assert!(copy.slug.starts_with("#jig/relayed-"), "{}", copy.slug);
         let kept = b_store.quarantined_records(&copy_id).unwrap();
-        assert_eq!(
-            kept.len(),
-            2,
-            "b's records of its copy, kept: the create and the first post"
-        );
+        assert_eq!(kept.len(), 1, "b's records of its copy, kept: the create");
         for state in [OfferState::Held, OfferState::Accepted, OfferState::Refused] {
             assert!(
                 b_store
@@ -3368,7 +3382,9 @@ mod tests {
             Err(IngestError::CarriedChannel { .. })
         ));
 
-        // The relay still carries what is not shared, both ways.
+        // The relay carries no post of a channel that is not shared, either
+        // way (#357): `a` holds `b`'s create, a copy `a` sequences, and refuses
+        // `b`'s posts into it, as `b` refuses `a`'s into its own.
         let elsewhere = post(
             &m.b,
             &m.user,
@@ -3377,25 +3393,39 @@ mod tests {
         )
         .await
         .unwrap();
-        let on_b = m.text(&m.b, &elsewhere, "from b").await.unwrap();
         eventually("b's open channel on a", || {
-            Mutual::held(&m.a, &on_b).then_some(())
+            Mutual::held(&m.a, &elsewhere).then_some(())
         })
         .await;
-        let on_a = m.text(&m.a, &elsewhere, "from a").await.unwrap();
-        eventually("a's post on b", || Mutual::held(&m.b, &on_a).then_some(())).await;
+        let on_b = m.text(&m.b, &elsewhere, "from b").await.unwrap();
+        let after_b = post(
+            &m.b,
+            &m.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#elsewhere-after", "tier": "public"}),
+        )
+        .await
+        .unwrap();
+        eventually("the relay past b's post", || {
+            Mutual::held(&m.a, &after_b).then_some(())
+        })
+        .await;
+        assert!(!Mutual::held(&m.a, &on_b), "b's post is refused on a");
     }
 
-    /// Two peers that each have their own `#general`: the relay lands `a`'s
-    /// posts, which name the channel by slug as clients post them, in `b`'s
-    /// own `#general`. Once `b` follows `a`'s, `a`'s chain names a block `b`
-    /// holds in its own channel. `b` leaves it there, stalls, and says so.
+    /// Two peers that each have their own `#general`. The relay used to land
+    /// `a`'s posts, which name the channel by slug as clients post them, in
+    /// `b`'s own `#general`, and once `b` followed `a`'s, `a`'s chain named a
+    /// block `b` held in its own channel, and the carried channel stalled
+    /// (#357). Now `b` refuses a relayed post into a channel it sequences:
+    /// `b`'s `#general` keeps only its own posts, and the share carries
+    /// `a`'s channel to `a`'s head.
     #[tokio::test]
-    async fn a_same_slug_channel_stalls_the_carried_one_visibly() {
+    async fn a_same_slug_channel_no_longer_stalls_the_carried_one() {
         let m = mutual().await;
-        // Made by another user: the same author's create of the same slug is
-        // the same block, so the same channel.
-        let ours = post(
+        // `b`'s own `#general`, made by another user: the same author's
+        // create of the same slug is the same block, so the same channel.
+        let _ours = post(
             &m.b,
             &SigningKey::from_bytes(&rand::random()),
             BlockKind::ChannelCreate,
@@ -3419,19 +3449,24 @@ mod tests {
         )
         .await
         .unwrap();
-        eventually("a's post in b's own #general", || {
-            Mutual::held(&m.b, &text).then_some(())
+        // The relay delivers in order: once a create made after the post is
+        // on `b`, the post had its turn.
+        let after = post(
+            &m.a,
+            &m.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#after", "tier": "public"}),
+        )
+        .await
+        .unwrap();
+        eventually("the relay past a's post", || {
+            Mutual::held(&m.b, &after).then_some(())
         })
         .await;
         let b_store = &m.b.ingest_ctx.store;
-        assert_eq!(
-            b_store
-                .get_block(&text)
-                .unwrap()
-                .unwrap()
-                .channel_id
-                .as_deref(),
-            Some(ours.as_str())
+        assert!(
+            b_store.get_block(&text).unwrap().is_none(),
+            "a's slug-named post is refused, not landed in b's own #general"
         );
 
         post(
@@ -3454,18 +3489,25 @@ mod tests {
                 .then_some(())
         })
         .await;
-        m.b_follows.stream.pull_all();
-        let stall = eventually("the stall", || b_store.carried_stalls().unwrap().pop()).await;
-        assert_eq!(
-            (
-                stall.channel_id.as_str(),
-                stall.seq,
-                stall.block_cid.as_str()
-            ),
-            (channel.as_str(), 1, text.as_str())
+        // `a`'s head moves on as the contract's own records land: compare
+        // with it as it stands, past the post.
+        let posted =
+            m.a.ingest_ctx
+                .store
+                .get_ingest_record(&text)
+                .unwrap()
+                .unwrap()
+                .seq;
+        eventually("b at a's head", || {
+            m.b_follows.stream.pull_all();
+            let a_head = Pair::head(&m.a, &channel);
+            (a_head >= Some(posted) && Pair::head(&m.b, &channel) == a_head).then_some(())
+        })
+        .await;
+        assert!(
+            b_store.carried_stalls().unwrap().is_empty(),
+            "nothing stalls"
         );
-        assert_eq!(stall.holder, ours);
-        // `b`'s own channel keeps its block, and its chain still names it.
         assert_eq!(
             b_store
                 .get_block(&text)
@@ -3473,23 +3515,24 @@ mod tests {
                 .unwrap()
                 .channel_id
                 .as_deref(),
-            Some(ours.as_str())
+            Some(channel.as_str()),
+            "a's post came by the contract, into a's channel"
         );
-        assert_eq!(b_store.get_ingest_record(&text).unwrap().unwrap().seq, 1);
-        // An operator sees it without reading logs.
-        let listed = operate(b_store, Operation::List).unwrap();
         assert!(
-            listed.contains(&format!(
-                "stalled: channel {channel} stalled at seq 1: block {text} is held in channel {ours}"
-            )),
-            "{listed}"
+            b_store
+                .get_ingest_record(&text)
+                .unwrap()
+                .is_some_and(|r| r.channel_id == channel),
+            "b's own #general does not name it"
         );
     }
 
     /// Once `b` follows `a`'s `#general`, `a`'s relay of a post that names
     /// it by slug is dropped: the slug here names only `b`'s own channel, so
     /// taking it would land `a`'s post there. The same slug from a peer that
-    /// does not sequence the carried channel still names `b`'s own.
+    /// does not sequence the carried channel names `b`'s own, which `b`
+    /// sequences, so it is refused too (#357): by slug or by id, a relayed
+    /// post lands in no channel `b` orders.
     #[tokio::test]
     async fn a_slug_named_relay_of_a_carried_channel_is_dropped() {
         let m = mutual().await;
@@ -3574,16 +3617,100 @@ mod tests {
             did_of(&SigningKey::from_bytes(&rand::random())),
             OfferPolicy::Hold,
         );
-        let landed = relay(&other, "from another peer, by slug").await;
-        assert_eq!(
+        let refused = relay(&other, "from another peer, by slug").await;
+        assert!(
+            b_store.get_block(&refused).unwrap().is_none(),
+            "a relayed post into b's own #general is refused"
+        );
+        assert!(
+            b_store.get_channel_by_id(&ours).unwrap().is_some(),
+            "b's #general is there: the refusal is not an unknown channel"
+        );
+    }
+
+    /// The v0.0.2 acceptance case (once `integration-tests` H3), on the one
+    /// path a channel now crosses servers by (JEP-0014 rule 37, #357): Alice
+    /// posts on `a`, and `b`, following `a`'s shared channel, holds the same
+    /// block under the same CID, in `a`'s records byte for byte.
+    ///
+    /// `b` executed nothing: a carried block has no receipt of the follower's
+    /// (JEP-0005 rule 12; `crate::follow`). H3 compared two servers'
+    /// `render_hash`es, which only the legacy relay, re-running each block on
+    /// the receiver, could give. Cross-server render agreement is
+    /// `integration-tests/tests/federated_render_agrees.rs`. This fails if a
+    /// follower starts executing carried blocks without that being decided.
+    #[tokio::test]
+    async fn a_post_crosses_by_a_share_and_runs_only_on_its_owner() {
+        let m = mutual().await;
+        let channel = post(
+            &m.a,
+            &m.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#hello", "tier": "public"}),
+        )
+        .await
+        .unwrap();
+        post(
+            &m.a,
+            &m.user,
+            BlockKind::ChannelShare,
+            serde_json::json!({
+                "channel_id": channel,
+                "to": m.b.server_did.to_did_jig_string(),
+                "grant": "read",
+            }),
+        )
+        .await
+        .unwrap();
+        let a_did = m.a.server_did.to_did_jig_string();
+        let b_store = &m.b.ingest_ctx.store;
+        eventually("the share accepted", || {
             b_store
-                .get_block(&landed)
+                .has_accepted_share(&channel, &a_did)
+                .unwrap()
+                .then_some(())
+        })
+        .await;
+
+        let text = m.text(&m.a, &channel, "hi from alice").await.unwrap();
+        // `a`'s head moves on as the contract's own records land: compare
+        // with it as it stands, past the post.
+        let posted =
+            m.a.ingest_ctx
+                .store
+                .get_ingest_record(&text)
                 .unwrap()
                 .unwrap()
-                .channel_id
-                .as_deref(),
-            Some(ours.as_str()),
-            "the same slug from a non-sequencer peer names b's own channel"
+                .seq;
+        let want = eventually("b at a's head", || {
+            m.b_follows.stream.pull_all();
+            let a_head = Pair::head(&m.a, &channel);
+            (a_head >= Some(posted) && Pair::head(&m.b, &channel) == a_head)
+                .then_some(a_head.unwrap())
+        })
+        .await;
+        let landed = b_store.get_block(&text).unwrap().unwrap();
+        assert_eq!(landed.channel_id.as_deref(), Some(channel.as_str()));
+        for seq in 0..=want {
+            assert_eq!(
+                b_store.ingest_record_bytes(&channel, seq).unwrap(),
+                m.a.ingest_ctx
+                    .store
+                    .ingest_record_bytes(&channel, seq)
+                    .unwrap(),
+                "seq {seq}"
+            );
+        }
+
+        let on_a = m.a.ingest_ctx.store.get_receipts_for_block(&text).unwrap();
+        assert!(
+            on_a.iter().any(|r| r.render_hash.is_some()),
+            "a executed the block: {on_a:?}"
+        );
+        let on_b = b_store.get_receipts_for_block(&text).unwrap();
+        assert!(
+            on_b.is_empty(),
+            "b carries the block and executed nothing: {on_b:?}"
         );
     }
 
@@ -3618,7 +3745,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let sentinel = m.text(&m.a, &channel, "after").await.unwrap();
+        // A relayed post lands nowhere here (#357): the sentinel is a create,
+        // which the relay delivers after the share.
+        let sentinel = post(
+            &m.a,
+            &m.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#sentinel", "tier": "public"}),
+        )
+        .await
+        .unwrap();
         eventually("the relay past the share", || {
             Mutual::held(&m.b, &sentinel).then_some(())
         })

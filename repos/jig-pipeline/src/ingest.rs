@@ -318,6 +318,15 @@ pub enum IngestError {
         channel_id: String,
         sequencer: String,
     },
+    /// A block a peer's legacy relay brought for a channel this server
+    /// sequences (JEP-0014 rule 37, #357). The relay would give the channel's
+    /// posts a second order: a channel crosses servers only by a share, and
+    /// a peer's users post through its grant.
+    #[error(
+        "`{kind}` refused: {RELAYED_INTO_SEQUENCED}: channel {channel_id} is sequenced \
+         here, and a peer's relay does not post to it; share the channel to carry it"
+    )]
+    RelayedIntoSequencedChannel { kind: String, channel_id: String },
     /// A relayed block for a channel the relaying server's share does not
     /// cover (JEP-0005 rule 15).
     #[error("`{kind}` refused: `{via}` relayed it outside its share of channel {channel_id}")]
@@ -670,6 +679,20 @@ pub async fn ingest(
             kind: kind_str.to_string(),
             channel_id: chan.id.clone(),
             sequencer: chan.sequencer_did.clone(),
+        });
+    }
+    // The legacy relay's blocks for a channel this server sequences: a peer
+    // posting into it this way would order the channel's posts a second
+    // time, as its own copy does (#357). A channel crosses servers only by a
+    // share (JEP-0014 rule 37). A channel-create names the channel it makes,
+    // which is not yet here: rule 1 and the sequencer binding judge it.
+    if let IngestSource::FederatedPeer { .. } = &source
+        && kind != BlockKind::ChannelCreate
+        && let Some(chan) = resolved_channel.as_ref()
+    {
+        return Err(IngestError::RelayedIntoSequencedChannel {
+            kind: kind_str.to_string(),
+            channel_id: chan.id.clone(),
         });
     }
 
@@ -1413,6 +1436,10 @@ fn self_join_admitted(
 ///
 /// Archived channels resolve too, so the caller can tell "retired" from "no
 /// such channel".
+/// The reason a refusal of a peer-relayed block into a channel this server
+/// sequences is logged under (JEP-0014 rule 37). Stable: operators grep for it.
+pub const RELAYED_INTO_SEQUENCED: &str = "relayed-into-sequenced-channel";
+
 pub fn channel_id_of(
     store: &SqliteStore,
     kind: BlockKind,

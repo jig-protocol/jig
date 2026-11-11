@@ -1422,8 +1422,124 @@ mod tests {
         );
     }
 
+    /// A post a peer relays into a channel this server sequences is refused,
+    /// whether it names the channel by slug or by id (JEP-0014 rule 37,
+    /// #357): the relay would order the channel's posts a second time. The
+    /// same post from this server's own client lands, so the refusal is the
+    /// relay's, not the channel's or the author's.
+    #[tokio::test]
+    async fn a_relayed_post_into_a_channel_sequenced_here_is_refused() {
+        use jig_pipeline::ingest::{IngestError, IngestSource, ingest};
+        let state = Arc::new(AppState::for_test().unwrap());
+        let id = jig_pipeline::ingest_record::label_cid("#ours");
+        state
+            .ingest_ctx
+            .store
+            .upsert_channel(&jig_pipeline::persist::StoredChannel {
+                id: id.clone(),
+                slug: "#ours".into(),
+                visibility: "open".into(),
+                created_at: 0,
+                owner_did: "did:jig:zOwner".into(),
+                suite: "none".into(),
+                sequencer_did: state.server_did.to_did_jig_string(),
+                co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
+            })
+            .unwrap();
+        let author = ed25519_dalek::SigningKey::from_bytes(&rand::random());
+        let from_peer = || IngestSource::FederatedPeer {
+            peer_did: jig_core::Did::from_str_unchecked("did:jig:zPeer".to_string()),
+            peer_url: "wss://test-peer".to_string(),
+        };
+
+        for (how, metadata) in [
+            (
+                "by slug",
+                serde_json::json!({"channel": "#ours", "body": "by slug"}),
+            ),
+            (
+                "by id",
+                serde_json::json!({"channel_id": id, "body": "by id"}),
+            ),
+        ] {
+            let (bundle_bytes, bundle_b64, sig_b64) =
+                relayed(&author, BlockKind::TextRender, metadata.clone());
+            let (manifest_bytes, code_bytes): (Vec<u8>, Vec<u8>) =
+                serde_json::from_slice(&bundle_bytes).unwrap();
+            let sig = base64::engine::general_purpose::STANDARD
+                .decode(&sig_b64)
+                .unwrap();
+            let refused = ingest(
+                &state.ingest_ctx,
+                jig_core::BlockBundle {
+                    manifest_bytes: &manifest_bytes,
+                    code_bytes: &code_bytes,
+                    resources: vec![],
+                },
+                sig,
+                from_peer(),
+            )
+            .await;
+            assert!(
+                matches!(
+                    &refused,
+                    Err(IngestError::RelayedIntoSequencedChannel { channel_id, .. })
+                        if *channel_id == id
+                ),
+                "{how}: {refused:?}"
+            );
+            assert!(
+                refused
+                    .unwrap_err()
+                    .to_string()
+                    .contains(jig_pipeline::ingest::RELAYED_INTO_SEQUENCED),
+                "{how}: the log line carries the stable reason"
+            );
+
+            // Through the relay's entry point: logged and dropped, never an
+            // error that would end the peer's link or stop a catch-up.
+            ingest_peer_block(&state, &test_peer(), &bundle_b64, Some(&sig_b64), "d:ours")
+                .await
+                .unwrap();
+            let cid = peer_block_cid(&bundle_bytes).unwrap();
+            assert!(
+                state.ingest_ctx.store.get_block(&cid).unwrap().is_none(),
+                "{how}"
+            );
+        }
+
+        // Control: this server's own client posts the same way, and it lands.
+        let (bundle_bytes, _, sig_b64) = relayed(
+            &author,
+            BlockKind::TextRender,
+            serde_json::json!({"channel_id": id, "body": "from a client here"}),
+        );
+        let (manifest_bytes, code_bytes): (Vec<u8>, Vec<u8>) =
+            serde_json::from_slice(&bundle_bytes).unwrap();
+        ingest(
+            &state.ingest_ctx,
+            jig_core::BlockBundle {
+                manifest_bytes: &manifest_bytes,
+                code_bytes: &code_bytes,
+                resources: vec![],
+            },
+            base64::engine::general_purpose::STANDARD
+                .decode(&sig_b64)
+                .unwrap(),
+            IngestSource::LocalClient {
+                conn_id: 0,
+                tiers: true,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
     /// Admission runs on relayed blocks: an author this server bans is
-    /// refused whichever server it posted through.
+    /// refused whichever server it posted through. A relayed post lands in no
+    /// channel here (#357), so the block is the one a relay still lands, a
+    /// peer's channel-create under the copying flag.
     #[tokio::test]
     async fn a_banned_author_is_refused_from_a_peer_too() {
         let banned = ed25519_dalek::SigningKey::from_bytes(&rand::random());
@@ -1431,28 +1547,13 @@ mod tests {
             .to_did_jig_string();
         let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
         config.auth.admission.banned_dids = vec![banned_did];
+        config.federation.naively_accept_peer_relayed_creates = true;
         let state = Arc::new(AppState::for_test_with_config(config).unwrap());
-        // A relayed post needs a channel this server holds.
-        state
-            .ingest_ctx
-            .store
-            .upsert_channel(&jig_pipeline::persist::StoredChannel {
-                id: jig_pipeline::ingest_record::label_cid("#remote"),
-                slug: "#remote".into(),
-                visibility: "open".into(),
-                created_at: 0,
-                owner_did: "did:jig:zOwner".into(),
-                suite: "none".into(),
-                sequencer_did: String::new(),
-                co_owners: Vec::new(),
-                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
-            })
-            .unwrap();
 
         let (bundle_bytes, bundle_b64, sig_b64) = relayed(
             &banned,
-            BlockKind::TextRender,
-            serde_json::json!({"channel": "#remote", "body": "hi"}),
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#from-banned", "tier": "public"}),
         );
         ingest_peer_block(
             &state,
@@ -1471,8 +1572,8 @@ mod tests {
         let admitted = ed25519_dalek::SigningKey::from_bytes(&rand::random());
         let (bundle_bytes, bundle_b64, sig_b64) = relayed(
             &admitted,
-            BlockKind::TextRender,
-            serde_json::json!({"channel": "#remote", "body": "hi"}),
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#from-admitted", "tier": "public"}),
         );
         ingest_peer_block(&state, &test_peer(), &bundle_b64, Some(&sig_b64), "d:ok")
             .await

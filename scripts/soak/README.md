@@ -24,52 +24,34 @@ scripts/soak/two-host-soak.sh ~/soak.env
 
 Every setting is listed at the top of the script.
 
-## Two paths
+## The path
 
-`SOAK_PATH` picks how the channel reaches B:
-
-- **`contract`** (the default): A shares the channel with B (JEP-0005,
-  `jig channel share`), and B follows A's ordered records, pulling what it
-  missed after any outage. Only A posts, and B reads the channel by its id.
-  B's peer entry for A must accept offers: local mode sets
-  `offers = "accept"`, and in remote mode you set it.
-- **`legacy`**: the relay every pair of peers runs for open channels. Both
-  sides post. It works only between servers from v0.2.0-alpha.4 or earlier:
-  since then a channel-create names the server that orders it, and a peer
-  takes a new channel only once it is shared. A server with
-  `[federation] naively_accept_peer_relayed_creates` stores the copy, but
-  clients refuse to read it, because its creation block names another
-  server.
+The channel reaches B by a share: A shares it with B (JEP-0005,
+`jig channel share`), and B follows A's ordered records, pulling what it
+missed after any outage. Only A posts, and B reads the channel by its id.
+B's peer entry for A must accept offers: local mode sets
+`offers = "accept"`, and in remote mode you set it.
 
 ```sh
-# The contract path, with A and B restarted in turn every 5 minutes:
-SOAK_PATH=contract SOAK_RESTART_EVERY=300 SOAK_RESTART_SIDE=alternate \
+# A and B restarted in turn every 5 minutes:
+SOAK_RESTART_EVERY=300 SOAK_RESTART_SIDE=alternate \
   SOAK_DURATION=3600 scripts/soak/two-host-soak.sh
 ```
 
-Before a channel-create named its sequencer, the legacy relay delivered a new
-open channel to B within seconds, and B took it as a channel it ordered
-itself; a share made after that was accepted but carried nothing. The contract
-path's default setup, `SOAK_CONTRACT_SETUP=isolated`, still creates and shares
-the channel while B is down, so everything B gets comes by the contract even
-against servers that predate that change. In remote mode this needs
-`SOAK_B_STOP_CMD` and `SOAK_B_START_CMD`. `SOAK_CONTRACT_SETUP=steady` shares
-with both up instead; against such older servers the run fails at setup,
+The default setup, `SOAK_CONTRACT_SETUP=isolated`, creates and shares the
+channel while B is down, so everything B gets comes by the contract. In
+remote mode this needs `SOAK_B_STOP_CMD` and `SOAK_B_START_CMD`.
+`SOAK_CONTRACT_SETUP=steady` shares with both up instead. Against servers
+from before a channel-create named its sequencer (v0.2.0-alpha.4 and
+earlier), the relay copies the channel to B first, and the run fails at setup,
 naming that collision.
 
-## Concurrent ingest
-
-`SOAK_INGEST=concurrent` (legacy path only) runs `SOAK_WRITERS` writers on
-each side (16 by default), and every writer on both sides posts on the same
-tick. Each server then orders its own client's posts and the other server's
-relayed ones into the channel at the same moment. Every read holds the page
-to the chain of signed ingest records the reader pinned for the channel; a
-server that signs two records with one sequence number, rewinds its clock or
-rewrites a record breaks that chain, and the client keeps the evidence.
-
-```sh
-SOAK_INGEST=concurrent SOAK_INTERVAL=2 SOAK_DURATION=600 scripts/soak/two-host-soak.sh
-```
+**Retired in v0.2.0-alpha.6 (#357):** `SOAK_PATH=legacy` (both sides posting
+over the peers' open-channel relay) and `SOAK_INGEST=concurrent` with
+`SOAK_WRITERS` (writers on both sides posting on one tick, which needed the
+legacy path). A server now refuses any post a peer relays into a channel it
+orders, so neither can run. The script refuses both with that reason. To soak
+older servers, run the script from v0.2.0-alpha.5.
 
 ## Remote mode
 
@@ -149,7 +131,8 @@ Latency is the first sighting minus the send time, so its resolution is
   `contract-refuse`. A share then delivers nothing. `SOAK_CONTRACT_SETUP=steady`
   shows it.
 - **Concurrent ingest signed a clock that ran backwards (fixed by #347).**
-  With 16 writers a side posting on the same tick, a build without #347
+  Found with the retired concurrent mode. With 16 writers a side posting on
+  the same tick, a build without #347
   signed record 605 with an older clock than record 604 within two minutes.
   Alice's client kept the proof (`chain-clock-backwards`) and refused her
   own server from then on, so every later send from A failed. With 4 writers
