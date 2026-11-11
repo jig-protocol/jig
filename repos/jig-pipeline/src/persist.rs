@@ -9,6 +9,9 @@
 //! denormalized columns (`render_hash`, `sender_did`, `block_kind`, etc.)
 //! are read-optimization indexes whose source of truth is the canonical bytes.
 
+use jig_core::tier::{
+    HistoryPolicy, JoinRole, JoinServers, LegacyTier, StoredTier, Tier, legacy_tier,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
@@ -91,6 +94,82 @@ pub struct StoredChannel {
     /// channel's life. With `owner_did` (the creator) they are the channel's
     /// root owners: every right, never unassigned (JEP-0005 rule 7b).
     pub co_owners: Vec<String>,
+    /// The channel's tier and the terms that go with it (JEP-0014), fixed at
+    /// creation. A channel from before tiers holds what rule 21 maps it to.
+    pub tiering: ChannelTiering,
+}
+
+/// A channel's tier and its tier terms, as stored (JEP-0014). Fixed for the
+/// channel's life, like its suite.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ChannelTiering {
+    pub tier: StoredTier,
+    /// The lowest server role that may self-join: set for `server` and
+    /// `shared` channels only (rules 12 and 13).
+    pub join: Option<JoinRole>,
+    /// Whose roles count for a self-join: set for `shared` channels only
+    /// (rule 13).
+    pub join_servers: Option<JoinServers>,
+    /// Whether members may re-share history (rule 17, reserved).
+    pub history: HistoryPolicy,
+    /// The 1:1 a group was grown from (rule 19), as a channel id.
+    pub from_dm: Option<String>,
+    /// The frozen channel this one succeeds (rule 23), as a channel id.
+    pub successor_of: Option<String>,
+}
+
+impl ChannelTiering {
+    /// Whether the channel's tier takes self-joins on a join rule: `server`
+    /// and `shared` (JEP-0014 rules 12 and 13).
+    pub fn takes_self_join(&self) -> bool {
+        use jig_core::tier::{StoredTier, Tier};
+        matches!(self.tier, StoredTier::Tier(Tier::Server | Tier::Shared))
+    }
+
+    /// `tier`, with the defaults its creation block would carry: `join =
+    /// member` for `server` and `shared`, `join_servers = owner` for `shared`.
+    pub fn of(tier: Tier) -> Self {
+        Self {
+            tier: tier.into(),
+            join: tier.takes_join().then_some(JoinRole::default()),
+            join_servers: tier.takes_join_servers().then_some(JoinServers::default()),
+            history: HistoryPolicy::default(),
+            from_dm: None,
+            successor_of: None,
+        }
+    }
+
+    /// The tier a channel with this stored visibility and suite has when it
+    /// was created with one: `open` plaintext is `public`, `open` `mls` is
+    /// `server` with `join = guest`, `restricted` `mls` is `private`. A
+    /// `restricted` plaintext channel has no tier and is frozen. For rows a
+    /// caller writes directly, such as fixtures; ingest reads the block's own
+    /// terms instead.
+    pub fn current(visibility: &str, suite: &str) -> Self {
+        let open = crate::visibility::is_open(visibility);
+        match (suite, open) {
+            ("none", true) => Self::of(Tier::Public),
+            ("mls", true) => Self {
+                join: Some(JoinRole::Guest),
+                ..Self::of(Tier::Server)
+            },
+            ("mls", false) => Self::of(Tier::Private),
+            _ => Self::legacy("", visibility, suite),
+        }
+    }
+
+    /// What a channel created before tiers is read as (rule 21).
+    pub fn legacy(slug: &str, visibility: &str, suite: &str) -> Self {
+        let LegacyTier { tier, join } = legacy_tier(slug, visibility, suite);
+        Self {
+            tier,
+            join,
+            join_servers: None,
+            history: HistoryPolicy::default(),
+            from_dm: None,
+            successor_of: None,
+        }
+    }
 }
 
 impl StoredChannel {
@@ -223,6 +302,46 @@ fn row_to_stored_block(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredBlock> {
 /// History order is (HLC wall, logical, origin, CID). The CID makes it total:
 /// one author's blocks in the same millisecond share the rest, and without it
 /// a page boundary between two of them could skip one.
+/// What a window of history selects: its rows, or each row's id and the
+/// bytes it stores (bundle, signature and receipts), which is enough to
+/// choose the rows of a page before loading any of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Select {
+    Rows,
+    Sizes,
+}
+
+impl Select {
+    /// The select list, with each column qualified by `table` (`b.` or
+    /// `blocks.`). Never empty: the receipt subquery's `receipts` has a
+    /// `cid` of its own, which an unqualified `cid` would name.
+    fn list(self, table: &str) -> String {
+        match self {
+            Select::Rows => BLOCK_COLUMNS
+                .split(", ")
+                .map(|c| format!("{table}{}", c.trim()))
+                .collect::<Vec<_>>()
+                .join(", "),
+            Select::Sizes => format!(
+                "{table}cid, length({table}bundle_bytes) + ifnull(length({table}sender_sig), 0) \
+                 + ifnull((SELECT SUM(length(rc.receipt_bytes)) FROM receipts rc \
+                 WHERE rc.block_cid = {table}cid), 0)"
+            ),
+        }
+    }
+}
+
+/// The newest `?2` blocks of channel `?1`, by the authors' clocks.
+fn history_newest_sql(select: Select) -> String {
+    let columns = select.list("blocks.");
+    format!(
+        "SELECT {columns} FROM blocks \
+         WHERE channel_id = ?1 \
+         ORDER BY hlc_wall_ms DESC, hlc_logical DESC, hlc_origin DESC, cid DESC \
+         LIMIT ?2"
+    )
+}
+
 fn history_sql(with_cursor: bool) -> String {
     if with_cursor {
         format!(
@@ -232,23 +351,19 @@ fn history_sql(with_cursor: bool) -> String {
              LIMIT ?4"
         )
     } else {
-        format!(
-            "SELECT {BLOCK_COLUMNS} FROM blocks \
-             WHERE channel_id = ?1 \
-             ORDER BY hlc_wall_ms DESC, hlc_logical DESC, hlc_origin DESC, cid DESC \
-             LIMIT ?2"
-        )
+        history_newest_sql(Select::Rows)
     }
 }
 
 /// History of a sequenced channel, newest first: by the sequencer's `seq`,
 /// not the authors' clocks (TM-02). `before_seq` bounds it for paging.
 fn sequenced_history_sql(with_before: bool) -> String {
-    let columns = BLOCK_COLUMNS
-        .split(", ")
-        .map(|c| format!("b.{}", c.trim()))
-        .collect::<Vec<_>>()
-        .join(", ");
+    sequenced_window_sql(with_before, Select::Rows)
+}
+
+/// A sequenced channel's window by `seq`, newest first, selecting `select`.
+fn sequenced_window_sql(with_before: bool, select: Select) -> String {
+    let columns = select.list("b.");
     let bound = if with_before { "AND r.seq < ?3" } else { "" };
     format!(
         "SELECT {columns} FROM ingest_records r JOIN blocks b ON b.cid = r.block_cid \
@@ -259,8 +374,15 @@ fn sequenced_history_sql(with_before: bool) -> String {
 /// The statement behind [`SqliteStore::list_blocks_before`]: the page just
 /// older than a cursor block, newest first, on the same index and order.
 fn history_before_sql() -> String {
+    history_before_window_sql(Select::Rows)
+}
+
+/// The window just older than a cursor block, by the authors' clocks,
+/// newest first, selecting `select`.
+fn history_before_window_sql(select: Select) -> String {
+    let columns = select.list("blocks.");
     format!(
-        "SELECT {BLOCK_COLUMNS} FROM blocks \
+        "SELECT {columns} FROM blocks \
          WHERE channel_id = ?1 \
            AND (hlc_wall_ms, hlc_logical, hlc_origin, cid) < (?2, ?3, ?4, ?5) \
          ORDER BY hlc_wall_ms DESC, hlc_logical DESC, hlc_origin DESC, cid DESC \
@@ -466,11 +588,46 @@ fn row_to_stored_alias_attestation(
     })
 }
 
+/// Parse a stored identifier, or fail the row: a value this build does not know
+/// is corruption, never a default.
+fn parse_column<T: std::str::FromStr>(r: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<T>
+where
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    let text: String = r.get(idx)?;
+    text.parse().map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, Box::new(e))
+    })
+}
+
+fn parse_optional_column<T: std::str::FromStr>(
+    r: &rusqlite::Row<'_>,
+    idx: usize,
+) -> rusqlite::Result<Option<T>>
+where
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    match r.get::<_, Option<String>>(idx)? {
+        None => Ok(None),
+        Some(text) => text.parse().map(Some).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, Box::new(e))
+        }),
+    }
+}
+
 fn row_to_stored_channel(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredChannel> {
     let co_owners: String = r.get(7)?;
     let co_owners: Vec<String> = serde_json::from_str(&co_owners).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
     })?;
+    let tiering = ChannelTiering {
+        tier: parse_column(r, 8)?,
+        join: parse_optional_column(r, 9)?,
+        join_servers: parse_optional_column(r, 10)?,
+        history: parse_column(r, 11)?,
+        from_dm: r.get(12)?,
+        successor_of: r.get(13)?,
+    };
     Ok(StoredChannel {
         id: r.get(0)?,
         slug: r.get(1)?,
@@ -480,11 +637,46 @@ fn row_to_stored_channel(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredChanne
         suite: r.get(5)?,
         sequencer_did: r.get(6)?,
         co_owners,
+        tiering,
     })
 }
 
-const CHANNEL_COLUMNS: &str =
-    "id, slug, visibility, created_at, owner_did, suite, sequencer_did, co_owners";
+const CHANNEL_COLUMNS: &str = "id, slug, visibility, created_at, owner_did, suite, sequencer_did, \
+     co_owners, tier, join_role, join_servers, history, from_dm, successor_of";
+
+/// Add the tier columns (JEP-0014) and give every row without a tier the one
+/// rule 21 maps it to: `open` `#jig/` plaintext channels are `public`, `restricted`
+/// `mls` ones `private`, `open` `mls` ones `server` with `join = guest`, and
+/// plaintext channels otherwise `frozen`.
+///
+/// `tier` is added as `NOT NULL DEFAULT ''`, and `''` means "not yet mapped":
+/// the backfill runs on every open, so a row can never keep it. Runs after
+/// [`rebuild_channels_slug_per_sequencer`], which rebuilds the table without
+/// these columns.
+fn add_channel_tiers(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "channels", "tier", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "channels", "join_role", "TEXT")?;
+    add_column_if_missing(conn, "channels", "join_servers", "TEXT")?;
+    add_column_if_missing(conn, "channels", "history", "TEXT NOT NULL DEFAULT 'none'")?;
+    add_column_if_missing(conn, "channels", "from_dm", "TEXT")?;
+    add_column_if_missing(conn, "channels", "successor_of", "TEXT")?;
+    let tx = conn.unchecked_transaction()?;
+    let untiered: Vec<(String, String, String, String)> = {
+        let mut stmt =
+            tx.prepare("SELECT id, slug, visibility, suite FROM channels WHERE tier = ''")?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, slug, visibility, suite) in untiered {
+        let mapped = ChannelTiering::legacy(&slug, &visibility, &suite);
+        tx.execute(
+            "UPDATE channels SET tier = ?2, join_role = ?3 WHERE id = ?1",
+            params![id, mapped.tier.as_str(), mapped.join.map(JoinRole::as_str)],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
 
 /// The `WHERE` term that keeps a slug lookup to the channels this server
 /// sequences: a slug is unique only per sequencer (JEP-0005 rule 1), and
@@ -1091,6 +1283,7 @@ impl SqliteStore {
         add_column_if_missing(conn, "channels", "suite", "TEXT NOT NULL DEFAULT 'none'")?;
         rekey_channels_by_id(conn)?;
         rebuild_channels_slug_per_sequencer(conn)?;
+        add_channel_tiers(conn)?;
         rebuild_alias_attestations_with_suffix(conn)?;
         crate::contracts::migrate(conn)?;
         crate::follow::migrate(conn)?;
@@ -1525,6 +1718,65 @@ impl SqliteStore {
         Ok(Some(newest_first))
     }
 
+    /// The window [`Self::list_blocks_by_channel_id`] (no cursor) or
+    /// [`Self::list_blocks_before_by_channel_id`] (`before`) would return,
+    /// newest first, as each block's CID and the bytes it stores: its bundle,
+    /// signature and receipts. Loads none of them, so a caller can choose a
+    /// page by size and load only that. `None` exactly when the `before`
+    /// cursor is not a block of the channel.
+    pub fn history_window_sizes(
+        &self,
+        channel_id: &str,
+        limit: usize,
+        before: Option<&str>,
+    ) -> Result<Option<Vec<(String, u64)>>> {
+        let limit = limit.min(MAX_HISTORY_LIMIT) as i64;
+        let row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<(String, u64)> {
+            Ok((r.get(0)?, r.get::<_, i64>(1)?.max(0) as u64))
+        };
+        let Some(before) = before else {
+            let conn = self.conn.lock().expect("SqliteStore mutex poisoned");
+            let sql = if Self::is_sequenced(&conn, channel_id)? {
+                sequenced_window_sql(false, Select::Sizes)
+            } else {
+                history_newest_sql(Select::Sizes)
+            };
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(params![channel_id, limit], row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            return Ok(Some(rows));
+        };
+        let Some(cursor) = self.get_block(before)? else {
+            return Ok(None);
+        };
+        if cursor.channel_id.as_deref() != Some(channel_id) {
+            return Ok(None);
+        }
+        let cursor_seq = self.get_ingest_record(&cursor.cid)?.map(|r| r.seq);
+        let conn = self.conn.lock().expect("SqliteStore mutex poisoned");
+        let rows = if let Some(cursor_seq) = cursor_seq {
+            conn.prepare(&sequenced_window_sql(true, Select::Sizes))?
+                .query_map(params![channel_id, limit, cursor_seq as i64], row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            conn.prepare(&history_before_window_sql(Select::Sizes))?
+                .query_map(
+                    params![
+                        channel_id,
+                        cursor.hlc_wall_ms as i64,
+                        cursor.hlc_logical as i64,
+                        cursor.hlc_origin,
+                        cursor.cid,
+                        limit
+                    ],
+                    row,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok(Some(rows))
+    }
+
     // --- receipts ---
 
     pub fn insert_receipt(&self, r: &StoredReceipt) -> Result<()> {
@@ -1923,6 +2175,28 @@ impl SqliteStore {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The server that relayed each sender's latest block in `channel_id`
+    /// (`federated_from`), by sender DID: `None` for one that wrote here
+    /// directly. A hint at where a member's client is, no more: a member who
+    /// only reads, or writes from two servers, is not told apart.
+    pub fn last_relay_by_sender(
+        &self,
+        channel_id: &str,
+    ) -> Result<std::collections::HashMap<String, Option<String>>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(
+            // One pass over the channel's blocks: each sender's latest row,
+            // then its relay. A subquery per block would be quadratic.
+            "SELECT sender_did, federated_from FROM blocks
+              WHERE rowid IN (SELECT MAX(rowid) FROM blocks
+                               WHERE channel_id = ?1 GROUP BY sender_did)",
+        )?;
+        let rows = stmt
+            .query_map([channel_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
 
@@ -2619,8 +2893,9 @@ impl SqliteStore {
 pub(crate) fn upsert_channel_on(conn: &Connection, c: &StoredChannel) -> Result<()> {
     conn.execute(
         "INSERT INTO channels
-             (id, slug, visibility, created_at, owner_did, suite, sequencer_did, co_owners)
-         VALUES (?,?,?,?,?,?,?,?)
+             (id, slug, visibility, created_at, owner_did, suite, sequencer_did, co_owners,
+              tier, join_role, join_servers, history, from_dm, successor_of)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET
             slug = excluded.slug,
             visibility = excluded.visibility,
@@ -2635,6 +2910,12 @@ pub(crate) fn upsert_channel_on(conn: &Connection, c: &StoredChannel) -> Result<
             c.sequencer_did,
             serde_json::to_string(&c.co_owners)
                 .map_err(|e| PersistError::Corrupt(format!("co_owners: {e}")))?,
+            c.tiering.tier.as_str(),
+            c.tiering.join.map(JoinRole::as_str),
+            c.tiering.join_servers.map(JoinServers::as_str),
+            c.tiering.history.as_str(),
+            c.tiering.from_dm,
+            c.tiering.successor_of,
         ],
     )?;
     Ok(())
@@ -2723,6 +3004,7 @@ mod tests {
             suite: "none".to_string(),
             sequencer_did: String::new(),
             co_owners: Vec::new(),
+            tiering: ChannelTiering::current("open", "none"),
         }
     }
 
@@ -3202,6 +3484,91 @@ mod tests {
         String,
         String,
     );
+
+    /// A store from before tiers: every row gets the tier rule 21 maps it to,
+    /// the `#jig/` row first, and opening the store again changes nothing.
+    #[test]
+    fn channels_from_before_tiers_get_their_rule_21_tier_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE channels (
+                 id          TEXT PRIMARY KEY,
+                 slug        TEXT UNIQUE NOT NULL,
+                 visibility  TEXT NOT NULL,
+                 created_at  INTEGER NOT NULL,
+                 owner_did   TEXT NOT NULL,
+                 archived_at INTEGER,
+                 suite       TEXT NOT NULL DEFAULT 'none'
+             );
+             INSERT INTO channels VALUES ('bafy_log', '#jig/manifest', 'open', 1, 'did:jig:zS', NULL, 'none');
+             INSERT INTO channels VALUES ('bafy_priv', '#team', 'restricted', 2, 'did:jig:zA', NULL, 'mls');
+             INSERT INTO channels VALUES ('bafy_srv', '#lobby', 'open', 3, 'did:jig:zA', NULL, 'mls');
+             INSERT INTO channels VALUES ('bafy_open', '#general', 'open', 4, 'did:jig:zA', NULL, 'none');
+             INSERT INTO channels VALUES ('bafy_old', '#secret', 'restricted', 5, 'did:jig:zA', 9, 'none');",
+        )
+        .unwrap();
+        SqliteStore::migrate(&conn).unwrap();
+        let tiers = |conn: &Connection| -> Vec<(String, String, Option<String>, String)> {
+            conn.prepare("SELECT id, tier, join_role, history FROM channels ORDER BY id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let row = |id: &str, tier: &str, join: Option<&str>| {
+            (
+                id.to_string(),
+                tier.to_string(),
+                join.map(str::to_string),
+                "none".to_string(),
+            )
+        };
+        let mapped = tiers(&conn);
+        assert_eq!(
+            mapped,
+            vec![
+                row("bafy_log", "public", None),
+                row("bafy_old", "frozen", None),
+                row("bafy_open", "frozen", None),
+                row("bafy_priv", "private", None),
+                row("bafy_srv", "server", Some("guest")),
+            ]
+        );
+        SqliteStore::migrate(&conn).unwrap();
+        assert_eq!(tiers(&conn), mapped, "the backfill runs once per row");
+        // Every row reads back as a channel.
+        let stored = conn
+            .prepare(&format!(
+                "SELECT {CHANNEL_COLUMNS} FROM channels ORDER BY id"
+            ))
+            .unwrap()
+            .query_map([], row_to_stored_channel)
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(stored[0].tiering, ChannelTiering::of(Tier::Public));
+        assert!(stored[1].tiering.tier.is_frozen());
+    }
+
+    /// A tier this build does not know fails the row, never reads as another.
+    #[test]
+    fn an_unknown_stored_tier_is_corruption() {
+        let conn = Connection::open_in_memory().unwrap();
+        SqliteStore::migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO channels (id, slug, visibility, created_at, owner_did, suite, tier)
+             VALUES ('bafy_x', '#x', 'open', 1, 'did:jig:zA', 'none', 'secret')",
+            [],
+        )
+        .unwrap();
+        let read = conn.query_row(
+            &format!("SELECT {CHANNEL_COLUMNS} FROM channels"),
+            [],
+            row_to_stored_channel,
+        );
+        assert!(read.is_err(), "{read:?}");
+    }
 
     /// A store from before channel terms: `channels` with `UNIQUE(slug)` and
     /// no `sequencer_did`. The migration rebuilds it with
@@ -4062,6 +4429,7 @@ mod tests {
             suite: "none".to_string(),
             sequencer_did: String::new(),
             co_owners: Vec::new(),
+            tiering: ChannelTiering::current("open", "none"),
         };
         store.upsert_channel(&ch).unwrap();
         let fetched = store.get_channel_by_slug("#hello").unwrap().unwrap();
@@ -4108,6 +4476,7 @@ mod tests {
             suite: "none".to_string(),
             sequencer_did: String::new(),
             co_owners: Vec::new(),
+            tiering: ChannelTiering::current("restricted", "none"),
         })
         .unwrap();
         s.upsert_membership(&StoredMembership {
@@ -4187,6 +4556,7 @@ mod tests {
             suite: "none".to_string(),
             sequencer_did: String::new(),
             co_owners: Vec::new(),
+            tiering: ChannelTiering::current("open", "none"),
         }
     }
 
@@ -4702,6 +5072,98 @@ mod tests {
         assert_eq!(page("bafy_h1", 50), Some(vec![]), "the start of history");
         assert_eq!(page("bafy_o2", 50), None, "another channel's block");
         assert_eq!(page("bafy_nope", 50), None, "an unknown block");
+    }
+
+    /// The size window names the blocks the history window would load, in
+    /// the same order, with what each stores: so a page chosen from it is a
+    /// prefix of the page the full query returns.
+    #[test]
+    fn the_size_window_is_the_history_window_without_the_blocks() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        seed_timeline_channel(&store, "#tie");
+        for cid in ["bafy_t1", "bafy_t2", "bafy_t3", "bafy_t4", "bafy_t5"] {
+            store.insert_block(&timeline_block(cid, "#tie", 0)).unwrap();
+        }
+        let id = store
+            .get_channel_by_slug_including_archived("#tie")
+            .unwrap()
+            .unwrap()
+            .id;
+        // A receipt counts toward its block's size, on every path.
+        store
+            .insert_receipt(&sample_receipt("bafy_r4", "bafy_t4", "srv", None))
+            .unwrap();
+        let receipt_len = sample_receipt("", "", "", None).receipt_bytes.len();
+        let stored = |block: &StoredBlock| {
+            let receipts = if block.cid == "bafy_t4" {
+                receipt_len
+            } else {
+                0
+            };
+            block.bundle_bytes.len() + block.sender_sig.len() + receipts
+        };
+        let check = |rows: Vec<StoredBlock>, sizes: Vec<(String, u64)>| {
+            let newest_first: Vec<&StoredBlock> = rows.iter().rev().collect();
+            assert_eq!(
+                sizes
+                    .iter()
+                    .map(|(cid, _)| cid.as_str())
+                    .collect::<Vec<_>>(),
+                newest_first
+                    .iter()
+                    .map(|b| b.cid.as_str())
+                    .collect::<Vec<_>>(),
+            );
+            for ((_, size), block) in sizes.iter().zip(newest_first) {
+                assert_eq!(*size as usize, stored(block), "{}", block.cid);
+            }
+        };
+        check(
+            store.list_blocks_by_channel_id(&id, 3, None).unwrap(),
+            store.history_window_sizes(&id, 3, None).unwrap().unwrap(),
+        );
+        for before in ["bafy_t5", "bafy_t3", "bafy_t1"] {
+            check(
+                store
+                    .list_blocks_before_by_channel_id(&id, 2, before)
+                    .unwrap()
+                    .unwrap(),
+                store
+                    .history_window_sizes(&id, 2, Some(before))
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            store
+                .history_window_sizes(&id, 2, Some("bafy_nope"))
+                .unwrap(),
+            None
+        );
+
+        // The same channel, sequenced: the window goes by `seq`. The size
+        // query reads no record, so placeholder records will do.
+        {
+            let conn = store.conn.lock().unwrap();
+            for (seq, cid) in ["bafy_t1", "bafy_t2", "bafy_t3", "bafy_t4", "bafy_t5"]
+                .iter()
+                .enumerate()
+            {
+                conn.execute(
+                    "INSERT INTO ingest_records (block_cid, channel_id, seq, record) \
+                     VALUES (?1, ?2, ?3, x'00')",
+                    params![cid, id, seq as i64],
+                )
+                .unwrap();
+            }
+        }
+        let sizes = store.history_window_sizes(&id, 3, None).unwrap().unwrap();
+        assert_eq!(
+            sizes.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>(),
+            ["bafy_t5", "bafy_t4", "bafy_t3"]
+        );
+        let t4 = store.get_block("bafy_t4").unwrap().unwrap();
+        assert_eq!(sizes[1].1 as usize, stored(&t4));
     }
 
     #[test]

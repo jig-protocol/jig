@@ -439,10 +439,14 @@ a timezone. Send the invites before anyone builds anything.
 | 9 | Them | **Back up `~/.jig/keys/*.key`** | copy into a password manager |
 | 10 | Them | Chat | `./jig chat '#gigue'` |
 
-You create `#gigue` once, from any machine: `jig channel create '#gigue'`.
-Teammates do **not** need `jig channel join` for an `open` channel — v0.0.2
-stores membership as derived state for bridge dispatch and does not gate reads
-or sends on it. Run `jig channel join` only for a `restricted` channel.
+You create `#gigue` once, from any machine:
+`jig channel create '#gigue' --tier server --join guest`. That makes an
+end-to-end encrypted channel that anyone the server lets in can join, whether or
+not its admission records list them as a member (drop `--join guest` to allow
+only recorded members). Each teammate then runs
+`jig channel join '#gigue'` once, before their first `jig chat`. A bare
+`jig channel create` makes a `private` channel instead, which people join only
+when you add them (`jig channel add`).
 
 ### Step 5 — macOS Gatekeeper
 
@@ -495,7 +499,11 @@ Three smaller sharp edges:
 - `jig tail` prints the raw 61-char DID and raw epoch-millis per line. Nicer rendering
   (`HH:MM`, a `[contacts]` name map, an inbound bell) is **in flight in this same batch**
   — check whether `jig-cli/src/cmd/display.rs` is wired up before promising it.
-- `jig --version` is not implemented. Identify a build by its file hash.
+- From v0.2.0-alpha.4, the first published release that prints its version,
+  `jig --version`, `jig-server --version` and `jig-nameserver --version` print the
+  release version (`jig 0.2.0-alpha.4`).
+  v0.2.0-alpha.2 and earlier print `0.0.1` whatever the release: identify those
+  by file hash, against that release's `SHA256SUMS`.
 - `--server`, `--config`, and `--did` are honoured by every subcommand,
   including `init`, `keys`, `server`, and `channel` (they were silently ignored
   for those four until recently). `--config <path>` requires the file to exist.
@@ -748,6 +756,61 @@ new identity.
 
 ---
 
+## Federation: sharing a channel with another server
+
+Two servers federate only if each lists the other under `[[federation.peers]]`
+(see `config.example.toml`), with the other's `/.well-known/jig` `server_did`
+as `expected_did`. Restart both after editing.
+
+To carry a channel on the other server (JEP-0005), so its users can read it
+there in this server's order:
+
+1. **The channel's owner, or an admin with the `share` right**, on this
+   server:
+
+   ```sh
+   jig channel share '#team' did:jig:<other server> --grant read
+   ```
+
+   `--grant` is `read`, `write` or `member` (JEP-0005 rule 7a). The server
+   checks the signer's right, and refuses a share naming a server that is not
+   one of its peers: the refusal shows in the channel as `NOT_A_PEER`.
+2. **The other server's operator** accepts the offer:
+
+   ```sh
+   sudo -u jig /opt/jig/bin/jig-server --config /etc/jig/config.toml contracts list
+   sudo -u jig /opt/jig/bin/jig-server --config /etc/jig/config.toml contracts accept <offer-id>
+   ```
+
+   As `jig`, not root: the command writes to the server's database. The
+   running server acts on it within 5 seconds. Skip this step by setting
+   `offers = "accept"` in that server's peer entry for this one. `contracts
+   refuse <offer-id>` turns an offer down.
+3. **Users of the other server** read the channel by its id, which `jig channel
+   share` prints: `jig read <channel-id>`. A slug names a channel only on the
+   server that orders it, so `jig read '#team'` there finds nothing.
+
+`jig channel unshare '#team' did:jig:<other server>` (or `contracts end
+<offer-id>` on either server) ends the share. This server stops streaming the
+channel's records at once. The other server keeps the copy it holds and lands
+nothing of the channel after, including any block of it the older peer relay
+still forwards.
+
+The server decides which channels may be shared: a channel whose tier keeps it
+on one server is refused (JEP-0014). Under a `write` or `member` grant, the other
+server relays its users' posts back to this one; under `read`, they post on
+this server.
+
+A channel reaches another server only once it is shared. Its creation block
+names the server that orders it, so a peer no longer takes a channel this
+server creates as one of its own. `naively_accept_peer_relayed_creates` (see
+`config.example.toml`) is for tests only: a server with it stores a copy of a
+peer's new channel, but clients refuse to read the copy, because its creation
+block names another server. Servers that trust each other set
+`offers = "accept"` and use `jig channel share`.
+
+---
+
 ## The nameserver
 
 The binary serves the alias API and its discovery documents. The legacy routes
@@ -932,6 +995,6 @@ planned for after v0.2.0-alpha.3.
   separate blast radius.
 - **Building on the VPS needs a toolchain first.** A fresh box has no rustup, no
   C compiler, and no pkg-config; `ring` needs a C compiler. The workspace MSRV
-  is **1.95** (`jig-runtime` and `jig-server` inherit it), set by wasmtime 48.
+  is **1.97** (`jig-runtime` and `jig-server` inherit it), set by wasmtime 50.
   A 1 vCPU box wants ~2 GB of swap and 45–90 minutes. Cross-building on your Mac
   and copying the binary over is usually the better trade.

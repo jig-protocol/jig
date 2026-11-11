@@ -491,6 +491,9 @@ struct ConnState {
     /// The other end of `peer_sender`, for the connection loop to take.
     peer_rx: Option<mpsc::Receiver<Envelope>>,
     peer_registration: Option<crate::v0_0_2_peer::Registration>,
+    /// Whether the hello asked for channel tiers (JEP-0014 rule 5): a client
+    /// that did not may read a `public` channel but not post to it.
+    tiers: bool,
 }
 
 /// A handshake that ends with the dialer's [`Frame::PeerProof`].
@@ -657,7 +660,8 @@ async fn handle_client_frame(
             Ok(()) => {
                 session.peer = jig_core::did::Did::from_did_jig_string(&awaiting.peer_did).ok();
                 if let Some(peer) = session.peer.clone() {
-                    let (sender, rx) = crate::v0_0_2_peer::PeerSender::new(peer);
+                    let (sender, rx) =
+                        crate::v0_0_2_peer::PeerSender::with_tiers(peer, session.tiers);
                     session.peer_registration = Some(state.peers.register(sender.clone()));
                     session.peer_sender = Some(sender);
                     session.peer_rx = Some(rx);
@@ -974,6 +978,7 @@ async fn handle_client_frame(
                 sig,
                 conn_id,
                 &format!("ws:{conn_id}"),
+                session.tiers,
             )
             .await
             {
@@ -1069,6 +1074,9 @@ pub(crate) fn handshake_capabilities(state: &AppState) -> jig_pipeline::handshak
         federation: true,
         // The bound ingest enforces, so the signed claim is the enforced one.
         max_future_skew_ms: state.ingest_ctx.hlc_clock.max_future_skew_ms(),
+        // Implemented; `negotiate` signs it only into a welcome whose hello
+        // asked for it.
+        tiers: true,
     }
 }
 
@@ -1134,6 +1142,7 @@ async fn complete_hello(
                 .await
                 .map_err(|err| err.to_string())?;
             session.handshaken = true;
+            session.tiers = hello.capabilities.tiers;
             if let Some(peer_did) = hello.peer_did {
                 session.awaiting_peer = Some(AwaitingPeer {
                     peer_did,
@@ -1419,6 +1428,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
     }
@@ -1603,6 +1613,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: "did:jig:zowner".to_string(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
         let mut ws = established(&url).await;
@@ -1970,6 +1981,7 @@ mod tests {
                     suite: "none".to_string(),
                     sequencer_did: String::new(),
                     co_owners: Vec::new(),
+                    tiering: jig_pipeline::persist::ChannelTiering::current(visibility, "none"),
                 })
                 .unwrap();
         }
@@ -2014,6 +2026,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
         let manifest = serde_json::to_vec(&serde_json::json!({

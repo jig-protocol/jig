@@ -33,7 +33,7 @@ cargo nextest run --workspace
 ```
 
 The toolchain is pinned in the root `rust-toolchain.toml` (rustup installs it), with the
-`wasm32-unknown-unknown` target; the workspace's minimum Rust version is 1.95. CI runs
+`wasm32-unknown-unknown` target; the workspace's minimum Rust version is 1.97. CI runs
 `fmt`, `clippy` and `nextest` on every crate above; [`CONTRIBUTING.md`](../CONTRIBUTING.md)
 has the details.
 
