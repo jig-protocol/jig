@@ -2715,8 +2715,9 @@ mod tests {
             self.page("", 0).entries.len()
         }
 
-        /// `n` posts to `channel` on `b`.
-        async fn texts(&self, channel: &str, n: usize) -> Vec<String> {
+        /// `n` posts to `channel` on `b`: blocks `a` refuses once it holds
+        /// the channel as a copy it sequences (#357).
+        async fn posts(&self, channel: &str, n: usize) -> Vec<String> {
             let mut cids = Vec::new();
             for i in 0..n {
                 cids.push(
@@ -2726,8 +2727,38 @@ mod tests {
                         BlockKind::TextRender,
                         serde_json::json!({
                             "channel_id": channel,
-                            "body": format!("text {i} {}", rand::random::<u64>()),
+                            "body": format!("post {i} {}", rand::random::<u64>()),
                         }),
+                    )
+                    .await
+                    .unwrap(),
+                );
+            }
+            cids
+        }
+
+        /// The CIDs of `b`'s answer to a catch-up after `after`.
+        fn page_cids(&self, after: &str, overlap: u64) -> Vec<String> {
+            self.page(after, overlap)
+                .entries
+                .iter()
+                .map(|e| crate::v0_0_2_federation::peer_block_cid(&e.bundle).unwrap())
+                .collect()
+        }
+
+        /// `n` channel-creates on `b`. The relay lands no post on `a` (#357):
+        /// a peer's create, under the copying flag `a` sets, is what it still
+        /// lands, so these are the blocks a catch-up is tested on.
+        async fn creates(&self, n: usize) -> Vec<String> {
+            let run = rand::random::<u32>();
+            let mut cids = Vec::new();
+            for i in 0..n {
+                cids.push(
+                    post(
+                        &self.b,
+                        &self.user,
+                        BlockKind::ChannelCreate,
+                        serde_json::json!({"slug": format!("#c-{run}-{i}"), "tier": "public"}),
                     )
                     .await
                     .unwrap(),
@@ -2788,7 +2819,7 @@ mod tests {
         let l = legacy().await;
         let channel = l.channel("#open").await;
         let mut before = vec![channel.clone()];
-        before.extend(l.texts(&channel, 3).await);
+        before.extend(l.creates(3).await);
 
         // No block from `b` yet: the first catch-up starts from `b`'s start.
         l.dial(&l.a);
@@ -2799,7 +2830,7 @@ mod tests {
         .await;
 
         // From then on, the live push.
-        let live = l.texts(&channel, 1).await;
+        let live = l.creates(1).await;
         Legacy::holds(&l.a, &live).await;
     }
 
@@ -2808,10 +2839,10 @@ mod tests {
         let l = legacy().await;
         let own = l.federating();
         let open = l.channel("#open").await;
-        let first = l.texts(&open, 1).await;
+        let first = l.creates(1).await;
         let restricted = l.restricted("#closed");
         let closed = l.stored_texts(&restricted, 2);
-        let last = l.texts(&open, 1).await;
+        let last = l.creates(1).await;
 
         let page = l.page("", 0);
         let replayed: Vec<String> = page.entries[own..]
@@ -2826,18 +2857,90 @@ mod tests {
         assert!(closed.iter().all(|cid| !held(&l.a, cid)));
     }
 
+    /// A catch-up whose records `a` refuses (posts into a copy `a`
+    /// sequences, #357) skips each one and goes on: the page lands what
+    /// follows, the catch-up finishes, and `a` remembers the last block it
+    /// dealt with, refused or not. The next reconnect asks from there,
+    /// stepping back only [`OVERLAP`](crate::v0_0_2_catch_up::OVERLAP), not
+    /// from the newest block it holds, which would ask for every refusal
+    /// again, each time.
+    #[tokio::test]
+    async fn a_refused_record_neither_stalls_a_catch_up_nor_comes_back() {
+        let l = legacy().await;
+        let x = l.channel("#x").await;
+        let landed = l.creates(1).await;
+        let overlap = crate::v0_0_2_catch_up::OVERLAP;
+        let refused = l.posts(&x, overlap as usize + 8).await;
+
+        let dial = l.dial(&l.a);
+        Legacy::holds(&l.a, &[x.clone(), landed[0].clone()]).await;
+        eventually("the catch-up done", || {
+            l.cursor(&l.a).is_none().then_some(())
+        })
+        .await;
+        assert!(refused.iter().all(|cid| !held(&l.a, cid)));
+        let seen =
+            l.a.ingest_ctx
+                .store
+                .catch_up_seen(&l.to_b.url)
+                .unwrap()
+                .expect("a remembers the last block it dealt with");
+        assert_eq!(&seen, refused.last().unwrap(), "past every refusal");
+        assert_eq!(
+            crate::v0_0_2_catch_up::resume_after(&l.a.ingest_ctx.store, &l.to_b).unwrap(),
+            seen,
+            "a reconnect asks from there"
+        );
+
+        // What `b` sends the next catch-up: from the last block seen, back
+        // `OVERLAP` rows. The refusals before that are not asked for again;
+        // starting from the newest block `a` holds would ask for all of them.
+        let again = l.page_cids(&seen, overlap);
+        assert!(!again.contains(&refused[0]), "{again:?}");
+        assert!(again.len() <= overlap as usize);
+
+        dial.abort();
+        l.dial(&l.a);
+        let more = l.creates(1).await;
+        Legacy::holds(&l.a, &more).await;
+        assert!(refused.iter().all(|cid| !held(&l.a, cid)));
+    }
+
+    /// The live push, too: one post `a` refuses does not wedge the link, and
+    /// is remembered as dealt with.
+    #[tokio::test]
+    async fn a_refused_live_post_does_not_wedge_the_link() {
+        let l = legacy().await;
+        let x = l.channel("#x").await;
+        l.dial(&l.a);
+        Legacy::holds(&l.a, std::slice::from_ref(&x)).await;
+        eventually("the catch-up done", || {
+            l.cursor(&l.a).is_none().then_some(())
+        })
+        .await;
+
+        let refused = l.posts(&x, 1).await;
+        let after = l.creates(1).await;
+        Legacy::holds(&l.a, &after).await;
+        assert!(!held(&l.a, &refused[0]));
+        assert_eq!(
+            l.a.ingest_ctx.store.catch_up_seen(&l.to_b.url).unwrap(),
+            Some(after[0].clone())
+        );
+    }
+
     #[tokio::test]
     async fn the_cursor_is_a_block_in_the_peers_own_order() {
         let l = legacy().await;
         let channel = l.channel("#open").await;
-        let early = l.texts(&channel, 2).await;
+        let early = l.creates(2).await;
         // Taken last, with an author's clock older than every block before
         // it: still after them in `b`'s order.
         let backdated = post_at(
             &l.b,
             &l.user,
-            BlockKind::TextRender,
-            serde_json::json!({"channel_id": channel, "body": "backdated"}),
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#backdated", "tier": "public"}),
             Some(jig_core::HlcTimestamp {
                 wall_ms: 1,
                 logical: 0,
@@ -2880,13 +2983,13 @@ mod tests {
 
     /// The live push need not reach `a` in `b`'s order: two ingests racing
     /// on `b` can fan out the later one first. Here `a` took `b`'s second
-    /// post live, not its first, when the link dropped: the reconnect's
+    /// block live, not its first, when the link dropped: the reconnect's
     /// overlap still brings the first.
     #[tokio::test]
     async fn a_block_pushed_out_of_order_is_caught_up_after_a_reconnect() {
         let l = legacy().await;
         let channel = l.channel("#open").await;
-        let texts = l.texts(&channel, 2).await;
+        let texts = l.creates(2).await;
         let b64 = base64::engine::general_purpose::STANDARD;
         for cid in [&channel, &texts[1]] {
             let block = l.b.ingest_ctx.store.get_block(cid).unwrap().unwrap();
@@ -2911,10 +3014,8 @@ mod tests {
     #[tokio::test]
     async fn catch_up_pages_past_one_frame() {
         let l = legacy().await;
-        let channel = l.channel("#open").await;
-        let texts = l
-            .texts(&channel, crate::v0_0_2_catch_up::MAX_ENTRIES * 2 + 5)
-            .await;
+        l.channel("#open").await;
+        let texts = l.creates(crate::v0_0_2_catch_up::MAX_ENTRIES * 2 + 5).await;
 
         let first = l.page("", 0);
         assert_eq!(first.entries.len(), crate::v0_0_2_catch_up::MAX_ENTRIES);
@@ -2927,14 +3028,14 @@ mod tests {
     #[tokio::test]
     async fn catch_up_stops_at_the_quota_and_keeps_its_place() {
         let mut l = legacy().await;
-        // `b`'s own blocks, then its channel and two posts, this minute.
+        // `b`'s own blocks, then its channel and two more creates, this minute.
         let quota = jig_config::v0_0_2_server::PeerQuotaConfig {
             blocks_per_min: l.federating() as u64 + 3,
             bytes_per_min: 8 * 1024 * 1024,
         };
         l.held_to(Some(quota));
-        let channel = l.channel("#open").await;
-        let texts = l.texts(&channel, 6).await;
+        l.channel("#open").await;
+        let texts = l.creates(6).await;
 
         l.dial(&l.a);
         Legacy::holds(&l.a, &texts[..2]).await;
@@ -2958,22 +3059,22 @@ mod tests {
             bytes_per_min: 8 * 1024 * 1024,
         };
         l.held_to(Some(quota));
-        let channel = l.channel("#open").await;
+        l.channel("#open").await;
         // More than the reconnect's overlap past where the quota stops it.
         let gap = l
-            .texts(&channel, crate::v0_0_2_catch_up::OVERLAP as usize + 30)
+            .creates(crate::v0_0_2_catch_up::OVERLAP as usize + 30)
             .await;
 
         let dial = l.dial(&l.a);
         Legacy::holds(&l.a, &gap[..4]).await;
-        let live = l.texts(&channel, 1).await;
+        let live = l.creates(1).await;
         Legacy::holds(&l.a, &live).await;
         assert!(!held(&l.a, gap.last().unwrap()), "stopped at the quota");
         dial.abort();
         let _ = dial.await;
 
         // Down: `b` takes more.
-        let while_down = l.texts(&channel, 3).await;
+        let while_down = l.creates(3).await;
 
         l.held_to(None);
         let a = restarted(&l.a).await;

@@ -389,13 +389,19 @@ pub(crate) struct CatchingUp {
     start: Instant,
     blocks: u64,
     bytes: u64,
+    /// Whether the live push has brought a block on this connection. Those
+    /// come after everything a catch-up replays, in the peer's order, so a
+    /// page no longer moves the last-seen block once one has.
+    live: bool,
 }
 
 impl CatchingUp {
     /// Ask `peer` for what this server missed, once subscribed: after an
-    /// unfinished catch-up's cursor if there is one, else after the newest
-    /// block it holds from `peer`, stepping back [`OVERLAP`]. With neither,
-    /// from the start.
+    /// unfinished catch-up's cursor if there is one, else after the last
+    /// block from `peer` it dealt with (landed or refused), else after the
+    /// newest block it holds from `peer`, stepping back [`OVERLAP`]. With
+    /// none, from the start. A refused block is never held, so starting from
+    /// the newest held one would ask for every refusal again (#357).
     ///
     /// The subscription is made first, so the live push carries everything
     /// the peer takes from then on: once a catch-up reaches the end, nothing
@@ -408,10 +414,7 @@ impl CatchingUp {
         out: &PeerSender,
     ) -> anyhow::Result<Self> {
         let store = &state.ingest_ctx.store;
-        let after = match store.catch_up_cursor(&peer.url)? {
-            Some(after) => after,
-            None => store.newest_block_from(&peer.url)?.unwrap_or_default(),
-        };
+        let after = resume_after(store, peer)?;
         store.set_catch_up_cursor(&peer.url, &after)?;
         let asked = Ask {
             after,
@@ -424,7 +427,16 @@ impl CatchingUp {
             start: Instant::now(),
             blocks: 0,
             bytes: 0,
+            live: false,
         })
+    }
+
+    /// The live push brought a block, which `ingest_peer_block` dealt with:
+    /// remember it as the last seen from `peer`, past anything a catch-up
+    /// page could still bring.
+    pub(crate) fn saw_live(&mut self, store: &SqliteStore, peer: &FederationPeer, cid: &str) {
+        self.live = true;
+        seen(store, peer, cid);
     }
 
     /// Count one block of `bytes` if this minute's quota has room for it,
@@ -504,6 +516,9 @@ async fn land(
     let b64 = base64::engine::general_purpose::STANDARD;
     // Where to resume if the quota stops this page part way.
     let mut resume = catching.asked.clone();
+    // The last entry this page dealt with: landed, held, or refused. Not one
+    // this server's store failed on, which is asked for again.
+    let mut dealt: Option<String> = None;
     for entry in &page.entries {
         let cid = crate::v0_0_2_federation::peer_block_cid(&entry.bundle).ok();
         // Held already (the overlap, or the live push): skipped before any
@@ -514,6 +529,7 @@ async fn land(
         if !held {
             if let Err(wait) = catching.take(quota, entry.bundle.len() as u64) {
                 tracing::info!(peer_url = %peer.url, "catch-up past this minute's quota; resuming in {wait:?}");
+                page_seen(store, peer, catching, dealt.as_deref());
                 save(store, peer, Some(&resume.after));
                 catching.ask(out, resume, wait);
                 return Ok(());
@@ -533,6 +549,7 @@ async fn land(
                 // or it would stall the catch-up.
                 if failed_here(&e) {
                     tracing::warn!(peer_url = %peer.url, "a caught-up block did not land; asking again in {STORE_RETRY:?}: {e:#}");
+                    page_seen(store, peer, catching, dealt.as_deref());
                     save(store, peer, Some(&resume.after));
                     catching.ask(out, resume, STORE_RETRY);
                     return Ok(());
@@ -541,12 +558,14 @@ async fn land(
             }
         }
         if let Some(cid) = cid {
+            dealt = Some(cid.clone());
             resume = Ask {
                 after: cid,
                 overlap: 0,
             };
         }
     }
+    page_seen(store, peer, catching, dealt.as_deref());
     if page.more {
         save(store, peer, Some(&page.last));
         let next = Ask {
@@ -568,6 +587,41 @@ async fn land(
 fn failed_here(e: &anyhow::Error) -> bool {
     e.downcast_ref::<jig_pipeline::persist::PersistError>()
         .is_some()
+}
+
+/// Where the next catch-up from `peer` asks from (before [`OVERLAP`]): an
+/// unfinished catch-up's cursor, else the last block from `peer` this server
+/// dealt with, else the newest it holds from `peer`, else the start.
+pub(crate) fn resume_after(store: &SqliteStore, peer: &FederationPeer) -> anyhow::Result<String> {
+    Ok(match store.catch_up_cursor(&peer.url)? {
+        Some(after) => after,
+        None => match store.catch_up_seen(&peer.url)? {
+            Some(seen) => seen,
+            None => store.newest_block_from(&peer.url)?.unwrap_or_default(),
+        },
+    })
+}
+
+/// Record the last entry a page dealt with as the last block seen from
+/// `peer`, unless the live push has brought one since this connection began:
+/// it comes after the page in the peer's order.
+fn page_seen(
+    store: &SqliteStore,
+    peer: &FederationPeer,
+    catching: &CatchingUp,
+    dealt: Option<&str>,
+) {
+    if let Some(cid) = dealt
+        && !catching.live
+    {
+        seen(store, peer, cid);
+    }
+}
+
+fn seen(store: &SqliteStore, peer: &FederationPeer, cid: &str) {
+    if let Err(e) = store.set_catch_up_seen(&peer.url, cid) {
+        tracing::warn!(peer_url = %peer.url, "last block seen from the peer not saved: {e:#}");
+    }
 }
 
 /// Keep how far the catch-up from `peer` got, or drop it at the end.
@@ -664,6 +718,7 @@ mod tests {
             start: Instant::now(),
             blocks: 0,
             bytes: 0,
+            live: false,
         }
     }
 

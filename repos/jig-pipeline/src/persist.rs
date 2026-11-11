@@ -1254,6 +1254,10 @@ impl SqliteStore {
                 peer_server_url  TEXT PRIMARY KEY,
                 after_cid        TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS catch_up_seen (
+                peer_server_url  TEXT PRIMARY KEY,
+                last_cid         TEXT NOT NULL
+            );
             "#,
         )?;
 
@@ -2786,6 +2790,31 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// The last block `peer_server_url` relayed that this server dealt with,
+    /// whether it landed or was refused. A catch-up resumes from it: a refused
+    /// block is never held, so the newest held block would ask for it again
+    /// on every reconnect (#357).
+    pub fn catch_up_seen(&self, peer_server_url: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT last_cid FROM catch_up_seen WHERE peer_server_url = ?1",
+                [peer_server_url],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Record `cid` as the last block from `peer_server_url` dealt with.
+    pub fn set_catch_up_seen(&self, peer_server_url: &str, cid: &str) -> Result<()> {
+        self.conn.lock().expect("poisoned").execute(
+            "INSERT INTO catch_up_seen (peer_server_url, last_cid) VALUES (?1, ?2)
+             ON CONFLICT(peer_server_url) DO UPDATE SET last_cid = excluded.last_cid",
+            params![peer_server_url, cid],
+        )?;
+        Ok(())
+    }
+
     // --- subscription cursors ---
 
     pub fn upsert_cursor(&self, c: &StoredCursor) -> Result<()> {
@@ -3382,6 +3411,7 @@ mod tests {
             "alias_attestations",
             "blocks",
             "catch_up_cursors",
+            "catch_up_seen",
             "channels",
             "memberships",
             "peers",

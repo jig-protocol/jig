@@ -811,10 +811,11 @@ block names another server. Servers that trust each other set
 
 The older peer relay no longer posts into channels: a server refuses any post
 a peer relays into a channel the server orders itself, whether the post names
-the channel or its id. It logs each one at WARN with the reason
-`relayed-into-sequenced-channel`. **Share any channel that reaches peers only
-through the relay**; until it is shared, peers' posts to it are refused and
-logged, and their users post on this server.
+the channel or its id. The first refusal per peer and channel is logged at WARN
+with the reason `relayed-into-sequenced-channel`, the rest at DEBUG, and each is
+counted in `jig_federation_relayed_refused_total`. **Share any channel that
+reaches peers only through the relay**; until it is shared, peers' posts to it
+are refused and logged, and their users post on this server.
 
 ---
 
