@@ -10,8 +10,9 @@ name: Soak smoke
 # SOAK_RESTART_EVERY fails on main until federation catches up on
 # resubscribe. workflow_dispatch can run that case on demand.
 #
-# The contract path (SOAK_PATH=contract) needs `jig channel share`, which
-# this smoke can run once the CLI on main has it.
+# It runs the contract path (SOAK_PATH=contract): A shares the channel with
+# B, and B follows it. Since a channel-create names the server that orders
+# it, the legacy relay no longer brings a new channel to a peer.
 
 on:
   pull_request:
@@ -62,6 +63,7 @@ jobs:
         run: cargo build --release --locked -p jig-server -p jig-cli
       - name: Soak
         env:
+          SOAK_PATH: contract
           SOAK_DURATION: ${{ inputs.duration || '180' }}
           SOAK_RESTART_EVERY: ${{ inputs.restart_every || '0' }}
           SOAK_INTERVAL: '5'

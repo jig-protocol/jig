@@ -57,6 +57,15 @@ pub enum ContractBlockError {
     Mismatch(&'static str),
 }
 
+/// Whether a channel of this tier may be shared with another server:
+/// `shared` (JEP-0014 rule 13), and the `public` and frozen channels shared
+/// before tiers. `private` and `server` channels never leave the server that
+/// orders them.
+pub fn crosses_servers(tier: jig_core::tier::StoredTier) -> bool {
+    use jig_core::tier::{StoredTier, Tier};
+    !matches!(tier, StoredTier::Tier(Tier::Private | Tier::Server))
+}
+
 /// What a `channel-share` or `channel-unshare` asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShareRequest {
@@ -1192,6 +1201,7 @@ pub(crate) mod tests {
                 suite: "none".to_string(),
                 sequencer_did: local.to_string(),
                 co_owners: Vec::new(),
+                tiering: crate::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
         store

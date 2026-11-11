@@ -27,10 +27,26 @@ use crate::persist::{
 pub async fn apply_effect(
     store: &Arc<SqliteStore>,
     bundle: &BlockBundle<'_>,
-    _receipt_bytes: &[u8],
+    receipt_bytes: &[u8],
     block_cid: &str,
 ) -> anyhow::Result<()> {
-    let manifest: BlockManifest = serde_json::from_slice(bundle.manifest_bytes)?;
+    apply_effect_as(store, bundle, receipt_bytes, block_cid, false).await
+}
+
+/// [`apply_effect`], with a `channel-create` stored as a relayed copy this
+/// server sequences when `relayed_copy` is set
+/// ([`crate::ingest::copies_relayed_create`]).
+pub async fn apply_effect_as(
+    store: &Arc<SqliteStore>,
+    bundle: &BlockBundle<'_>,
+    _receipt_bytes: &[u8],
+    block_cid: &str,
+    relayed_copy: bool,
+) -> anyhow::Result<()> {
+    let mut manifest: BlockManifest = serde_json::from_slice(bundle.manifest_bytes)?;
+    if relayed_copy {
+        manifest = crate::ingest::as_relayed_copy(&manifest);
+    }
     let Some(kind) = manifest.kind else {
         // No kind field — pre-v0.0.2 fixture or malformed; no effect.
         return Ok(());
@@ -158,13 +174,22 @@ fn apply_channel_create_under(
 ) -> anyhow::Result<()> {
     let slug = meta_str(m, "slug")
         .ok_or_else(|| anyhow::anyhow!("channel-create missing `slug` in metadata"))?;
-    let visibility = meta_str(m, "visibility").unwrap_or("open");
     let suite = crate::mls_gate::requested_suite(m)
         .map_err(|_| anyhow::anyhow!("channel-create names an unknown suite"))?;
     let now = chrono::Utc::now().timestamp();
     let owner_did = sender_did_string(m);
     let terms = crate::ingest::channel_terms(m, sequencer)
         .map_err(|e| anyhow::anyhow!("channel-create terms: {e}"))?;
+    let declared = meta_str(m, "visibility").unwrap_or("open");
+    let tiering = terms.stored_tiering(slug, declared, suite.as_str());
+    // The stored visibility is what the read gate and clients that predate
+    // tiers go by, so a tiered channel stores its tier's: `private` is
+    // `restricted` even when the block carries no `visibility`.
+    let visibility = tiering
+        .tier
+        .tier()
+        .map(|tier| tier.legacy_visibility())
+        .unwrap_or(declared);
 
     crate::persist::upsert_channel_on(
         conn,
@@ -175,8 +200,9 @@ fn apply_channel_create_under(
             created_at: now,
             owner_did: owner_did.clone(),
             suite: suite.as_str().to_string(),
-            sequencer_did: terms.sequencer,
+            sequencer_did: terms.sequencer.clone(),
             co_owners: terms.co_owners.clone(),
+            tiering,
         },
     )?;
     // The creator and every co-owner are members, with role `owner`: a
@@ -489,6 +515,34 @@ mod tests {
         let members = s.list_members("bafy_create").unwrap();
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].role, "owner");
+    }
+
+    /// A tiered channel stores its tier's visibility, which is what the read
+    /// gate and clients that predate tiers go by: a `private` channel is
+    /// `restricted` though its block says nothing about visibility.
+    #[tokio::test]
+    async fn a_private_channel_is_stored_restricted_without_a_visibility() {
+        let s = store();
+        let m = manifest_with(
+            BlockKind::ChannelCreate,
+            "did:jig:zOwner",
+            json!({"slug": "#sec", "tier": "private", "suite": "mls"}),
+        );
+        let (mb, cb) = as_bundle(m);
+        let bundle = BlockBundle {
+            manifest_bytes: &mb,
+            code_bytes: &cb,
+            resources: vec![],
+        };
+        apply_effect(&s, &bundle, &[], "bafy_private")
+            .await
+            .unwrap();
+        let ch = s.get_channel_by_slug("#sec").unwrap().unwrap();
+        assert_eq!(ch.visibility, "restricted");
+        assert_eq!(
+            ch.tiering,
+            crate::persist::ChannelTiering::of(jig_core::tier::Tier::Private)
+        );
     }
 
     #[tokio::test]
