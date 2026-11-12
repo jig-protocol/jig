@@ -1764,6 +1764,56 @@ mod tests {
         );
     }
 
+    /// A live block refused for now whose resume point cannot be saved comes
+    /// back as `HoldNotSaved`, on which the inbound loop ends the link, so
+    /// nothing lands after it before the reconnect asks for it again.
+    #[tokio::test]
+    async fn a_hold_that_cannot_be_saved_ends_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let store = Arc::new(jig_pipeline::persist::SqliteStore::open(&path).unwrap());
+        let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
+        config.auth.rate_limit.per_did_burst = 1;
+        config.auth.rate_limit.per_did_per_second = 1;
+        config.federation.naively_accept_peer_relayed_creates = true;
+        let state = Arc::new(
+            AppState::for_test_from(
+                config,
+                store,
+                ed25519_dalek::SigningKey::from_bytes(&rand::random()),
+            )
+            .unwrap(),
+        );
+        let author = ed25519_dalek::SigningKey::from_bytes(&rand::random());
+        let frame = |slug: &str| {
+            let (_, bundle_b64, sig_b64) = relayed(
+                &author,
+                BlockKind::ChannelCreate,
+                serde_json::json!({"slug": slug, "tier": "public"}),
+            );
+            Envelope::new(Frame::Block {
+                bundle_b64,
+                sig_b64: Some(sig_b64),
+                receipts: vec![],
+                delivery_cid: format!("d:{slug}"),
+                ingest: None,
+            })
+        };
+        let mut catching = crate::v0_0_2_catch_up::CatchingUp::for_test();
+
+        handle_relayed_frame(&state, &test_peer(), &mut catching, frame("#first"))
+            .await
+            .unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TABLE catch_up_seen;")
+            .unwrap();
+        let e = handle_relayed_frame(&state, &test_peer(), &mut catching, frame("#second"))
+            .await
+            .expect_err("over the author's rate, with nowhere to keep the resume point");
+        assert!(e.downcast_ref::<HoldNotSaved>().is_some(), "{e:#}");
+    }
+
     /// A peer still running the relay sends every post of a channel, each
     /// refused: the first per peer and channel is logged at WARN, the rest
     /// only counted.

@@ -436,6 +436,22 @@ impl CatchingUp {
         })
     }
 
+    /// A catch-up asked from the start, with nothing counted or seen yet.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        CatchingUp {
+            asked: Ask {
+                after: String::new(),
+                overlap: OVERLAP,
+            },
+            start: Instant::now(),
+            blocks: 0,
+            bytes: 0,
+            live: false,
+            held: false,
+        }
+    }
+
     /// The live push brought a block, which `ingest_peer_block` dealt with:
     /// remember it as the last seen from `peer`, past anything a catch-up
     /// page could still bring.
@@ -743,17 +759,7 @@ mod tests {
     }
 
     fn catching() -> CatchingUp {
-        CatchingUp {
-            asked: Ask {
-                after: String::new(),
-                overlap: OVERLAP,
-            },
-            start: Instant::now(),
-            blocks: 0,
-            bytes: 0,
-            live: false,
-            held: false,
-        }
+        CatchingUp::for_test()
     }
 
     /// A store failure while landing a caught-up block is asked again; a
