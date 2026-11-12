@@ -393,6 +393,10 @@ pub(crate) struct CatchingUp {
     /// come after everything a catch-up replays, in the peer's order, so a
     /// page no longer moves the last-seen block once one has.
     live: bool,
+    /// Whether a live block failed here (the store, or the author's rate):
+    /// the last-seen block then stays before it until this connection ends,
+    /// so the reconnect's catch-up asks for it again.
+    held: bool,
 }
 
 impl CatchingUp {
@@ -428,6 +432,7 @@ impl CatchingUp {
             blocks: 0,
             bytes: 0,
             live: false,
+            held: false,
         })
     }
 
@@ -436,7 +441,16 @@ impl CatchingUp {
     /// page could still bring.
     pub(crate) fn saw_live(&mut self, store: &SqliteStore, peer: &FederationPeer, cid: &str) {
         self.live = true;
-        seen(store, peer, cid);
+        if !self.held {
+            seen(store, peer, cid);
+        }
+    }
+
+    /// A live block failed here: keep the last-seen block where it is for
+    /// the rest of this connection (see [`Self::held`]).
+    pub(crate) fn hold_seen(&mut self) {
+        self.live = true;
+        self.held = true;
     }
 
     /// Count one block of `bytes` if this minute's quota has room for it,
@@ -580,13 +594,17 @@ async fn land(
     Ok(())
 }
 
-/// Whether `ingest_peer_block` failed in this server's store rather than on
-/// the block: every store failure it returns is a [`PersistError`].
+/// Whether `ingest_peer_block` failed here rather than on the block, so that
+/// asking again can land it: a store failure (every one it returns is a
+/// [`PersistError`]), or an author over this server's rate
+/// ([`RetryLater`](crate::v0_0_2_federation::RetryLater)).
 ///
 /// [`PersistError`]: jig_pipeline::persist::PersistError
-fn failed_here(e: &anyhow::Error) -> bool {
+pub(crate) fn failed_here(e: &anyhow::Error) -> bool {
     e.downcast_ref::<jig_pipeline::persist::PersistError>()
         .is_some()
+        || e.downcast_ref::<crate::v0_0_2_federation::RetryLater>()
+            .is_some()
 }
 
 /// Where the next catch-up from `peer` asks from (before [`OVERLAP`]): an
@@ -719,6 +737,7 @@ mod tests {
             blocks: 0,
             bytes: 0,
             live: false,
+            held: false,
         }
     }
 
@@ -739,6 +758,35 @@ mod tests {
         assert!(!failed_here(&base64().unwrap_err()));
         let json = || -> anyhow::Result<Vec<u8>> { Ok(serde_json::from_slice(b"{")?) };
         assert!(!failed_here(&json().unwrap_err()));
+
+        // An author over this server's rate: waiting changes the answer.
+        let later = anyhow::Error::from(crate::v0_0_2_federation::RetryLater("rate".into()));
+        assert!(failed_here(&later));
+    }
+
+    /// A live block that failed here holds the last block seen where it was,
+    /// for the rest of the connection: later live blocks do not move it past
+    /// the failure, so a reconnect asks for it again.
+    #[test]
+    fn a_live_failure_holds_the_last_block_seen() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let peer = FederationPeer {
+            url: "wss://held-peer".to_string(),
+            expected_did: "did:jig:zPeer".to_string(),
+            alias: None,
+            publish: false,
+            quota: None,
+            offers: Default::default(),
+        };
+        let mut c = catching();
+        c.saw_live(&store, &peer, "bafy-before");
+        c.hold_seen();
+        c.saw_live(&store, &peer, "bafy-after");
+        assert_eq!(
+            store.catch_up_seen(&peer.url).unwrap().as_deref(),
+            Some("bafy-before")
+        );
+        assert_eq!(resume_after(&store, &peer).unwrap(), "bafy-before");
     }
 
     #[tokio::test(start_paused = true)]

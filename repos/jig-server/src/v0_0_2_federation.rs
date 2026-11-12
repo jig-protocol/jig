@@ -544,8 +544,17 @@ async fn handle_relayed_frame(
             ..
         } => {
             // Landed or refused, it is dealt with: a reconnect's catch-up
-            // starts past it. A store failure returns an error and is not.
-            ingest_peer_block(state, peer, &bundle_b64, sig_b64.as_deref(), &delivery_cid).await?;
+            // starts past it. A block this server failed on (its store, or
+            // the author's rate) is not: the last block seen stays before it
+            // for the rest of this connection, so the reconnect asks again.
+            if let Err(e) =
+                ingest_peer_block(state, peer, &bundle_b64, sig_b64.as_deref(), &delivery_cid).await
+            {
+                if crate::v0_0_2_catch_up::failed_here(&e) {
+                    catching.hold_seen();
+                }
+                return Err(e);
+            }
             if let Some(cid) = base64::engine::general_purpose::STANDARD
                 .decode(&bundle_b64)
                 .ok()
@@ -715,6 +724,18 @@ pub async fn ingest_peer_block(
             Ok(())
         }
         Err(IngestError::Persist(e)) => Err(e.into()),
+        // Waiting changes the answer (the author is over this server's rate):
+        // not dealt with, so a catch-up asks for it again and the live push
+        // does not move past it.
+        Err(
+            e @ IngestError::NotAdmitted {
+                refusal: jig_pipeline::ingest::AdmissionRefusal::RateLimited,
+                ..
+            },
+        ) => {
+            debug!(peer_url = %peer.url, %delivery_cid, "peer block not taken yet: {e}");
+            Err(RetryLater(e.to_string()).into())
+        }
         Err(ref e @ IngestError::RelayedIntoSequencedChannel { ref channel_id, .. }) => {
             crate::v0_0_2_ws::metrics::relayed_into_sequenced();
             if first_refusal_into(&peer.url, channel_id) {
@@ -730,6 +751,20 @@ pub async fn ingest_peer_block(
         }
     }
 }
+
+/// A peer block this server did not take for now, and would on asking again
+/// (the author is over this server's rate). Like a store failure, it is not
+/// dealt with: [`crate::v0_0_2_catch_up`] keeps its place before it.
+#[derive(Debug)]
+pub struct RetryLater(pub String);
+
+impl std::fmt::Display for RetryLater {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "not taken yet, asked for again later: {}", self.0)
+    }
+}
+
+impl std::error::Error for RetryLater {}
 
 /// Whether this is the first refusal this run of a post `peer_url` relayed
 /// into `channel_id`, a channel this server sequences. A peer still running
@@ -1577,6 +1612,46 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// An author over this server's rate is not refused for good: waiting
+    /// changes the answer, so `ingest_peer_block` says to ask again
+    /// ([`RetryLater`]), and neither a catch-up nor the live push moves past
+    /// the block (`v0_0_2_catch_up::failed_here`).
+    #[tokio::test]
+    async fn a_rate_limited_peer_block_is_asked_for_again() {
+        let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
+        config.auth.rate_limit.per_did_burst = 1;
+        config.auth.rate_limit.per_did_per_second = 1;
+        config.federation.naively_accept_peer_relayed_creates = true;
+        let state = Arc::new(AppState::for_test_with_config(config).unwrap());
+        let author = ed25519_dalek::SigningKey::from_bytes(&rand::random());
+
+        let mut outcomes = Vec::new();
+        for slug in ["#first", "#second"] {
+            let (bundle_bytes, bundle_b64, sig_b64) = relayed(
+                &author,
+                BlockKind::ChannelCreate,
+                serde_json::json!({"slug": slug, "tier": "public"}),
+            );
+            let outcome =
+                ingest_peer_block(&state, &test_peer(), &bundle_b64, Some(&sig_b64), "d:rate")
+                    .await;
+            let held = state
+                .ingest_ctx
+                .store
+                .get_block(&peer_block_cid(&bundle_bytes).unwrap())
+                .unwrap()
+                .is_some();
+            outcomes.push((outcome, held));
+        }
+        let (first, first_held) = &outcomes[0];
+        assert!(first.is_ok() && *first_held, "{first:?}");
+        let (second, second_held) = &outcomes[1];
+        let e = second.as_ref().expect_err("the burst is spent");
+        assert!(e.downcast_ref::<RetryLater>().is_some(), "{e:#}");
+        assert!(crate::v0_0_2_catch_up::failed_here(e));
+        assert!(!second_held);
     }
 
     /// A peer still running the relay sends every post of a channel, each

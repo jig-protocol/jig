@@ -3,10 +3,10 @@
 `two-host-soak.sh` runs two federated jig-servers under steady traffic and
 checks every message.
 
-- **Traffic:** one client on each server (alice on A, bob on B). Each posts
-  to one open channel every `SOAK_INTERVAL` seconds.
+- **Traffic:** A shares one channel with B. Alice, a client on A, posts to it
+  every `SOAK_INTERVAL` seconds, and bob, a client on B, reads it.
 - **What it checks:**
-  - every message reaches the other server within `SOAK_DEADLINE`;
+  - every message reaches B within `SOAK_DEADLINE`;
   - how long that takes;
   - whether `/healthz`, memory and file descriptors hold steady.
 - **Faults:** it can restart server B on a schedule.
@@ -139,6 +139,6 @@ Latency is the first sighting minus the send time, so its resolution is
   a side the race did not show in two minutes: use 16 or more. On main
   with #347, the same run for three minutes delivered 1424 of 1424 each way,
   and both clients verified the chain to record 2850.
-- **The warm-up exists for the same reason.** Before sending, the harness
-  waits until a post crosses each way, re-posting until one does. Posts made
-  before both links are up would otherwise be lost the same way.
+- **The warm-up.** Before sending, the harness waits until a post on A is
+  read on B, re-posting until one is. That checks the peering and the share,
+  and keeps the time before the link is up out of the numbers.
