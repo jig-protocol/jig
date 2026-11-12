@@ -551,7 +551,7 @@ async fn handle_relayed_frame(
                 ingest_peer_block(state, peer, &bundle_b64, sig_b64.as_deref(), &delivery_cid).await
             {
                 if crate::v0_0_2_catch_up::failed_here(&e) {
-                    catching.hold_seen();
+                    catching.hold_seen(&state.ingest_ctx.store, peer);
                 }
                 return Err(e);
             }
@@ -705,16 +705,45 @@ pub async fn ingest_peer_block(
         return Ok(());
     }
 
-    let sig = sig_b64
-        .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
-        .unwrap_or_default();
     let source = jig_pipeline::ingest::IngestSource::FederatedPeer {
         peer_did: jig_core::Did::from_str_unchecked(jig_pipeline::effect::canonical_did_string(
             &peer.expected_did,
         )),
         peer_url: peer.url.clone(),
     };
-    match jig_pipeline::ingest::ingest(&state.ingest_ctx, bundle, sig, source).await {
+    // What ingest would refuse for its channel is dropped before ingest, so
+    // that it never reaches admission: a refused post would spend its
+    // author's rate, and once that is spent come back rate-limited, which is
+    // asked for again, for a block that is only ever refused.
+    if let Some(kind) = manifest.kind
+        && let Some(refused) = jig_pipeline::ingest::refused_from_a_peer(
+            &state.ingest_ctx.store,
+            &state.ingest_ctx.server_did,
+            kind,
+            &manifest,
+            &block_cid,
+            &source,
+        )?
+    {
+        return dealt_with(peer, delivery_cid, Err(refused));
+    }
+
+    let sig = sig_b64
+        .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+        .unwrap_or_default();
+    let ingested = jig_pipeline::ingest::ingest(&state.ingest_ctx, bundle, sig, source).await;
+    dealt_with(peer, delivery_cid, ingested)
+}
+
+/// What the relay does with ingest's answer for a peer's block: an error
+/// only for what is not dealt with (a store failure, a block refused for
+/// now), so the link and a catch-up go on past everything else.
+fn dealt_with(
+    peer: &jig_config::v0_0_2_server::FederationPeer,
+    delivery_cid: &str,
+    ingested: Result<String, IngestError>,
+) -> anyhow::Result<()> {
+    match ingested {
         Ok(block_cid) => {
             debug!(peer_url = %peer.url, %delivery_cid, %block_cid, "ingested peer block");
             Ok(())
@@ -1652,6 +1681,66 @@ mod tests {
         assert!(e.downcast_ref::<RetryLater>().is_some(), "{e:#}");
         assert!(crate::v0_0_2_catch_up::failed_here(e));
         assert!(!second_held);
+    }
+
+    /// A post the relay refuses for its channel, one this server sequences
+    /// or one it has no row for, is refused before admission: however many
+    /// an author sends, none comes back rate-limited (to be asked for again)
+    /// and none spends the author's rate, so their next create still lands.
+    #[tokio::test]
+    async fn a_refused_post_is_never_rate_limited_and_spends_no_rate() {
+        let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
+        config.auth.rate_limit.per_did_burst = 1;
+        config.auth.rate_limit.per_did_per_second = 1;
+        config.federation.naively_accept_peer_relayed_creates = true;
+        let state = Arc::new(AppState::for_test_with_config(config).unwrap());
+        let id = jig_pipeline::ingest_record::label_cid("#ours");
+        state
+            .ingest_ctx
+            .store
+            .upsert_channel(&jig_pipeline::persist::StoredChannel {
+                id: id.clone(),
+                slug: "#ours".into(),
+                visibility: "open".into(),
+                created_at: 0,
+                owner_did: "did:jig:zOwner".into(),
+                suite: "none".into(),
+                sequencer_did: state.server_did.to_did_jig_string(),
+                co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
+            })
+            .unwrap();
+        let author = ed25519_dalek::SigningKey::from_bytes(&rand::random());
+
+        for i in 0..5 {
+            for metadata in [
+                serde_json::json!({"channel": "#ours", "body": format!("by slug {i}")}),
+                serde_json::json!({"channel_id": id, "body": format!("by id {i}")}),
+                serde_json::json!({"channel": "#nowhere", "body": format!("unknown {i}")}),
+            ] {
+                let (bundle_bytes, bundle_b64, sig_b64) =
+                    relayed(&author, BlockKind::TextRender, metadata.clone());
+                ingest_peer_block(&state, &test_peer(), &bundle_b64, Some(&sig_b64), "d:busy")
+                    .await
+                    .unwrap_or_else(|e| panic!("{metadata}: {e:#}"));
+                let cid = peer_block_cid(&bundle_bytes).unwrap();
+                assert!(state.ingest_ctx.store.get_block(&cid).unwrap().is_none());
+            }
+        }
+
+        let (bundle_bytes, bundle_b64, sig_b64) = relayed(
+            &author,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#after", "tier": "public"}),
+        );
+        ingest_peer_block(&state, &test_peer(), &bundle_b64, Some(&sig_b64), "d:after")
+            .await
+            .unwrap();
+        let cid = peer_block_cid(&bundle_bytes).unwrap();
+        assert!(
+            state.ingest_ctx.store.get_block(&cid).unwrap().is_some(),
+            "the author's one block of rate is unspent"
+        );
     }
 
     /// A peer still running the relay sends every post of a channel, each

@@ -2585,10 +2585,16 @@ mod tests {
     }
 
     async fn legacy() -> Legacy {
+        legacy_tuned(|_| {}).await
+    }
+
+    /// [`legacy`], with `a`'s config tuned further.
+    async fn legacy_tuned(tune: impl FnOnce(&mut JigServerConfig)) -> Legacy {
         // A peer's channel-create reaches `a` over the relay only when its
         // operator opts in to copying them.
         let mut a = state_tuned(vec![], &[], |config| {
             config.federation.naively_accept_peer_relayed_creates = true;
+            tune(config);
         });
         let b = state_with(
             vec![peer(
@@ -2908,6 +2914,39 @@ mod tests {
         let more = l.creates(1).await;
         Legacy::holds(&l.a, &more).await;
         assert!(refused.iter().all(|cid| !held(&l.a, cid)));
+    }
+
+    /// A refused post is refused before admission: it spends none of its
+    /// author's rate on `a`. Otherwise a busy author's posts, once the rate
+    /// was spent, would come back rate-limited, asked for again for ever.
+    /// `a` admits the author three blocks, the three creates it lands, and
+    /// is relayed forty posts it refuses as well.
+    #[tokio::test]
+    async fn a_refused_record_spends_none_of_its_authors_rate() {
+        let l = legacy_tuned(|config| {
+            config.auth.rate_limit.per_did_burst = 3;
+            config.auth.rate_limit.per_did_per_second = 1;
+        })
+        .await;
+        let x = l.channel("#x").await;
+        let landed = l.creates(1).await;
+        let refused = l
+            .posts(&x, crate::v0_0_2_catch_up::OVERLAP as usize + 8)
+            .await;
+        let past = l.creates(1).await;
+
+        l.dial(&l.a);
+        Legacy::holds(&l.a, &[x.clone(), landed[0].clone(), past[0].clone()]).await;
+        eventually("the catch-up done", || {
+            l.cursor(&l.a).is_none().then_some(())
+        })
+        .await;
+        assert!(refused.iter().all(|cid| !held(&l.a, cid)));
+        assert_eq!(
+            l.a.ingest_ctx.store.catch_up_seen(&l.to_b.url).unwrap(),
+            Some(past[0].clone()),
+            "past every refusal, to the create after them"
+        );
     }
 
     /// The live push, too: one post `a` refuses does not wedge the link, and

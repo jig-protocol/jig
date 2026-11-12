@@ -447,8 +447,26 @@ impl CatchingUp {
     }
 
     /// A live block failed here: keep the last-seen block where it is for
-    /// the rest of this connection (see [`Self::held`]).
-    pub(crate) fn hold_seen(&mut self) {
+    /// the rest of this connection (see [`Self::held`]). With none recorded
+    /// yet (a server upgrading, whose first catch-up dealt with nothing),
+    /// record where a reconnect would ask from now: otherwise the blocks
+    /// landing after this one would move the newest held block past it,
+    /// and a reconnect would ask from there.
+    pub(crate) fn hold_seen(&mut self, store: &SqliteStore, peer: &FederationPeer) {
+        if !self.held {
+            match store.catch_up_seen(&peer.url) {
+                Ok(Some(_)) => {}
+                Ok(None) => match resume_after(store, peer) {
+                    Ok(from) => seen(store, peer, &from),
+                    Err(e) => {
+                        tracing::warn!(peer_url = %peer.url, "last block seen from the peer not saved: {e:#}")
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(peer_url = %peer.url, "last block seen from the peer not read: {e:#}")
+                }
+            }
+        }
         self.live = true;
         self.held = true;
     }
@@ -780,13 +798,34 @@ mod tests {
         };
         let mut c = catching();
         c.saw_live(&store, &peer, "bafy-before");
-        c.hold_seen();
+        c.hold_seen(&store, &peer);
         c.saw_live(&store, &peer, "bafy-after");
         assert_eq!(
             store.catch_up_seen(&peer.url).unwrap().as_deref(),
             Some("bafy-before")
         );
         assert_eq!(resume_after(&store, &peer).unwrap(), "bafy-before");
+    }
+
+    /// With no last-seen block yet (an upgraded server whose first catch-up
+    /// dealt with nothing), a live failure records where a reconnect asks
+    /// from: the blocks landing after it do not move that past it.
+    #[test]
+    fn a_live_failure_with_nothing_seen_yet_keeps_the_resume_point() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let peer = FederationPeer {
+            url: "wss://unseen-peer".to_string(),
+            expected_did: "did:jig:zPeer".to_string(),
+            alias: None,
+            publish: false,
+            quota: None,
+            offers: Default::default(),
+        };
+        let mut c = catching();
+        c.hold_seen(&store, &peer);
+        assert_eq!(store.catch_up_seen(&peer.url).unwrap().as_deref(), Some(""));
+        c.saw_live(&store, &peer, "bafy-after");
+        assert_eq!(resume_after(&store, &peer).unwrap(), "", "from the start");
     }
 
     #[tokio::test(start_paused = true)]

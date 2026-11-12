@@ -1421,6 +1421,58 @@ fn self_join_admitted(
     }
 }
 
+/// The reason a refusal of a peer-relayed block into a channel this server
+/// sequences is logged under (JEP-0014 rule 37). Stable: operators grep for it.
+pub const RELAYED_INTO_SEQUENCED: &str = "relayed-into-sequenced-channel";
+
+/// The refusal [`ingest`] gives a block the legacy relay brought
+/// ([`IngestSource::FederatedPeer`]) for the channel it names, if it gives
+/// one: an archived channel, an unknown one, one another server sequences,
+/// or one this server sequences (#357). Ingest makes the same checks in the
+/// same order, after admission, so that a caller it will not deal with gets
+/// one answer whatever channel it names. Admission charges the author's rate,
+/// though, so a busy author's relayed posts would spend it on blocks that are
+/// only refused, and once it is spent come back as rate-limited, which the
+/// relay asks for again, rather than refused. The relay answers its peer
+/// nothing, so it asks this first and drops what it names. A `channel-create`
+/// gets `None`: it names a channel not yet here, and ingest judges it.
+pub fn refused_from_a_peer(
+    store: &SqliteStore,
+    server_did: &Did,
+    kind: BlockKind,
+    manifest: &jig_core::BlockManifest,
+    block_cid: &str,
+    source: &IngestSource,
+) -> crate::persist::Result<Option<IngestError>> {
+    if kind == BlockKind::ChannelCreate || !matches!(source, IngestSource::FederatedPeer { .. }) {
+        return Ok(None);
+    }
+    let Some(named) = channel_id_of(store, kind, manifest, block_cid)? else {
+        return Ok(None);
+    };
+    let Some(id) = named.id else {
+        return Ok(requires_existing_channel(kind, source)
+            .then_some(IngestError::UnknownChannel { slug: named.named }));
+    };
+    let Some(chan) = store.get_channel_by_id(&id)? else {
+        return Ok(Some(IngestError::ChannelArchived { slug: named.named }));
+    };
+    if !chan.sequencer_did.is_empty()
+        && crate::effect::canonical_did_string(&chan.sequencer_did)
+            != server_did.to_did_jig_string()
+    {
+        return Ok(Some(IngestError::CarriedChannel {
+            kind: kind.as_str().to_string(),
+            channel_id: chan.id,
+            sequencer: chan.sequencer_did,
+        }));
+    }
+    Ok(Some(IngestError::RelayedIntoSequencedChannel {
+        kind: kind.as_str().to_string(),
+        channel_id: chan.id,
+    }))
+}
+
 /// The channel a block belongs to — the ONE rule shared by the write gate,
 /// the persisted `blocks.channel_id` column, fanout and the effect layer.
 /// `None` when the block names no channel at all.
@@ -1436,10 +1488,6 @@ fn self_join_admitted(
 ///
 /// Archived channels resolve too, so the caller can tell "retired" from "no
 /// such channel".
-/// The reason a refusal of a peer-relayed block into a channel this server
-/// sequences is logged under (JEP-0014 rule 37). Stable: operators grep for it.
-pub const RELAYED_INTO_SEQUENCED: &str = "relayed-into-sequenced-channel";
-
 pub fn channel_id_of(
     store: &SqliteStore,
     kind: BlockKind,
