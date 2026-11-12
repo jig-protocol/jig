@@ -466,6 +466,7 @@ pub(crate) async fn connect_and_relay(
                                 break Err(ContractClosed(reason).into());
                             }
                             Ok(None) => {}
+                            Err(e) if e.downcast_ref::<HoldNotSaved>().is_some() => break Err(e),
                             Err(e) => warn!(peer_url = %peer.url, "inbound frame error: {e}"),
                         }
                     }
@@ -550,8 +551,10 @@ async fn handle_relayed_frame(
             if let Err(e) =
                 ingest_peer_block(state, peer, &bundle_b64, sig_b64.as_deref(), &delivery_cid).await
             {
-                if crate::v0_0_2_catch_up::failed_here(&e) {
-                    catching.hold_seen(&state.ingest_ctx.store, peer);
+                if crate::v0_0_2_catch_up::failed_here(&e)
+                    && let Err(not_held) = catching.hold_seen(&state.ingest_ctx.store, peer)
+                {
+                    return Err(HoldNotSaved(format!("{e:#}; {not_held:#}")).into());
                 }
                 return Err(e);
             }
@@ -794,6 +797,24 @@ impl std::fmt::Display for RetryLater {
 }
 
 impl std::error::Error for RetryLater {}
+
+/// A live block failed here and where the reconnect should ask from could
+/// not be recorded: the connection ends, so nothing lands after the block
+/// before a reconnect asks for it again.
+#[derive(Debug)]
+pub struct HoldNotSaved(pub String);
+
+impl std::fmt::Display for HoldNotSaved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a failed block's resume point was not saved, ending the link: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for HoldNotSaved {}
 
 /// Whether this is the first refusal this run of a post `peer_url` relayed
 /// into `channel_id`, a channel this server sequences. A peer still running

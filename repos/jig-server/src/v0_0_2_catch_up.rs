@@ -451,24 +451,21 @@ impl CatchingUp {
     /// yet (a server upgrading, whose first catch-up dealt with nothing),
     /// record where a reconnect would ask from now: otherwise the blocks
     /// landing after this one would move the newest held block past it,
-    /// and a reconnect would ask from there.
-    pub(crate) fn hold_seen(&mut self, store: &SqliteStore, peer: &FederationPeer) {
-        if !self.held {
-            match store.catch_up_seen(&peer.url) {
-                Ok(Some(_)) => {}
-                Ok(None) => match resume_after(store, peer) {
-                    Ok(from) => seen(store, peer, &from),
-                    Err(e) => {
-                        tracing::warn!(peer_url = %peer.url, "last block seen from the peer not saved: {e:#}")
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(peer_url = %peer.url, "last block seen from the peer not read: {e:#}")
-                }
-            }
-        }
+    /// and a reconnect would ask from there. An error if that could not be
+    /// recorded: the caller ends the connection, so nothing lands after the
+    /// failed block before the reconnect asks for it again.
+    pub(crate) fn hold_seen(
+        &mut self,
+        store: &SqliteStore,
+        peer: &FederationPeer,
+    ) -> anyhow::Result<()> {
+        let first = !self.held;
         self.live = true;
         self.held = true;
+        if first && store.catch_up_seen(&peer.url)?.is_none() {
+            store.set_catch_up_seen(&peer.url, &resume_after(store, peer)?)?;
+        }
+        Ok(())
     }
 
     /// Count one block of `bytes` if this minute's quota has room for it,
@@ -798,7 +795,7 @@ mod tests {
         };
         let mut c = catching();
         c.saw_live(&store, &peer, "bafy-before");
-        c.hold_seen(&store, &peer);
+        c.hold_seen(&store, &peer).unwrap();
         c.saw_live(&store, &peer, "bafy-after");
         assert_eq!(
             store.catch_up_seen(&peer.url).unwrap().as_deref(),
@@ -822,10 +819,33 @@ mod tests {
             offers: Default::default(),
         };
         let mut c = catching();
-        c.hold_seen(&store, &peer);
+        c.hold_seen(&store, &peer).unwrap();
         assert_eq!(store.catch_up_seen(&peer.url).unwrap().as_deref(), Some(""));
         c.saw_live(&store, &peer, "bafy-after");
         assert_eq!(resume_after(&store, &peer).unwrap(), "", "from the start");
+    }
+
+    /// A hold whose resume point cannot be recorded is an error, which ends
+    /// the connection before anything lands after the failed block.
+    #[test]
+    fn a_hold_that_cannot_be_recorded_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let store = SqliteStore::open(&path).unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TABLE catch_up_seen;")
+            .unwrap();
+        let peer = FederationPeer {
+            url: "wss://broken-peer".to_string(),
+            expected_did: "did:jig:zPeer".to_string(),
+            alias: None,
+            publish: false,
+            quota: None,
+            offers: Default::default(),
+        };
+        let mut c = catching();
+        assert!(c.hold_seen(&store, &peer).is_err());
     }
 
     #[tokio::test(start_paused = true)]
