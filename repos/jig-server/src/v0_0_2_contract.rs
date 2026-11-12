@@ -2858,8 +2858,8 @@ mod tests {
     }
 
     /// A catch-up whose records `a` refuses (posts into a copy `a`
-    /// sequences, #357) skips each one and goes on: the page lands what
-    /// follows, the catch-up finishes, and `a` remembers the last block it
+    /// sequences, #357) skips each one and goes on: the create after them
+    /// lands in the same catch-up, the catch-up finishes, and `a` remembers the last block it
     /// dealt with, refused or not. The next reconnect asks from there,
     /// stepping back only [`OVERLAP`](crate::v0_0_2_catch_up::OVERLAP), not
     /// from the newest block it holds, which would ask for every refusal
@@ -2871,9 +2871,10 @@ mod tests {
         let landed = l.creates(1).await;
         let overlap = crate::v0_0_2_catch_up::OVERLAP;
         let refused = l.posts(&x, overlap as usize + 8).await;
+        let past = l.creates(1).await;
 
         let dial = l.dial(&l.a);
-        Legacy::holds(&l.a, &[x.clone(), landed[0].clone()]).await;
+        Legacy::holds(&l.a, &[x.clone(), landed[0].clone(), past[0].clone()]).await;
         eventually("the catch-up done", || {
             l.cursor(&l.a).is_none().then_some(())
         })
@@ -2885,7 +2886,10 @@ mod tests {
                 .catch_up_seen(&l.to_b.url)
                 .unwrap()
                 .expect("a remembers the last block it dealt with");
-        assert_eq!(&seen, refused.last().unwrap(), "past every refusal");
+        assert_eq!(
+            seen, past[0],
+            "past every refusal, to the create after them"
+        );
         assert_eq!(
             crate::v0_0_2_catch_up::resume_after(&l.a.ingest_ctx.store, &l.to_b).unwrap(),
             seen,
