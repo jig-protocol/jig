@@ -702,6 +702,11 @@ mod tests {
         let mut d = exec(ok(1), true);
         d.world = "jig:block/renderer@0.2.0".into();
         assert_eq!(compare(&a, &d), Comparison::DifferentRuns);
+        // Another build of the component (another release), with another outcome: still
+        // different runs, never a divergence.
+        let mut e = exec(ok(2), true);
+        e.component = [8; 32];
+        assert_eq!(compare(&a, &e), Comparison::DifferentRuns);
     }
 
     // PV-02: a member's receipt for encrypted content is never read from the plaintext store.
