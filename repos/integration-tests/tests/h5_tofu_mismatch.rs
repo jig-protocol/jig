@@ -182,6 +182,7 @@ async fn send_text_render_with_nickname(
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{}/api/v1/blocks", server.http_url()))
+        .header("jig-capabilities", "tiers")
         .json(&payload)
         .send()
         .await?;

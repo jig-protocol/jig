@@ -22,8 +22,8 @@
 //!
 //! Every run is bounded three ways, all per store:
 //!
-//! - **Fuel**, the bound that decides receipts. wasmtime 49.0.3 charges bulk memory operations
-//!   per byte, so fuel tracks CPU closely, but only as closely as its cost table does.
+//! - **Fuel**, the bound that decides receipts. wasmtime has charged bulk memory operations
+//!   per byte since 47, so fuel tracks CPU closely, but only as closely as its cost table does.
 //! - **A wall-clock deadline**, from `crate::engine`'s epoch ticker, as a backstop for work
 //!   fuel prices too low: a cost-table gap, host-side canonical-ABI copies, a slow or loaded
 //!   machine. This engine runs its own ticker. Missing the deadline is

@@ -3,10 +3,10 @@
 `two-host-soak.sh` runs two federated jig-servers under steady traffic and
 checks every message.
 
-- **Traffic:** one client on each server (alice on A, bob on B). Each posts
-  to one open channel every `SOAK_INTERVAL` seconds.
+- **Traffic:** A shares one channel with B. Alice, a client on A, posts to it
+  every `SOAK_INTERVAL` seconds, and bob, a client on B, reads it.
 - **What it checks:**
-  - every message reaches the other server within `SOAK_DEADLINE`;
+  - every message reaches B within `SOAK_DEADLINE`;
   - how long that takes;
   - whether `/healthz`, memory and file descriptors hold steady.
 - **Faults:** it can restart server B on a schedule.
@@ -24,47 +24,34 @@ scripts/soak/two-host-soak.sh ~/soak.env
 
 Every setting is listed at the top of the script.
 
-## Two paths
+## The path
 
-`SOAK_PATH` picks how the channel reaches B:
-
-- **`legacy`** (the default): the relay every pair of peers runs for open
-  channels. Both sides post.
-- **`contract`**: A shares the channel with B (JEP-0005, `jig channel
-  share`), and B follows A's ordered records, pulling what it missed after
-  any outage. Only A posts, because B does not relay writes back yet, and B
-  reads the channel by its id. B's peer entry for A must accept offers:
-  local mode sets `offers = "accept"`, and in remote mode you set it.
+The channel reaches B by a share: A shares it with B (JEP-0005,
+`jig channel share`), and B follows A's ordered records, pulling what it
+missed after any outage. Only A posts, and B reads the channel by its id.
+B's peer entry for A must accept offers: local mode sets
+`offers = "accept"`, and in remote mode you set it.
 
 ```sh
-# The contract path, with A and B restarted in turn every 5 minutes:
-SOAK_PATH=contract SOAK_RESTART_EVERY=300 SOAK_RESTART_SIDE=alternate \
+# A and B restarted in turn every 5 minutes:
+SOAK_RESTART_EVERY=300 SOAK_RESTART_SIDE=alternate \
   SOAK_DURATION=3600 scripts/soak/two-host-soak.sh
 ```
 
-Between peers that are both up, the legacy relay delivers a new open channel
-to B within seconds, and B takes it as a channel it orders itself. A share
-made after that is accepted but carries nothing. So the contract path's
-default setup, `SOAK_CONTRACT_SETUP=isolated`, creates and shares the channel
-while B is down: the legacy relay is live-only, so it never brings that
-channel to B, and everything B gets comes by the contract. In remote mode
-this needs `SOAK_B_STOP_CMD` and `SOAK_B_START_CMD`.
-`SOAK_CONTRACT_SETUP=steady` shares with both up instead, and the run fails
-at setup, naming that collision, until it is fixed.
+The default setup, `SOAK_CONTRACT_SETUP=isolated`, creates and shares the
+channel while B is down, so everything B gets comes by the contract. In
+remote mode this needs `SOAK_B_STOP_CMD` and `SOAK_B_START_CMD`.
+`SOAK_CONTRACT_SETUP=steady` shares with both up instead. Against servers
+from before a channel-create named its sequencer (v0.2.0-alpha.4 and
+earlier), the relay copies the channel to B first, and the run fails at setup,
+naming that collision.
 
-## Concurrent ingest
-
-`SOAK_INGEST=concurrent` (legacy path only) runs `SOAK_WRITERS` writers on
-each side (16 by default), and every writer on both sides posts on the same
-tick. Each server then orders its own client's posts and the other server's
-relayed ones into the channel at the same moment. Every read holds the page
-to the chain of signed ingest records the reader pinned for the channel; a
-server that signs two records with one sequence number, rewinds its clock or
-rewrites a record breaks that chain, and the client keeps the evidence.
-
-```sh
-SOAK_INGEST=concurrent SOAK_INTERVAL=2 SOAK_DURATION=600 scripts/soak/two-host-soak.sh
-```
+**Retired in v0.2.0-alpha.6 (#357):** `SOAK_PATH=legacy` (both sides posting
+over the peers' open-channel relay) and `SOAK_INGEST=concurrent` with
+`SOAK_WRITERS` (writers on both sides posting on one tick, which needed the
+legacy path). A server now refuses any post a peer relays into a channel it
+orders, so neither can run. The script refuses both with that reason. To soak
+older servers, run the script from v0.2.0-alpha.5.
 
 ## Remote mode
 
@@ -138,19 +125,20 @@ Latency is the first sighting minus the send time, so its resolution is
   40 s, the contract path (isolated setup) delivered every post: 35 of 35,
   p95 3 s, at most 8 s just after a restart. B pulls A's records from its own
   head after each reconnect.
-- **Between peers that are both up, the legacy relay takes the channel
-  first.** B orders the channel itself, and acts on owner-only blocks
+- **Between peers that are both up, the legacy relay took the channel
+  first** (before a channel-create named its sequencer). B orders the channel itself, and acts on owner-only blocks
   relayed to it: a `channel-share` relayed from A makes B log its own
   `contract-refuse`. A share then delivers nothing. `SOAK_CONTRACT_SETUP=steady`
   shows it.
 - **Concurrent ingest signed a clock that ran backwards (fixed by #347).**
-  With 16 writers a side posting on the same tick, a build without #347
+  Found with the retired concurrent mode. With 16 writers a side posting on
+  the same tick, a build without #347
   signed record 605 with an older clock than record 604 within two minutes.
   Alice's client kept the proof (`chain-clock-backwards`) and refused her
   own server from then on, so every later send from A failed. With 4 writers
   a side the race did not show in two minutes: use 16 or more. On main
   with #347, the same run for three minutes delivered 1424 of 1424 each way,
   and both clients verified the chain to record 2850.
-- **The warm-up exists for the same reason.** Before sending, the harness
-  waits until a post crosses each way, re-posting until one does. Posts made
-  before both links are up would otherwise be lost the same way.
+- **The warm-up.** Before sending, the harness waits until a post on A is
+  read on B, re-posting until one is. That checks the peering and the share,
+  and keeps the time before the link is up out of the numbers.

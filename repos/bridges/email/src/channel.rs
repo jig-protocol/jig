@@ -26,7 +26,7 @@ pub fn thread_slug(did_a: &str, did_b: &str) -> String {
 
 use jig_bridge_core::{SubmitDenied, SubmitHandle};
 use jig_client::Identity;
-use jig_client::blocks::{BuiltBlock, build_channel_create, build_member_add};
+use jig_client::blocks::{BuiltBlock, build_member_add, build_with_metadata};
 
 const ENSURED_NS: &str = "channel-ensured";
 
@@ -62,7 +62,13 @@ pub(crate) async fn ensure_thread_channel(
         return Ok(());
     }
     let hlc = jig_core::HlcTimestamp::now_wall(creator.did().clone());
-    let cc = build_channel_create(creator, slug, "restricted", hlc);
+    // In-process, so no `sequencer`: the block reaches this server only.
+    let cc = build_with_metadata(
+        creator,
+        jig_core::BlockKind::ChannelCreate,
+        hlc,
+        serde_json::json!({"slug": slug, "visibility": "restricted"}),
+    );
     // FIXME(alpha): partial-ensure window — if channel-create succeeds but the
     // member-add below is denied, the marker is never written, so the next
     // inbound re-submits channel-create and creates a duplicate channel row

@@ -82,6 +82,10 @@ pub const SYSTEM: &str = "*";
 pub fn decode(d: &DeliveredBlock) -> Result<DecodedBlock> {
     let opened = open(d).context("opening delivered block")?;
     let mut decoded = plain(&opened, &d.receipts);
+    if let Some(notice) = contract_end_notice(&opened) {
+        decoded.sender = SYSTEM.to_string();
+        decoded.body = notice;
+    }
     if decoded.kind == Some(BlockKind::TextRender) {
         decoded.body.push_str(render_check(d, &opened).marker());
     }
@@ -138,8 +142,12 @@ pub fn present(opened: &OpenedBlock, receipts: &[ReceiptRef], seen: &Seen) -> Op
         Some(d)
     };
     match seen {
-        Seen::Plain => Some(plain(opened, receipts)),
-        Seen::Control => None,
+        // A contract-end is plaintext in any channel, so the session reads
+        // it as such; its notice shows either way.
+        Seen::Plain => contract_end_notice(opened)
+            .and_then(system)
+            .or_else(|| Some(plain(opened, receipts))),
+        Seen::Control => contract_end_notice(opened).and_then(system),
         Seen::Text { sender, text } => {
             let mut d = plain(opened, receipts);
             d.sender = sender.clone();
@@ -162,6 +170,29 @@ pub fn present(opened: &OpenedBlock, receipts: &[ReceiptRef], seen: &Seen) -> Op
             system(format!("could not follow a membership change: {reason}"))
         }
     }
+}
+
+/// A signed `contract-end` in the channel's log: the server it names no
+/// longer carries the channel, and a member whose client is there no longer
+/// reaches it. Who that is, the owner's server can only guess from who last
+/// wrote through it; nothing is removed for them.
+fn contract_end_notice(opened: &OpenedBlock) -> Option<String> {
+    if opened.manifest.kind != Some(BlockKind::ContractEnd)
+        || opened.authenticity != Authenticity::Verified
+    {
+        return None;
+    }
+    let to = opened
+        .manifest
+        .metadata
+        // The server the record is about (JEP-0005's `to`).
+        .get("to")?
+        .as_str()?;
+    Some(format!(
+        "{} no longer carries this channel; `jig channel members <channel> --via {to}` \
+         lists the members who last wrote through it",
+        shorten_did(to)
+    ))
 }
 
 /// A block as plaintext: body from metadata, sender from the verified key.
@@ -234,6 +265,53 @@ mod tests {
             receipts,
             delivery_cid: "bafy_test_delivery".into(),
             ingest: None,
+        }
+    }
+
+    /// A signed contract-end in the log says which server stopped carrying
+    /// the channel, and how to list who last wrote through it.
+    #[test]
+    fn a_contract_end_tells_who_to_look_for() {
+        let owner = test_identity();
+        let hlc = HlcTimestamp::now_wall(owner.did().clone());
+        let block = jig_client::blocks::build_with_metadata(
+            &owner,
+            BlockKind::ContractEnd,
+            hlc,
+            serde_json::json!({"channel_id": "bafy_channel", "to": "did:jig:zfollower"}),
+        );
+        let decoded = decode(&signed(&block, vec![])).unwrap();
+        assert_eq!(decoded.sender, SYSTEM);
+        assert!(decoded.is_message());
+        assert!(
+            decoded.body.contains("--via did:jig:zfollower"),
+            "{}",
+            decoded.body
+        );
+        // In an encrypted channel's history, as the MLS session reads it.
+        let keys = tempfile::tempdir().unwrap();
+        let mls = jig_client::secure::Session::open(
+            keys.path(),
+            Identity::generate_for_tests(&keys.path().join("id")),
+        )
+        .unwrap();
+        let opened = open(&signed(&block, vec![])).unwrap();
+        let seen = mls.observe("https://server.test", &opened);
+        assert_eq!(seen, Seen::Plain);
+        let shown = present(&opened, &[], &seen).unwrap();
+        assert_eq!(shown.sender, SYSTEM);
+        assert!(
+            shown.body.contains("--via did:jig:zfollower"),
+            "{}",
+            shown.body
+        );
+        // Unsigned, it says nothing.
+        let unsigned = decode(&delivered_for(
+            base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
+            vec![],
+        ));
+        if let Ok(d) = unsigned {
+            assert_ne!(d.sender, SYSTEM);
         }
     }
 

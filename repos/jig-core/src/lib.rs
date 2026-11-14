@@ -42,6 +42,7 @@ mod serde_helpers;
 pub mod signing;
 pub mod slug;
 pub mod suite;
+pub mod tier;
 #[cfg(feature = "ed25519")]
 pub mod tls_binding;
 pub mod wasm_validation;

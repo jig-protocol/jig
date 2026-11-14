@@ -187,6 +187,9 @@ pub async fn run(ctx: &CliContext, args: ChatArgs) -> Result<()> {
         backlog.lines,
         ctx.effective().contacts.clone(),
     );
+    // JEP-0014 rule 5: an unencrypted channel shows its tier and who can
+    // read it.
+    state.notice = reader.notice().map(str::to_string);
 
     let result = event_loop(
         &mut terminal,
@@ -265,7 +268,12 @@ async fn event_loop(
                 KeyCode::Esc => return Ok(()),
                 KeyCode::Char('q') | KeyCode::Char('c') if ctrl => return Ok(()),
                 KeyCode::Enter => {
-                    handle_submit(state, client, ctx, reader, status_tx);
+                    // JEP-0014 rule 5: nothing is posted to a channel whose
+                    // tier label the terminal cannot show.
+                    let size = terminal.size().context("terminal size")?;
+                    if crate::cmd::chat_view::may_send(state, size.width, size.height) {
+                        handle_submit(state, client, ctx, reader, status_tx);
+                    }
                 }
                 KeyCode::Backspace => {
                     delete_before_cursor(state);

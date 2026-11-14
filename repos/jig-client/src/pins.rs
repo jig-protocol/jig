@@ -1007,6 +1007,42 @@ pub fn prove_channel(
     })
 }
 
+/// [`prove_channel`], for a channel one of `orders` sequences: the serving
+/// server's DIDs for its own channel, or the proven owner's for one it
+/// carries. A creation block that names its sequencer must name one of them,
+/// so a server cannot serve another's channel as its own. One that names
+/// none predates sequencers and proves nothing either way.
+pub fn prove_channel_ordered_by(
+    slug: &str,
+    cid: &str,
+    bundle_b64: &str,
+    sig_b64: &str,
+    orders: &[String],
+) -> Result<ChannelPin, PinError> {
+    let pin = prove_channel(slug, cid, bundle_b64, sig_b64)?;
+    let canonical = jig_pipeline::effect::canonical_did_string;
+    let named = STANDARD
+        .decode(bundle_b64)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<(Vec<u8>, Vec<u8>)>(&b).ok())
+        .and_then(|(m, _)| serde_json::from_slice::<BlockManifest>(&m).ok())
+        .and_then(|m| {
+            m.metadata
+                .get(jig_pipeline::ingest::SEQUENCER_KEY)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+    if let Some(named) = named
+        && !orders.iter().any(|did| canonical(did) == canonical(&named))
+    {
+        return Err(PinError::Unproven {
+            slug: slug.to_string(),
+            reason: format!("its creator named another server to order it, {named}"),
+        });
+    }
+    Ok(pin)
+}
+
 /// Whether `sequencer`, as a listing names it, is a server other than the
 /// one whose DIDs are `server_dids` (its DID and those its key links lead
 /// from). An empty name is the server's own.
@@ -1076,6 +1112,19 @@ pub fn prove_carried(
     if created.to_string() != channel_id {
         return Err(unproven("the offer's creation block is another channel's"));
     }
+    // The creator named the server that orders the channel in the block it
+    // signed: the offer's signer must be that server.
+    let manifest: jig_core::BlockManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|_| unproven("the offer's creation block is malformed"))?;
+    match manifest
+        .metadata
+        .get(jig_pipeline::ingest::SEQUENCER_KEY)
+        .and_then(|v| v.as_str())
+    {
+        Some(named) if canonical(named) == canonical(sequencer) => {}
+        Some(_) => return Err(unproven("the channel's creator named another server")),
+        None => return Err(unproven("the channel's creation block names no server")),
+    }
     Ok(canonical(sequencer))
 }
 
@@ -1123,7 +1172,7 @@ mod tests {
     fn served(id: &Identity, slug: &str, suite: Option<&str>) -> (String, String, String) {
         let hlc = HlcTimestamp::now_wall(id.did().clone());
         let block = match suite {
-            None => build_channel_create(id, slug, "open", hlc),
+            None => build_channel_create(id, slug, "open", "did:jig:zserver", hlc),
             Some(s) => build_with_metadata(
                 id,
                 BlockKind::ChannelCreate,
@@ -1216,6 +1265,30 @@ mod tests {
             );
         }
         assert!(!served_as("open", None).unwrap().encrypted());
+    }
+
+    /// A server cannot serve a channel another server orders as its own: the
+    /// creation block names who orders it.
+    #[test]
+    fn a_creation_block_names_who_may_serve_it_as_its_own() {
+        let owner = identity();
+        let hlc = HlcTimestamp::now_wall(owner.did().clone());
+        let block = build_channel_create(&owner, "#ops", "open", "did:jig:zelsewhere", hlc);
+        let (bundle, sig) = (
+            STANDARD.encode(block.canonical_bytes()),
+            STANDARD.encode(&block.sender_sig),
+        );
+        let cid = block.cid();
+        let here = vec!["did:jig:zhere".to_string()];
+        assert!(matches!(
+            prove_channel_ordered_by("#ops", &cid, &bundle, &sig, &here),
+            Err(PinError::Unproven { reason, .. }) if reason.contains("another server")
+        ));
+        let elsewhere = vec!["did:jig:zelsewhere".to_string()];
+        assert!(prove_channel_ordered_by("#ops", &cid, &bundle, &sig, &elsewhere).is_ok());
+        // A creation from before sequencers names none.
+        let (bundle, sig, cid) = served(&owner, "#legacy", Some("none"));
+        assert!(prove_channel_ordered_by("#legacy", &cid, &bundle, &sig, &here).is_ok());
     }
 
     #[test]
@@ -1853,20 +1926,31 @@ mod tests {
 
     /// A channel created on `owner`'s server and offered to `follower`.
     fn carried() -> Carried {
-        use base64::Engine as _;
         let owner = jig_core::crypto::ed25519::generate_signing_key();
+        let named = did_of_key(&owner);
+        carried_naming(owner, Some(&named))
+    }
+
+    /// A share of a channel whose creation block names `named` as the server
+    /// that orders it (or no server), offered by `owner`.
+    fn carried_naming(owner: ed25519_dalek::SigningKey, named: Option<&str>) -> Carried {
+        use base64::Engine as _;
         let follower = Did::from_ed25519_pubkey(
             jig_core::crypto::ed25519::generate_signing_key()
                 .verifying_key()
                 .as_bytes(),
         )
         .to_did_jig_string();
-        let create = build_channel_create(
-            &identity(),
-            "#team",
-            "open",
-            HlcTimestamp::now_wall(Did::from_ed25519_pubkey(&[1; 32])),
-        );
+        let hlc = HlcTimestamp::now_wall(Did::from_ed25519_pubkey(&[1; 32]));
+        let create = match named {
+            Some(named) => build_channel_create(&identity(), "#team", "open", named, hlc),
+            None => build_with_metadata(
+                &identity(),
+                BlockKind::ChannelCreate,
+                hlc,
+                json!({"slug": "#team", "visibility": "open"}),
+            ),
+        };
         let creation_block =
             serde_json::to_vec(&(&create.manifest_bytes, &create.code_bytes)).unwrap();
         let channel_id = jig_core::BlockBundle {
@@ -1899,6 +1983,42 @@ mod tests {
 
     fn did_of_key(key: &ed25519_dalek::SigningKey) -> String {
         Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string()
+    }
+
+    /// The offer proves who orders a channel only together with the creation
+    /// block: its signed `sequencer` must name the offer's signer. A server
+    /// that mints a key and offers itself another server's channel proves
+    /// nothing, nor does an offer for a channel whose creator named no server.
+    #[test]
+    fn the_creation_block_names_who_orders_a_carried_channel() {
+        let minted = jig_core::crypto::ed25519::generate_signing_key();
+        let real = did_of_key(&jig_core::crypto::ed25519::generate_signing_key());
+        let c = carried_naming(minted.clone(), Some(&real));
+        let error = prove_carried(
+            "wss://follower",
+            "#team",
+            &c.channel_id,
+            &did_of_key(&minted),
+            std::slice::from_ref(&c.follower),
+            Some(&c.offer_b64),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("named another server"),
+            "{error}"
+        );
+
+        let c = carried_naming(minted.clone(), None);
+        let error = prove_carried(
+            "wss://follower",
+            "#team",
+            &c.channel_id,
+            &did_of_key(&minted),
+            std::slice::from_ref(&c.follower),
+            Some(&c.offer_b64),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("names no server"), "{error}");
     }
 
     #[test]

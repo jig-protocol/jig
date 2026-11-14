@@ -147,7 +147,7 @@ mod tests {
 /// The real `jig` argument surface, which had no parse tests at all before this.
 ///
 /// These assert on the *accepted command-line shapes*, which is the contract
-/// users and scripts actually depend on — `docs/GETTING_STARTED.md` documents
+/// users and scripts actually depend on — `repos/jig-cli/README.md` documents
 /// `jig tail --channel`, and `install.sh` ends by running `jig chat <channel>`.
 /// Both must keep parsing regardless of how the internals are refactored.
 #[cfg(test)]
@@ -181,8 +181,8 @@ mod cli_surface {
         assert_eq!(channel_of(&["jig", "tail", "#ops"]), "#ops");
     }
 
-    /// Regression guard: documented in docs/GETTING_STARTED.md and
-    /// repos/jig-cli/README.md. Removing this flag would silently break both.
+    /// Regression guard: documented in repos/jig-cli/README.md, and older
+    /// scripts use it. Removing this flag would silently break both.
     #[test]
     fn tail_still_accepts_the_channel_flag() {
         assert_eq!(channel_of(&["jig", "tail", "--channel", "#ops"]), "#ops");

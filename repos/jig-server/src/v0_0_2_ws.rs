@@ -64,6 +64,7 @@ pub mod metrics {
     static CONNECTIONS_ACTIVE: AtomicU64 = AtomicU64::new(0);
     static SUBSCRIBERS_ACTIVE: AtomicU64 = AtomicU64::new(0);
     static BLOCKS_INGESTED: AtomicU64 = AtomicU64::new(0);
+    static RELAYED_INTO_SEQUENCED: AtomicU64 = AtomicU64::new(0);
     /// Cardinality is bounded by the channels this server actually serves,
     /// which is the same bound the block store already carries.
     static CHANNEL_MESSAGES: RwLock<BTreeMap<String, u64>> = RwLock::new(BTreeMap::new());
@@ -106,6 +107,17 @@ pub mod metrics {
         }
     }
 
+    /// Record one post a peer relayed into a channel this server sequences,
+    /// refused (JEP-0014 rule 37, #357).
+    pub fn relayed_into_sequenced() {
+        RELAYED_INTO_SEQUENCED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many [`relayed_into_sequenced`] refusals since start.
+    pub fn relayed_into_sequenced_total() -> u64 {
+        RELAYED_INTO_SEQUENCED.load(Ordering::Relaxed)
+    }
+
     /// Saturating decrement — a gauge that underflows to u64::MAX is worse
     /// than one that is briefly wrong.
     ///
@@ -137,13 +149,22 @@ pub mod metrics {
     /// Prometheus text exposition (format version 0.0.4) of the live counters.
     pub fn render_prometheus() -> String {
         let snap = snapshot();
-        render(
+        let mut out = render(
             snap.connections_active,
             snap.subscribers_active,
             snap.blocks_ingested,
             &snap.channels,
             &jig_pipeline::metrics::ingested_by_source(),
-        )
+        );
+        out.push_str(&format!(
+            "# HELP jig_federation_relayed_refused_total Blocks a peer relayed and this server \
+             refused, by reason.\n\
+             # TYPE jig_federation_relayed_refused_total counter\n\
+             jig_federation_relayed_refused_total{{reason=\"{}\"}} {}\n",
+            jig_pipeline::ingest::RELAYED_INTO_SEQUENCED,
+            relayed_into_sequenced_total()
+        ));
+        out
     }
 
     /// Pure renderer — separated from the globals so its output format is
@@ -361,7 +382,18 @@ async fn handle_socket(
                     Message::Text(_) if ip.is_some_and(|ip| !state.auth.charge_ip(ip)) => {
                         let outcome = crate::auth::GateOutcome::RateLimited;
                         let (status, code, message) = state.auth.disclosure.disclose(&outcome);
-                        let _ = send_error(&mut socket, Some(status), code, None, &message).await;
+                        let wait = (code == "RATE_LIMITED")
+                            .then(|| state.auth.ip_retry_after_ms())
+                            .flatten();
+                        let _ = send_error_after(
+                            &mut socket,
+                            Some(status),
+                            code,
+                            None,
+                            &message,
+                            wait,
+                        )
+                        .await;
                     }
                     Message::Text(text) => {
                         if let Err(e) = handle_client_frame(
@@ -480,6 +512,9 @@ struct ConnState {
     /// The other end of `peer_sender`, for the connection loop to take.
     peer_rx: Option<mpsc::Receiver<Envelope>>,
     peer_registration: Option<crate::v0_0_2_peer::Registration>,
+    /// Whether the hello asked for channel tiers (JEP-0014 rule 5): a client
+    /// that did not may read a `public` channel but not post to it.
+    tiers: bool,
 }
 
 /// A handshake that ends with the dialer's [`Frame::PeerProof`].
@@ -646,7 +681,8 @@ async fn handle_client_frame(
             Ok(()) => {
                 session.peer = jig_core::did::Did::from_did_jig_string(&awaiting.peer_did).ok();
                 if let Some(peer) = session.peer.clone() {
-                    let (sender, rx) = crate::v0_0_2_peer::PeerSender::new(peer);
+                    let (sender, rx) =
+                        crate::v0_0_2_peer::PeerSender::with_tiers(peer, session.tiers);
                     session.peer_registration = Some(state.peers.register(sender.clone()));
                     session.peer_sender = Some(sender);
                     session.peer_rx = Some(rx);
@@ -774,7 +810,9 @@ async fn handle_client_frame(
                         "ws subscribe refused"
                     );
                     let (status, code, message) = state.auth.disclosure.disclose(&outcome);
-                    let _ = send_error(socket, Some(status), code, None, &message).await;
+                    let wait = rate_wait(state, code);
+                    let _ =
+                        send_error_after(socket, Some(status), code, None, &message, wait).await;
                     return Ok(());
                 }
             }
@@ -800,7 +838,9 @@ async fn handle_client_frame(
                         "ws subscribe refused"
                     );
                     let (status, code, message) = state.auth.disclosure.disclose(&outcome);
-                    let _ = send_error(socket, Some(status), code, None, &message).await;
+                    let wait = rate_wait(state, code);
+                    let _ =
+                        send_error_after(socket, Some(status), code, None, &message, wait).await;
                     return Ok(());
                 }
             };
@@ -845,7 +885,9 @@ async fn handle_client_frame(
                             "ws subscribe refused"
                         );
                         let (status, code, message) = state.auth.disclosure.disclose(&outcome);
-                        let _ = send_error(socket, Some(status), code, None, &message).await;
+                        let wait = rate_wait(state, code);
+                        let _ = send_error_after(socket, Some(status), code, None, &message, wait)
+                            .await;
                         return Ok(());
                     }
                     Err(SubscribeRefusal::Store(detail)) => {
@@ -957,6 +999,7 @@ async fn handle_client_frame(
                 sig,
                 conn_id,
                 &format!("ws:{conn_id}"),
+                session.tiers,
             )
             .await
             {
@@ -985,12 +1028,13 @@ async fn handle_client_frame(
                     .block_cid()
                     .ok()
                     .map(|cid| cid.to_string());
-                    let _ = send_error(
+                    let _ = send_error_after(
                         socket,
                         Some(refusal.status.as_u16()),
                         &refusal.code,
                         ref_cid,
                         &refusal.message,
+                        refusal.retry_after_ms,
                     )
                     .await;
                 }
@@ -1051,6 +1095,9 @@ pub(crate) fn handshake_capabilities(state: &AppState) -> jig_pipeline::handshak
         federation: true,
         // The bound ingest enforces, so the signed claim is the enforced one.
         max_future_skew_ms: state.ingest_ctx.hlc_clock.max_future_skew_ms(),
+        // Implemented; `negotiate` signs it only into a welcome whose hello
+        // asked for it.
+        tiers: true,
     }
 }
 
@@ -1116,6 +1163,7 @@ async fn complete_hello(
                 .await
                 .map_err(|err| err.to_string())?;
             session.handshaken = true;
+            session.tiers = hello.capabilities.tiers;
             if let Some(peer_did) = hello.peer_did {
                 session.awaiting_peer = Some(AwaitingPeer {
                     peer_did,
@@ -1236,11 +1284,32 @@ async fn send_error(
     ref_cid: Option<String>,
     message: &str,
 ) -> Result<(), axum::Error> {
+    send_error_after(socket, status, code, ref_cid, message, None).await
+}
+
+/// When a caller refused at a gate as `code` may try again: a DID over its
+/// rate, after one token's refill. Nothing for any other refusal.
+fn rate_wait(state: &AppState, code: &str) -> Option<u64> {
+    (code == "RATE_LIMITED")
+        .then(|| state.auth.did_retry_after_ms())
+        .flatten()
+}
+
+/// [`send_error`], saying when to send again (`retry_after_ms`).
+async fn send_error_after(
+    socket: &mut WebSocket,
+    status: Option<u16>,
+    code: &str,
+    ref_cid: Option<String>,
+    message: &str,
+    retry_after_ms: Option<u64>,
+) -> Result<(), axum::Error> {
     let frame = Envelope::new(Frame::Error {
         status,
         code: code.to_string(),
         ref_cid,
         message: message.to_string(),
+        retry_after_ms,
     });
     let json = serde_json::to_string(&frame).map_err(axum::Error::new)?;
     socket.send(Message::Text(json.into())).await
@@ -1380,6 +1449,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
     }
@@ -1510,6 +1580,7 @@ mod tests {
                 code,
                 message,
                 ref_cid,
+                ..
             } => {
                 assert_eq!(code, "UNKNOWN_CHANNEL");
                 assert_eq!(status, Some(404));
@@ -1563,6 +1634,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: "did:jig:zowner".to_string(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
         let mut ws = established(&url).await;
@@ -1930,6 +2002,7 @@ mod tests {
                     suite: "none".to_string(),
                     sequencer_did: String::new(),
                     co_owners: Vec::new(),
+                    tiering: jig_pipeline::persist::ChannelTiering::current(visibility, "none"),
                 })
                 .unwrap();
         }
@@ -1974,6 +2047,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
         let manifest = serde_json::to_vec(&serde_json::json!({
@@ -2062,13 +2136,17 @@ mod tests {
     }
 
     /// An upgraded connection is still charged to its address, frame by frame:
-    /// past the burst a frame is refused, not processed.
+    /// past the burst a frame is refused, not processed, and the refill lets
+    /// exactly as many more in as it has made.
     #[tokio::test]
     async fn frames_past_the_address_rate_are_refused() {
         let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
         config.auth.rate_limit.per_ip_burst = 3;
         config.auth.rate_limit.per_ip_per_second = 1;
         let state = Arc::new(AppState::for_test_with_config(config).unwrap());
+        // Held still, so a slow runner refills nothing between frames.
+        let clock = crate::auth::rate::ManualClock::new();
+        state.auth.set_rate_clock(&clock);
         let app = Router::new()
             .route("/api/v1/ws", get(ws_handler))
             .with_state(state)
@@ -2077,32 +2155,42 @@ mod tests {
         let url = format!("ws://{}/api/v1/ws", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        // The hello is the first of three. 1/s is the slowest refill there
-        // is, so a slow runner may see one between frames: count frames up to
-        // the first refusal rather than assume exactly two more get in.
-        let start = std::time::Instant::now();
         let mut ws = established(&url).await;
-        let mut processed = 0u32;
-        loop {
-            ws.send(TMessage::Text("not valid json".into()))
-                .await
-                .unwrap();
-            match next_frame(&mut ws).await.frame {
-                Frame::Error { status, code, .. } if code == "RATE_LIMITED" => {
-                    assert_eq!(status, Some(429));
-                    break;
+        // Frames processed before the first refusal.
+        async fn until_refused(
+            ws: &mut tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        ) -> u32 {
+            let mut processed = 0u32;
+            loop {
+                ws.send(TMessage::Text("not valid json".into()))
+                    .await
+                    .unwrap();
+                match next_frame(ws).await.frame {
+                    Frame::Error {
+                        status,
+                        code,
+                        retry_after_ms,
+                        ..
+                    } if code == "RATE_LIMITED" => {
+                        assert_eq!(status, Some(429));
+                        // One token's refill at 1 a second.
+                        assert_eq!(retry_after_ms, Some(1_000));
+                        return processed;
+                    }
+                    Frame::Error { .. } => processed += 1,
+                    other => panic!("expected an error frame, got {other:?}"),
                 }
-                Frame::Error { .. } => processed += 1,
-                other => panic!("expected an error frame, got {other:?}"),
+                assert!(processed <= 64, "the address was never limited");
             }
-            assert!(processed <= 64, "the address was never limited");
         }
-        let refilled = start.elapsed().as_secs() as u32 + 1;
-        assert!(
-            (2..=2 + refilled).contains(&processed),
-            "{processed} frames after the hello got in over {:?}",
-            start.elapsed()
-        );
+        // The hello was the first of three.
+        assert_eq!(until_refused(&mut ws).await, 2);
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(until_refused(&mut ws).await, 1, "a second refills one");
+        clock.advance(Duration::from_secs(10));
+        assert_eq!(until_refused(&mut ws).await, 3, "and never past the burst");
     }
 
     /// A well-formed frame at a version or suite this server does not speak,
