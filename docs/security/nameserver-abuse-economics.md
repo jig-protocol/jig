@@ -29,19 +29,20 @@ penalty bits on a keyed puzzle that only the nameserver could solve.
 
 - **A price that is cheap to check.** Solving costs the client `E` digests on average.
   Checking costs the nameserver one, before any signature or store read.
-- **Order under load.** Strangers waiting for the pool are served highest bid first.
+- **Order under load.** Strangers waiting for the pool are served highest bid first, with
+  bids counted only up to `max_effort`; between capped bids, arrival order decides.
 - **No reuse.** Work is bound to the action, the alias, the nameserver, the subject and a
   single-use challenge (JEP-0008 rule 11). Work for one registration pays for no other.
 - **No work for nothing.** A closed suffix, a short, reserved or taken name is refused at
   the challenge, before any work.
 
-| Name | Effort | One server core |
-| --- | --- | --- |
-| 5 letters or more | 2^20 | about 0.2 s |
-| 4 letters | 2^22 | about 0.8 s |
-| 3 letters | 2^24 | about 3 s |
-| 1 or 2 letters | refused (allowlist only) | — |
-| renew, rotate | 1 | one digest |
+| Name | Effort | One server core | Headroom to `max_effort` (2^26) |
+| --- | --- | --- | --- |
+| 5 letters or more | 2^20 | about 0.2 s | 64× |
+| 4 letters | 2^22 | about 0.8 s | 16× |
+| 3 letters | 2^24 | about 3 s | 4× |
+| 1 or 2 letters | refused (allowlist only) | — | — |
+| renew, rotate | 1 | one digest | — |
 
 ## What proof-of-work does not buy
 
@@ -75,9 +76,11 @@ not use it.
   botnet or a large address pool walks around them.
 
 What the pool does not do: decide who gets the tokens. Under contention the queue sells
-them to the highest bidder, so an attacker with more compute can take most of the cap and
-leave honest newcomers with `503 REGISTRATION_BUSY`. The pool bounds how fast names go,
-not who gets them.
+them to the highest bidder, but a bid counts only up to `max_effort` (2^26, about 12 s on
+one server core). Past that, arrival order decides, so compute buys priority only until an
+honest client also bids the cap. An attacker who reaches the cap faster can still take
+most of the tokens and leave honest newcomers with `503 REGISTRATION_BUSY`. The pool bounds
+how fast names go, not who gets them.
 
 ## Length scaling
 
@@ -89,9 +92,9 @@ Short names are scarce, so they cost more (R1 decision 1):
 - The multiplier applies even when the controller is idle, because the floor `min_effort`
   is taken before it (JEP-0008 rule 18, amended).
 
-At the defaults a 3-letter name already costs `max_effort` (2^24). The controller and
-penalties cannot raise it further, so a 3-letter name and a 5-letter one cost the same
-under heavy load.
+At the defaults a 3-letter name costs 2^24, a quarter of `max_effort` (2^26, DJ's decision
+for short-name headroom). The controller and penalties can raise it 4× before the cap, so
+under heavy load a 3-letter name still costs more than a 5-letter one until both reach it.
 
 ## Penalties and decay
 
@@ -101,14 +104,15 @@ Penalties raise what one client is asked for its next registration. They key on:
   before the signature, so the DID it names is not proven yet;
 - **the pair** (alias, DID), for a signed attempt on a name another DID holds.
 
-Each point doubles the effort, up to `max_effort`. So penalties have 16× of range for a
-long name, 4× for a 4-letter one and none for a 3-letter one at the defaults.
+Each point doubles the effort, up to `max_effort`. So penalties have 64× of range for a
+long name, 16× for a 4-letter one and 4× for a 3-letter one at the defaults. Points past
+those that take `min_effort` to `max_effort` change no price and are not kept.
 
-**Decay remembers repeat offenders.** A penalty lives `penalty_decay_secs` (600 s). A
-repeat before it lapses adds a point and doubles its life, up to a day. When the life ends,
-all its points lapse at once.
+**Decay remembers repeat offenders.** One point decays per `penalty_decay_secs` (600 s). A
+repeat while points remain adds a point and doubles the time each point takes to decay, up
+to a day. A key whose points have all decayed starts over (JEP-0008 rule 27).
 
-| Offences, each before the last lapsed | Life of the penalty |
+| Offences, each while points remained | Time for one point to decay |
 | --- | --- |
 | 1 | 10 minutes |
 | 2 | 20 minutes |
@@ -151,11 +155,13 @@ What still works for a griefer:
 
 ## Servers
 
-A server's one-time admission work is the same puzzle (`admit`), at a fixed `2^pow_bits`
-(default 2^20), and off by default. It makes spreading a flood across rate-limit buckets
-cost something; it does not stop a Sybil. Capacity pools at servers (member, invited and
-stranger shares, JEP-0008 rules 21–23) are what bounds strangers there, and are not on
-`main` yet. <!-- R1 task 5a: confirm against the merged [auth.pools] PR -->
+A server's one-time admission work is the same puzzle (`admit`), off by default (D26,
+JEP-0008 rule 33). A server that turns it on asks at least `min_effort` (default 2^20), and
+its controller raises the effort when more unknown DIDs arrive per window than its target
+(rule 17). It makes spreading a flood across rate-limit buckets cost something; it does not
+stop a Sybil. Capacity pools (`[auth.pools]`, JEP-0008 rules 21–23) are what bounds
+strangers there: strangers share at most 20 % of local writes and invited subjects 10 %, so
+however many identities a flood brings, members keep the rest.
 
 ## Known weaknesses the design must close
 
@@ -164,29 +170,27 @@ Each is a gap, not an accepted property:
 - **Linear Sybil cost.** Identities are free and the pool prices names, not identities.
   Standing (reputation under a ruleset) must cost more per identity than hashing, without
   linking identities (AB-05, JEP-0009).
-- **Compute buys the pool.** The queue serves the highest bid, and bids are not capped at
-  `max_effort`, so a GPU or a botnet outbids every phone. Algorithm agility (Equi-X, rule 8)
-  narrows the GPU gap only.
-- **No headroom for short names.** At the defaults a 3-letter name is already at
-  `max_effort`.
-- **No metrics.** The nameserver counts admitted and refused registrations, the suggested
-  effort and the queue, but exports none of it. An operator reads the effort by asking for
-  a challenge.
+- **Compute still buys speed in the pool.** Bids count only up to `max_effort`, but a GPU or
+  a botnet reaches the cap in milliseconds where a phone takes minutes, and arrives first.
+  Algorithm agility (Equi-X, rule 8) narrows the GPU gap only.
 - **State is per process and in memory.** A restart refills every pool, drops penalties and
   resets the controller; several processes share nothing.
-- **Penalties differ from JEP-0008 in shape.** Points lapse all at once, not one per
-  `decay_secs` (rule 27); a signed refusal charges the pair but not the address (rule 26).
+- **A taken name charges the pair only.** `ALIAS_TAKEN` comes after valid work and a valid
+  signature, so it charges the (alias, DID) pair and not the address (DJ's decision): a
+  NAT's other users pay nothing for it, and a careful attacker who never sends bad work
+  pays no address penalty at all.
 - **No squatting remedy.** Signed, logged operator removal (R1 decision 5) is not built, and
   no tribunal can rule on a name.
-- **Server admission is fixed and off by default**, not adaptive (JEP-0008 rule 33).
+- **Server admission is off by default** (D26). It adapts to load once turned on, and turns
+  on by default only with R2's earned standing (JEP-0008 rule 33).
 - **No tribunals, transparency log or reporting from encrypted channels.**
 
 ## Open questions
 
 - Which admission input closes linear Sybil cost: cross-registration within a ruleset
   group, soul validation, invites (JEP-0009), or something else.
-- Whether the queue should cap a bid at `max_effort`, or fall back to arrival order under
-  load, so compute buys less of the pool.
+- Whether arrival order between capped bids should give way to something compute cannot
+  buy, such as standing, so a GPU's speed stops deciding who gets the pool.
 - Whether short names need their own ceiling, so length scaling keeps working under load.
 - What `strangers_per_hour` and `burst` should be after `@jig`'s first week (R1 decision 2).
 - Whether R1's measurements justify a second algorithm (rule 8).

@@ -456,31 +456,40 @@ rules 6–15 are normative; this section describes the reference server.
   and rate limits still apply to it.
 
 **Status:** partial. The reference server does this under `[auth.admission] unknown_dids =
-"proof-of-work"`. The effort is still set by `pow_bits` (default 20, accepted 1 to 28), as
-`2^pow_bits`. The default policy is still `admit`, and the effort is fixed: no controller
-adapts it to load and no ruleset sets it, so rule 33's adaptive default-on is not built
-yet. The CLI does the work the first time it talks to such a server, in the JEP-0008 form
-when the server advertises `admission_pow`, else in the legacy form. 2^20 digests take
-about 0.2 s on one server core and far less on a GPU. The work makes minting identities to
-spread a flood across rate-limit buckets cost something; it does not stop a determined
-Sybil (see [Sybil resistance](#sybil-resistance)).
+"proof-of-work"`. The effort is at least `min_effort` (default 2^20; the legacy `pow_bits`
+means `2^pow_bits`) and at most `max_effort` (default 2^24). A controller (rule 17) doubles
+it above the floor after a window (`controller_window_secs`, 60) in which more distinct
+unknown DIDs arrived than `controller_target` (100), and halves it after a quiet one. With
+`min_effort = 0` an idle server asks no work. A proof is checked against the lowest effort
+offered within an offer's lifetime, so a rise mid-solve refuses nobody. No ruleset sets
+these yet, and the default policy is still `admit`: rule 33's default-on waits for R2's
+earned standing (D26). The CLI does the work the first time it talks to such a server, in
+the JEP-0008 form when the server advertises `admission_pow`, else in the legacy form. 2^20
+digests take about 0.2 s on one server core and far less on a GPU. The work makes minting
+identities to spread a flood across rate-limit buckets cost something; it does not stop a
+determined Sybil (see [Sybil resistance](#sybil-resistance)).
 
 ### Capacity pools (servers)
-
-<!-- R1 task 5a: confirm against the merged [auth.pools] PR -->
 
 JEP-0008 rules 21–23 divide a server's capacity between members, invited subjects and
 strangers, so a flood of fresh identities reaches only the stranger pool.
 
-- **Shares.** Each pool gets a share of the server's local writes. Strangers get at most
-  20 % and invited subjects at most 10 % by default. Members never wait on the other pools.
-- **Members**, until JEP-0009, are DIDs in the server's admission `records`, or DIDs whose
-  admission proof is at least `local_member_age_secs` old.
+- **Shares.** Each pool gets a share of the server's local writes (`[auth.pools]`
+  `writes_per_second`, default 1000, burst 2000). Strangers get at most 20 % and invited
+  subjects at most 10 % by default; members get the rest. Boot refuses shares that leave
+  members nothing, or a nonzero share whose burst is under one write.
+- **Lending.** A pool idle for a second lends what it holds above half its burst, and its
+  own first request stops the lending (rule 23, amended). A member arriving mid-flood has
+  at least half the members' burst at once and all of their rate from then on.
+- **Members**, until JEP-0009, are DIDs in the server's admission `records` with no negative
+  score, or DIDs whose admission proof is at least `local_member_age_secs` (7 days) old.
 - **Invited** stays empty until JEP-0009 defines invites.
 - **Strangers** are everyone else, and every `--anon` key.
 
-**Status:** not on `main`. It lands in a separate PR as `[auth.pools]`. Until then a server
-has only its per-DID and per-address rate limits (`[auth.rate_limit]`).
+**Status:** partial. The reference server pools local client writes, after its per-DID and
+per-address rate limits (rule 23). Blocks a peer relays or a bridge submits are not charged
+(rule 30). Live subscriptions are not pooled yet, and invites do not exist yet, so the
+invited pool stays empty.
 
 ### Cross-registration within a ruleset group
 
@@ -635,8 +644,9 @@ E = clamp( max(min_effort, suggested)
 ```
 
 - `suggested` is the pool's controller (below). `m_standing` is 1 until JEP-0009.
-- Defaults: `min_effort` 2^20, `max_effort` 2^24, `short_name_len` 5, `short_name_factor`
-  4. So 4 letters cost 4× and 3 letters 16× a name of 5 or more.
+- Defaults: `min_effort` 2^20, `max_effort` 2^26, `max_solve_secs` 13, `short_name_len` 5,
+  `short_name_factor` 4. So 4 letters cost 4× and 3 letters 16× a name of 5 or more, and a
+  3-letter name still has 4× of headroom.
 - 1 and 2 letters are reserved: `min_alias_len = 3` refuses them, and only a
   `registration_allow` entry can register them.
 - An allowlisted registration (`registration_allow`) pays `min_effort`, with no length
@@ -656,9 +666,10 @@ many strangers register per hour, however much compute they bring.
 - **Tokens.** A token bucket of `strangers_per_hour` (default 60) with `burst` (default 10).
   A stranger whose work and signature verified takes a token.
 - **Queue.** With no token, the request waits in a queue of `queue_len` (default 20),
-  highest bid first, arrival order between equal bids. A full queue takes a newcomer only
-  if it bids more than the lowest waiting request, which is then refused. After
-  `queue_wait_secs` (default 10) without a token, the answer is `503 REGISTRATION_BUSY`.
+  highest bid first, with bids counted only up to `max_effort`, and arrival order between
+  equal bids. A full queue takes a newcomer only if it bids more than the lowest waiting
+  request, which is then refused. After `queue_wait_secs` (default 10) without a token, the
+  answer is `503 REGISTRATION_BUSY`.
 - **Replays.** The request claims its challenge before it queues, so a replay of the same
   proof takes no second token.
 - **Controller** (`doubling`, per `controller_window_secs`, default 300). After a window in
@@ -695,10 +706,11 @@ Penalties raise the effort a registration is asked for (rules 26–27). They key
 - **`pair:<alias>|<did>`**, for a signed register attempt on an alias another DID holds.
   Other DIDs asking for the same alias pay nothing more.
 
-Each point doubles the effort: the pair's and the address's points add, up to 32 counted,
-and the result is clamped at `max_effort`. A penalty lives `penalty_decay_secs` (default
-600). A repeat offence before it lapses adds a point and doubles its life, up to a day; when
-the life ends, all its points lapse at once. At most 100 000 keys are held. Renew and rotate
+Each point doubles the effort: the pair's and the address's points add, and the result is
+clamped at `max_effort`. Points past those that take `min_effort` to `max_effort` are not
+kept. One point decays per `penalty_decay_secs` (default 600). A repeat offence while points
+remain adds a point and doubles the time each point takes to decay, up to a day; a key whose
+points have all decayed starts over (rule 27). At most 100 000 keys are held. Renew and rotate
 neither read nor add penalties. Penalties, the pool and the controller are in memory and
 per process, like the rate limits.
 
@@ -848,8 +860,9 @@ not yet meet.
   checked before any signature (nameservers).
 - Cap stranger registrations per suffix with a pool that compute cannot raise
   (nameservers).
-- Divide a server's capacity into member, invited and stranger pools (servers) *(not yet
-  implemented)*.
+- Divide a server's capacity into member, invited and stranger pools (servers) *(partial:
+  local writes only; subscriptions are not pooled, and the invited pool stays empty until
+  JEP-0009)*.
 - Scale proof-of-work by standing under an adopted ruleset, within its bounds *(not yet
   implemented: standing is 1 until JEP-0009)*.
 - Refuse used, expired or mismatched challenges.

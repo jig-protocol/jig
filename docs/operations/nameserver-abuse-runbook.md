@@ -47,10 +47,16 @@ proxy or client reports; users saying registration is slow or always busy.
 
 ### Read the pool and the effort
 
-The nameserver exports **no metrics**. It counts admitted and refused registrations, the
-suggested effort, the queue and the tokens per suffix in memory, but no route, log line or
-metrics endpoint publishes them. It logs nothing per request, except an info line for each
-allowlisted registration. What you can see today:
+The nameserver serves **`GET /metrics`** in the Prometheus text format, per suffix. It
+names no DID or alias, and like jig-server's `/metrics` it is not gated:
+
+- `jig_ns_registrations_admitted_total` and `jig_ns_registrations_busy_total`: strangers
+  admitted, and refused with `503 REGISTRATION_BUSY`;
+- `jig_ns_suggested_effort`: what the controller asks now, before length and penalties;
+- `jig_ns_pool_queued` and `jig_ns_pool_tokens`: requests waiting, and tokens left.
+
+A rising busy count with `pool_tokens` near 0 is a flood the pool is holding. It logs
+nothing per request, except an info line for each allowlisted registration. Other readings:
 
 - **The effort asked now.** Ask for a challenge as a client would, for a name of 5 or more
   letters, with any valid `did:jig`:
@@ -86,10 +92,10 @@ allowlisted registration. What you can see today:
    honest and the queue is busy. `enabled = false` turns the pool off and admits every
    stranger whose work verifies: do not do that during a flood.
 3. **Raise the price.** `min_effort` (default 2^20) is the floor every stranger pays;
-   `max_effort` (default 2^24) caps the controller and the penalties. Boot refuses a
-   `max_effort` that does not fit `max_solve_secs` at 5.5 million digests a second, or one
-   above 2^28. A higher price slows phones as well as bots, and `jig` refuses an offer it
-   cannot solve within its own time cap.
+   `max_effort` (default 2^26) caps the controller, the penalties and the bids. Boot
+   refuses a `max_effort` that does not fit `max_solve_secs` (default 13) at 5.5 million
+   digests a second, or one above 2^28. A higher price slows phones as well as bots, and
+   `jig` refuses an offer it cannot solve within its own time cap.
 4. **Lower the rate limits** in `[alias_rate_limits]`: `per_ip_per_min` (default 30),
    `challenge_per_ip_per_min` (default 60). They bound one address, not a botnet.
 5. **Close the suffix** if none of this is enough ([section 2](#2-close-a-suffix-fast)).
