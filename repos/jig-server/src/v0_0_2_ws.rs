@@ -227,6 +227,19 @@ pub async fn ws_handler(
         .on_upgrade(move |socket| handle_socket(socket, state, conn_id, ip, tls_exporter))
 }
 
+/// The address a request came from: its TCP peer, as the listener recorded
+/// it. `None` for a server started without connection info (tests driving
+/// the router directly). What [`per_ip_rate`] charges and what a REST write's
+/// relay slots are keyed by (`v0_0_2_relay::rest_caller`). Behind a
+/// passthrough proxy every client has the proxy's address, so they share one
+/// bucket and one set of relay slots; no forwarded header is trusted yet
+/// (#399).
+pub fn client_ip(extensions: &axum::http::Extensions) -> Option<std::net::IpAddr> {
+    extensions
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0.ip())
+}
+
 /// `[auth.rate_limit]` per remote address, on every request this router
 /// serves. A server started without connection info (tests driving the
 /// router directly) has no address to charge.
@@ -235,11 +248,7 @@ async fn per_ip_rate(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let ip = req
-        .extensions()
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|c| c.0.ip());
-    if let Some(ip) = ip
+    if let Some(ip) = client_ip(req.extensions())
         && !state.auth.charge_ip(ip)
     {
         let outcome = crate::auth::GateOutcome::RateLimited;

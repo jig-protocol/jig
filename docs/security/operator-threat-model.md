@@ -169,8 +169,11 @@ each block to the ones before it. A signed per-channel sequence does that for on
 comparison across servers and members covers a server that signs two different chains. The
 sequence is built: the server signs it and clients check it (#169); comparison is design work.
 
-**Status evidence.** `IngestError::DuplicateBlock` refuses a CID seen before, which also
-stops replay of control-plane blocks. Read proofs go through a
+**Status evidence.** A CID seen before is never applied, stored or fanned out again, which
+also stops replay of control-plane blocks. Resubmitted by a client (or relayed to its
+owner again), a held block is answered with its CID before admission, so a replay
+charges its author nothing (#396). From a peer or a bridge it is refused
+(`IngestError::DuplicateBlock`). Read proofs go through a
 `ReplayGuard` (`jig-server/src/auth/`). The manifest's `hlc_ts` is set by the block's
 author (TM-02), not the server. Since #161 the server signs an `ingest` record for every
 block of a channel it holds: `seq`, `prev` (the hash of the record before) and its own clock

@@ -681,6 +681,17 @@ impl Relay {
     }
 }
 
+/// The in-flight key for a REST write from `ip`: the caller's address, so a
+/// caller resubmitting someone else's signed block holds its own relay
+/// slots, not the author's. A request with no address (a router driven
+/// without connection info) falls back to the block's `author`.
+pub fn rest_caller(ip: Option<std::net::IpAddr>, author: &str) -> String {
+    match ip {
+        Some(ip) => format!("rest:ip:{ip}"),
+        None => format!("rest:{author}"),
+    }
+}
+
 /// Post a client's block on `state`'s server: through its [`Relay`], once
 /// the contract runs ([`crate::v0_0_2_contract`]), or straight to ingest.
 /// `conn` names the client's connection for the in-flight cap.

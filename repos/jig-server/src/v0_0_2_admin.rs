@@ -208,6 +208,7 @@ pub async fn create_channel(
 pub async fn add_member(
     State(state): State<Arc<AppState>>,
     Path(channel_ref): Path<String>,
+    extensions: axum::http::Extensions,
     Json(body): Json<BundleSubmission>,
 ) -> Result<Json<AdminResult>, (StatusCode, Json<AdminError>)> {
     let (manifest_bytes, code_bytes, sig) = decode_submission(&body)?;
@@ -248,7 +249,7 @@ pub async fn add_member(
         &manifest_bytes,
         &code_bytes,
         sig,
-        &format!("rest:{author}"),
+        &crate::v0_0_2_relay::rest_caller(crate::v0_0_2_ws::client_ip(&extensions), &author),
     )
     .await
     .map_err(|refusal| {
@@ -719,7 +720,22 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
 
-        let again = build_channel_archive(&owner, "#scratch", test_hlc(&owner));
+        // The same block again is the block already held: its CID, and
+        // nothing applied twice.
+        let (status, body) = post_json(
+            router.clone(),
+            &archive_path("#scratch"),
+            submission_from(&first),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+
+        // A second archive is refused: the channel is already archived.
+        let later = HlcTimestamp {
+            logical: 1,
+            ..test_hlc(&owner)
+        };
+        let again = build_channel_archive(&owner, "#scratch", later);
         let (status, body) =
             post_json(router, &archive_path("#scratch"), submission_from(&again)).await;
         assert_eq!(status, StatusCode::GONE, "body={body}");

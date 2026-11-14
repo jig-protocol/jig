@@ -4368,11 +4368,146 @@ mod tests {
         crate::v0_0_2_admin::add_member(
             State(state.clone()),
             Path(channel.to_string()),
+            axum::http::Extensions::new(),
             axum::Json(body),
         )
         .await
         .map(|ok| ok.0.block_cid)
         .map_err(|(status, body)| (status, body.0.code.clone()))
+    }
+
+    /// `parts` posted to `POST /api/v1/blocks` from `ip`, as the listener
+    /// records a caller's address.
+    async fn rest_post(
+        state: &Arc<AppState>,
+        parts: &(Vec<u8>, Vec<u8>, Vec<u8>),
+        ip: &str,
+    ) -> Result<String, (StatusCode, String)> {
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let body = crate::v0_0_2_blocks::SubmitBody {
+            bundle_b64: b64(&serde_json::to_vec(&(&parts.0, &parts.1)).unwrap()),
+            sig_b64: b64(&parts.2),
+        };
+        let mut extensions = axum::http::Extensions::new();
+        let addr: std::net::SocketAddr = format!("{ip}:40000").parse().unwrap();
+        extensions.insert(axum::extract::ConnectInfo(addr));
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            crate::v0_0_2_blocks::CAPABILITIES_HEADER,
+            jig_core::tier::TIERS_FEATURE.parse().unwrap(),
+        );
+        crate::v0_0_2_blocks::submit_block(
+            axum::extract::State(state.clone()),
+            headers,
+            extensions,
+            axum::Json(body),
+        )
+        .await
+        .map(|ok| ok.0.block_cid)
+        .map_err(|(status, body)| (status, body.0.code.clone()))
+    }
+
+    /// A REST write's relay slots are its caller's: whoever replays an
+    /// author's signed blocks from their own address fills their own
+    /// [`crate::v0_0_2_relay::MAX_IN_FLIGHT`], and the author, from theirs,
+    /// still gets through.
+    #[tokio::test]
+    async fn a_replayer_holds_its_own_relay_slots_not_the_authors() {
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.carried("write").await;
+        let (silent, mut swallowed) = PeerSender::new(p.owner.server_did.clone());
+        let _registration = p.follower.peers.register(silent);
+        let author = SigningKey::from_bytes(&rand::random());
+        let mut waiting = Vec::new();
+        for i in 0..crate::v0_0_2_relay::MAX_IN_FLIGHT {
+            let parts = signed(
+                &author,
+                BlockKind::TextRender,
+                text_in(&channel, &format!("{i}")),
+            );
+            let follower = p.follower.clone();
+            waiting.push(tokio::spawn(async move {
+                rest_post(&follower, &parts, "192.0.2.1").await
+            }));
+        }
+        let ten_s = std::time::Duration::from_secs(10);
+        for _ in 0..crate::v0_0_2_relay::MAX_IN_FLIGHT {
+            tokio::time::timeout(ten_s, swallowed.recv())
+                .await
+                .expect("a replayed write is relayed")
+                .expect("a relay sent");
+        }
+        let more = signed(&author, BlockKind::TextRender, text_in(&channel, "more"));
+        assert_eq!(
+            rest_post(&p.follower, &more, "192.0.2.1")
+                .await
+                .unwrap_err(),
+            (StatusCode::TOO_MANY_REQUESTS, "RELAY_BUSY".to_string()),
+            "the replayer's own slots are full"
+        );
+
+        let own = signed(&author, BlockKind::TextRender, text_in(&channel, "mine"));
+        let mine = {
+            let follower = p.follower.clone();
+            tokio::spawn(async move { rest_post(&follower, &own, "198.51.100.7").await })
+        };
+        tokio::time::timeout(ten_s, swallowed.recv())
+            .await
+            .expect("the author's write is relayed, not RELAY_BUSY")
+            .expect("a relay sent");
+        mine.abort();
+        for task in waiting {
+            task.abort();
+        }
+    }
+
+    /// A block the owner holds, resubmitted by anyone, is answered with its
+    /// CID and spends none of its author's per-DID rate; a block that has not
+    /// landed still does.
+    #[tokio::test]
+    async fn a_held_block_resubmitted_spends_none_of_its_authors_rate() {
+        let p = pair_tuned(OfferPolicy::Accept, None, |c| {
+            c.auth.rate_limit.per_did_burst = 4;
+            c.auth.rate_limit.per_did_per_second = 1;
+        })
+        .await;
+        let channel = p.channel().await;
+        let parts = signed(&p.user, BlockKind::TextRender, text_in(&channel, "once"));
+        let cid = rest_post(&p.owner, &parts, "198.51.100.7").await.unwrap();
+        for _ in 0..12 {
+            assert_eq!(rest_post(&p.owner, &parts, "192.0.2.1").await.unwrap(), cid);
+        }
+        assert_eq!(
+            rest_post(&p.owner, &parts, "198.51.100.7").await.unwrap(),
+            cid,
+            "the author's own retry succeeds"
+        );
+        let next = signed(&p.user, BlockKind::TextRender, text_in(&channel, "next"));
+        rest_post(&p.owner, &next, "198.51.100.7")
+            .await
+            .expect("the replays spent none of the author's rate");
+
+        // Never landed: refused at the write gate, and charged every time.
+        let stranger = SigningKey::from_bytes(&rand::random());
+        let refused = signed(
+            &stranger,
+            BlockKind::ChannelShare,
+            serde_json::json!({
+                "channel_id": channel,
+                "to": p.follower.server_did.to_did_jig_string(),
+                "grant": "write",
+            }),
+        );
+        let codes: Vec<String> =
+            futures::future::join_all((0..8).map(|_| rest_post(&p.owner, &refused, "192.0.2.1")))
+                .await
+                .into_iter()
+                .map(|r| r.unwrap_err().1)
+                .collect();
+        assert!(
+            codes.iter().any(|c| c == "RATE_LIMITED"),
+            "a block that never landed is charged: {codes:?}"
+        );
     }
 
     /// The members route relays a carried channel's membership like any
