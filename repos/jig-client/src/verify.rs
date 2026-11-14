@@ -293,6 +293,19 @@ mod tests {
         assert_eq!(verify(&d, &opened), Verification::Agree);
     }
 
+    /// A server running another text-block build (another release, another Unicode version
+    /// for NFKC) is not compared against this client's: its receipt is unverified, never a
+    /// divergence, even when its outcome differs. Otherwise an older client would flag a newer
+    /// server's honest renders.
+    #[test]
+    fn a_server_on_another_component_is_unverified_not_a_divergence() {
+        let (d, opened, mut exec) = delivered("hello");
+        exec.component = [0x5a; 32];
+        exec.outcome = Outcome::Ok { hash: [0xee; 32] };
+        let d = with_receipt(d, exec, &server_key());
+        assert!(matches!(verify(&d, &opened), Verification::Unverified(_)));
+    }
+
     #[test]
     fn a_forged_server_hash_is_a_divergence() {
         let (d, opened, mut exec) = delivered("hello");

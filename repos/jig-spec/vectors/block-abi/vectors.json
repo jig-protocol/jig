@@ -543,7 +543,7 @@
     {
       "name": "text-block-plain",
       "component": "../../../text-block/artifacts/text_block.component.wasm",
-      "component-hash": "blake3:8ab0a9ebe0261c63973cccabdbb5c5f04ac703486e8de890518bb2c91175b179",
+      "component-hash": "blake3:99593614ee82449902364ae342cc9d4d671e39c9da0c2d236394908e3c351fb8",
       "world": "renderer",
       "max-memory-pages": 256,
       "fuel": 50000000,
@@ -571,7 +571,7 @@
     {
       "name": "text-block-empty",
       "component": "../../../text-block/artifacts/text_block.component.wasm",
-      "component-hash": "blake3:8ab0a9ebe0261c63973cccabdbb5c5f04ac703486e8de890518bb2c91175b179",
+      "component-hash": "blake3:99593614ee82449902364ae342cc9d4d671e39c9da0c2d236394908e3c351fb8",
       "world": "renderer",
       "max-memory-pages": 256,
       "fuel": 50000000,
@@ -599,7 +599,7 @@
     {
       "name": "text-block-mention-and-link",
       "component": "../../../text-block/artifacts/text_block.component.wasm",
-      "component-hash": "blake3:8ab0a9ebe0261c63973cccabdbb5c5f04ac703486e8de890518bb2c91175b179",
+      "component-hash": "blake3:99593614ee82449902364ae342cc9d4d671e39c9da0c2d236394908e3c351fb8",
       "world": "renderer",
       "max-memory-pages": 256,
       "fuel": 50000000,
@@ -627,7 +627,7 @@
     {
       "name": "text-block-markdown",
       "component": "../../../text-block/artifacts/text_block.component.wasm",
-      "component-hash": "blake3:8ab0a9ebe0261c63973cccabdbb5c5f04ac703486e8de890518bb2c91175b179",
+      "component-hash": "blake3:99593614ee82449902364ae342cc9d4d671e39c9da0c2d236394908e3c351fb8",
       "world": "renderer",
       "max-memory-pages": 256,
       "fuel": 50000000,
@@ -655,7 +655,7 @@
     {
       "name": "text-block-unicode",
       "component": "../../../text-block/artifacts/text_block.component.wasm",
-      "component-hash": "blake3:8ab0a9ebe0261c63973cccabdbb5c5f04ac703486e8de890518bb2c91175b179",
+      "component-hash": "blake3:99593614ee82449902364ae342cc9d4d671e39c9da0c2d236394908e3c351fb8",
       "world": "renderer",
       "max-memory-pages": 256,
       "fuel": 50000000,
@@ -683,7 +683,7 @@
     {
       "name": "text-block-invalid-utf8",
       "component": "../../../text-block/artifacts/text_block.component.wasm",
-      "component-hash": "blake3:8ab0a9ebe0261c63973cccabdbb5c5f04ac703486e8de890518bb2c91175b179",
+      "component-hash": "blake3:99593614ee82449902364ae342cc9d4d671e39c9da0c2d236394908e3c351fb8",
       "world": "renderer",
       "max-memory-pages": 256,
       "fuel": 50000000,
