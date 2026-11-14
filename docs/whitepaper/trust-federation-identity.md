@@ -789,11 +789,15 @@ a high-sec ruleset group, cross-checked.
   DID, and only listed peers may subscribe to its federation stream. Peer connections use
   TLS by default. Antipattern flags that weaken federation are off by default and listed in
   `/.well-known/jig` under `unsafe_options_active` when set.
-- **None.** Channel and membership state do not replicate; each server keeps its own. There
-  is no contract offer or acceptance, and no specification of how a member on one server
-  writes to a channel another server owns.
-- Federation has been exercised in tests and on private networks, never between two hosts on
-  the public internet.
+- **Built: the owner sequences, and followers carry its records.** A shared channel's owner
+  orders every block and signs its `ingest` record. A follower holds the owner's blocks and
+  records as they arrived, never re-signs or re-sequences them, and delivers in `seq` order
+  (JEP-0005 rules 2, 12 and 13,
+  [`jig-pipeline/src/follow.rs`](../../repos/jig-pipeline/src/follow.rs)).
+- **Built: writes through a follower.** A user on a follower writes to a channel another
+  server owns by posting to its own server, which relays the block to the owner within its
+  grant. Content needs a `write` grant and membership changes a `member` grant; the owner
+  runs its full write gate on every relayed block (JEP-0005 rules 7a and 15).
 
 ### 9.3 To be designed
 
@@ -1302,7 +1306,7 @@ gap.
 | High-sec nameservers cross-register; no single nameserver decides a group-wide claim | None: nameservers do not coordinate | Replicated registry, thresholds, operator independence (NS-03) |
 | Anchors are opt-in with no veto (D19) | None | Structural "no veto"; anchor replacement |
 | Federation is a data contract fixing the channel's suite (D12) | Partial: suite fixed per channel; channels cross only by a share, `shared` ones as ciphertext | Contract contents and signed acceptance |
-| One owning server per channel (D24) | None: each server keeps its own channel state | Cross-server writes: survey XMPP MUC, IRC, Matrix, ActivityPub groups |
+| One owning server per channel (D24) | Partial: a shared channel's owner sequences it and followers carry its records; members on a follower write through it under a grant | Cross-server writes: survey XMPP MUC, IRC, Matrix, ActivityPub groups |
 | A peer is a transport; relayed blocks pass every gate | Built: relayed blocks run through `ingest` and the write gate (authors not asked for admission proof-of-work); peers listed and pinned in configuration | Peer DID in the contract; per-peer limits |
 | Pluggable suites, MLS default and first (D1, D13) | Built: MLS per channel; validating delivery service | Non-MLS plug-in shape (D13); per-suite conformance |
 | End-to-end encryption by default | Partial: DMs and restricted channels always encrypted; open channels plaintext unless created `mls` | Encryption on by default |
