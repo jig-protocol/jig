@@ -20,7 +20,7 @@ blake3 = { workspace = true }
 # Guest bindings for the `jig:block` renderer world, used only by the component build
 # (`--features component`, see build-artifact.sh). 0.57 is the version wasip2 already
 # pins in the lockfile; its macro adds only build-time host crates.
-wit-bindgen = { version = "0.57", optional = true }
+wit-bindgen = { version = "0.63", optional = true }
 
 [features]
 # The `jig:block/renderer@0.1.0` exports (JEP-0006). build-artifact.sh builds the core module
