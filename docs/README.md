@@ -24,7 +24,7 @@ should not be read as a status page.
 | --- | --- | --- |
 | [`deploy/README.md`](../deploy/README.md) | CURRENT | Operator runbook: systemd units, the strict `/etc/jig/config.toml`, backups, sealing the server key, and the server-key warning. The unit files carry their own rationale in comments; this doc covers sequence. |
 | [`deployment/install-benchmark.md`](deployment/install-benchmark.md) | CURRENT | The 60-second `curl \| bash` install gate: the manual procedure on a $5-class VM, still the only measure on target hardware, and the CI runs (`scripts/install-smoke.sh` in `release.yml` and `install-smoke.yml`) with their first measurements. |
-| [`operations/nameserver-abuse-runbook.md`](operations/nameserver-abuse-runbook.md) | HISTORICAL | Nameserver incident runbooks: harassment reports, registration and relay abuse, a compromised nameserver, a rogue or contradicting nameserver. Mostly out of date since #154 removed the legacy routes it calls; a banner lists the steps that still apply; tribunal steps are marked future. |
+| [`operations/nameserver-abuse-runbook.md`](operations/nameserver-abuse-runbook.md) | CURRENT | Nameserver incident runbooks: a registration flood (reading the effort, adjusting the pool), closing a suffix, a squatting complaint, harassment reports, a compromised nameserver, a rogue or contradicting nameserver. Steps that need tribunals or operator removal are marked not yet implemented. |
 
 ## Design and implementation records
 
@@ -42,7 +42,7 @@ should not be read as a status page.
 | [`security/audit-scope.md`](security/audit-scope.md) | CURRENT | Scope for the external security audit (D27), split decided 2026-10-25 (one firm, Phase 1 before G3): seven areas by priority, entry points and threat-register rows for each, how to split the work, and what must be code-complete first. |
 | [`security/operator-threat-model.md`](security/operator-threat-model.md) | CURRENT | The model and evidence behind the spec's operator [threat register](../repos/jig-spec/src/threat-register.md). |
 | [`security/encryption.md`](security/encryption.md) | CURRENT | Why encryption is shaped as it is: suite field, refusals, MLS, DMs as locked channels, the DID key as MLS signer, a validating delivery service, the client plaintext cache. |
-| [`security/nameserver-abuse-economics.md`](security/nameserver-abuse-economics.md) | CURRENT | Why nameserver proof-of-work, rate limits and penalties are shaped as they are: Sybil and spam cost models, decay, griefing, federation, tribunals per ruleset group, and the known weaknesses the design must close. Rationale for the spec's [Identity and Reputation](../repos/jig-spec/src/identity-and-reputation.md) chapter. |
+| [`security/nameserver-abuse-economics.md`](security/nameserver-abuse-economics.md) | CURRENT | Why nameserver proof-of-work, the registration pool, length scaling and penalties are shaped as they are under JEP-0008: what work buys and does not, decay, griefing, and the known weaknesses the design must close. Rationale for the spec's [Identity and Reputation](../repos/jig-spec/src/identity-and-reputation.md) chapter. |
 | [`whitepaper/trust-federation-identity.md`](whitepaper/trust-federation-identity.md) | CURRENT | Whitepaper (non-normative): identity, `--anon`, reputation, security levels and ruleset groups, anchor nameservers, federation as a data contract, and the threat families beyond operators. Separates, for each topic, what jig must guarantee, what v0.2 does today, and what is still to design. |
 
 ## Crate documentation

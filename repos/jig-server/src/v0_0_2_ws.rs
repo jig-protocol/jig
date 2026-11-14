@@ -64,6 +64,7 @@ pub mod metrics {
     static CONNECTIONS_ACTIVE: AtomicU64 = AtomicU64::new(0);
     static SUBSCRIBERS_ACTIVE: AtomicU64 = AtomicU64::new(0);
     static BLOCKS_INGESTED: AtomicU64 = AtomicU64::new(0);
+    static RELAYED_INTO_SEQUENCED: AtomicU64 = AtomicU64::new(0);
     /// Cardinality is bounded by the channels this server actually serves,
     /// which is the same bound the block store already carries.
     static CHANNEL_MESSAGES: RwLock<BTreeMap<String, u64>> = RwLock::new(BTreeMap::new());
@@ -106,6 +107,17 @@ pub mod metrics {
         }
     }
 
+    /// Record one post a peer relayed into a channel this server sequences,
+    /// refused (JEP-0014 rule 37, #357).
+    pub fn relayed_into_sequenced() {
+        RELAYED_INTO_SEQUENCED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many [`relayed_into_sequenced`] refusals since start.
+    pub fn relayed_into_sequenced_total() -> u64 {
+        RELAYED_INTO_SEQUENCED.load(Ordering::Relaxed)
+    }
+
     /// Saturating decrement — a gauge that underflows to u64::MAX is worse
     /// than one that is briefly wrong.
     ///
@@ -137,13 +149,22 @@ pub mod metrics {
     /// Prometheus text exposition (format version 0.0.4) of the live counters.
     pub fn render_prometheus() -> String {
         let snap = snapshot();
-        render(
+        let mut out = render(
             snap.connections_active,
             snap.subscribers_active,
             snap.blocks_ingested,
             &snap.channels,
             &jig_pipeline::metrics::ingested_by_source(),
-        )
+        );
+        out.push_str(&format!(
+            "# HELP jig_federation_relayed_refused_total Blocks a peer relayed and this server \
+             refused, by reason.\n\
+             # TYPE jig_federation_relayed_refused_total counter\n\
+             jig_federation_relayed_refused_total{{reason=\"{}\"}} {}\n",
+            jig_pipeline::ingest::RELAYED_INTO_SEQUENCED,
+            relayed_into_sequenced_total()
+        ));
+        out
     }
 
     /// Pure renderer — separated from the globals so its output format is
@@ -361,7 +382,18 @@ async fn handle_socket(
                     Message::Text(_) if ip.is_some_and(|ip| !state.auth.charge_ip(ip)) => {
                         let outcome = crate::auth::GateOutcome::RateLimited;
                         let (status, code, message) = state.auth.disclosure.disclose(&outcome);
-                        let _ = send_error(&mut socket, Some(status), code, None, &message).await;
+                        let wait = (code == "RATE_LIMITED")
+                            .then(|| state.auth.ip_retry_after_ms())
+                            .flatten();
+                        let _ = send_error_after(
+                            &mut socket,
+                            Some(status),
+                            code,
+                            None,
+                            &message,
+                            wait,
+                        )
+                        .await;
                     }
                     Message::Text(text) => {
                         if let Err(e) = handle_client_frame(
@@ -778,7 +810,9 @@ async fn handle_client_frame(
                         "ws subscribe refused"
                     );
                     let (status, code, message) = state.auth.disclosure.disclose(&outcome);
-                    let _ = send_error(socket, Some(status), code, None, &message).await;
+                    let wait = rate_wait(state, code);
+                    let _ =
+                        send_error_after(socket, Some(status), code, None, &message, wait).await;
                     return Ok(());
                 }
             }
@@ -804,7 +838,9 @@ async fn handle_client_frame(
                         "ws subscribe refused"
                     );
                     let (status, code, message) = state.auth.disclosure.disclose(&outcome);
-                    let _ = send_error(socket, Some(status), code, None, &message).await;
+                    let wait = rate_wait(state, code);
+                    let _ =
+                        send_error_after(socket, Some(status), code, None, &message, wait).await;
                     return Ok(());
                 }
             };
@@ -849,7 +885,9 @@ async fn handle_client_frame(
                             "ws subscribe refused"
                         );
                         let (status, code, message) = state.auth.disclosure.disclose(&outcome);
-                        let _ = send_error(socket, Some(status), code, None, &message).await;
+                        let wait = rate_wait(state, code);
+                        let _ = send_error_after(socket, Some(status), code, None, &message, wait)
+                            .await;
                         return Ok(());
                     }
                     Err(SubscribeRefusal::Store(detail)) => {
@@ -990,12 +1028,13 @@ async fn handle_client_frame(
                     .block_cid()
                     .ok()
                     .map(|cid| cid.to_string());
-                    let _ = send_error(
+                    let _ = send_error_after(
                         socket,
                         Some(refusal.status.as_u16()),
                         &refusal.code,
                         ref_cid,
                         &refusal.message,
+                        refusal.retry_after_ms,
                     )
                     .await;
                 }
@@ -1245,11 +1284,32 @@ async fn send_error(
     ref_cid: Option<String>,
     message: &str,
 ) -> Result<(), axum::Error> {
+    send_error_after(socket, status, code, ref_cid, message, None).await
+}
+
+/// When a caller refused at a gate as `code` may try again: a DID over its
+/// rate, after one token's refill. Nothing for any other refusal.
+fn rate_wait(state: &AppState, code: &str) -> Option<u64> {
+    (code == "RATE_LIMITED")
+        .then(|| state.auth.did_retry_after_ms())
+        .flatten()
+}
+
+/// [`send_error`], saying when to send again (`retry_after_ms`).
+async fn send_error_after(
+    socket: &mut WebSocket,
+    status: Option<u16>,
+    code: &str,
+    ref_cid: Option<String>,
+    message: &str,
+    retry_after_ms: Option<u64>,
+) -> Result<(), axum::Error> {
     let frame = Envelope::new(Frame::Error {
         status,
         code: code.to_string(),
         ref_cid,
         message: message.to_string(),
+        retry_after_ms,
     });
     let json = serde_json::to_string(&frame).map_err(axum::Error::new)?;
     socket.send(Message::Text(json.into())).await
@@ -1520,6 +1580,7 @@ mod tests {
                 code,
                 message,
                 ref_cid,
+                ..
             } => {
                 assert_eq!(code, "UNKNOWN_CHANNEL");
                 assert_eq!(status, Some(404));
@@ -2107,8 +2168,15 @@ mod tests {
                     .await
                     .unwrap();
                 match next_frame(ws).await.frame {
-                    Frame::Error { status, code, .. } if code == "RATE_LIMITED" => {
+                    Frame::Error {
+                        status,
+                        code,
+                        retry_after_ms,
+                        ..
+                    } if code == "RATE_LIMITED" => {
                         assert_eq!(status, Some(429));
+                        // One token's refill at 1 a second.
+                        assert_eq!(retry_after_ms, Some(1_000));
                         return processed;
                     }
                     Frame::Error { .. } => processed += 1,
