@@ -33,7 +33,7 @@ zeroize = { version = "1", optional = true }
 # Keys and local state at rest (`keystore`), and the `test-aead` conformance
 # suite (`test-suite`). chacha20poly1305 is already in the tree through openmls;
 # argon2 is the passphrase KDF.
-chacha20poly1305 = { version = "0.11", optional = true, default-features = false, features = ["alloc"] }
+chacha20poly1305 = { version = "0.11", optional = true, default-features = false, features = ["alloc", "zeroize"] }
 argon2 = { version = "0.6", optional = true, default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
