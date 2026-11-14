@@ -156,12 +156,17 @@ What still works for a griefer:
 ## Servers
 
 A server's one-time admission work is the same puzzle (`admit`), off by default (D26,
-JEP-0008 rule 33). A server that turns it on asks at least `min_effort` (default 2^20), and
-its controller raises the effort when more unknown DIDs arrive per window than its target
-(rule 17). It makes spreading a flood across rate-limit buckets cost something; it does not
-stop a Sybil. Capacity pools (`[auth.pools]`, JEP-0008 rules 21–23) are what bounds
-strangers there: strangers share at most 20 % of local writes and invited subjects 10 %, so
-however many identities a flood brings, members keep the rest.
+JEP-0008 rule 33). A server that turns it on asks at least `min_effort` (default 2^20). Its
+controller (rule 17) raises the effort above that floor only after several windows in a row
+with more unknown DIDs than its target: six at the defaults, since its suggestion starts at
+`controller_start_effort` (2^16) and doubles once a window. It makes spreading a flood
+across rate-limit buckets cost something; it does not stop a Sybil. Capacity pools
+(`[auth.pools]`, JEP-0008 rules 21–23) are what bounds strangers there. Strangers get at
+most 20 % of local writes and invited subjects 10 %, plus what an idle pool lends above
+half its burst; a server with no members lends strangers the whole member share. However
+many identities a flood brings, a member's first request stops the lending, and members
+keep at least half their burst at once and their full rate after. Stamps for posts (rule
+29) are not asked yet: the verifier exists but nothing calls it.
 
 ## Known weaknesses the design must close
 

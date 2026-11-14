@@ -272,7 +272,8 @@ Non-goals:
 - **AB-01, replay and theft.** Work is bound to the verifier, subject, action and binding. Stamps
   are single-use within two epochs, and challenges are consumed.
 - **AB-02, botnets.** PoW is not an identity price. A flood of fresh identities, however cheaply
-  solved, reaches only the stranger pool (rule 23). Members are unaffected; strangers are slowed.
+  solved, reaches only the stranger pool and what idle pools lend it (rule 23). A member's first
+  request stops the lending, and members keep at least half their burst; strangers are slowed.
 - **Griefing.** Penalties key on (target, requester), so a third party cannot raise a victim's
   price.
 - **Forged load signals.** The effort is signed and checked against the pinned DID (rule 16).

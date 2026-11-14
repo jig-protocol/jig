@@ -457,22 +457,27 @@ rules 6–15 are normative; this section describes the reference server.
 
 **Status:** partial. The reference server does this under `[auth.admission] unknown_dids =
 "proof-of-work"`. The effort is at least `min_effort` (default 2^20; the legacy `pow_bits`
-means `2^pow_bits`) and at most `max_effort` (default 2^24). A controller (rule 17) doubles
-it above the floor after a window (`controller_window_secs`, 60) in which more distinct
-unknown DIDs arrived than `controller_target` (100), and halves it after a quiet one. With
-`min_effort = 0` an idle server asks no work. A proof is checked against the lowest effort
-offered within an offer's lifetime, so a rise mid-solve refuses nobody. No ruleset sets
-these yet, and the default policy is still `admit`: rule 33's default-on waits for R2's
-earned standing (D26). The CLI does the work the first time it talks to such a server, in
-the JEP-0008 form when the server advertises `admission_pow`, else in the legacy form. 2^20
-digests take about 0.2 s on one server core and far less on a GPU. The work makes minting
-identities to spread a flood across rate-limit buckets cost something; it does not stop a
-determined Sybil (see [Sybil resistance](#sybil-resistance)).
+means `2^pow_bits`) and at most `max_effort` (default 2^24). A controller (rule 17) keeps a
+suggested effort apart from that floor, and the server asks the greater of the two. After a
+window (`controller_window_secs`, 60) in which more distinct unknown DIDs arrived than
+`controller_target` (100), the suggestion doubles, starting from `controller_start_effort`
+(2^16); after one with at most half the target it halves, and below
+`controller_start_effort` it falls to 0. So at the defaults the effort asked first rises
+above 2^20 after six windows in a row over target. With `min_effort = 0` an idle server
+asks no work. A proof is checked against the lowest effort offered within an offer's
+lifetime, so a rise mid-solve refuses nobody. No ruleset sets these yet, and the default
+policy is still `admit`: rule 33's default-on waits for R2's earned standing (D26). The CLI
+does the work the first time it talks to such a server, in the JEP-0008 form when the
+server advertises `admission_pow`, else in the legacy form. 2^20 digests take about 0.2 s
+on one server core and far less on a GPU. The work makes minting identities to spread a
+flood across rate-limit buckets cost something; it does not stop a determined Sybil (see
+[Sybil resistance](#sybil-resistance)).
 
 ### Capacity pools (servers)
 
 JEP-0008 rules 21–23 divide a server's capacity between members, invited subjects and
-strangers, so a flood of fresh identities reaches only the stranger pool.
+strangers, so a flood of fresh identities reaches the stranger pool and what idle pools
+lend it, and members keep at least half their burst.
 
 - **Shares.** Each pool gets a share of the server's local writes (`[auth.pools]`
   `writes_per_second`, default 1000, burst 2000). Strangers get at most 20 % and invited
@@ -480,7 +485,9 @@ strangers, so a flood of fresh identities reaches only the stranger pool.
   members nothing, or a nonzero share whose burst is under one write.
 - **Lending.** A pool idle for a second lends what it holds above half its burst, and its
   own first request stops the lending (rule 23, amended). A member arriving mid-flood has
-  at least half the members' burst at once and all of their rate from then on.
+  at least half the members' burst at once and all of their rate from then on. A server
+  with no members at all (no records, nobody aged in) lends strangers the whole member
+  share.
 - **Members**, until JEP-0009, are DIDs in the server's admission `records` with no negative
   score, or DIDs whose admission proof is at least `local_member_age_secs` (7 days) old.
 - **Invited** stays empty until JEP-0009 defines invites.
@@ -490,6 +497,12 @@ strangers, so a flood of fresh identities reaches only the stranger pool.
 per-address rate limits (rule 23). Blocks a peer relays or a bridge submits are not charged
 (rule 30). Live subscriptions are not pooled yet, and invites do not exist yet, so the
 invited pool stays empty.
+
+**Stamps** (rule 29): not yet implemented. `jig-server` has the verifier (`auth/stamps.rs`:
+epoch salts and the replay set, rules 13–14), but nothing calls it and no configuration key
+turns it on, so no server asks `post` stamps of strangers yet. Its salts and replay set are
+in memory and per process: a restart starts a new epoch, and several instances behind one
+DID would need shared state it does not provide.
 
 ### Cross-registration within a ruleset group
 
@@ -555,6 +568,7 @@ Rules:
 | `/.well-known/jig-ns-delegation` | GET | Signed delegation for a DNS-rooted suffix |
 | `/v1/suffixes` | GET | Suffixes served, their registration mode, and the nameserver's DID |
 | `/v1/handles` | GET | Every registered alias; served only with `[v0_0_2.debug] list_handles` |
+| `/metrics` | GET | Prometheus text per suffix: pool tokens, queue length, suggested effort, registrations admitted and refused busy |
 
 ### Challenge flow
 
@@ -613,12 +627,14 @@ So work done for one action, alias, nameserver or challenge fails for any other.
 5. The proof of control (the DID's signature), then the reachability record.
 6. `ALIAS_TAKEN` by another DID.
 7. The [registration pool](#the-registration-pool), for a stranger.
-8. Consume the challenge; `ALIAS_TAKEN` and `DID_HOLDS_NAME` again, since the store can
-   change meanwhile.
+8. Consume the challenge; then `ALIAS_TAKEN` again, since the store can change meanwhile,
+   and `DID_HOLDS_NAME`, checked only here so that no unsigned request can map a DID to its
+   name.
 
 Renew checks the work, then the proof of control, then consumes the challenge, then that
 the DID holds the alias. Rotate checks the work before both signatures, and consumes the
-challenge last. No refusal before the consume uses the challenge up.
+challenge last. No refusal before the consume uses the challenge up; the two after it, in
+register, use up both the challenge and the stranger's pool token.
 
 **Refusals.**
 
@@ -661,8 +677,12 @@ E = clamp( max(min_effort, suggested)
 Per suffix, in `[v0_0_2.nameserver.alias_suffixes.pool]` (rules 17, 21–24). It bounds how
 many strangers register per hour, however much compute they bring.
 
-- **Strangers** are registrants the suffix's `registration_allow` does not name. Renew and
-  rotate by the holder, and allowlisted registrations, skip the pool.
+- **Strangers** are registrants the suffix's `registration_allow` does not name for that
+  alias: the allowlist exempts (DID, alias) pairs, so a listed DID registering another
+  alias is a stranger on an open suffix and refused on a closed one. Renew and rotate by the holder, and allowlisted registrations, skip
+  the pool. This differs from JEP-0008 rule 24, which makes every `ns-register` a stranger
+  action; the allowlist (R1 decision 3) is the reference nameserver's exception, not yet in
+  the JEP.
 - **Tokens.** A token bucket of `strangers_per_hour` (default 60) with `burst` (default 10).
   A stranger whose work and signature verified takes a token.
 - **Queue.** With no token, the request waits in a queue of `queue_len` (default 20),

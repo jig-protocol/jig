@@ -146,8 +146,7 @@ What exists today:
   rotate do not check the reserved lists.
 - **Hand it over later.** Add a `registration_allow` entry for the complainant's DID and
   the exact alias. If the name lapses, the nameserver lets that DID register it, even while
-  it is reserved. Until then, it gets `409 ALIAS_TAKEN` like anyone else. (On a closed
-  suffix, today's `jig` will not try: see [section 2](#2-close-a-suffix-fast).)
+  it is reserved. Until then, it gets `409 ALIAS_TAKEN` like anyone else.
 
 Record what you were told and what you did. Then:
 
