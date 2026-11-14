@@ -248,7 +248,8 @@ mod tests {
         let opened = crate::open::open(&delivered).expect("the block opens");
         let record = signed_record(3, &opened.cid);
         let input = text_input(&opened.manifest).expect("the block has a body");
-        let server = BlockExecutor::for_tests(jig_runtime::RuntimeConfig::default()).unwrap();
+        let server =
+            BlockExecutor::for_tests(jig_pipeline::executor::test_runtime_config()).unwrap();
         let run = server
             .render(&text_render_invocation(&input, &opened.cid, &record))
             .unwrap();
