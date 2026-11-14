@@ -707,6 +707,174 @@
         "outcome": "error",
         "hash": "blake3:d7d665c40df3ea5d6276d9281039bd7a525f4de1a67de31911bc165dde8f232b"
       }
+    },
+    {
+      "name": "text-block-next-plain",
+      "component": "../../../text-block/artifacts/text_block.next.component.wasm",
+      "component-hash": "blake3:99593614ee82449902364ae342cc9d4d671e39c9da0c2d236394908e3c351fb8",
+      "world": "renderer",
+      "max-memory-pages": 256,
+      "fuel": 50000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "68656c6c6f20776f726c64"
+        }
+      },
+      "invocation-hash": "blake3:ec31d7d67fe58a2b3a82343ca58b58d26ef6c20c44cc39f400aed742945106b3",
+      "expected": {
+        "outcome": "ok",
+        "hash": "blake3:ca67984c475d0d64f5ddf6a0dd114bae1f373105d8c8024955e88eb7f06831db"
+      }
+    },
+    {
+      "name": "text-block-next-empty",
+      "component": "../../../text-block/artifacts/text_block.next.component.wasm",
+      "component-hash": "blake3:99593614ee82449902364ae342cc9d4d671e39c9da0c2d236394908e3c351fb8",
+      "world": "renderer",
+      "max-memory-pages": 256,
+      "fuel": 50000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": ""
+        }
+      },
+      "invocation-hash": "blake3:538c99458b886479f4c5dd4e9c965fc86af2b98bfbd1dfa217515a55e04db941",
+      "expected": {
+        "outcome": "ok",
+        "hash": "blake3:87d2727e65f35ec81c61cc69d74bdd9628ff0c2fac59c8fc0cd29841e27abb59"
+      }
+    },
+    {
+      "name": "text-block-next-mention-and-link",
+      "component": "../../../text-block/artifacts/text_block.next.component.wasm",
+      "component-hash": "blake3:99593614ee82449902364ae342cc9d4d671e39c9da0c2d236394908e3c351fb8",
+      "world": "renderer",
+      "max-memory-pages": 256,
+      "fuel": 50000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "68657920406469643a6a69673a7a364d6b667269656e64207365652068747470733a2f2f6578616d706c652e6f72672f613f623d63"
+        }
+      },
+      "invocation-hash": "blake3:86ab348b07514532eaa36f6447ca8dec01bd594efddfec02e42bfadcafdba525",
+      "expected": {
+        "outcome": "ok",
+        "hash": "blake3:46e0d5074224f70bbb7902c0a699b4a1f1e54b5bd69ca46c7f3bdc3723905f84"
+      }
+    },
+    {
+      "name": "text-block-next-markdown",
+      "component": "../../../text-block/artifacts/text_block.next.component.wasm",
+      "component-hash": "blake3:99593614ee82449902364ae342cc9d4d671e39c9da0c2d236394908e3c351fb8",
+      "world": "renderer",
+      "max-memory-pages": 256,
+      "fuel": 50000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "2a2a626f6c642a2a205f656d5f2060636f6465600a0a3e2071756f7465"
+        }
+      },
+      "invocation-hash": "blake3:67b30a57a3a50ea58c11296ffd43ef38f318c13b3c1eeb4203262fde76d96de8",
+      "expected": {
+        "outcome": "ok",
+        "hash": "blake3:efc2619ece23bb21550e2be3e97b6a1c96f385e532cb0eff0093740a8aae68ac"
+      }
+    },
+    {
+      "name": "text-block-next-unicode",
+      "component": "../../../text-block/artifacts/text_block.next.component.wasm",
+      "component-hash": "blake3:99593614ee82449902364ae342cc9d4d671e39c9da0c2d236394908e3c351fb8",
+      "world": "renderer",
+      "max-memory-pages": 256,
+      "fuel": 50000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "6e61c3af766520636166c3a920e697a5e69cace8aa9e20f09f8e89"
+        }
+      },
+      "invocation-hash": "blake3:60a3ddb4b28aaf4d0773c093dded7642ed28d777929610bbc1eb0992db13186a",
+      "expected": {
+        "outcome": "ok",
+        "hash": "blake3:2d2127c3bfbfde84dbb80e179ea321e6c550a73322b18c230425a03bccd35a8c"
+      }
+    },
+    {
+      "name": "text-block-next-invalid-utf8",
+      "component": "../../../text-block/artifacts/text_block.next.component.wasm",
+      "component-hash": "blake3:99593614ee82449902364ae342cc9d4d671e39c9da0c2d236394908e3c351fb8",
+      "world": "renderer",
+      "max-memory-pages": 256,
+      "fuel": 50000000,
+      "timeout-ms": 10000,
+      "invocation": {
+        "block-cid": "bafyvectorblock",
+        "sender-did": "did:jig:z6MkvectorSender",
+        "channel-cid": "bafyvectorchannel",
+        "ingest-seq": 1,
+        "ingest-hlc": {
+          "wall-ms": 1747680000000,
+          "logical": 3
+        },
+        "input": {
+          "media-type": "text/plain",
+          "body-hex": "fffe"
+        }
+      },
+      "invocation-hash": "blake3:5ff3df3e0914906218f0ec220c612a5ef1e778d4b44622cc427779b5598edb3d",
+      "expected": {
+        "outcome": "error",
+        "hash": "blake3:d7d665c40df3ea5d6276d9281039bd7a525f4de1a67de31911bc165dde8f232b"
+      }
     }
   ]
 }
