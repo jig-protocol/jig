@@ -236,7 +236,13 @@ mod tests {
             logical: 0,
             server_did: id.did().clone(),
         };
-        let create = jig_client::blocks::build_channel_create(&id, "#hello", "open", hlc.clone());
+        let create = jig_client::blocks::build_channel_create(
+            &id,
+            "#hello",
+            "open",
+            "did:jig:zserver",
+            hlc.clone(),
+        );
         let text = build_text_render(&id, "#hello", "hello team", hlc);
 
         let blocks = vec![

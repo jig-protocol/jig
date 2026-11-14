@@ -15,9 +15,11 @@ use jig_client::blocks::BuiltBlock;
 use jig_client::chain::{ChannelChain, Step};
 use jig_client::limits;
 use jig_client::open::open;
-use jig_client::pins::{ChannelPin, Pins, prove_channel};
+use jig_client::pins::{
+    ChannelPin, Pins, names_another_server, prove_carried, prove_channel_ordered_by,
+};
 use jig_client::read_auth::{ReadProof, signable_path};
-use jig_client::secure::{CommitLock, Seen, Session, history_reaches, replay_order};
+use jig_client::secure::{CommitLock, ReadIn, Seen, Session, history_reaches, replay_order};
 use jig_client::{Client, ClientError, DeliveredBlock, Identity};
 use jig_mls::member::Commit;
 use serde::Deserialize;
@@ -84,6 +86,17 @@ pub struct ChannelInfo {
     pub slug: String,
     #[serde(default = "none_suite")]
     pub suite: String,
+    /// The server that orders the channel, as the listing says. Taken from
+    /// another server only with `share` ([`Secure::channel`]).
+    #[serde(default)]
+    pub sequencer: String,
+    /// The owner's signed offer, for a channel the server carries.
+    #[serde(default)]
+    pub share: Option<String>,
+    /// The channel's tier (JEP-0014), or `frozen`, as the listing says.
+    /// Absent from servers before tiers. Unsigned: shown, never trusted.
+    #[serde(default)]
+    pub tier: Option<String>,
 }
 
 fn none_suite() -> String {
@@ -126,6 +139,7 @@ pub async fn connect_pinned(server: &str, identity: Identity) -> Result<Client> 
             .server(server)
             .map(|p| p.links.clone())
             .unwrap_or_default(),
+        carried: pins.carried(server),
     };
     let client = Client::connect_with_options(server, identity, options)
         .await
@@ -172,7 +186,6 @@ struct Replayed {
     lines: Vec<DecodedBlock>,
     /// Members who left and may need tidying, until one is seen back.
     left: Vec<String>,
-    slug: Option<String>,
     cids: std::collections::HashSet<String>,
     deliveries: Vec<String>,
 }
@@ -342,6 +355,9 @@ impl Secure {
             .http()
             .await?
             .post(&url)
+            // Outside a connection, the features a hello would ask for
+            // (JEP-0014 rule 5): this client labels `public` channels.
+            .header("jig-capabilities", jig_core::tier::TIERS_FEATURE)
             .json(&body)
             .send()
             .await
@@ -369,10 +385,15 @@ impl Secure {
             channels: Vec<ChannelInfo>,
         }
         let listing: Listing = self.get_json("/api/v1/channels").await?;
-        let Some(mut info) = listing.channels.into_iter().find(|c| c.slug == slug) else {
+        let ours = Pins::load(&Pins::default_path())?
+            .server(&self.server)
+            .map(|p| p.sequencers())
+            .unwrap_or_default();
+        let Some(mut info) = pick(listing.channels, slug, &ours)? else {
             return Ok(None);
         };
         let pin = self.proven(&info).await?;
+        self.anchor(&info)?;
         if pin.suite != info.suite {
             eprintln!(
                 "warning: the server lists {slug} as `{}`, but its owner created it `{}`; \
@@ -391,6 +412,41 @@ impl Secure {
             );
         }
         Ok(Some(info))
+    }
+
+    /// Pin which server orders `info`'s channel. One the listing says
+    /// another server orders is carried for that owner only if the owner's
+    /// signed offer to this server proves it ([`prove_carried`]); then its
+    /// records are held to the owner. A server cannot name another
+    /// sequencer, or take a carried channel back as its own
+    /// ([`Pins::anchor_channel`]).
+    fn anchor(&self, info: &ChannelInfo) -> Result<()> {
+        let mut pins = Pins::load(&Pins::default_path())?;
+        let ours = pins
+            .server(&self.server)
+            .map(|p| p.sequencers())
+            .unwrap_or_default();
+        let other = names_another_server(&ours, &info.sequencer).then_some(info.sequencer.as_str());
+        let owner = match other {
+            Some(sequencer) => Some(prove_carried(
+                &self.server,
+                &info.slug,
+                &info.id,
+                sequencer,
+                &ours,
+                info.share.as_deref(),
+            )?),
+            None => None,
+        };
+        if pins.anchor_channel(&self.server, &info.slug, &info.id, owner.as_deref())? {
+            eprintln!(
+                "note: {} is now carried here for {}, which orders it; its history is checked \
+                 against that server's records from now on",
+                info.slug,
+                owner.as_deref().unwrap_or_default()
+            );
+        }
+        Ok(())
     }
 
     /// What `info`'s creation block proves, from the pin when it names the
@@ -424,7 +480,20 @@ impl Secure {
         let sig = served.sig_b64.with_context(|| {
             format!("the server serves {}'s creation block unsigned", info.slug)
         })?;
-        let proven = prove_channel(&info.slug, &info.id, &served.bundle_b64, &sig)?;
+        // Who may order it: this server, under any DID its key links lead
+        // from, or the owner the listing names for a carried channel, which
+        // `anchor` then proves.
+        let ours = pins
+            .server(&self.server)
+            .map(|p| p.sequencers())
+            .unwrap_or_default();
+        let orders = if names_another_server(&ours, &info.sequencer) {
+            vec![info.sequencer.clone()]
+        } else {
+            ours
+        };
+        let proven =
+            prove_channel_ordered_by(&info.slug, &info.id, &served.bundle_b64, &sig, &orders)?;
         Ok(pins.check_channel(&self.server, &info.slug, proven)?)
     }
 
@@ -433,19 +502,22 @@ impl Secure {
     /// listing's suite is the owner's signed one ([`Self::channel`]). A
     /// channel no longer listed to us is still what this device pinned.
     /// Failing to find out is an error, never a reason to send in the clear.
-    pub async fn encrypted(&self, slug: &str) -> Result<bool> {
+    /// Also returns the tier the server lists, for a label (JEP-0014 rule 5).
+    pub async fn encrypted_with_tier(&self, slug: &str) -> Result<(bool, Option<String>)> {
         let held = self.session.has_group(&self.server, slug)?;
         let pinned = Pins::load(&Pins::default_path())?
             .channel(&self.server, slug)
             .map(ChannelPin::encrypted);
-        let listed = self.channel(slug).await?.map(|c| c.encrypted()).or(pinned);
+        let info = self.channel(slug).await?;
+        let tier = info.as_ref().and_then(|c| c.tier.clone());
+        let listed = info.map(|c| c.encrypted()).or(pinned);
         if held && listed == Some(false) {
             eprintln!(
                 "warning: the server lists {slug} as unencrypted, but this device holds its \
                  MLS group; treating it as encrypted"
             );
         }
-        Ok(must_encrypt(held, listed))
+        Ok((must_encrypt(held, listed), tier))
     }
 
     /// Keep enough key packages published that others can add us while we
@@ -552,7 +624,7 @@ impl Secure {
             return self.process(slug, &delivered);
         }
         match self.forward_from(slug, &head).await? {
-            Forwarded::Done(replayed) => Ok(self.finish(replayed)),
+            Forwarded::Done(replayed) => Ok(self.finish(slug, replayed)),
             Forwarded::Broken {
                 mut replayed,
                 head,
@@ -573,16 +645,16 @@ impl Secure {
                     Some(at) => newest[at + 1..].to_vec(),
                     None => self.back_to(slug, &head, newest).await?,
                 };
-                self.replay_into(&mut replayed, &delivered);
+                self.replay_into(slug, &mut replayed, &delivered);
                 self.move_head(slug, &delivered)?;
-                Ok(self.finish(replayed))
+                Ok(self.finish(slug, replayed))
             }
         }
     }
 
     /// Replay `delivered` and move the head to its newest block.
     fn process(&self, slug: &str, delivered: &[DeliveredBlock]) -> Result<Synced> {
-        let synced = self.replay(delivered);
+        let synced = self.replay(slug, delivered);
         self.move_head(slug, delivered)?;
         Ok(synced)
     }
@@ -668,7 +740,7 @@ impl Secure {
                     "a page repeats blocks already read".into(),
                 ));
             }
-            self.replay_into(&mut replayed, &page);
+            self.replay_into(slug, &mut replayed, &page);
             let Some(last) = page.iter().rev().find_map(|d| open(d).ok()) else {
                 return Ok(Forwarded::Done(replayed));
             };
@@ -819,7 +891,7 @@ impl Secure {
             older.append(&mut delivered);
             delivered = older;
         }
-        let shown = self.replay(&delivered);
+        let shown = self.replay(slug, &delivered);
         Ok(Synced {
             tidy: synced.tidy,
             ..shown
@@ -850,15 +922,46 @@ impl Secure {
         parse_history(&body.to_string())
     }
 
+    /// The id and slug of the channel this device names `reference`, from
+    /// what it pinned ([`Self::channel`] pins a channel before it is read);
+    /// else `reference` itself, as an id or a slug. Blocks of the channel
+    /// name it by one of the two ([`Session::observe_in`]).
+    fn names(&self, reference: &str) -> (String, String) {
+        let pinned = Pins::load(&Pins::default_path()).ok().and_then(|pins| {
+            pins.channel_by_ref(&self.server, reference)
+                .map(|(slug, pin)| (pin.create_cid.clone(), slug.to_string()))
+        });
+        pinned.unwrap_or_else(|| {
+            if jig_core::canonical_cid::is_canonical_text(reference) {
+                (reference.to_string(), String::new())
+            } else {
+                (String::new(), reference.to_string())
+            }
+        })
+    }
+
+    /// What one block of `reference`'s live stream means, read through the
+    /// group state filed under `reference`, as [`Self::replay`] reads its
+    /// history.
+    pub fn observe(&self, reference: &str, block: &jig_client::open::OpenedBlock) -> Seen {
+        let (id, slug) = self.names(reference);
+        let channel = ReadIn {
+            key: reference,
+            id: &id,
+            slug: &slug,
+        };
+        self.session.observe_in(&self.server, Some(&channel), block)
+    }
+
     /// [`Secure::sync`] over blocks already fetched.
-    pub fn replay(&self, delivered: &[DeliveredBlock]) -> Synced {
+    pub fn replay(&self, reference: &str, delivered: &[DeliveredBlock]) -> Synced {
         let mut replayed = Replayed::default();
-        self.replay_into(&mut replayed, delivered);
-        self.finish(replayed)
+        self.replay_into(reference, &mut replayed, delivered);
+        self.finish(reference, replayed)
     }
 
     /// Process `delivered`, in MLS order, into what a replay has found.
-    fn replay_into(&self, r: &mut Replayed, delivered: &[DeliveredBlock]) {
+    fn replay_into(&self, reference: &str, r: &mut Replayed, delivered: &[DeliveredBlock]) {
         let mut opened = Vec::with_capacity(delivered.len());
         let mut receipts = std::collections::HashMap::new();
         for d in delivered {
@@ -873,14 +976,14 @@ impl Secure {
         r.cids.extend(opened.iter().map(|o| o.cid.clone()));
         r.deliveries
             .extend(delivered.iter().map(|d| d.delivery_cid.clone()));
+        let (id, slug) = self.names(reference);
+        let channel = ReadIn {
+            key: reference,
+            id: &id,
+            slug: &slug,
+        };
         for o in replay_order(opened) {
-            if r.slug.is_none() {
-                r.slug = o
-                    .manifest
-                    .kind
-                    .and_then(|k| jig_pipeline_slug(k, &o.manifest));
-            }
-            let seen = self.session.observe(&self.server, &o);
+            let seen = self.session.observe_in(&self.server, Some(&channel), &o);
             match &seen {
                 Seen::Left { member, tidy: true } => r.left.push(member.clone()),
                 // Back again since they left: nothing to tidy.
@@ -895,19 +998,14 @@ impl Secure {
     }
 
     /// What a replay found, once every page has been processed.
-    fn finish(&self, r: Replayed) -> Synced {
+    fn finish(&self, reference: &str, r: Replayed) -> Synced {
         // Only those still in the tree once everything has been replayed: a
         // later block in the same history may already have removed them.
-        let tidy = match r.slug {
-            Some(slug) => {
-                let still = self
-                    .session
-                    .group_members(&self.server, &slug)
-                    .unwrap_or_default();
-                r.left.into_iter().filter(|d| still.contains(d)).collect()
-            }
-            None => Vec::new(),
-        };
+        let still = self
+            .session
+            .group_members(&self.server, reference)
+            .unwrap_or_default();
+        let tidy = r.left.into_iter().filter(|d| still.contains(d)).collect();
         Synced {
             lines: r.lines,
             tidy,
@@ -1040,21 +1138,85 @@ pub fn mls_fields(c: &Commit) -> serde_json::Value {
     v
 }
 
-fn jig_pipeline_slug(kind: jig_core::BlockKind, m: &jig_core::BlockManifest) -> Option<String> {
-    let key = if kind == jig_core::BlockKind::ChannelCreate {
-        "slug"
-    } else {
-        "channel"
-    };
-    m.metadata
-        .get(key)
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
+/// The listed channel `reference` names: the one whose id it is, else the
+/// one this server orders under that slug (`ours`, the server's DIDs). A
+/// slug names a channel only where it is ordered, so a channel this server
+/// carries for its owner is named by its id here, whatever order the listing
+/// is in: a carried channel and this server's own may share a slug.
+fn pick(
+    channels: Vec<ChannelInfo>,
+    reference: &str,
+    ours: &[String],
+) -> Result<Option<ChannelInfo>> {
+    let mut carried = None;
+    let mut by_slug = None;
+    for channel in channels {
+        if !channel.id.is_empty() && channel.id == reference {
+            return Ok(Some(channel));
+        }
+        if channel.slug == reference && by_slug.is_none() {
+            if names_another_server(ours, &channel.sequencer) {
+                carried.get_or_insert(channel);
+            } else {
+                by_slug = Some(channel);
+            }
+        }
+    }
+    match (by_slug, carried) {
+        (Some(own), _) => Ok(Some(own)),
+        (None, Some(c)) => anyhow::bail!(
+            "{reference} here is a channel this server carries for {}; name it by its id, {}",
+            c.sequencer,
+            c.id
+        ),
+        (None, None) => Ok(None),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::must_encrypt;
+    use super::{ChannelInfo, must_encrypt, pick};
+
+    fn listed(id: &str, slug: &str, sequencer: &str) -> ChannelInfo {
+        ChannelInfo {
+            id: id.to_string(),
+            slug: slug.to_string(),
+            suite: "none".to_string(),
+            sequencer: sequencer.to_string(),
+            share: None,
+            tier: None,
+        }
+    }
+
+    /// A slug names the channel this server orders, never one it carries,
+    /// whatever order the listing is in; a carried channel is named by id.
+    #[test]
+    fn a_slug_names_the_servers_own_channel_not_a_carried_one() {
+        let ours = vec!["did:jig:zfollower".to_string()];
+        let carried = listed("bafycarried", "#shared", "did:jig:zowner");
+        let own = listed("bafyown", "#shared", "did:jig:zfollower");
+        for listing in [
+            vec![carried.clone(), own.clone()],
+            vec![own.clone(), carried.clone()],
+        ] {
+            let got = pick(listing.clone(), "#shared", &ours).unwrap().unwrap();
+            assert_eq!(got.id, "bafyown");
+            let got = pick(listing, "bafycarried", &ours).unwrap().unwrap();
+            assert_eq!(got.id, "bafycarried");
+        }
+        // Only a carried channel under the slug: refused, naming its id.
+        let error = pick(vec![carried], "#shared", &ours)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("bafycarried"), "{error}");
+        // A listing that names no sequencer is the server's own.
+        let legacy = listed("bafylegacy", "#old", "");
+        assert_eq!(
+            pick(vec![legacy], "#old", &ours).unwrap().unwrap().id,
+            "bafylegacy"
+        );
+        assert!(pick(vec![], "#none", &ours).unwrap().is_none());
+    }
 
     /// A server can say anything about a channel's suite. A device that
     /// holds the group never takes its word for "unencrypted" (OP-03).

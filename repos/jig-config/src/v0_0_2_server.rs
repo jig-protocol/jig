@@ -288,6 +288,10 @@ pub struct AuthSection {
     /// How fast one identity, or one address, may use this server. See
     /// [`RateLimitSection`].
     pub rate_limit: RateLimitSection,
+
+    /// How the server's write capacity is shared between members, invited
+    /// and strangers. See [`PoolsSection`].
+    pub pools: PoolsSection,
 }
 
 impl Default for AuthSection {
@@ -298,6 +302,7 @@ impl Default for AuthSection {
             replay_capacity: 100_000,
             admission: AdmissionSection::default(),
             rate_limit: RateLimitSection::default(),
+            pools: PoolsSection::default(),
         }
     }
 }
@@ -340,6 +345,54 @@ impl Default for RateLimitSection {
             per_ip_per_second: 100,
             replay_per_did: 2_000,
             max_tracked: 100_000,
+        }
+    }
+}
+
+/// `[auth.pools]`: the capacity pools of JEP-0008 rules 21–23. The server's
+/// accepted local writes per second are shared between members, invited and
+/// strangers, so a flood of fresh identities cannot take the capacity members
+/// write with, however many identities it brings.
+///
+/// - **Members** are DIDs with a nonempty `[auth.admission] records` entry
+///   holding no negative score, and DIDs whose admission proof of work is at
+///   least `local_member_age_secs` old.
+/// - **Invited** is empty until invites exist (JEP-0009).
+/// - **Strangers** are everyone else.
+///
+/// The stranger pool gets `stranger_share_pct` of the capacity and the invited
+/// pool `invited_share_pct`; members get the rest. A pool that has had no
+/// demand for a second lends what it holds above half its burst; its first
+/// request takes it back. So members never wait on a flood of strangers, and
+/// a server with no members yet lends their share out.
+///
+/// Blocks a federated peer relays or a bridge submits are not charged here:
+/// the peer pays at its own ingress (JEP-0008 rule 30).
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PoolsSection {
+    /// Accepted local writes per second, all pools together. `0` turns the
+    /// pools off.
+    pub writes_per_second: u32,
+    /// The most writes the pools hold for a burst, all pools together.
+    pub writes_burst: u32,
+    /// Percent of capacity the stranger pool gets (rule 23: 20).
+    pub stranger_share_pct: u8,
+    /// Percent of capacity the invited pool gets (rule 23: 10).
+    pub invited_share_pct: u8,
+    /// How long ago a DID must have done this server's admission proof of
+    /// work to count as a member (rule 21's `local_member_age`).
+    pub local_member_age_secs: u64,
+}
+
+impl Default for PoolsSection {
+    fn default() -> Self {
+        Self {
+            writes_per_second: 1_000,
+            writes_burst: 2_000,
+            stranger_share_pct: 20,
+            invited_share_pct: 10,
+            local_member_age_secs: 7 * 24 * 60 * 60,
         }
     }
 }
@@ -430,6 +483,15 @@ pub struct FederationSection {
     /// still checked by the signed welcome, but nothing after the welcome is
     /// protected on a plaintext link. Surfaces in `unsafe_options_active`.
     pub dangerously_allow_plaintext_federation: bool,
+    /// For tests only: a `channel-create` a configured peer relays, which
+    /// names another server as its sequencer (or none), is stored as a copy
+    /// this server sequences, as the legacy relay did before creates named
+    /// their sequencer. Clients refuse to read such a copy, because its
+    /// creation block names another server. Off, such a create is refused,
+    /// and a channel reaches a peer only once it is shared (JEP-0005):
+    /// servers that trust each other set `offers = "accept"` and use
+    /// `jig channel share`. Surfaces in `unsafe_options_active`.
+    pub naively_accept_peer_relayed_creates: bool,
     /// The quota for every peer without its own `quota`, published in the
     /// server manifest (JEP-0005 rule 16). Defaults to
     /// [`DEFAULT_PEER_BLOCKS_PER_MIN`] blocks and [`DEFAULT_PEER_BYTES_PER_MIN`]
@@ -475,6 +537,7 @@ impl Default for FederationSection {
             peers: Vec::new(),
             dangerously_disable_federation_tls: false,
             dangerously_allow_plaintext_federation: false,
+            naively_accept_peer_relayed_creates: false,
             default_peer_quota: PeerQuotaConfig {
                 blocks_per_min: DEFAULT_PEER_BLOCKS_PER_MIN,
                 bytes_per_min: DEFAULT_PEER_BYTES_PER_MIN,
@@ -1068,6 +1131,9 @@ impl JigServerConfig {
         if self.federation.dangerously_allow_plaintext_federation {
             active.push("federation.dangerously_allow_plaintext_federation".to_string());
         }
+        if self.federation.naively_accept_peer_relayed_creates {
+            active.push("federation.naively_accept_peer_relayed_creates".to_string());
+        }
         if self.identity.naively_allow_unknown_handles_fallback {
             active.push("identity.naively_allow_unknown_handles_fallback".to_string());
         }
@@ -1309,6 +1375,7 @@ mod tests {
         let cfg = JigServerConfig::default();
         assert!(!cfg.federation.dangerously_disable_federation_tls);
         assert!(!cfg.federation.dangerously_allow_plaintext_federation);
+        assert!(!cfg.federation.naively_accept_peer_relayed_creates);
         assert!(!cfg.identity.naively_allow_unknown_handles_fallback);
         assert!(!cfg.debug.list_handles);
     }
@@ -1355,6 +1422,7 @@ mod tests {
         let mut cfg = JigServerConfig::default();
         cfg.federation.dangerously_disable_federation_tls = true;
         cfg.federation.dangerously_allow_plaintext_federation = true;
+        cfg.federation.naively_accept_peer_relayed_creates = true;
         cfg.identity.naively_allow_unknown_handles_fallback = true;
         cfg.identity.dangerously_allow_plaintext_nameservers = true;
         cfg.debug.list_handles = true;
@@ -1367,6 +1435,7 @@ mod tests {
         assert!(active.contains(&"auth.require_authenticated_reads=false".to_string()));
         assert!(active.contains(&"federation.dangerously_disable_federation_tls".to_string()));
         assert!(active.contains(&"federation.dangerously_allow_plaintext_federation".to_string()));
+        assert!(active.contains(&"federation.naively_accept_peer_relayed_creates".to_string()));
         assert!(active.contains(&"identity.naively_allow_unknown_handles_fallback".to_string()));
         assert!(active.contains(&"identity.dangerously_allow_plaintext_nameservers".to_string()));
         assert!(active.contains(&"debug.list_handles".to_string()));

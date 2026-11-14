@@ -441,10 +441,17 @@ async fn check_chain_in(
 ) -> Result<ChainCheck> {
     use jig_client::chain::{ChannelChain, Step};
     let mut pins = Pins::load(pins_path)?;
+    // Pinned under its slug; a channel read by its id is found by that.
+    let pinned = pins
+        .channel_by_ref(server, slug)
+        .map(|(slug, pin)| (slug.to_string(), pin.clone()));
+    let slug = pinned
+        .as_ref()
+        .map_or(slug, |(pinned_as, _)| pinned_as.as_str());
     // The server's DID and, along the key links this device holds for it,
     // the DIDs it signed as before (JEP-0012).
     let (Some(channel), Some(sequencers)) = (
-        pins.channel(server, slug).cloned(),
+        pinned.as_ref().map(|(_, pin)| pin.clone()),
         pins.server(server)
             .filter(|p| !p.server_did.is_empty())
             .map(|p| p.sequencers()),
@@ -472,6 +479,12 @@ async fn check_chain_in(
         }
         head => head,
     };
+    // A channel the server carries for its owner is held to the owner, the
+    // DID the pin proved (`Pins::anchor_channel`), never to the server.
+    let sequencers = match &channel.sequencer {
+        Some(owner) => vec![owner.clone()],
+        None => sequencers,
+    };
     let mut chain = ChannelChain::across(&channel.create_cid, sequencers, head);
     let mut sorted: Vec<_> = records.iter().collect();
     sorted.sort_by_key(|r| r.seq);
@@ -487,7 +500,12 @@ async fn check_chain_in(
         };
         let step = accept(&mut chain, record, Some(&record.block_cid))?;
         if let Step::Gap { from, to } = step {
-            match fetch_records(who, server, slug, from, to).await {
+            // A carried channel is named by its id on this server.
+            let reference = match channel.sequencer {
+                Some(_) => channel.create_cid.as_str(),
+                None => slug,
+            };
+            match fetch_records(who, server, reference, from, to).await {
                 Ok(filler) if filler.len() as u64 == to - from => {
                     for missing in &filler {
                         accept(&mut chain, missing, None)?;
@@ -501,6 +519,11 @@ async fn check_chain_in(
                 }
             }
         }
+    }
+    // Accepted, and the user told: the server signed them out of clock
+    // order, which a fixed server never does.
+    for defect in chain.take_clock_defects() {
+        eprintln!("warning: {server} {slug}: {defect}.");
     }
     if let Some(head) = chain.head() {
         pins.advance_chain(server, slug, head)?;
@@ -673,6 +696,7 @@ async fn check_manifest_in(
             suite: "none".into(),
             owner_did: welcome.server_did.clone(),
             chain_head: None,
+            sequencer: None,
         },
     )?;
     if let ChainCheck::Unfilled { from, to } =
@@ -949,6 +973,7 @@ mod tests {
                 suite: "none".into(),
                 owner_did: did,
                 chain_head: None,
+                sequencer: None,
             },
         )
         .unwrap();
@@ -1090,6 +1115,48 @@ mod tests {
         assert_eq!(head_seq(&path), Some(2));
     }
 
+    /// A channel the server carries for its owner, pinned as such: its
+    /// history is held to the owner. The server's own signature on it
+    /// breaks it, and proves nothing against the server, which never
+    /// signed that channel's chain.
+    #[tokio::test]
+    async fn a_carried_channels_history_is_held_to_its_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let who = jig_client::Identity::generate_for_tests(dir.path());
+        let (server, owner) = (
+            jig_core::crypto::ed25519::generate_signing_key(),
+            jig_core::crypto::ed25519::generate_signing_key(),
+        );
+        let path = pinned(dir.path(), &server, None);
+        let owner_did = jig_core::Did::from_ed25519_pubkey(owner.verifying_key().as_bytes())
+            .to_did_jig_string();
+        Pins::load(&path)
+            .unwrap()
+            .anchor_channel(SERVER, "#ops", &label_cid("bafyCreate"), Some(&owner_did))
+            .unwrap();
+
+        let r0 = sign(&owner, 0, "bafyCreate", GENESIS_PREV);
+        let r1 = sign(&owner, 1, "bafyA", r0.hash());
+        // Read by its id, as a carried channel is on the server carrying it.
+        let id = label_cid("bafyCreate");
+        let got = check_chain_in(&path, &who, SERVER, &id, &[r0.clone(), r1.clone()])
+            .await
+            .unwrap();
+        assert_eq!(got, ChainCheck::Verified);
+        assert_eq!(head_seq(&path), Some(1));
+
+        let forged = sign(&server, 2, "bafyB", r1.hash());
+        let e = check_chain_in(&path, &who, SERVER, "#ops", &[forged])
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("contradicted"), "{e}");
+        assert_eq!(head_seq(&path), Some(1));
+        assert!(
+            Pins::load(&path).unwrap().refusal(SERVER).is_none(),
+            "nothing signed twice by one key, so no sticky refusal"
+        );
+    }
+
     #[tokio::test]
     async fn history_that_forks_from_the_pin_is_refused_and_the_pin_holds() {
         let dir = tempfile::tempdir().unwrap();
@@ -1206,6 +1273,7 @@ mod tests {
                 ingest_wall_ms: 0,
                 ingest_logical: 0,
                 record: None,
+                high: None,
             },
         )
         .unwrap();

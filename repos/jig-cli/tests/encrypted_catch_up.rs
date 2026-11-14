@@ -77,6 +77,7 @@ impl Member {
 async fn post(server: &TestJigServer, path: &str, block: &BuiltBlock) {
     let resp = reqwest::Client::new()
         .post(format!("{}{path}", server.http_url()))
+        .header("jig-capabilities", "tiers")
         .json(&json!({
             "bundle_b64": STANDARD.encode(block.canonical_bytes()),
             "sig_b64": STANDARD.encode(&block.sender_sig),
@@ -332,6 +333,7 @@ async fn away_and_back(serves: Serves) -> usize {
         BlockKind::ChannelCreate,
         owner.hlc(),
         json!({"slug": "#sec", "suite": "mls", "visibility": "open",
+               "sequencer": server.server_did_string,
                "mls_group_info": STANDARD.encode(&created.group_info),
                "mls_ratchet_tree": STANDARD.encode(&created.ratchet_tree)}),
     );

@@ -258,6 +258,7 @@ async fn a_banned_did_cannot_use_the_admin_routes_even_as_an_owner() {
         &me,
         "#mine",
         "open",
+        &server.server_did(),
         HlcTimestamp::now_wall(me.did().clone()),
     );
     let (status, body) = server.try_submit(&create).await;

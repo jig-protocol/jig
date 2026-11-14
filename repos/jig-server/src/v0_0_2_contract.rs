@@ -91,6 +91,8 @@ pub struct Contracts {
     /// The same [`Relay`] as `AppState::relay`, once [`handle`] has set it:
     /// one table of requests waiting on owners.
     relay: Arc<Relay>,
+    /// Serves `federation-catch-up` to the peers that dial this server.
+    replay: crate::v0_0_2_catch_up::Replay,
 }
 
 /// Run the contract on `state`'s server:
@@ -136,6 +138,7 @@ pub fn start(state: &AppState) -> Contracts {
 /// resending, the decisions and the pulls.
 fn handle(state: &AppState) -> Contracts {
     let contracts = Contracts::new(state);
+    repair_relayed_copies(&state.ingest_ctx.store);
     if !state.set_peer_frames(Arc::new(contracts.clone())) {
         tracing::warn!("a peer-frame handler was already registered; contract frames go to it");
     }
@@ -169,6 +172,62 @@ fn handle(state: &AppState) -> Contracts {
     contracts
 }
 
+/// Set aside this server's relayed copy of `channel_id`, if it holds one,
+/// now that it follows the channel's owner for it: the owner's stream lands
+/// the channel under its own id, from its first block, in the owner's order.
+/// The copy is kept, whole ([`SqliteStore::quarantine_relayed_copy`]).
+fn quarantine_relayed_copy(store: &SqliteStore, channel_id: &str) {
+    match store.quarantine_relayed_copy(channel_id) {
+        Ok(Some(copy)) => tracing::warn!(
+            channel_id,
+            copy_id = copy.copy_id,
+            slug = copy.slug,
+            own_blocks = copy.own_blocks,
+            "set aside the federation relay's copy of a channel this server now follows; \
+             blocks this server's users posted in it stay in the copy"
+        ),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(
+            channel_id,
+            "the relayed copy of a followed channel was not set aside: {e:#}"
+        ),
+    }
+}
+
+/// At boot: a server that accepted a share while it held the relay's copy of
+/// the channel (before this was handled) sequences a copy of a channel it
+/// follows, and its stream refuses the owner's every record. Set each such
+/// copy aside, so the stream lands the channel. Report the copies left: the
+/// relay keeps one of each open channel of a peer, until it is shared.
+fn repair_relayed_copies(store: &SqliteStore) {
+    let copies = match store.relayed_copies() {
+        Ok(copies) => copies,
+        Err(e) => {
+            tracing::warn!("listing the federation relay's copies: {e:#}");
+            return;
+        }
+    };
+    let mut followed = 0;
+    for channel_id in &copies {
+        if store.is_followed(channel_id).unwrap_or(false) {
+            followed += 1;
+            quarantine_relayed_copy(store, channel_id);
+        }
+    }
+    if followed > 0 {
+        tracing::warn!(
+            followed,
+            "set aside relayed copies of channels this server follows"
+        );
+    }
+    if copies.len() > followed {
+        tracing::info!(
+            copies = copies.len() - followed,
+            "channels held as federation relay copies; sharing one sets its copy aside"
+        );
+    }
+}
+
 impl Contracts {
     pub fn new(state: &AppState) -> Self {
         let federation = Arc::new(state.config.federation.clone());
@@ -189,6 +248,7 @@ impl Contracts {
                     state.peers.clone(),
                 ))
             }),
+            replay: crate::v0_0_2_catch_up::Replay::new(state.ingest_ctx.clone(), federation),
         }
     }
 
@@ -274,7 +334,9 @@ impl Contracts {
         {
             Ok(offers) => {
                 for offer in offers {
-                    self.send(&offer.peer_did, OFFER_FRAME, offer.offer);
+                    if self.may_offer(&offer.channel_id, &offer.peer_did) {
+                        self.send(&offer.peer_did, OFFER_FRAME, offer.offer);
+                    }
                 }
             }
             Err(e) => tracing::warn!("listing unanswered offers: {e}"),
@@ -354,8 +416,42 @@ impl Contracts {
             answer: None,
             share_cid: Some(share_cid.to_string()),
         })?;
-        self.send(to, OFFER_FRAME, offer.envelope);
+        if self.may_offer(&channel.id, to) {
+            self.send(to, OFFER_FRAME, offer.envelope);
+        }
         Ok(())
+    }
+
+    /// Whether `channel`'s offer may go to `peer` now. A `shared` channel's
+    /// offer waits for a connection whose handshake says the peer implements
+    /// tiers (JEP-0014): a server without them would carry it as an untiered
+    /// channel. It stays unanswered, and goes out on a later resend once the
+    /// peer has upgraded.
+    fn may_offer(&self, channel_id: &str, peer: &str) -> bool {
+        use jig_core::tier::{StoredTier, Tier};
+        let shared = self
+            .store()
+            .get_channel_by_id(channel_id)
+            .ok()
+            .flatten()
+            .is_some_and(|c| c.tiering.tier == StoredTier::Tier(Tier::Shared));
+        if !shared {
+            return true;
+        }
+        let Ok(did) = Did::from_did_jig_string(peer) else {
+            return false;
+        };
+        match self.peers.sender_for(&did) {
+            Some(sender) if !sender.tiers() => {
+                tracing::info!(
+                    peer,
+                    channel_id,
+                    "a shared channel's offer waits: the peer does not implement tiers"
+                );
+                false
+            }
+            _ => true,
+        }
     }
 
     /// End the live share with `to`, and withdraw any offer to it not yet
@@ -585,9 +681,27 @@ impl Contracts {
         if cid != offer.channel_id || manifest.kind != Some(BlockKind::ChannelCreate) {
             return Err(RefuseCode::PolicyRefused);
         }
+        // The creator names the server that orders the channel; a creation
+        // block from before sequencers names none, and binds to no server,
+        // so no client could prove the carried channel either.
+        if manifest
+            .metadata
+            .get(jig_pipeline::ingest::SEQUENCER_KEY)
+            .and_then(|v| v.as_str())
+            .is_none()
+        {
+            return Err(RefuseCode::PolicyRefused);
+        }
         let terms = jig_pipeline::ingest::channel_terms(&manifest, &offer.owner)
             .map_err(|_| RefuseCode::PolicyRefused)?;
         if terms.sequencer != offer.owner {
+            return Err(RefuseCode::PolicyRefused);
+        }
+        // A tier that stays on its owner's server is not carried here,
+        // whatever its owner offers.
+        if let Some(tiering) = &terms.tiering
+            && !contracts::crosses_servers(tiering.tier)
+        {
             return Err(RefuseCode::PolicyRefused);
         }
         // Rule 9: a suite this server carries, and no fallback.
@@ -598,6 +712,25 @@ impl Contracts {
         }
         if self.suffix_conflict(&offer.attested_suffixes).is_some() {
             return Err(RefuseCode::SuffixConflict);
+        }
+        // A channel of this server's own under the offered id: it cannot
+        // follow another sequencer for it. A copy the federation relay made
+        // is not one; accepting sets it aside.
+        let local = self.store().local_sequencer().to_string();
+        let owned_here = self
+            .store()
+            .get_channel_by_id_including_archived(&offer.channel_id.to_string())
+            .ok()
+            .flatten()
+            .is_some_and(|c| c.sequencer_did.is_empty() || c.sequencer_did == local);
+        if owned_here
+            && !self
+                .store()
+                .relayed_copies()
+                .unwrap_or_default()
+                .contains(&offer.channel_id.to_string())
+        {
+            return Err(RefuseCode::PolicyRefused);
         }
         Ok(policy)
     }
@@ -617,6 +750,7 @@ impl Contracts {
             OfferState::Accepted,
             Some(&accept.envelope),
         )?;
+        quarantine_relayed_copy(self.store(), &offer.channel_id.to_string());
         Ok(accept.envelope)
     }
 
@@ -764,6 +898,9 @@ impl PeerFrames for Contracts {
             return handled;
         }
         if let Some(handled) = self.relay.on_peer_frame(peer, kind, body, out) {
+            return handled;
+        }
+        if let Some(handled) = self.replay.on_peer_frame(peer, kind, body, out) {
             return handled;
         }
         let peer = peer.to_did_jig_string();
@@ -926,7 +1063,7 @@ fn list(store: &SqliteStore) -> anyhow::Result<String> {
     if offers.is_empty() {
         return Ok("no contract offers".to_string());
     }
-    Ok(offers
+    let mut lines = offers
         .iter()
         .map(|o| {
             format!(
@@ -939,8 +1076,16 @@ fn list(store: &SqliteStore) -> anyhow::Result<String> {
                 o.channel_id
             )
         })
-        .collect::<Vec<_>>()
-        .join("\n"))
+        .collect::<Vec<_>>();
+    // A carried channel that cannot take its owner's next record, and why
+    // (deploy/README.md, "A stalled carried channel").
+    lines.extend(
+        store
+            .carried_stalls()?
+            .iter()
+            .map(|stall| format!("stalled: {stall}")),
+    );
+    Ok(lines.join("\n"))
 }
 
 /// The one offer whose hex id starts with `prefix`.
@@ -1078,6 +1223,8 @@ mod tests {
         follower: Arc<AppState>,
         follows: Contracts,
         user: SigningKey,
+        /// The owner's dial to the follower.
+        dial: tokio::task::JoinHandle<anyhow::Result<()>>,
     }
 
     async fn pair(offers: OfferPolicy) -> Pair {
@@ -1125,7 +1272,7 @@ mod tests {
         // No timers: each test acts on decisions when it means to.
         handle(&owner);
         let follows = handle(&follower);
-        tokio::spawn({
+        let dial = tokio::spawn({
             let owner = owner.clone();
             async move { crate::v0_0_2_federation::connect_and_relay(&owner, &to_follower).await }
         });
@@ -1140,6 +1287,7 @@ mod tests {
             follower,
             follows,
             user: SigningKey::from_bytes(&rand::random()),
+            dial,
         }
     }
 
@@ -1150,7 +1298,25 @@ mod tests {
         kind: BlockKind,
         meta: serde_json::Value,
     ) -> Result<String, IngestError> {
+        post_at(state, key, kind, meta, None).await
+    }
+
+    /// [`post`], with the author's clock at `hlc`.
+    async fn post_at(
+        state: &AppState,
+        key: &SigningKey,
+        kind: BlockKind,
+        mut meta: serde_json::Value,
+        hlc: Option<jig_core::HlcTimestamp>,
+    ) -> Result<String, IngestError> {
         use ed25519_dalek::Signer as _;
+        // A channel-create names the server it is created on.
+        if kind == BlockKind::ChannelCreate
+            && meta.get(jig_pipeline::ingest::SEQUENCER_KEY).is_none()
+        {
+            meta[jig_pipeline::ingest::SEQUENCER_KEY] =
+                serde_json::json!(state.server_did.to_did_jig_string());
+        }
         let mut builder = BlockManifest::builder()
             .version(semver::Version::new(0, 1, 0))
             .author(Author {
@@ -1163,12 +1329,11 @@ mod tests {
                 builder = builder.metadata_entry(&k, v);
             }
         }
-        let manifest_bytes = builder
-            .build()
-            .unwrap()
-            .with_kind(kind)
-            .to_canonical_bytes()
-            .unwrap();
+        let mut manifest = builder.build().unwrap().with_kind(kind);
+        if let Some(hlc) = hlc {
+            manifest = manifest.with_hlc(hlc);
+        }
+        let manifest_bytes = manifest.to_canonical_bytes().unwrap();
         let code_bytes: Vec<u8> = Vec::new();
         let sig = key
             .sign(&serde_json::to_vec(&(&manifest_bytes, &code_bytes)).unwrap())
@@ -1183,7 +1348,10 @@ mod tests {
             &state.ingest_ctx,
             bundle,
             sig,
-            IngestSource::LocalClient { conn_id: 1 },
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
         )
         .await
     }
@@ -1194,7 +1362,7 @@ mod tests {
                 &self.owner,
                 &self.user,
                 BlockKind::ChannelCreate,
-                serde_json::json!({"slug": "#shared"}),
+                serde_json::json!({"slug": "#shared", "tier": "public"}),
             )
             .await
             .unwrap()
@@ -1359,6 +1527,55 @@ mod tests {
                 .contract_offers_in(Side::Owner, OfferState::Offered)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// JEP-0014 rules 12 and 13: a `private` channel never leaves its
+    /// owner's server. Its share is refused when posted, and nothing is sent.
+    #[tokio::test]
+    async fn a_private_channel_is_not_offered() {
+        let p = pair(OfferPolicy::Accept).await;
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let did = jig_core::did::Did::from_ed25519_pubkey(p.user.verifying_key().as_bytes());
+        let creator = jig_mls::member::Member::new(&p.user.to_bytes(), &did).unwrap();
+        let created = creator.create_group().unwrap();
+        let channel = post(
+            &p.owner,
+            &p.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({
+                "slug": "#private",
+                "tier": "private",
+                "suite": "mls",
+                "mls_group_info": b64(&created.group_info),
+                "mls_ratchet_tree": b64(&created.ratchet_tree),
+            }),
+        )
+        .await
+        .unwrap();
+        let shared = post(
+            &p.owner,
+            &p.user,
+            BlockKind::ChannelShare,
+            serde_json::json!({
+                "channel_id": channel,
+                "to": p.follower.server_did.to_did_jig_string(),
+                "grant": "read",
+            }),
+        )
+        .await;
+        match shared {
+            Err(e) => assert!(e.to_string().contains("stays on the server"), "{e}"),
+            Ok(cid) => panic!("the share landed: {cid}"),
+        }
+        assert!(
+            p.owner
+                .ingest_ctx
+                .store
+                .contract_offers_in(Side::Owner, OfferState::Offered)
+                .unwrap()
+                .is_empty(),
+            "no offer was made"
         );
     }
 
@@ -1610,12 +1827,39 @@ mod tests {
         assert_eq!(answer_to(&contracts, &owner, &good), None);
         assert_eq!(answer_to(&contracts, &owner, &good), None, "answered again");
 
+        // A creation block naming no sequencer binds to no server: no client
+        // could prove the channel carried.
+        let unbound = creation(&owner, serde_json::json!({"sequencer": null}));
+        assert_eq!(
+            answer_to(
+                &contracts,
+                &owner,
+                &offer_to(&follower, &owner, unbound, &[])
+            )
+            .as_deref(),
+            Some("POLICY_REFUSED")
+        );
         // Rule 9: a suite this server does not carry, with no fallback.
         let suite = creation(&owner, serde_json::json!({"suite": "pq-mls-2"}));
         assert_eq!(
             answer_to(&contracts, &owner, &offer_to(&follower, &owner, suite, &[])).as_deref(),
             Some("UNSUPPORTED_SUITE")
         );
+        // JEP-0014 rules 12 and 13: `private` and `server` stay on their
+        // owner's server; `shared` crosses.
+        for (tier, refused) in [("private", true), ("server", true), ("shared", false)] {
+            let offered = creation(&owner, serde_json::json!({"tier": tier, "suite": "mls"}));
+            assert_eq!(
+                answer_to(
+                    &contracts,
+                    &owner,
+                    &offer_to(&follower, &owner, offered, &[])
+                )
+                .as_deref(),
+                refused.then_some("POLICY_REFUSED"),
+                "{tier}"
+            );
+        }
         // A suffix this server attests (`dns`, as `Names.Example.org`): the
         // same claim from the owner is no conflict, and the same suffix under
         // another authority is.
@@ -1753,7 +1997,7 @@ mod tests {
             &owner,
             &user,
             BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#c"}),
+            serde_json::json!({"slug": "#c", "tier": "public"}),
         )
         .await
         .unwrap();
@@ -1957,6 +2201,51 @@ mod tests {
         }
     }
 
+    /// A follower lists a channel it carries as ordered by its owner, with
+    /// the owner's offer: what lets a client hold the channel's records to
+    /// the owner without taking the follower's word for it.
+    #[tokio::test]
+    async fn a_follower_lists_a_carried_channel_with_its_owners_offer() {
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.shared(1).await;
+        p.follows.stream.pull_all();
+        p.caught_up(&channel).await;
+        let owner = p.owner.server_did.to_did_jig_string();
+        let follower = p.follower.server_did.to_did_jig_string();
+
+        let row = p
+            .follower
+            .ingest_ctx
+            .store
+            .get_channel_by_id(&channel)
+            .unwrap()
+            .unwrap();
+        let view = crate::v0_0_2_blocks::view_of(&p.follower, row).unwrap();
+        assert_eq!(view.sequencer, owner);
+        let proven = jig_client::pins::prove_carried(
+            "wss://follower",
+            &view.slug,
+            &view.id,
+            &view.sequencer,
+            std::slice::from_ref(&follower),
+            view.share.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(proven, owner);
+
+        // The owner lists its own channel as its own, with nothing to prove.
+        let row = p
+            .owner
+            .ingest_ctx
+            .store
+            .get_channel_by_id(&channel)
+            .unwrap()
+            .unwrap();
+        let view = crate::v0_0_2_blocks::view_of(&p.owner, row).unwrap();
+        assert_eq!(view.sequencer, owner);
+        assert!(view.share.is_none());
+    }
+
     #[tokio::test]
     async fn a_follower_carries_the_owners_chain_as_signed() {
         let p = pair(OfferPolicy::Accept).await;
@@ -2126,7 +2415,7 @@ mod tests {
             &owner,
             &user,
             BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#limited"}),
+            serde_json::json!({"slug": "#limited", "tier": "public"}),
         )
         .await
         .unwrap();
@@ -2283,6 +2572,1150 @@ mod tests {
         );
     }
 
+    // ---- Federation catch-up, the legacy path (v0_0_2_catch_up) ------------
+
+    /// Two servers on the legacy federation path, not yet connected: `a`
+    /// dials `b` and subscribes to its federation stream.
+    struct Legacy {
+        a: Arc<AppState>,
+        b: Arc<AppState>,
+        /// `b`, as `a` lists it.
+        to_b: FederationPeer,
+        user: SigningKey,
+    }
+
+    async fn legacy() -> Legacy {
+        // A peer's channel-create reaches `a` over the relay only when its
+        // operator opts in to copying them.
+        let mut a = state_tuned(vec![], &[], |config| {
+            config.federation.naively_accept_peer_relayed_creates = true;
+        });
+        let b = state_with(
+            vec![peer(
+                "ws://127.0.0.1:1",
+                a.server_did.to_did_jig_string(),
+                OfferPolicy::Hold,
+            )],
+            &[],
+        );
+        let (b, url) = serve(b).await;
+        let to_b = peer(&url, b.server_did.to_did_jig_string(), OfferPolicy::Hold);
+        a.config.federation.peers = vec![to_b.clone()];
+        let a = Arc::new(a);
+        crate::v0_0_2_manifest_log::publish(&a).await.unwrap();
+        crate::v0_0_2_manifest_log::publish(&b).await.unwrap();
+        handle(&a);
+        handle(&b);
+        Legacy {
+            a,
+            b,
+            to_b,
+            user: SigningKey::from_bytes(&rand::random()),
+        }
+    }
+
+    impl Legacy {
+        /// `a` holds `b` to `quota` from its next dial.
+        fn held_to(&mut self, quota: Option<jig_config::v0_0_2_server::PeerQuotaConfig>) {
+            self.to_b.quota = quota;
+        }
+
+        /// `a` dials `b`, as `spawn_federation_peers` does.
+        fn dial(&self, a: &Arc<AppState>) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+            let (a, to_b) = (a.clone(), self.to_b.clone());
+            tokio::spawn(
+                async move { crate::v0_0_2_federation::connect_and_relay(&a, &to_b).await },
+            )
+        }
+
+        /// An open channel on `b`.
+        async fn channel(&self, slug: &str) -> String {
+            post(
+                &self.b,
+                &self.user,
+                BlockKind::ChannelCreate,
+                serde_json::json!({"slug": slug, "tier": "public"}),
+            )
+            .await
+            .unwrap()
+        }
+
+        /// A restricted channel on `b` the user owns, unencrypted (as the
+        /// federation tests make one: creating it takes an MLS group).
+        fn restricted(&self, slug: &str) -> String {
+            let id = jig_pipeline::ingest_record::label_cid(slug);
+            self.b
+                .ingest_ctx
+                .store
+                .upsert_channel(&jig_pipeline::persist::StoredChannel {
+                    id: id.clone(),
+                    slug: slug.into(),
+                    visibility: "restricted".into(),
+                    created_at: 0,
+                    owner_did: did_of(&self.user),
+                    suite: "none".into(),
+                    sequencer_did: String::new(),
+                    co_owners: Vec::new(),
+                    tiering: jig_pipeline::persist::ChannelTiering::current("restricted", "none"),
+                })
+                .unwrap();
+            id
+        }
+
+        /// `n` posts to the restricted `channel` on `b`, put in its store as
+        /// a frozen channel holds them: ingest takes no new ones.
+        fn stored_texts(&self, channel: &str, n: usize) -> Vec<String> {
+            use ed25519_dalek::Signer as _;
+            (0..n)
+                .map(|i| {
+                    let manifest_bytes = BlockManifest::builder()
+                        .version(semver::Version::new(0, 1, 0))
+                        .author(Author {
+                            did: did_of(&self.user).into(),
+                            public_key: None,
+                            roles: vec![],
+                        })
+                        .metadata_entry("channel_id", serde_json::json!(channel))
+                        .metadata_entry("body", serde_json::json!(format!("closed {i}")))
+                        .build()
+                        .unwrap()
+                        .with_kind(BlockKind::TextRender)
+                        .to_canonical_bytes()
+                        .unwrap();
+                    let bundle_bytes =
+                        serde_json::to_vec(&(&manifest_bytes, &Vec::<u8>::new())).unwrap();
+                    let cid = crate::v0_0_2_federation::peer_block_cid(&bundle_bytes).unwrap();
+                    self.b
+                        .ingest_ctx
+                        .store
+                        .insert_block(&jig_pipeline::persist::StoredBlock {
+                            cid: cid.clone(),
+                            channel_id: Some(channel.to_string()),
+                            block_kind: "text-render".into(),
+                            sender_did: did_of(&self.user),
+                            sender_sig: self.user.sign(&bundle_bytes).to_bytes().to_vec(),
+                            bundle_bytes,
+                            is_synthetic: false,
+                            hlc_wall_ms: 0,
+                            hlc_logical: 0,
+                            hlc_origin: String::new(),
+                            posted_at: 0,
+                            origin_server: self.b.server_did.to_did_jig_string(),
+                            federated_from: None,
+                        })
+                        .unwrap();
+                    cid
+                })
+                .collect()
+        }
+
+        /// How many of `b`'s blocks federate so far: its own manifest log's,
+        /// before a test posts anything.
+        fn federating(&self) -> usize {
+            self.page("", 0).entries.len()
+        }
+
+        /// `n` posts to `channel` on `b`.
+        async fn texts(&self, channel: &str, n: usize) -> Vec<String> {
+            let mut cids = Vec::new();
+            for i in 0..n {
+                cids.push(
+                    post(
+                        &self.b,
+                        &self.user,
+                        BlockKind::TextRender,
+                        serde_json::json!({
+                            "channel_id": channel,
+                            "body": format!("text {i} {}", rand::random::<u64>()),
+                        }),
+                    )
+                    .await
+                    .unwrap(),
+                );
+            }
+            cids
+        }
+
+        fn cursor(&self, state: &AppState) -> Option<String> {
+            state
+                .ingest_ctx
+                .store
+                .catch_up_cursor(&self.to_b.url)
+                .unwrap()
+        }
+
+        /// `b`'s answer to a catch-up after `after`.
+        fn page(&self, after: &str, overlap: u64) -> crate::v0_0_2_catch_up::Page {
+            Contracts::new(&self.b)
+                .replay
+                .page(&crate::v0_0_2_catch_up::Ask {
+                    after: after.to_string(),
+                    overlap,
+                })
+                .unwrap()
+        }
+
+        /// Wait for `state` to hold every block of `cids`.
+        async fn holds(state: &AppState, cids: &[String]) {
+            eventually("the blocks caught up", || {
+                cids.iter().all(|cid| held(state, cid)).then_some(())
+            })
+            .await
+        }
+    }
+
+    fn held(state: &AppState, cid: &str) -> bool {
+        state.ingest_ctx.store.get_block(cid).unwrap().is_some()
+    }
+
+    /// This server again, on the same store and key: a restart.
+    async fn restarted(state: &AppState) -> Arc<AppState> {
+        let state = Arc::new(
+            AppState::for_test_from(
+                state.config.clone(),
+                state.ingest_ctx.store.clone(),
+                state.ingest_ctx.server_key.clone(),
+            )
+            .unwrap(),
+        );
+        crate::v0_0_2_manifest_log::publish(&state).await.unwrap();
+        handle(&state);
+        state
+    }
+
+    #[tokio::test]
+    async fn a_dialer_gets_what_the_peer_took_before_its_first_dial() {
+        let l = legacy().await;
+        let channel = l.channel("#open").await;
+        let mut before = vec![channel.clone()];
+        before.extend(l.texts(&channel, 3).await);
+
+        // No block from `b` yet: the first catch-up starts from `b`'s start.
+        l.dial(&l.a);
+        Legacy::holds(&l.a, &before).await;
+        eventually("the catch-up done", || {
+            l.cursor(&l.a).is_none().then_some(())
+        })
+        .await;
+
+        // From then on, the live push.
+        let live = l.texts(&channel, 1).await;
+        Legacy::holds(&l.a, &live).await;
+    }
+
+    #[tokio::test]
+    async fn catch_up_replays_only_the_channels_that_federate() {
+        let l = legacy().await;
+        let own = l.federating();
+        let open = l.channel("#open").await;
+        let first = l.texts(&open, 1).await;
+        let restricted = l.restricted("#closed");
+        let closed = l.stored_texts(&restricted, 2);
+        let last = l.texts(&open, 1).await;
+
+        let page = l.page("", 0);
+        let replayed: Vec<String> = page.entries[own..]
+            .iter()
+            .map(|e| crate::v0_0_2_federation::peer_block_cid(&e.bundle).unwrap())
+            .collect();
+        assert_eq!(replayed, [open.clone(), first[0].clone(), last[0].clone()]);
+        assert!(!page.more);
+
+        l.dial(&l.a);
+        Legacy::holds(&l.a, &last).await;
+        assert!(closed.iter().all(|cid| !held(&l.a, cid)));
+    }
+
+    #[tokio::test]
+    async fn the_cursor_is_a_block_in_the_peers_own_order() {
+        let l = legacy().await;
+        let channel = l.channel("#open").await;
+        let early = l.texts(&channel, 2).await;
+        // Taken last, with an author's clock older than every block before
+        // it: still after them in `b`'s order.
+        let backdated = post_at(
+            &l.b,
+            &l.user,
+            BlockKind::TextRender,
+            serde_json::json!({"channel_id": channel, "body": "backdated"}),
+            Some(jig_core::HlcTimestamp {
+                wall_ms: 1,
+                logical: 0,
+                server_did: l.b.server_did.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let after = |cid: &str| -> Vec<String> {
+            l.page(cid, 0)
+                .entries
+                .iter()
+                .map(|e| crate::v0_0_2_federation::peer_block_cid(&e.bundle).unwrap())
+                .collect()
+        };
+        assert_eq!(after(&early[0]), [early[1].clone(), backdated.clone()]);
+        assert_eq!(after(&backdated), Vec::<String>::new());
+
+        l.dial(&l.a);
+        Legacy::holds(&l.a, std::slice::from_ref(&backdated)).await;
+        // `a` keeps each block under `b`'s CID, byte for byte: the cursor it
+        // sends next is a block `b` finds in its own store.
+        for cid in [&channel, &early[0], &early[1], &backdated] {
+            let ours = l.a.ingest_ctx.store.get_block(cid).unwrap().unwrap();
+            let theirs = l.b.ingest_ctx.store.get_block(cid).unwrap().unwrap();
+            assert_eq!(ours.bundle_bytes, theirs.bundle_bytes);
+            assert_eq!(ours.federated_from.as_deref(), Some(l.to_b.url.as_str()));
+        }
+        let next = l.a.ingest_ctx.store.newest_block_from(&l.to_b.url).unwrap();
+        assert_eq!(next.as_deref(), Some(backdated.as_str()));
+        assert!(
+            l.b.ingest_ctx
+                .store
+                .block_position(&backdated)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// The live push need not reach `a` in `b`'s order: two ingests racing
+    /// on `b` can fan out the later one first. Here `a` took `b`'s second
+    /// post live, not its first, when the link dropped: the reconnect's
+    /// overlap still brings the first.
+    #[tokio::test]
+    async fn a_block_pushed_out_of_order_is_caught_up_after_a_reconnect() {
+        let l = legacy().await;
+        let channel = l.channel("#open").await;
+        let texts = l.texts(&channel, 2).await;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        for cid in [&channel, &texts[1]] {
+            let block = l.b.ingest_ctx.store.get_block(cid).unwrap().unwrap();
+            crate::v0_0_2_federation::ingest_peer_block(
+                &l.a,
+                &l.to_b,
+                &base64::Engine::encode(&b64, &block.bundle_bytes),
+                Some(&base64::Engine::encode(&b64, &block.sender_sig)),
+                "live",
+            )
+            .await
+            .unwrap();
+        }
+        assert!(!held(&l.a, &texts[0]));
+        let newest = l.a.ingest_ctx.store.newest_block_from(&l.to_b.url).unwrap();
+        assert_eq!(newest.as_deref(), Some(texts[1].as_str()));
+
+        l.dial(&l.a);
+        Legacy::holds(&l.a, &texts[..1]).await;
+    }
+
+    #[tokio::test]
+    async fn catch_up_pages_past_one_frame() {
+        let l = legacy().await;
+        let channel = l.channel("#open").await;
+        let texts = l
+            .texts(&channel, crate::v0_0_2_catch_up::MAX_ENTRIES * 2 + 5)
+            .await;
+
+        let first = l.page("", 0);
+        assert_eq!(first.entries.len(), crate::v0_0_2_catch_up::MAX_ENTRIES);
+        assert!(first.more);
+
+        l.dial(&l.a);
+        Legacy::holds(&l.a, &texts).await;
+    }
+
+    #[tokio::test]
+    async fn catch_up_stops_at_the_quota_and_keeps_its_place() {
+        let mut l = legacy().await;
+        // `b`'s own blocks, then its channel and two posts, this minute.
+        let quota = jig_config::v0_0_2_server::PeerQuotaConfig {
+            blocks_per_min: l.federating() as u64 + 3,
+            bytes_per_min: 8 * 1024 * 1024,
+        };
+        l.held_to(Some(quota));
+        let channel = l.channel("#open").await;
+        let texts = l.texts(&channel, 6).await;
+
+        l.dial(&l.a);
+        Legacy::holds(&l.a, &texts[..2]).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            texts[2..].iter().all(|cid| !held(&l.a, cid)),
+            "nothing past the quota this minute"
+        );
+        assert_eq!(l.cursor(&l.a).as_deref(), Some(texts[1].as_str()));
+    }
+
+    /// The legacy path across a restart of the dialer part way through a
+    /// catch-up, with the live push landing blocks past the gap first: the
+    /// restarted server resumes where the catch-up got to, not after the
+    /// newest block it holds.
+    #[tokio::test]
+    async fn a_dialer_restarted_mid_catch_up_misses_nothing() {
+        let mut l = legacy().await;
+        let quota = jig_config::v0_0_2_server::PeerQuotaConfig {
+            blocks_per_min: l.federating() as u64 + 5,
+            bytes_per_min: 8 * 1024 * 1024,
+        };
+        l.held_to(Some(quota));
+        let channel = l.channel("#open").await;
+        // More than the reconnect's overlap past where the quota stops it.
+        let gap = l
+            .texts(&channel, crate::v0_0_2_catch_up::OVERLAP as usize + 30)
+            .await;
+
+        let dial = l.dial(&l.a);
+        Legacy::holds(&l.a, &gap[..4]).await;
+        let live = l.texts(&channel, 1).await;
+        Legacy::holds(&l.a, &live).await;
+        assert!(!held(&l.a, gap.last().unwrap()), "stopped at the quota");
+        dial.abort();
+        let _ = dial.await;
+
+        // Down: `b` takes more.
+        let while_down = l.texts(&channel, 3).await;
+
+        l.held_to(None);
+        let a = restarted(&l.a).await;
+        l.dial(&a);
+        Legacy::holds(&a, &gap).await;
+        Legacy::holds(&a, &while_down).await;
+        eventually("the catch-up done", || l.cursor(&a).is_none().then_some(())).await;
+    }
+
+    /// The contract path across a restart of the follower while the owner
+    /// streams to it: the owner's records past the follower's head arrive
+    /// once it is back.
+    #[tokio::test]
+    async fn a_follower_restarted_mid_stream_catches_up() {
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.shared(0).await;
+        p.follows.stream.pull_all();
+        p.caught_up(&channel).await;
+        for i in 0..5 {
+            p.text(&channel, &format!("live {i}")).await;
+        }
+        p.dial.abort();
+        // Down: the owner takes more, past one frame.
+        for i in 0..crate::v0_0_2_stream::MAX_ENTRIES + 6 {
+            p.text(&channel, &format!("while down {i}")).await;
+        }
+
+        // Back, on the same store and key, at a new address.
+        let (follower, url) = serve(
+            AppState::for_test_from(
+                p.follower.config.clone(),
+                p.follower.ingest_ctx.store.clone(),
+                p.follower.ingest_ctx.server_key.clone(),
+            )
+            .unwrap(),
+        )
+        .await;
+        crate::v0_0_2_manifest_log::publish(&follower)
+            .await
+            .unwrap();
+        let follows = handle(&follower);
+        let to_follower = peer(
+            &url,
+            follower.server_did.to_did_jig_string(),
+            OfferPolicy::Hold,
+        );
+        tokio::spawn({
+            let owner = p.owner.clone();
+            async move { crate::v0_0_2_federation::connect_and_relay(&owner, &to_follower).await }
+        });
+        eventually("the connection", || {
+            (p.owner.peers.sender_for(&follower.server_did).is_some()
+                && follower.peers.sender_for(&p.owner.server_did).is_some())
+            .then_some(())
+        })
+        .await;
+
+        // What a follower does every `PULL_EVERY`.
+        follows.stream.pull_all();
+        let want = Pair::head(&p.owner, &channel).unwrap();
+        eventually("the restarted follower at the owner's head", || {
+            (Pair::head(&follower, &channel) == Some(want)).then_some(())
+        })
+        .await;
+        for seq in 0..=want {
+            assert_eq!(
+                follower
+                    .ingest_ctx
+                    .store
+                    .ingest_record_bytes(&channel, seq)
+                    .unwrap(),
+                p.owner
+                    .ingest_ctx
+                    .store
+                    .ingest_record_bytes(&channel, seq)
+                    .unwrap(),
+                "seq {seq}"
+            );
+        }
+    }
+
+    // ---- The federation relay and the contract on one channel ---------------
+
+    /// Two servers peered both ways, each dialing the other and running its
+    /// side of the contract, as every pair that shares a channel is. `b`
+    /// accepts `a`'s offers.
+    struct Mutual {
+        a: Arc<AppState>,
+        b: Arc<AppState>,
+        b_follows: Contracts,
+        user: SigningKey,
+    }
+
+    async fn mutual() -> Mutual {
+        // Each lists the other, which takes both keys first.
+        let (a_key, b_key) = (
+            SigningKey::from_bytes(&rand::random()),
+            SigningKey::from_bytes(&rand::random()),
+        );
+        let state = |key: &SigningKey, other: &SigningKey, offers| {
+            let mut config = JigServerConfig::default();
+            config.federation.dangerously_allow_plaintext_federation = true;
+            config.federation.peers = vec![peer("ws://127.0.0.1:1", did_of(other), offers)];
+            // The relay's copies this guards are made only on opting in.
+            config.federation.naively_accept_peer_relayed_creates = true;
+            AppState::for_test_from(
+                config,
+                Arc::new(jig_pipeline::persist::SqliteStore::open_in_memory().unwrap()),
+                key.clone(),
+            )
+            .unwrap()
+        };
+        let a = state(&a_key, &b_key, OfferPolicy::Hold);
+        let b = state(&b_key, &a_key, OfferPolicy::Accept);
+        let (a, a_url) = serve(a).await;
+        let (b, b_url) = serve(b).await;
+        for state in [&a, &b] {
+            crate::v0_0_2_manifest_log::publish(state).await.unwrap();
+        }
+        handle(&a);
+        let b_follows = handle(&b);
+        for (from, to, url) in [(&a, &b, &b_url), (&b, &a, &a_url)] {
+            let (from, to_peer) = (
+                from.clone(),
+                peer(url, to.server_did.to_did_jig_string(), OfferPolicy::Hold),
+            );
+            tokio::spawn(async move {
+                crate::v0_0_2_federation::connect_and_relay(&from, &to_peer).await
+            });
+        }
+        // Each subscribed to the other's federation stream: the relay carries
+        // only what lands after that.
+        for _ in 0..500 {
+            if a.ingest_ctx.fanout.local_subscription_count().await == 1
+                && b.ingest_ctx.fanout.local_subscription_count().await == 1
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        eventually("both links", || {
+            (a.peers.sender_for(&b.server_did).is_some()
+                && b.peers.sender_for(&a.server_did).is_some())
+            .then_some(())
+        })
+        .await;
+        Mutual {
+            a,
+            b,
+            b_follows,
+            user: SigningKey::from_bytes(&rand::random()),
+        }
+    }
+
+    impl Mutual {
+        async fn text(
+            &self,
+            state: &AppState,
+            channel: &str,
+            body: &str,
+        ) -> Result<String, IngestError> {
+            post(
+                state,
+                &self.user,
+                BlockKind::TextRender,
+                serde_json::json!({"channel_id": channel, "body": body}),
+            )
+            .await
+        }
+
+        fn held(state: &AppState, cid: &str) -> bool {
+            state.ingest_ctx.store.get_block(cid).unwrap().is_some()
+        }
+
+        /// A post in `channel` that only `b` holds, as its own user's.
+        fn own_post(&self, channel: &str) -> String {
+            use ed25519_dalek::Signer as _;
+            let manifest_bytes = BlockManifest::builder()
+                .version(semver::Version::new(0, 1, 0))
+                .author(Author {
+                    did: did_of(&self.user).into(),
+                    public_key: None,
+                    roles: vec![],
+                })
+                .metadata_entry("channel_id", serde_json::json!(channel))
+                .metadata_entry("body", serde_json::json!("only on b"))
+                .build()
+                .unwrap()
+                .with_kind(BlockKind::TextRender)
+                .to_canonical_bytes()
+                .unwrap();
+            let bundle_bytes = serde_json::to_vec(&(&manifest_bytes, &Vec::<u8>::new())).unwrap();
+            let cid = crate::v0_0_2_federation::peer_block_cid(&bundle_bytes).unwrap();
+            self.b
+                .ingest_ctx
+                .store
+                .insert_block(&StoredBlock {
+                    cid: cid.clone(),
+                    channel_id: Some(channel.to_string()),
+                    block_kind: BlockKind::TextRender.as_str().to_string(),
+                    sender_did: did_of(&self.user),
+                    sender_sig: self.user.sign(&bundle_bytes).to_bytes().to_vec(),
+                    bundle_bytes,
+                    is_synthetic: false,
+                    hlc_wall_ms: 0,
+                    hlc_logical: 0,
+                    hlc_origin: String::new(),
+                    posted_at: 0,
+                    origin_server: self.b.server_url.clone(),
+                    federated_from: None,
+                })
+                .unwrap();
+            cid
+        }
+    }
+
+    /// The collision this guards against: the relay landed `a`'s channel on
+    /// `b` as `b`'s own, so a share made `b` act as its owner (offering it to
+    /// itself, and writing a refusal into its copy), and `b`'s stream then
+    /// refused every record of `a`'s, its row saying `b` sequenced it.
+    #[tokio::test]
+    async fn a_shared_channel_is_carried_by_the_contract_not_the_relay() {
+        let m = mutual().await;
+        // Made once both links are up, so the relay copies it at once.
+        let channel = post(
+            &m.a,
+            &m.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#k", "tier": "public"}),
+        )
+        .await
+        .unwrap();
+        let first = m.text(&m.a, &channel, "before the share").await.unwrap();
+        // A post only `b` holds: its user posted it in `b`'s copy, and `a`
+        // never took it (stored as such, as a lost relay leaves it).
+        let own = m.own_post(&channel);
+        eventually("the relay's copy on b", || {
+            Mutual::held(&m.b, &first).then_some(())
+        })
+        .await;
+        assert_eq!(
+            m.b.ingest_ctx.store.relayed_copies().unwrap(),
+            std::slice::from_ref(&channel)
+        );
+
+        post(
+            &m.a,
+            &m.user,
+            BlockKind::ChannelShare,
+            serde_json::json!({
+                "channel_id": channel,
+                "to": m.b.server_did.to_did_jig_string(),
+                "grant": "write",
+            }),
+        )
+        .await
+        .unwrap();
+        let b_did = m.b.server_did.to_did_jig_string();
+        let a_did = m.a.server_did.to_did_jig_string();
+        eventually("the share accepted", || {
+            (m.b.ingest_ctx
+                .store
+                .has_accepted_share(&channel, &a_did)
+                .unwrap()
+                && m.a
+                    .ingest_ctx
+                    .store
+                    .contract_offers_for(&channel, &b_did, Side::Owner, OfferState::Accepted)
+                    .unwrap()
+                    .len()
+                    == 1)
+                .then_some(())
+        })
+        .await;
+
+        // `b` never acted as the owner, and its copy is set aside, whole,
+        // under its own id: `a`'s chain lands under the channel's.
+        let b_store = &m.b.ingest_ctx.store;
+        assert!(b_store.relayed_copies().unwrap().is_empty());
+        let copy_id = jig_pipeline::ingest_record::label_cid(&format!("relayed-copy:{channel}"));
+        let copy = b_store.get_channel_by_id(&copy_id).unwrap().unwrap();
+        assert!(copy.slug.starts_with("#jig/relayed-"), "{}", copy.slug);
+        let kept = b_store.quarantined_records(&copy_id).unwrap();
+        assert_eq!(
+            kept.len(),
+            2,
+            "b's records of its copy, kept: the create and the first post"
+        );
+        for state in [OfferState::Held, OfferState::Accepted, OfferState::Refused] {
+            assert!(
+                b_store
+                    .contract_offers_for(&channel, &b_did, Side::Owner, state)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        // What `b` carries, it does not relay: a peer of `b`'s would take it
+        // as its own copy.
+        let (relayed, mut relayed_rx) = tokio::sync::mpsc::unbounded_channel();
+        m.b.ingest_ctx
+            .fanout
+            .subscribe_local(
+                jig_pipeline::fanout::SubscriptionScope::Federation {
+                    block_kinds: vec![],
+                },
+                jig_pipeline::fanout::SubscriberIdentity::Did(did_of(&SigningKey::from_bytes(
+                    &rand::random(),
+                ))),
+                relayed,
+            )
+            .await;
+
+        m.b_follows.stream.pull_all();
+        for i in 0..3 {
+            m.text(&m.a, &channel, &format!("after the share {i}"))
+                .await
+                .unwrap();
+        }
+        let head = |state: &AppState| Pair::head(state, &channel);
+        let want = eventually("a's records past the share", || {
+            Pair::head(&m.a, &channel).filter(|h| *h >= 5)
+        })
+        .await;
+        m.b_follows.stream.pull_all();
+        eventually("b at a's head", || (head(&m.b) == Some(want)).then_some(())).await;
+
+        // One chain, a's, byte for byte, holding nothing signed by b.
+        let row = b_store.get_channel_by_id(&channel).unwrap().unwrap();
+        assert_eq!(row.sequencer_did, a_did);
+        for seq in 0..=want {
+            assert_eq!(
+                b_store.ingest_record_bytes(&channel, seq).unwrap(),
+                m.a.ingest_ctx
+                    .store
+                    .ingest_record_bytes(&channel, seq)
+                    .unwrap(),
+                "seq {seq}"
+            );
+        }
+        let kinds: Vec<String> = kinds_in(&m.a, &channel)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(
+            !kinds
+                .iter()
+                .any(|k| k == BlockKind::ContractRefuse.as_str()),
+            "no refusal of b's in a's log: {kinds:?}"
+        );
+        assert_eq!(kinds_in(&m.b, &channel).len(), kinds.len());
+        // What `a` never took stays in the copy; what `a`'s chain landed
+        // came back into the channel.
+        let own_block = b_store.get_block(&own).unwrap().unwrap();
+        assert_eq!(own_block.channel_id.as_deref(), Some(copy_id.as_str()));
+        let back = b_store.get_block(&first).unwrap().unwrap();
+        assert_eq!(back.channel_id.as_deref(), Some(channel.as_str()));
+
+        let mut relayed_any = Vec::new();
+        while let Ok((block, _)) = relayed_rx.try_recv() {
+            relayed_any.push(block.block_kind);
+        }
+        assert!(relayed_any.is_empty(), "b relayed {relayed_any:?}");
+
+        // Posts both ways: a post on `b` goes to `a` under the share's grant
+        // (JEP-0005 rule 15), lands in `a`'s chain, and comes back through the
+        // contract, never the relay. One chain still, `a`'s, byte for byte.
+        let parts = signed(&m.user, BlockKind::TextRender, text_in(&channel, "on b"));
+        let on_b = client_post(&m.b, &parts).await.unwrap();
+        assert!(Mutual::held(&m.a, &on_b));
+        m.b_follows.stream.pull_all();
+        let want = Pair::head(&m.a, &channel).unwrap();
+        eventually("b at a's head, with its own post", || {
+            (head(&m.b) == Some(want)).then_some(())
+        })
+        .await;
+        for seq in 0..=want {
+            assert_eq!(
+                b_store.ingest_record_bytes(&channel, seq).unwrap(),
+                m.a.ingest_ctx
+                    .store
+                    .ingest_record_bytes(&channel, seq)
+                    .unwrap(),
+                "seq {seq}, after the relayed post"
+            );
+        }
+        let landed = b_store.get_block(&on_b).unwrap().unwrap();
+        assert_eq!(landed.channel_id.as_deref(), Some(channel.as_str()));
+        // A post that skips the grant path is still refused here.
+        assert!(matches!(
+            m.text(&m.b, &channel, "around the relay").await,
+            Err(IngestError::CarriedChannel { .. })
+        ));
+
+        // The relay still carries what is not shared, both ways.
+        let elsewhere = post(
+            &m.b,
+            &m.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#elsewhere", "tier": "public"}),
+        )
+        .await
+        .unwrap();
+        let on_b = m.text(&m.b, &elsewhere, "from b").await.unwrap();
+        eventually("b's open channel on a", || {
+            Mutual::held(&m.a, &on_b).then_some(())
+        })
+        .await;
+        let on_a = m.text(&m.a, &elsewhere, "from a").await.unwrap();
+        eventually("a's post on b", || Mutual::held(&m.b, &on_a).then_some(())).await;
+    }
+
+    /// Two peers that each have their own `#general`: the relay lands `a`'s
+    /// posts, which name the channel by slug as clients post them, in `b`'s
+    /// own `#general`. Once `b` follows `a`'s, `a`'s chain names a block `b`
+    /// holds in its own channel. `b` leaves it there, stalls, and says so.
+    #[tokio::test]
+    async fn a_same_slug_channel_stalls_the_carried_one_visibly() {
+        let m = mutual().await;
+        // Made by another user: the same author's create of the same slug is
+        // the same block, so the same channel.
+        let ours = post(
+            &m.b,
+            &SigningKey::from_bytes(&rand::random()),
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#general", "tier": "public"}),
+        )
+        .await
+        .unwrap();
+        let channel = post(
+            &m.a,
+            &m.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#general", "tier": "public"}),
+        )
+        .await
+        .unwrap();
+        let text = post(
+            &m.a,
+            &m.user,
+            BlockKind::TextRender,
+            serde_json::json!({"channel": "#general", "body": "by slug"}),
+        )
+        .await
+        .unwrap();
+        eventually("a's post in b's own #general", || {
+            Mutual::held(&m.b, &text).then_some(())
+        })
+        .await;
+        let b_store = &m.b.ingest_ctx.store;
+        assert_eq!(
+            b_store
+                .get_block(&text)
+                .unwrap()
+                .unwrap()
+                .channel_id
+                .as_deref(),
+            Some(ours.as_str())
+        );
+
+        post(
+            &m.a,
+            &m.user,
+            BlockKind::ChannelShare,
+            serde_json::json!({
+                "channel_id": channel,
+                "to": m.b.server_did.to_did_jig_string(),
+                "grant": "read",
+            }),
+        )
+        .await
+        .unwrap();
+        let a_did = m.a.server_did.to_did_jig_string();
+        eventually("the share accepted", || {
+            b_store
+                .has_accepted_share(&channel, &a_did)
+                .unwrap()
+                .then_some(())
+        })
+        .await;
+        m.b_follows.stream.pull_all();
+        let stall = eventually("the stall", || b_store.carried_stalls().unwrap().pop()).await;
+        assert_eq!(
+            (
+                stall.channel_id.as_str(),
+                stall.seq,
+                stall.block_cid.as_str()
+            ),
+            (channel.as_str(), 1, text.as_str())
+        );
+        assert_eq!(stall.holder, ours);
+        // `b`'s own channel keeps its block, and its chain still names it.
+        assert_eq!(
+            b_store
+                .get_block(&text)
+                .unwrap()
+                .unwrap()
+                .channel_id
+                .as_deref(),
+            Some(ours.as_str())
+        );
+        assert_eq!(b_store.get_ingest_record(&text).unwrap().unwrap().seq, 1);
+        // An operator sees it without reading logs.
+        let listed = operate(b_store, Operation::List).unwrap();
+        assert!(
+            listed.contains(&format!(
+                "stalled: channel {channel} stalled at seq 1: block {text} is held in channel {ours}"
+            )),
+            "{listed}"
+        );
+    }
+
+    /// Once `b` follows `a`'s `#general`, `a`'s relay of a post that names
+    /// it by slug is dropped: the slug here names only `b`'s own channel, so
+    /// taking it would land `a`'s post there. The same slug from a peer that
+    /// does not sequence the carried channel still names `b`'s own.
+    #[tokio::test]
+    async fn a_slug_named_relay_of_a_carried_channel_is_dropped() {
+        let m = mutual().await;
+        let ours = post(
+            &m.b,
+            &SigningKey::from_bytes(&rand::random()),
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#general", "tier": "public"}),
+        )
+        .await
+        .unwrap();
+        let channel = post(
+            &m.a,
+            &m.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#general", "tier": "public"}),
+        )
+        .await
+        .unwrap();
+        post(
+            &m.a,
+            &m.user,
+            BlockKind::ChannelShare,
+            serde_json::json!({
+                "channel_id": channel,
+                "to": m.b.server_did.to_did_jig_string(),
+                "grant": "read",
+            }),
+        )
+        .await
+        .unwrap();
+        let a_did = m.a.server_did.to_did_jig_string();
+        let b_store = &m.b.ingest_ctx.store;
+        eventually("the share accepted", || {
+            b_store
+                .has_accepted_share(&channel, &a_did)
+                .unwrap()
+                .then_some(())
+        })
+        .await;
+        assert!(b_store.is_followed(&channel).unwrap());
+        // The carried channel's row comes with the owner's stream.
+        m.b_follows.stream.pull_all();
+        eventually("the carried channel on b", || {
+            b_store.carried_channel_by_slug("#general").unwrap()
+        })
+        .await;
+
+        let relay = |from: &FederationPeer, body: &str| {
+            let (manifest, code, sig) = signed(
+                &m.user,
+                BlockKind::TextRender,
+                serde_json::json!({"channel": "#general", "body": body}),
+            );
+            let bundle = serde_json::to_vec(&(&manifest, &code)).unwrap();
+            let cid = crate::v0_0_2_federation::peer_block_cid(&bundle).unwrap();
+            let (state, from) = (m.b.clone(), from.clone());
+            async move {
+                let b64 = base64::engine::general_purpose::STANDARD;
+                crate::v0_0_2_federation::ingest_peer_block(
+                    &state,
+                    &from,
+                    &b64.encode(&bundle),
+                    Some(&b64.encode(&sig)),
+                    "d:slug",
+                )
+                .await
+                .unwrap();
+                cid
+            }
+        };
+
+        let sequencer = peer("ws://127.0.0.1:1", a_did.clone(), OfferPolicy::Hold);
+        let dropped = relay(&sequencer, "from the owner, by slug").await;
+        assert!(
+            b_store.get_block(&dropped).unwrap().is_none(),
+            "the owner's slug-named relay is dropped, not landed in b's own #general"
+        );
+
+        let other = peer(
+            "ws://127.0.0.1:2",
+            did_of(&SigningKey::from_bytes(&rand::random())),
+            OfferPolicy::Hold,
+        );
+        let landed = relay(&other, "from another peer, by slug").await;
+        assert_eq!(
+            b_store
+                .get_block(&landed)
+                .unwrap()
+                .unwrap()
+                .channel_id
+                .as_deref(),
+            Some(ours.as_str()),
+            "the same slug from a non-sequencer peer names b's own channel"
+        );
+    }
+
+    /// A share the relay brings is refused: it is a request to the channel's
+    /// sequencer, and this server would act on it as owner of its copy.
+    #[tokio::test]
+    async fn a_share_from_a_peer_is_refused() {
+        let m = mutual().await;
+        let channel = post(
+            &m.a,
+            &m.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#k", "tier": "public"}),
+        )
+        .await
+        .unwrap();
+        eventually("the relay's copy on b", || {
+            Mutual::held(&m.b, &channel).then_some(())
+        })
+        .await;
+        // Shared with a third server: `a` refuses it (NOT_A_PEER), and `b`
+        // must not take it at all.
+        let share = post(
+            &m.a,
+            &m.user,
+            BlockKind::ChannelShare,
+            serde_json::json!({
+                "channel_id": channel,
+                "to": did_of(&SigningKey::from_bytes(&rand::random())),
+                "grant": "read",
+            }),
+        )
+        .await
+        .unwrap();
+        let sentinel = m.text(&m.a, &channel, "after").await.unwrap();
+        eventually("the relay past the share", || {
+            Mutual::held(&m.b, &sentinel).then_some(())
+        })
+        .await;
+        assert!(!Mutual::held(&m.b, &share));
+        let refusals: Vec<String> = kinds_in(&m.b, &channel)
+            .into_iter()
+            .map(|(k, _)| k)
+            .filter(|k| k.starts_with("contract-"))
+            .collect();
+        assert!(refusals.is_empty(), "{refusals:?}");
+    }
+
+    /// A server that accepted a share while it held the relay's copy (as one
+    /// running the release before this fix did) sets the copy aside at boot,
+    /// keeping all of it.
+    #[tokio::test]
+    async fn a_forked_copy_is_set_aside_at_boot() {
+        let m = mutual().await;
+        let followed = post(
+            &m.a,
+            &m.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#k", "tier": "public"}),
+        )
+        .await
+        .unwrap();
+        let other = post(
+            &m.a,
+            &m.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#other", "tier": "public"}),
+        )
+        .await
+        .unwrap();
+        eventually("the relay's copies on b", || {
+            (Mutual::held(&m.b, &followed) && Mutual::held(&m.b, &other)).then_some(())
+        })
+        .await;
+        let store = &m.b.ingest_ctx.store;
+        // The accept, as the release before this fix kept it: the copy stays.
+        store
+            .put_contract_offer(&StoredOffer {
+                offer_id: rand::random(),
+                channel_id: followed.clone(),
+                side: Side::Follower,
+                peer_did: m.a.server_did.to_did_jig_string(),
+                grant: Grant::Read,
+                state: OfferState::Accepted,
+                offer: vec![],
+                answer: None,
+                share_cid: None,
+            })
+            .unwrap();
+
+        let from_a_store = m.a.ingest_ctx.store.get_block(&followed).unwrap().unwrap();
+        let records = store
+            .list_ingest_records_by_id(&followed, 0, 100)
+            .unwrap()
+            .len();
+        repair_relayed_copies(store);
+        assert!(store.get_channel_by_id(&followed).unwrap().is_none());
+        let copy_id = jig_pipeline::ingest_record::label_cid(&format!("relayed-copy:{followed}"));
+        assert!(store.get_channel_by_id(&copy_id).unwrap().is_some());
+        assert_eq!(store.quarantined_records(&copy_id).unwrap().len(), records);
+        let create = store.get_block(&followed).unwrap().unwrap();
+        assert_eq!(
+            create.channel_id.as_deref(),
+            Some(copy_id.as_str()),
+            "kept, aside"
+        );
+
+        // Until the owner's stream lands it again, the relay cannot bring the
+        // copy back (a catch-up replays a peer's channels from their start).
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let from_a = peer(
+            "ws://127.0.0.1:1",
+            m.a.server_did.to_did_jig_string(),
+            OfferPolicy::Hold,
+        );
+        crate::v0_0_2_federation::ingest_peer_block(
+            &m.b,
+            &from_a,
+            &base64::Engine::encode(&b64, &from_a_store.bundle_bytes),
+            Some(&base64::Engine::encode(&b64, &from_a_store.sender_sig)),
+            "replayed",
+        )
+        .await
+        .unwrap();
+        assert!(store.get_channel_by_id(&followed).unwrap().is_none());
+        assert_eq!(
+            store.relayed_copies().unwrap(),
+            [other],
+            "a copy not shared stays"
+        );
+    }
+
     // ---- Writes through a follower (JEP-0005 rules 7a, 15) -----------------
 
     use crate::v0_0_2_relay::{Refusal, Submit};
@@ -2325,7 +3758,7 @@ mod tests {
         state: &AppState,
         parts: &(Vec<u8>, Vec<u8>, Vec<u8>),
     ) -> Result<String, Refusal> {
-        crate::v0_0_2_relay::post(state, &parts.0, &parts.1, parts.2.clone(), 7, "ws:7").await
+        crate::v0_0_2_relay::post(state, &parts.0, &parts.1, parts.2.clone(), 7, "ws:7", true).await
     }
 
     /// The submit a follower would send for `parts`, into `channel`.
@@ -2359,6 +3792,432 @@ mod tests {
         }
     }
 
+    /// A `shared` MLS channel on `p`'s owner, created by its user: the
+    /// channel, the user's MLS member and the group's id.
+    async fn shared_mls_channel(p: &Pair) -> (String, jig_mls::member::Member, Vec<u8>) {
+        shared_mls_channel_with(p, "#across", serde_json::json!({})).await
+    }
+
+    /// [`shared_mls_channel`] as `slug`, its creation block carrying `terms`
+    /// too (`join`, `join_servers`).
+    async fn shared_mls_channel_with(
+        p: &Pair,
+        slug: &str,
+        terms: serde_json::Value,
+    ) -> (String, jig_mls::member::Member, Vec<u8>) {
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let did = jig_core::did::Did::from_ed25519_pubkey(p.user.verifying_key().as_bytes());
+        let creator = jig_mls::member::Member::new(&p.user.to_bytes(), &did).unwrap();
+        let created = creator.create_group().unwrap();
+        let mut meta = serde_json::json!({
+            "slug": slug,
+            "tier": "shared",
+            "suite": "mls",
+            "mls_group_info": b64(&created.group_info),
+            "mls_ratchet_tree": b64(&created.ratchet_tree),
+        });
+        if let (Some(meta), serde_json::Value::Object(terms)) = (meta.as_object_mut(), terms) {
+            meta.extend(terms);
+        }
+        let channel = post(&p.owner, &p.user, BlockKind::ChannelCreate, meta)
+            .await
+            .unwrap();
+        (channel, creator, created.group_id)
+    }
+
+    /// JEP-0014 rule 13: a self-join through a follower, by an MLS external
+    /// commit against the group the follower mirrors. The follower checks
+    /// the joiner's role on its side and relays it under its `member` grant
+    /// only if the channel lets granted servers' roles count; the owner then
+    /// takes it on that grant.
+    #[tokio::test]
+    async fn a_self_join_through_a_follower_needs_granted_servers_and_the_followers_role() {
+        use jig_mls::member::Member;
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let p = pair(OfferPolicy::Accept).await;
+        // A joiner on the follower is a guest there: admitted, not recorded.
+        let cases = [
+            (
+                "#granted",
+                serde_json::json!({"join": "guest", "join_servers": "granted"}),
+                None,
+            ),
+            (
+                "#owners",
+                serde_json::json!({"join": "guest"}),
+                Some("join there"),
+            ),
+            (
+                "#members",
+                serde_json::json!({"join": "member", "join_servers": "granted"}),
+                Some("below"),
+            ),
+        ];
+        for (slug, terms, refused) in cases {
+            let (channel, _, _) = shared_mls_channel_with(&p, slug, terms).await;
+            p.share(&channel, "member").await;
+            p.both(&channel, OfferState::Accepted).await;
+            p.follows.stream.pull_all();
+            p.caught_up(&channel).await;
+
+            let key = SigningKey::from_bytes(&rand::random());
+            let did = jig_core::did::Did::from_ed25519_pubkey(key.verifying_key().as_bytes());
+            let joiner = Member::new(&key.to_bytes(), &did).unwrap();
+            let mirrored = p
+                .follower
+                .ingest_ctx
+                .store
+                .get_mls_group_by_id(&channel)
+                .unwrap()
+                .unwrap();
+            let (_, commit) = joiner.join_external(&mirrored.group_info.unwrap()).unwrap();
+            let did = did.to_did_jig_string();
+            let parts = signed(
+                &key,
+                BlockKind::MemberAdd,
+                serde_json::json!({
+                    "channel_id": channel,
+                    "member_did": did,
+                    "mls_commit": b64(&commit.commit),
+                }),
+            );
+            let joined = client_post(&p.follower, &parts).await;
+            let at_owner = p
+                .owner
+                .ingest_ctx
+                .store
+                .is_member_by_id(&channel, &did)
+                .unwrap();
+            match refused {
+                None => {
+                    joined.unwrap();
+                    assert!(at_owner, "{slug}: the owner took the join");
+                }
+                Some(why) => {
+                    let refusal = joined.unwrap_err();
+                    assert_eq!(refusal.code, "JOIN_REFUSED", "{slug}: {refusal:?}");
+                    assert!(refusal.message.contains(why), "{slug}: {}", refusal.message);
+                    assert!(!at_owner, "{slug}: nothing reached the owner");
+                    // A follower that relays it anyway meets the owner's own
+                    // check where only the owner's roles count.
+                    if slug == "#owners" {
+                        let answer = p
+                            .owner_relay()
+                            .accept(&p.follower.server_did, submit_of(&channel, &parts))
+                            .await;
+                        let (_, expected, _) = crate::v0_0_2_ingest_error::classify_ingest_error(
+                            &IngestError::NotChannelOwner {
+                                kind: "member-add".into(),
+                                slug: String::new(),
+                                sender: did.clone(),
+                            },
+                        );
+                        assert_eq!(answer.code, expected, "{answer:?}");
+                        assert!(
+                            !p.owner
+                                .ingest_ctx
+                                .store
+                                .is_member_by_id(&channel, &did)
+                                .unwrap()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A `shared` channel's offer goes only to a peer whose handshake says
+    /// it implements tiers: one without them would carry it untiered. The
+    /// offer waits, unanswered.
+    #[tokio::test]
+    async fn a_shared_channel_is_not_offered_to_a_peer_without_tiers() {
+        let p = pair(OfferPolicy::Accept).await;
+        let (channel, _, _) = shared_mls_channel(&p).await;
+        // The follower's newest connection is one that did not ask for tiers.
+        let (old, mut old_rx) = PeerSender::new(p.follower.server_did.clone());
+        let _registration = p.owner.peers.register(old);
+        p.share(&channel, "write").await;
+        let offered = eventually("the owner's offer", || {
+            p.offers(Side::Owner, &channel, OfferState::Offered).pop()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(old_rx.try_recv().is_err(), "nothing sent to the old peer");
+        assert!(
+            p.offers(Side::Follower, &channel, OfferState::Accepted)
+                .is_empty(),
+            "the follower never saw it"
+        );
+        assert_eq!(
+            p.offers(Side::Owner, &channel, OfferState::Offered),
+            vec![offered],
+            "the offer waits"
+        );
+    }
+
+    /// JEP-0014 rule 13 across servers: a `shared` MLS channel on its owner,
+    /// shared with a follower. A member whose client is on the follower joins
+    /// by Welcome and posts through it; the owner's member reads the post.
+    /// Neither server ever holds the plaintext.
+    #[tokio::test]
+    async fn a_shared_mls_channel_is_written_through_its_follower_and_read_at_its_owner() {
+        use jig_mls::member::Member;
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let did = |key: &SigningKey| {
+            jig_core::did::Did::from_ed25519_pubkey(key.verifying_key().as_bytes())
+        };
+        let p = pair(OfferPolicy::Accept).await;
+        let (channel, creator, gid) = shared_mls_channel(&p).await;
+        p.share(&channel, "write").await;
+        p.both(&channel, OfferState::Accepted).await;
+
+        // A member whose client is on the follower, added on the owner. Its
+        // key package reaches the creator directly (custodians: Task 8).
+        let remote_key = SigningKey::from_bytes(&rand::random());
+        let remote = Member::new(&remote_key.to_bytes(), &did(&remote_key)).unwrap();
+        let kp = remote.key_packages(1, false).unwrap().remove(0);
+        let remote_did = did(&remote_key).to_did_jig_string();
+        let commit = creator.add(&gid, &kp, &remote_did).unwrap();
+        post(
+            &p.owner,
+            &p.user,
+            BlockKind::MemberAdd,
+            serde_json::json!({
+                "channel_id": channel,
+                "member_did": remote_did,
+                "mls_commit": b64(&commit.commit),
+                "mls_welcome": b64(commit.welcome.as_ref().unwrap()),
+            }),
+        )
+        .await
+        .unwrap();
+        creator.confirm(&gid).unwrap();
+        assert_eq!(
+            remote
+                .join_welcome(commit.welcome.as_ref().unwrap())
+                .unwrap(),
+            gid
+        );
+        p.follows.stream.pull_all();
+        p.caught_up(&channel).await;
+        assert_eq!(
+            p.follower
+                .ingest_ctx
+                .store
+                .get_mls_group_by_id(&channel)
+                .unwrap()
+                .unwrap()
+                .epoch,
+            1,
+            "the follower's mirror moved with the commit"
+        );
+
+        // The remote member posts through the follower.
+        let secret = "the meeting moved to thursday";
+        let (ct, epoch) = remote.encrypt(&gid, secret.as_bytes()).unwrap();
+        let parts = {
+            use ed25519_dalek::Signer as _;
+            let manifest = BlockManifest::builder()
+                .version(semver::Version::new(0, 1, 0))
+                .author(Author {
+                    did: did(&remote_key),
+                    public_key: None,
+                    roles: vec![],
+                })
+                .privacy(jig_core::Privacy {
+                    encryption: jig_core::EncryptionSuite::Mls,
+                    recipients: vec![],
+                    metadata_visibility: Default::default(),
+                })
+                .metadata_entry("channel_id", serde_json::json!(channel))
+                .metadata_entry("mls_message", serde_json::json!(b64(&ct)))
+                .metadata_entry("mls_epoch", serde_json::json!(epoch))
+                .build()
+                .unwrap()
+                .with_kind(BlockKind::TextRender)
+                .to_canonical_bytes()
+                .unwrap();
+            let code: Vec<u8> = Vec::new();
+            let sig = remote_key
+                .sign(&serde_json::to_vec(&(&manifest, &code)).unwrap())
+                .to_bytes()
+                .to_vec();
+            (manifest, code, sig)
+        };
+        let cid = client_post(&p.follower, &parts).await.unwrap();
+        let at_owner = p
+            .owner
+            .ingest_ctx
+            .store
+            .get_block(&cid)
+            .unwrap()
+            .expect("landed at the owner");
+        assert_eq!(at_owner.channel_id.as_deref(), Some(channel.as_str()));
+        p.caught_up(&channel).await;
+        // The owner knows which server relayed the member's latest write:
+        // the hint `jig channel members --via` lists after a contract ends.
+        let via = p
+            .owner
+            .ingest_ctx
+            .store
+            .last_relay_by_sender(&channel)
+            .unwrap();
+        assert_eq!(
+            via.get(&remote_did).cloned().flatten(),
+            Some(p.follower.server_did.to_did_jig_string())
+        );
+        assert_eq!(via.get(&did(&p.user).to_did_jig_string()), Some(&None));
+
+        // The owner's member reads it from what the owner stored.
+        let (stored, _): (Vec<u8>, Vec<u8>) =
+            serde_json::from_slice(&at_owner.bundle_bytes).unwrap();
+        let stored: BlockManifest = serde_json::from_slice(&stored).unwrap();
+        let ct = base64::engine::general_purpose::STANDARD
+            .decode(stored.metadata["mls_message"].as_str().unwrap())
+            .unwrap();
+        let read = creator.decrypt(&gid, &ct).unwrap();
+        assert_eq!(read.plaintext, secret.as_bytes());
+
+        // Neither server holds the plaintext, in any block of the channel.
+        for state in [&p.owner, &p.follower] {
+            for (_, manifest) in kinds_in(state, &channel) {
+                assert!(
+                    !serde_json::to_string(&manifest).unwrap().contains(secret),
+                    "a server holds the plaintext"
+                );
+            }
+        }
+    }
+
+    /// The client's side of the test above: jig-client's own builders and
+    /// MLS sessions, as `jig` runs them. The owner's member names the
+    /// channel by slug on its server; the member on the follower names it by
+    /// id, the only name it has there, and files its group under the id. Its
+    /// `send` reaches the owner, and the owner's member reads it.
+    #[tokio::test]
+    async fn a_member_on_the_follower_sends_to_a_shared_mls_channel_by_its_id() {
+        use jig_client::Identity;
+        use jig_client::blocks::{BuiltBlock, build_sealed_text, build_with_metadata};
+        use jig_client::secure::{ReadIn, Seen, Session};
+        const OWNER: &str = "wss://owner";
+        const FOLLOWER: &str = "wss://follower";
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let parts = |b: &BuiltBlock| {
+            (
+                b.manifest_bytes.clone(),
+                b.code_bytes.clone(),
+                b.sender_sig.clone(),
+            )
+        };
+        // A block as a server serves it to a client, from what it stored.
+        let served = |state: &AppState, cid: &str| {
+            let block = state.ingest_ctx.store.get_block(cid).unwrap().unwrap();
+            jig_client::open::open(&jig_client::DeliveredBlock {
+                bundle_b64: b64(&block.bundle_bytes),
+                sig_b64: Some(b64(&block.sender_sig)),
+                receipts: vec![],
+                delivery_cid: format!("delivery:{cid}"),
+                ingest: None,
+            })
+            .unwrap()
+        };
+        let homes = tempfile::tempdir().unwrap();
+        let p = pair(OfferPolicy::Accept).await;
+
+        // The owner's member creates the channel on the owner.
+        let alice = Identity::from_signing_key(p.user.clone());
+        let alice_mls = Session::open(
+            &homes.path().join("alice"),
+            Identity::from_signing_key(p.user.clone()),
+        )
+        .unwrap();
+        let created = alice_mls.create_group(OWNER, "#across").unwrap();
+        let channel = post(
+            &p.owner,
+            &p.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({
+                "slug": "#across",
+                "tier": "shared",
+                "suite": "mls",
+                "mls_group_info": b64(&created.group_info),
+                "mls_ratchet_tree": b64(&created.ratchet_tree),
+            }),
+        )
+        .await
+        .unwrap();
+        p.share(&channel, "write").await;
+        p.both(&channel, OfferState::Accepted).await;
+
+        // She adds bob, whose client is on the follower, by slug.
+        let bob_key = SigningKey::from_bytes(&rand::random());
+        let bob = Identity::from_signing_key(bob_key.clone());
+        let bob_mls = Session::open(
+            &homes.path().join("bob"),
+            Identity::from_signing_key(bob_key),
+        )
+        .unwrap();
+        let kp = bob_mls.key_packages(1, false).unwrap().remove(0);
+        let commit = alice_mls
+            .prepare_add(OWNER, "#across", &kp, bob_mls.did())
+            .unwrap();
+        let add = build_with_metadata(
+            &alice,
+            BlockKind::MemberAdd,
+            jig_core::HlcTimestamp::now_wall(alice.did().clone()),
+            serde_json::json!({
+                "channel": "#across",
+                "member_did": bob_mls.did(),
+                "mls_commit": b64(&commit.commit),
+                "mls_welcome": b64(commit.welcome.as_ref().unwrap()),
+                "mls_epoch": commit.epoch,
+            }),
+        );
+        let add = client_post(&p.owner, &parts(&add)).await.unwrap();
+        alice_mls.confirm(OWNER, "#across").unwrap();
+        p.follows.stream.pull_all();
+        p.caught_up(&channel).await;
+
+        // Bob reads the add from the follower, under the id.
+        let at_follower = ReadIn {
+            key: &channel,
+            id: &channel,
+            slug: "#across",
+        };
+        assert_eq!(
+            bob_mls.observe_in(FOLLOWER, Some(&at_follower), &served(&p.follower, &add)),
+            Seen::Joined
+        );
+
+        // `jig send <id>` on the follower.
+        let secret = "the meeting moved to thursday";
+        let (message, epoch) = bob_mls.encrypt(FOLLOWER, &channel, secret).unwrap();
+        let sent = build_sealed_text(
+            &bob,
+            &channel,
+            &message,
+            epoch,
+            jig_core::HlcTimestamp::now_wall(bob.did().clone()),
+        );
+        let cid = client_post(&p.follower, &parts(&sent))
+            .await
+            .expect("the follower takes a post to the channel by its id");
+
+        // The owner's member reads it from what the owner stored.
+        let at_owner = ReadIn {
+            key: "#across",
+            id: &channel,
+            slug: "#across",
+        };
+        assert_eq!(
+            alice_mls.observe_in(OWNER, Some(&at_owner), &served(&p.owner, &cid)),
+            Seen::Text {
+                sender: bob_mls.did().to_string(),
+                text: secret.to_string(),
+            }
+        );
+    }
+
     #[tokio::test]
     async fn a_write_through_a_write_follower_lands_at_the_owner_and_comes_back() {
         let p = pair(OfferPolicy::Accept).await;
@@ -2390,6 +4249,48 @@ mod tests {
         // The same signed block again is the block already taken.
         assert_eq!(client_post(&p.follower, &parts).await.unwrap(), cid);
         assert_eq!(Pair::head(&p.owner, &channel), Some(head), "it landed once");
+    }
+
+    /// `jig send` on a follower: the client's own block builder names the
+    /// carried channel by the id it was given, and the write lands at the
+    /// owner. A slug names the channel only at its owner.
+    #[tokio::test]
+    async fn a_client_on_a_follower_posts_to_a_carried_channel_by_its_id() {
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.carried("write").await;
+        let user = jig_client::identity::Identity::from_signing_key(SigningKey::from_bytes(
+            &rand::random(),
+        ));
+        let hlc = jig_core::HlcTimestamp {
+            wall_ms: 1_747_680_000_000,
+            logical: 0,
+            server_did: user.did().clone(),
+        };
+        let parts = |block: jig_client::blocks::BuiltBlock| {
+            (block.manifest_bytes, block.code_bytes, block.sender_sig)
+        };
+
+        let by_slug = parts(jig_client::blocks::build_text_render(
+            &user,
+            "#shared",
+            "by slug",
+            hlc.clone(),
+        ));
+        let refused = client_post(&p.follower, &by_slug).await.unwrap_err();
+        assert_eq!(refused.code, "UNKNOWN_CHANNEL", "{refused:?}");
+
+        let by_id = parts(jig_client::blocks::build_text_render(
+            &user, &channel, "by id", hlc,
+        ));
+        let cid = client_post(&p.follower, &by_id).await.unwrap();
+        let block = p
+            .owner
+            .ingest_ctx
+            .store
+            .get_block(&cid)
+            .unwrap()
+            .expect("the owner records it");
+        assert_eq!(block.channel_id.as_deref(), Some(channel.as_str()));
     }
 
     #[tokio::test]
@@ -2478,7 +4379,7 @@ mod tests {
             &p.owner,
             &p.user,
             BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#unshared"}),
+            serde_json::json!({"slug": "#unshared", "tier": "public"}),
         )
         .await
         .unwrap();
@@ -2501,7 +4402,7 @@ mod tests {
         let create = signed(
             &author,
             BlockKind::ChannelCreate,
-            serde_json::json!({"slug": "#new"}),
+            serde_json::json!({"slug": "#new", "tier": "public"}),
         );
         let answer = relay.accept(follower, submit_of(&channel, &create)).await;
         assert_eq!(answer.code, "RELAY_OUTSIDE_SHARE", "{answer:?}");
@@ -2587,7 +4488,8 @@ mod tests {
         let gone = {
             let follower = follower.clone();
             tokio::spawn(async move {
-                crate::v0_0_2_relay::post(&follower, &parts.0, &parts.1, parts.2, 8, "ws:8").await
+                crate::v0_0_2_relay::post(&follower, &parts.0, &parts.1, parts.2, 8, "ws:8", true)
+                    .await
             })
         };
         swallowed.recv().await.expect("its relay sent");
@@ -2628,6 +4530,10 @@ mod tests {
                 suite: jig_core::EncryptionSuite::Unencrypted.as_str().to_string(),
                 sequencer_did: owner.clone(),
                 co_owners: vec![],
+                tiering: jig_pipeline::persist::ChannelTiering::current(
+                    "open",
+                    jig_core::EncryptionSuite::Unencrypted.as_str(),
+                ),
             })
             .unwrap();
         store

@@ -752,6 +752,37 @@ fn violation(why: &str) -> CloseReason {
     }
 }
 
+/// Decode `body` as the stream frame `kind` names, as [`Stream::on_peer_frame`]
+/// does, for the fuzz targets in `repos/fuzz`. Whatever decodes must survive
+/// its own encoding. Returns whether it decoded. CI checks that no release
+/// binary enables the `fuzzing` feature.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_decode_frame(kind: &str, body: &[u8]) -> bool {
+    fn round_trip<T: PartialEq + std::fmt::Debug>(
+        decoded: Option<T>,
+        encode: impl Fn(&T) -> Vec<u8>,
+        decode: impl Fn(&[u8]) -> Option<T>,
+    ) -> bool {
+        let Some(decoded) = decoded else { return false };
+        assert_eq!(decode(&encode(&decoded)).as_ref(), Some(&decoded));
+        true
+    }
+    match kind {
+        RECORDS_FRAME => round_trip(Records::decode(body), Records::encode, Records::decode),
+        RECORDS_FROM_FRAME => round_trip(
+            RecordsFrom::decode(body),
+            RecordsFrom::encode,
+            RecordsFrom::decode,
+        ),
+        RECORDS_LATER_FRAME => round_trip(
+            RecordsLater::decode(body),
+            RecordsLater::encode,
+            RecordsLater::decode,
+        ),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

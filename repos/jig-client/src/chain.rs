@@ -47,6 +47,13 @@ pub struct ChainHead {
     /// in a pin written before heads were kept whole.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record: Option<IngestRecord>,
+    /// The record with the highest clock the chain has accepted up to here,
+    /// when it is not [`Self::record`]: a small step back (a
+    /// [`ClockDefect`]) left the head below it. Every later record is held to
+    /// it, so a sequencer cannot walk its clock back step by step, across
+    /// sessions too. `None` in a pin written before it was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high: Option<IngestRecord>,
 }
 
 impl ChainHead {
@@ -65,7 +72,38 @@ impl ChainHead {
             ingest_wall_ms: record.ingest_wall_ms,
             ingest_logical: record.ingest_logical,
             record: Some(record.clone()),
+            high: None,
         }
+    }
+
+    /// The highest clock accepted up to this head: [`Self::high`]'s, or the
+    /// head's own.
+    pub fn clock_high(&self) -> (u64, u32) {
+        self.high
+            .as_ref()
+            .map_or((self.ingest_wall_ms, self.ingest_logical), |r| {
+                (r.ingest_wall_ms, r.ingest_logical)
+            })
+    }
+
+    /// The record that holds [`Self::clock_high`], when it was kept.
+    fn high_record(&self) -> Option<&IngestRecord> {
+        self.high.as_ref().or(self.record.as_ref())
+    }
+
+    /// Its `seq`, or the head's when only the head's clock is known.
+    fn high_seq(&self) -> u64 {
+        self.high.as_ref().map_or(self.seq, |r| r.seq)
+    }
+
+    /// The head at `record`, which comes after this one, keeping the
+    /// highest clock accepted so far.
+    fn after(&self, record: &IngestRecord) -> Self {
+        let mut next = Self::of(record);
+        if (record.ingest_wall_ms, record.ingest_logical) < self.clock_high() {
+            next.high = self.high_record().cloned();
+        }
+        next
     }
 }
 
@@ -172,6 +210,25 @@ impl ChainProof {
             if head.channel_id != self.channel_id {
                 return Err("the head record is for another channel".to_string());
             }
+            // An earlier record than the one just before: the clock of a
+            // later record more than the tolerance below an earlier one's
+            // is a contradiction whatever lies between (JEP-0002 rule 9).
+            if head.seq.saturating_add(1) < self.record.seq {
+                self.record
+                    .verify(&self.sequencer)
+                    .map_err(|e| format!("the record does not verify: {e}"))?;
+                if self.record.channel_id != self.channel_id {
+                    return Err("the record is for another channel".to_string());
+                }
+                return if below_tolerance(clock_of(head), &self.record) {
+                    Ok(ChainBreak::ClockBackwards {
+                        head: head.seq,
+                        seq: self.record.seq,
+                    })
+                } else {
+                    Err("the records do not contradict each other".to_string())
+                };
+            }
             chain.head = Some(ChainHead::of(head));
         }
         match chain.accept(&self.record, None) {
@@ -179,6 +236,49 @@ impl ChainProof {
             Err(e) => Err(format!("the records break, but prove nothing: {e}")),
             Ok(_) => Err("the records do not contradict each other".to_string()),
         }
+    }
+}
+
+/// How far, in milliseconds, a record's clock may be below the highest clock
+/// its chain has accepted and still be taken as a defect rather than a
+/// contradiction (JEP-0002 rule 9). Servers before the fix for concurrent
+/// ingest signed such steps under load, a few milliseconds at most, and those
+/// records stay in their chains.
+pub const CLOCK_STEP_TOLERANCE_MS: u64 = 1000;
+
+fn clock_of(record: &IngestRecord) -> (u64, u32) {
+    (record.ingest_wall_ms, record.ingest_logical)
+}
+
+/// Whether `record`'s clock is below `high` by more than
+/// [`CLOCK_STEP_TOLERANCE_MS`] of wall time.
+fn below_tolerance(high: (u64, u32), record: &IngestRecord) -> bool {
+    clock_of(record) < high
+        && high.0.saturating_sub(record.ingest_wall_ms) > CLOCK_STEP_TOLERANCE_MS
+}
+
+/// A record whose clock stepped back from the one before it by at most
+/// [`CLOCK_STEP_TOLERANCE_MS`], signed by the same key, with `seq` and `prev`
+/// intact: the server's defect, accepted and reported, not a contradiction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClockDefect {
+    pub channel_id: String,
+    /// The record before it, and the record that stepped back.
+    pub head: u64,
+    pub seq: u64,
+    /// How far back its wall clock went; 0 when only the logical counter did.
+    pub back_ms: u64,
+}
+
+impl std::fmt::Display for ClockDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "record {} of channel {} is signed with a clock {} ms before record {}'s: a \
+             sequencer defect, not a contradiction (at most {CLOCK_STEP_TOLERANCE_MS} ms is \
+             reported, not refused)",
+            self.seq, self.channel_id, self.back_ms, self.head
+        )
     }
 }
 
@@ -190,6 +290,8 @@ pub struct ChannelChain {
     /// one it signs as now. Never empty.
     sequencers: Vec<String>,
     head: Option<ChainHead>,
+    /// Small clock steps back accepted since [`Self::take_clock_defects`].
+    clock_defects: Vec<ClockDefect>,
 }
 
 impl ChannelChain {
@@ -214,6 +316,7 @@ impl ChannelChain {
             channel_id: channel_id.to_string(),
             sequencers,
             head,
+            clock_defects: Vec::new(),
         }
     }
 
@@ -241,6 +344,12 @@ impl ChannelChain {
         self.head.as_ref()
     }
 
+    /// The clock defects accepted since the last call, oldest first, for the
+    /// caller to show.
+    pub fn take_clock_defects(&mut self) -> Vec<ClockDefect> {
+        std::mem::take(&mut self.clock_defects)
+    }
+
     /// What shows `broke`, which [`Self::accept`] returned for `record`, to
     /// someone who does not trust this client: `None` when the break proves
     /// nothing against the sequencer, or when the head it broke against was
@@ -251,6 +360,15 @@ impl ChannelChain {
         }
         let head = match broke {
             ChainBreak::BadGenesis => None,
+            // The record that holds the highest clock: the one the record
+            // came too far below.
+            ChainBreak::ClockBackwards { head: at, .. } => {
+                let head = self.head.as_ref()?;
+                match &head.high {
+                    Some(high) if high.seq == *at => Some(high.clone()),
+                    _ => Some(head.record.clone()?),
+                }
+            }
             _ => Some(self.head.as_ref()?.record.clone()?),
         };
         // Two records prove something against one key. Across a key change
@@ -337,6 +455,14 @@ impl ChannelChain {
             return Ok(Step::Behind);
         }
         if record.seq > head.seq + 1 {
+            // What is missing cannot be checked, but no later record may be
+            // further below the highest clock accepted than the tolerance.
+            if below_tolerance(head.clock_high(), record) {
+                return Err(ChainBreak::ClockBackwards {
+                    head: head.high_seq(),
+                    seq: record.seq,
+                });
+            }
             return Ok(Step::Gap {
                 from: head.seq + 1,
                 to: record.seq,
@@ -351,12 +477,34 @@ impl ChannelChain {
         if (record.ingest_wall_ms, record.ingest_logical)
             < (head.ingest_wall_ms, head.ingest_logical)
         {
-            return Err(ChainBreak::ClockBackwards {
+            // A small step back by the key that signed the head, with `seq`
+            // and `prev` already checked, is the sequencer's defect (JEP-0002
+            // rule 9): reported, not refused. Small is measured from the
+            // highest clock the chain has accepted, not the head's, so steps
+            // do not add up. A head kept without its record cannot show who
+            // signed it, so it stays strict.
+            let back_ms = head.ingest_wall_ms.saturating_sub(record.ingest_wall_ms);
+            let same_signer = head.record.as_ref().is_some_and(|signed| {
+                jig_pipeline::handshake::same_did(&signed.sequencer, &record.sequencer)
+            });
+            if !same_signer || below_tolerance(head.clock_high(), record) {
+                return Err(ChainBreak::ClockBackwards {
+                    head: if same_signer {
+                        head.high_seq()
+                    } else {
+                        head.seq
+                    },
+                    seq: record.seq,
+                });
+            }
+            self.clock_defects.push(ClockDefect {
+                channel_id: self.channel_id.clone(),
                 head: head.seq,
                 seq: record.seq,
+                back_ms,
             });
         }
-        self.head = Some(ChainHead::of(record));
+        self.head = Some(head.after(record));
         Ok(Step::Next)
     }
 
@@ -371,7 +519,10 @@ impl ChannelChain {
     ) -> Result<Step, ChainBreak> {
         let step = self.accept(record, block_cid)?;
         if matches!(step, Step::Gap { .. }) {
-            self.head = Some(ChainHead::of(record));
+            self.head = Some(match &self.head {
+                Some(head) => head.after(record),
+                None => ChainHead::of(record),
+            });
         }
         Ok(step)
     }
@@ -401,13 +552,17 @@ mod tests {
         }
 
         fn push(&mut self, block: &str, wall: u64) -> IngestRecord {
+            self.push_at(block, wall, 0)
+        }
+
+        fn push_at(&mut self, block: &str, wall: u64, logical: u32) -> IngestRecord {
             let seq = self.records.len() as u64;
             let prev = self.records.last().map_or(GENESIS_PREV, IngestRecord::hash);
             let record = RecordSigner {
                 channel_id: label_cid("bafyCreate"),
                 key: &self.key,
                 ingest_wall_ms: wall,
-                ingest_logical: 0,
+                ingest_logical: logical,
             }
             .sign(seq, &label_cid(block), prev)
             .unwrap();
@@ -567,6 +722,40 @@ mod tests {
         );
     }
 
+    /// A follower that carried a channel as the federation relay's copy, then
+    /// follows it from its owner, serves the owner's records under the same
+    /// channel and seqs (jig-server sets the copy aside on the accept). A
+    /// client that pinned the copy's records cannot make the follower out to
+    /// have contradicted itself: the two chains are signed by two keys.
+    #[test]
+    fn a_new_sequencer_for_a_channel_proves_nothing_against_the_old_one() {
+        let (mut copy, mut owner) = (Seq::new(), Seq::new());
+        let channel = label_cid("bafyCreate");
+        let pinned = [copy.push("bafyCreate", 10), copy.push("bafyPost", 20)];
+        let landed = [owner.push("bafyCreate", 10), owner.push("bafyPost", 30)];
+
+        // Held to the follower's key, as a client holds its server's.
+        let mut chain = ChannelChain::new(&channel, &copy.did(), None);
+        for record in &pinned {
+            chain.accept(record, None).unwrap();
+        }
+        let broke = chain.accept(&landed[1], None).unwrap_err();
+        assert!(matches!(broke, ChainBreak::Unsigned(_)), "{broke}");
+        assert!(!broke.is_signed_proof());
+        assert!(chain.proof(&landed[1], &broke).is_none());
+
+        // Held to the owner's key, over the pinned head: the two records
+        // differ at seq 1, but the head is not the owner's, so no proof is
+        // built from them, or none that verifies.
+        let mut chain = ChannelChain::new(&channel, &owner.did(), chain.head().cloned());
+        let broke = chain.accept(&landed[1], None).unwrap_err();
+        assert!(
+            chain
+                .proof(&landed[1], &broke)
+                .is_none_or(|proof| proof.verify().is_err())
+        );
+    }
+
     #[test]
     fn a_skipped_entry_is_a_gap_to_fill_not_a_contradiction() {
         let mut server = Seq::new();
@@ -634,10 +823,11 @@ mod tests {
     fn a_record_that_does_not_fit_is_a_contradiction() {
         let mut server = Seq::new();
         let did = server.did();
-        let first = server.push("bafyCreate", 50);
+        let first = server.push("bafyCreate", 5_000);
         let mut chain = ChannelChain::new(&label_cid("bafyCreate"), &did, None);
         chain.accept(&first, None).unwrap();
 
+        // Further back than a defect is let be.
         let slow = server.push("bafyPost", 10);
         assert_eq!(
             chain.clone().accept(&slow, None),
@@ -660,6 +850,200 @@ mod tests {
             other_channel.accept(&first, None),
             Err(ChainBreak::OtherChannel { .. })
         ));
+    }
+
+    /// A step back of at most [`CLOCK_STEP_TOLERANCE_MS`], by the key that
+    /// signed the head, with `seq` and `prev` intact, is a defect: accepted,
+    /// and reported once. Anything more is a contradiction, as before.
+    #[test]
+    fn a_small_clock_step_back_is_a_reported_defect_not_a_contradiction() {
+        let create = label_cid("bafyCreate");
+        // Logical only: the same millisecond, counter 1 then 0, as an
+        // unfixed server signs two blocks that raced.
+        let mut server = Seq::new();
+        let did = server.did();
+        let mut chain = ChannelChain::new(&create, &did, None);
+        chain
+            .accept(&server.push_at("bafyCreate", 5_000, 1), None)
+            .unwrap();
+        let raced = server.push_at("bafyRaced", 5_000, 0);
+        assert_eq!(chain.accept(&raced, None), Ok(Step::Next));
+        assert_eq!(
+            chain.take_clock_defects(),
+            [ClockDefect {
+                channel_id: create.clone(),
+                head: 0,
+                seq: 1,
+                back_ms: 0,
+            }]
+        );
+        assert!(chain.take_clock_defects().is_empty(), "reported once");
+        assert_eq!(chain.head().unwrap().seq, 1, "the head moved");
+        // 15 ms back, the most a soak of the unfixed server showed.
+        let late = server.push("bafyLate", 4_985);
+        assert_eq!(chain.accept(&late, None), Ok(Step::Next));
+        assert_eq!(chain.take_clock_defects()[0].back_ms, 15);
+        // Live, too, and a re-delivery adds nothing.
+        // Exactly the tolerance below the highest clock accepted (5 000).
+        let at_limit = server.push("bafyLimit", 5_000 - CLOCK_STEP_TOLERANCE_MS);
+        assert_eq!(chain.accept_live(&at_limit, None), Ok(Step::Next));
+        assert_eq!(chain.accept(&at_limit, None), Ok(Step::Behind));
+        assert_eq!(chain.take_clock_defects().len(), 1);
+
+        // One millisecond more is a contradiction, with its proof.
+        let mut strict = Seq::new();
+        let did = strict.did();
+        let mut chain = ChannelChain::new(&create, &did, None);
+        chain
+            .accept(&strict.push("bafyCreate", 5_000), None)
+            .unwrap();
+        let too_far = strict.push("bafyFar", 5_000 - CLOCK_STEP_TOLERANCE_MS - 1);
+        let broke = chain.accept(&too_far, None).unwrap_err();
+        assert_eq!(broke, ChainBreak::ClockBackwards { head: 0, seq: 1 });
+        let proof = chain.proof(&too_far, &broke).expect("a signed proof");
+        assert_eq!(proof.verify(), Ok(broke));
+        assert!(chain.take_clock_defects().is_empty());
+
+        // A proof of a small step no longer shows a contradiction.
+        let mut small = Seq::new();
+        let first = small.push("bafyCreate", 5_000);
+        let second = small.push("bafySmall", 4_990);
+        let kept = ChainProof {
+            channel_id: create.clone(),
+            sequencer: small.did(),
+            head: Some(first),
+            record: second,
+        };
+        assert!(kept.verify().is_err());
+    }
+
+    /// The tolerance is measured from the highest clock the chain has
+    /// accepted, so a sequencer cannot walk its clock back step by step:
+    /// three steps of 600 ms each, the second already 1200 ms below the
+    /// highest. The same holds across sessions, from the head as pinned.
+    #[test]
+    fn steps_back_do_not_add_up_past_the_highest_clock_accepted() {
+        let create = label_cid("bafyCreate");
+        let mut server = Seq::new();
+        let did = server.did();
+        let top = server.push("bafyCreate", 5_000);
+        let first = server.push("bafyOne", 4_400);
+        let second = server.push("bafyTwo", 3_800);
+
+        let mut chain = ChannelChain::new(&create, &did, None);
+        chain.accept(&top, None).unwrap();
+        assert_eq!(chain.accept(&first, None), Ok(Step::Next));
+        assert_eq!(chain.take_clock_defects()[0].back_ms, 600);
+        let pinned = chain.head().unwrap().clone();
+        assert_eq!(pinned.clock_high(), (5_000, 0), "the highest is kept");
+        let broke = chain.clone().accept(&second, None).unwrap_err();
+        assert_eq!(broke, ChainBreak::ClockBackwards { head: 0, seq: 2 });
+        // The proof is the highest record and this one, and stands alone.
+        let proof = chain.proof(&second, &broke).expect("a signed proof");
+        assert_eq!(proof.head.as_ref(), Some(&top));
+        assert_eq!(proof.verify(), Ok(broke.clone()));
+
+        // A new session, from the head as kept: the same answer.
+        let kept: ChainHead =
+            serde_json::from_str(&serde_json::to_string(&pinned).unwrap()).unwrap();
+        let mut resumed = ChannelChain::new(&create, &did, Some(kept));
+        assert_eq!(resumed.clone().accept(&second, None), Err(broke.clone()));
+        // Past a gap, and on a live stream, as well.
+        let mut gapped = Seq {
+            key: server.key.clone(),
+            records: server.records[..2].to_vec(),
+        };
+        gapped.push("bafySkipped", 4_500);
+        let far = gapped.push("bafyFar", 3_900);
+        assert_eq!(
+            resumed.clone().accept_live(&far, None),
+            Err(ChainBreak::ClockBackwards { head: 0, seq: 3 })
+        );
+
+        // Back up within the tolerance of the highest is fine, and moves
+        // nothing but the head.
+        let mut climbing = Seq {
+            key: server.key.clone(),
+            records: server.records[..2].to_vec(),
+        };
+        let up = climbing.push("bafyUp", 4_600);
+        assert_eq!(resumed.accept(&up, None), Ok(Step::Next));
+        assert!(resumed.take_clock_defects().is_empty(), "not a step back");
+        assert_eq!(resumed.head().unwrap().clock_high(), (5_000, 0));
+        let past = climbing.push("bafyPast", 5_100);
+        assert_eq!(resumed.accept(&past, None), Ok(Step::Next));
+        assert_eq!(resumed.head().unwrap().high, None, "a new highest");
+
+        // Two records far apart in seq prove nothing unless the later one is
+        // more than the tolerance below the earlier one.
+        let near = ChainProof {
+            channel_id: create.clone(),
+            sequencer: did.clone(),
+            head: Some(top),
+            record: first,
+        };
+        assert!(near.verify().is_err());
+    }
+
+    /// The step is let be only when the head's own record shows the same key
+    /// signed it. A head signed by another key, or kept without its record,
+    /// stays strict.
+    #[test]
+    fn a_clock_step_back_from_another_key_or_a_bare_head_is_a_contradiction() {
+        let create = label_cid("bafyCreate");
+        let mut ours = Seq::new();
+        let did = ours.did();
+        let first = ours.push("bafyCreate", 5_000);
+        let step = ours.push("bafyStep", 4_990);
+
+        // The head this device holds was signed by another key.
+        let mut theirs = Seq::new();
+        let their_head = theirs.push("bafyCreate", 5_000);
+        let mut held = ChainHead::of(&first);
+        held.record = Some(their_head);
+        let mut chain = ChannelChain::new(&create, &did, Some(held));
+        assert_eq!(
+            chain.accept(&step, None),
+            Err(ChainBreak::ClockBackwards { head: 0, seq: 1 })
+        );
+
+        // Across a key change: the head is the old DID's, the next record
+        // the new one's, 10 ms lower. Two keys' clocks are not one
+        // sequencer's defect: a contradiction, which proves nothing alone.
+        let mut rotated = Seq::new();
+        let old_did = rotated.did();
+        let before = rotated.push("bafyCreate", 5_000);
+        rotated.rotate();
+        let new_did = rotated.did();
+        let after = rotated.push("bafyAfter", 4_990);
+        let mut chain = ChannelChain::across(&create, vec![old_did, new_did], None);
+        chain.accept(&before, None).unwrap();
+        let broke = chain.accept(&after, None).unwrap_err();
+        assert_eq!(broke, ChainBreak::ClockBackwards { head: 0, seq: 1 });
+        assert_eq!(chain.proof(&after, &broke), None);
+        assert!(chain.take_clock_defects().is_empty());
+
+        // A record from another key altogether is refused as unsigned.
+        let mut chain = ChannelChain::new(&create, &did, None);
+        chain.accept(&first, None).unwrap();
+        let mut other = Seq {
+            key: generate_signing_key(),
+            records: vec![first.clone()],
+        };
+        assert!(matches!(
+            chain.accept(&other.push("bafyOther", 4_990), None),
+            Err(ChainBreak::Unsigned(_))
+        ));
+        assert!(chain.take_clock_defects().is_empty());
+
+        // A head kept without its record cannot show who signed it.
+        let mut bare = ChainHead::of(&first);
+        bare.record = None;
+        let mut chain = ChannelChain::new(&create, &did, Some(bare));
+        assert_eq!(
+            chain.accept(&step, None),
+            Err(ChainBreak::ClockBackwards { head: 0, seq: 1 })
+        );
     }
 
     #[test]
