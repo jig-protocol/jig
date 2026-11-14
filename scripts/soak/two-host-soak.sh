@@ -12,16 +12,15 @@
 #   SOAK_MODE          local (default): boot two servers on this machine,
 #                      peered over loopback. remote: use two servers that are
 #                      already running and list each other as peers.
-#   SOAK_PATH          contract (default): A shares the channel with B
+#   SOAK_PATH          contract, the only path: A shares the channel with B
 #                      (JEP-0005, `jig channel share`), B follows A's
-#                      records, and only A posts. legacy: the channel crosses
-#                      by the peers' open-channel relay, and both sides post;
-#                      only between servers that predate a channel-create
-#                      naming its sequencer (v0.2.0-alpha.4 and earlier).
+#                      records, and only A posts. legacy was retired in
+#                      v0.2.0-alpha.6 (#357): a server refuses posts the
+#                      peers' relay brings into a channel it orders.
 #   SOAK_CONTRACT_SETUP isolated (default): create and share the channel
 #                      while B is down, so only the contract can bring it to
-#                      B. steady: with both up, where the legacy relay gets
-#                      there first (see README). Remote isolated mode needs
+#                      B. steady: with both up (see README). Remote isolated
+#                      mode needs
 #                      SOAK_B_STOP_CMD and SOAK_B_START_CMD.
 #   SOAK_A_URL         remote: server A's base URL, https://HOST:PORT
 #   SOAK_B_URL         remote: server B's base URL
@@ -35,13 +34,6 @@
 #   SOAK_SETTLE        seconds to keep reading after the last send (default
 #                      SOAK_DEADLINE)
 #   SOAK_HEALTH_EVERY  seconds between health samples (default 60)
-#   SOAK_INGEST        paced (default): one writer per side. concurrent
-#                      (legacy path only): SOAK_WRITERS writers per side, all
-#                      posting on the same tick, so each server takes its
-#                      own client's posts and the other server's relayed ones
-#                      into the channel at the same moment
-#   SOAK_WRITERS       concurrent: writers per side (default 16; 4 did not
-#                      reach #347's race in two minutes)
 #   SOAK_RESTART_EVERY seconds between server restarts (default 0: none)
 #   SOAK_RESTART_SIDE  b (default), a, or alternate: which server restarts
 #   SOAK_A_RESTART_CMD remote: command that restarts server A (e.g. over ssh)
@@ -81,19 +73,18 @@ RESTART_EVERY="${SOAK_RESTART_EVERY:-0}"
 RESTART_SIDE="${SOAK_RESTART_SIDE:-b}"
 FED_PATH="${SOAK_PATH:-contract}"
 SETUP="${SOAK_CONTRACT_SETUP:-isolated}"
-INGEST="${SOAK_INGEST:-paced}"
-WRITERS="${SOAK_WRITERS:-16}"
-case "$FED_PATH" in legacy | contract) ;; *) echo "SOAK_PATH is legacy or contract" >&2; exit 1 ;; esac
+WRITERS=1
+retired() {
+  echo "$1 was retired in v0.2.0-alpha.6 (#357): a server refuses posts the peers' relay brings into a channel it orders. To soak older servers, run this script from v0.2.0-alpha.5." >&2
+  exit 1
+}
+case "$FED_PATH" in contract) ;; legacy) retired SOAK_PATH=legacy ;; *) echo "SOAK_PATH is contract" >&2; exit 1 ;; esac
+case "${SOAK_INGEST:-paced}" in paced) ;; concurrent) retired SOAK_INGEST=concurrent ;; *) echo "SOAK_INGEST is paced" >&2; exit 1 ;; esac
 case "$SETUP" in isolated | steady) ;; *) echo "SOAK_CONTRACT_SETUP is isolated or steady" >&2; exit 1 ;; esac
 case "$RESTART_SIDE" in a | b | alternate) ;; *) echo "SOAK_RESTART_SIDE is a, b or alternate" >&2; exit 1 ;; esac
-case "$INGEST" in paced) WRITERS=1 ;; concurrent) ;; *) echo "SOAK_INGEST is paced or concurrent" >&2; exit 1 ;; esac
-if [ "$INGEST" = concurrent ] && [ "$FED_PATH" != legacy ]; then
-  echo "SOAK_INGEST=concurrent needs SOAK_PATH=legacy: on the contract path only A posts" >&2; exit 1
-fi
-case "$WRITERS" in '' | *[!0-9]* | 0) echo "SOAK_WRITERS is a whole number from 1" >&2; exit 1 ;; esac
 # Whether B comes up only after the channel is shared.
 LATE_B=0
-if [ "$FED_PATH" = contract ] && [ "$SETUP" = isolated ]; then LATE_B=1; fi
+if [ "$SETUP" = isolated ]; then LATE_B=1; fi
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
 OUT="${SOAK_OUT:-$PWD/soak-out/$RUN_ID}"
 CHANNEL="#soak-${RUN_ID,,}"
@@ -251,7 +242,7 @@ if [ "$MODE" = local ]; then
   printf '\n[[federation.peers]]\nurl = "wss://127.0.0.1:%s"\nexpected_did = "%s"\n' \
     "$(local_port a)" "$(cat "$(local_dir a)/did")" >> "$(local_dir b)/config.toml"
   # B takes A's offers without an operator.
-  [ "$FED_PATH" = contract ] && echo 'offers = "accept"' >> "$(local_dir b)/config.toml"
+  echo 'offers = "accept"' >> "$(local_dir b)/config.toml"
   local_start a
   [ "$LATE_B" = 1 ] || local_start b
 elif [ "$MODE" != remote ]; then
@@ -289,8 +280,7 @@ client_init() {
 
 # Wait until FROM's posts are read on TO's server, through REF (the slug, or
 # on a follower the channel's id): this checks the peering, and keeps the
-# time before the links are up out of the numbers. Posts made while a link
-# is down never cross later on the legacy relay, so the warm-up posts again
+# time before the links are up out of the numbers. The warm-up posts again
 # until one is seen.
 warm_up() {
   local from="$1" to="$2" ref="$3" wait="$4" n=0 deadline
@@ -308,34 +298,27 @@ warm_up() {
 
 client_init a
 as a channel create "$CHANNEL" --tier public --yes >/dev/null 2>&1 || fail "could not create $CHANNEL on A"
-READ_A="$CHANNEL"; READ_B="$CHANNEL"
-if [ "$FED_PATH" = contract ]; then
-  as a channel share --help >/dev/null 2>&1 || fail "$BIN/jig has no \`channel share\`: build one that does"
-  if [ "$LATE_B" = 1 ] && [ "$MODE" = remote ]; then remote_b stop; fi
-  as a channel share "$CHANNEL" "$DID_B" --grant write > "$WORK/share.out" 2>&1 || { cat "$WORK/share.out" >&2; fail "jig channel share"; }
-  READ_B="$(sed -n 's/.*read it by its id: jig read \(.*\)$/\1/p' "$WORK/share.out")"
-  [ -n "$READ_B" ] || { cat "$WORK/share.out" >&2; fail "no channel id in jig channel share's output"; }
-  if [ "$LATE_B" = 1 ]; then
-    if [ "$MODE" = local ]; then local_start b; else remote_b start; fi
-  fi
-  client_init b
-  # B accepts within a resend of the offer (30 s), then pulls every 10 s.
-  warm_up a b "$READ_B" 240
-  # A followed channel has no slug on B. If B serves A's posts by slug, B
-  # took the channel as its own from the legacy relay, and what B shows is
-  # that copy, not the contract's.
-  if as b --json read "$CHANNEL" --limit 200 2>/dev/null | grep -qF "soak $RUN_ID warmup a "; then
-    printf '# Two-host soak %s\n\n**FAIL**: server B holds %s as a channel it sequences itself (it came by the legacy relay before the share), so the contract carries nothing to it. See scripts/soak/README.md.\n' \
-      "$RUN_ID" "$CHANNEL" | tee "$OUT/summary.md"
-    exit 1
-  fi
-  log "run $RUN_ID: $CHANNEL shared with B (id $READ_B), ${DURATION}s of posts on A every ${INTERVAL}s"
-else
-  client_init b
-  warm_up a b "$READ_B" 120
-  warm_up b a "$READ_A" 120
-  log "run $RUN_ID: channel $CHANNEL, ${DURATION}s of sends every ${INTERVAL}s each way, $WRITERS writer(s) per side"
+READ_B="$CHANNEL"
+as a channel share --help >/dev/null 2>&1 || fail "$BIN/jig has no \`channel share\`: build one that does"
+if [ "$LATE_B" = 1 ] && [ "$MODE" = remote ]; then remote_b stop; fi
+as a channel share "$CHANNEL" "$DID_B" --grant write > "$WORK/share.out" 2>&1 || { cat "$WORK/share.out" >&2; fail "jig channel share"; }
+READ_B="$(sed -n 's/.*read it by its id: jig read \(.*\)$/\1/p' "$WORK/share.out")"
+[ -n "$READ_B" ] || { cat "$WORK/share.out" >&2; fail "no channel id in jig channel share's output"; }
+if [ "$LATE_B" = 1 ]; then
+  if [ "$MODE" = local ]; then local_start b; else remote_b start; fi
 fi
+client_init b
+# B accepts within a resend of the offer (30 s), then pulls every 10 s.
+warm_up a b "$READ_B" 240
+# A followed channel has no slug on B. If B serves A's posts by slug, B
+# holds the channel as one it orders itself (a copy an older relay made),
+# and what B shows is that copy, not the contract's.
+if as b --json read "$CHANNEL" --limit 200 2>/dev/null | grep -qF "soak $RUN_ID warmup a "; then
+  printf '# Two-host soak %s\n\n**FAIL**: server B holds %s as a channel it sequences itself, so the contract carries nothing to it. See scripts/soak/README.md.\n' \
+    "$RUN_ID" "$CHANNEL" | tee "$OUT/summary.md"
+  exit 1
+fi
+log "run $RUN_ID: $CHANNEL shared with B (id $READ_B), ${DURATION}s of posts on A every ${INTERVAL}s"
 
 # --- the run ---------------------------------------------------------------------
 
@@ -468,10 +451,6 @@ reader b "$READ_B" & PIDS+=($!)
 if [ "$RESTART_EVERY" -gt 0 ]; then restarter & PIDS+=($!); fi
 SENDERS=()
 for ((w = 0; w < WRITERS; w++)); do sender a "$w" & SENDERS+=($!); done
-if [ "$FED_PATH" = legacy ]; then
-  reader a "$READ_A" & PIDS+=($!)
-  for ((w = 0; w < WRITERS; w++)); do sender b "$w" & SENDERS+=($!); done
-fi
 PIDS+=("${SENDERS[@]}")
 wait "${SENDERS[@]}"
 log "sending done; reading for ${SETTLE}s more"

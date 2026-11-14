@@ -65,8 +65,10 @@ KNOWN_GAPS="${JIG_UPGRADE_KNOWN_GAPS-}"
 #     its new DID ("is not the channel this device pinned"). Fixed by #335, so
 #     it fails the run when the last step is this build.
 RELEASED_GAPS="install-reuses-old-server@v0.2.0-alpha.1 install-reuses-old-server@v0.2.0-alpha.2"
-# alpha.3 was cut before #334, so its installer has the gap too; it has #335.
+# alpha.3, alpha.4 and alpha.5 were cut before #334 merged, so their
+# installers have the gap too; all three have #335.
 RELEASED_GAPS="$RELEASED_GAPS install-reuses-old-server@v0.2.0-alpha.3"
+RELEASED_GAPS="$RELEASED_GAPS install-reuses-old-server@v0.2.0-alpha.4 install-reuses-old-server@v0.2.0-alpha.5"
 RELEASED_GAPS="$RELEASED_GAPS rotate-locks-out-clients@v0.2.0-alpha.1 rotate-locks-out-clients@v0.2.0-alpha.2"
 ALLOWED_SIGNERS="$(cd "$(dirname "$0")/.." && pwd)/.github/release/allowed_signers"
 
