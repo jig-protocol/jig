@@ -4563,6 +4563,17 @@ mod tests {
         let join = signed(&joiner, BlockKind::MemberAdd, member(&channel, &joiner_did));
         members_post(&p.follower, &channel, &join).await.unwrap();
         assert!(is_member(&joiner_did), "the join landed at the owner");
+        let via = p
+            .owner
+            .ingest_ctx
+            .store
+            .last_relay_by_sender(&channel)
+            .unwrap();
+        assert_eq!(
+            via.get(&joiner_did).cloned().flatten(),
+            Some(p.follower.server_did.to_did_jig_string()),
+            "the owner took the join as relayed by the follower"
+        );
         let add = signed(&p.user, BlockKind::MemberAdd, member(&channel, &added));
         members_post(&p.follower, &channel, &add).await.unwrap();
         assert!(is_member(&added), "the add landed at the owner");
