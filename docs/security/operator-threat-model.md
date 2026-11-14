@@ -244,7 +244,11 @@ manifest gates, admission, the kind allowlist, archived channels, the write gate
 suite gate, effects, and the server's own execution and receipt. Before that it drops
 encrypted content, a peer's shares and contract records (they are the sequencer's own),
 blocks for a channel this server carries by contract, and blocks for a local channel that
-does not federate. Relayed receipts are not kept. A `text-render`, membership, role,
+does not federate. It also drops every block other than a `channel-create` that names a
+channel this server sequences, by slug or by id (JEP-0014 rule 37, #357): a channel crosses
+servers only by a share, so the relay cannot give it a second order. These are logged
+under `relayed-into-sequenced-channel` and counted, and the drop comes before admission, so
+a refused post spends none of its author's rate. Relayed receipts are not kept. A `text-render`, membership, role,
 promote, archive, share or contract block that names a channel this server has no row for
 is refused, from any source. A relayed `channel-create` must name this server as its sequencer
 (`SEQUENCER_REQUIRED`, `NOT_SEQUENCER`), so a peer's new channel is never taken as this

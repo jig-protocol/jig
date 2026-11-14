@@ -132,6 +132,7 @@ hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 
 [dev-dependencies]
 rcgen = "0.14"
+rusqlite = { workspace = true }
 tempfile = "3.8"
 jig-client = { path = "../jig-client", features = ["test-support"] }
 # The suite conformance vectors (tests/suite_vectors.rs): `test-aead`

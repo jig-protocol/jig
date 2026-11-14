@@ -64,6 +64,7 @@ pub mod metrics {
     static CONNECTIONS_ACTIVE: AtomicU64 = AtomicU64::new(0);
     static SUBSCRIBERS_ACTIVE: AtomicU64 = AtomicU64::new(0);
     static BLOCKS_INGESTED: AtomicU64 = AtomicU64::new(0);
+    static RELAYED_INTO_SEQUENCED: AtomicU64 = AtomicU64::new(0);
     /// Cardinality is bounded by the channels this server actually serves,
     /// which is the same bound the block store already carries.
     static CHANNEL_MESSAGES: RwLock<BTreeMap<String, u64>> = RwLock::new(BTreeMap::new());
@@ -106,6 +107,17 @@ pub mod metrics {
         }
     }
 
+    /// Record one post a peer relayed into a channel this server sequences,
+    /// refused (JEP-0014 rule 37, #357).
+    pub fn relayed_into_sequenced() {
+        RELAYED_INTO_SEQUENCED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many [`relayed_into_sequenced`] refusals since start.
+    pub fn relayed_into_sequenced_total() -> u64 {
+        RELAYED_INTO_SEQUENCED.load(Ordering::Relaxed)
+    }
+
     /// Saturating decrement — a gauge that underflows to u64::MAX is worse
     /// than one that is briefly wrong.
     ///
@@ -137,13 +149,22 @@ pub mod metrics {
     /// Prometheus text exposition (format version 0.0.4) of the live counters.
     pub fn render_prometheus() -> String {
         let snap = snapshot();
-        render(
+        let mut out = render(
             snap.connections_active,
             snap.subscribers_active,
             snap.blocks_ingested,
             &snap.channels,
             &jig_pipeline::metrics::ingested_by_source(),
-        )
+        );
+        out.push_str(&format!(
+            "# HELP jig_federation_relayed_refused_total Blocks a peer relayed and this server \
+             refused, by reason.\n\
+             # TYPE jig_federation_relayed_refused_total counter\n\
+             jig_federation_relayed_refused_total{{reason=\"{}\"}} {}\n",
+            jig_pipeline::ingest::RELAYED_INTO_SEQUENCED,
+            relayed_into_sequenced_total()
+        ));
+        out
     }
 
     /// Pure renderer — separated from the globals so its output format is

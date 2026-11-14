@@ -721,6 +721,14 @@ peer's new channel, but clients refuse to read the copy, because its creation
 block names another server. Servers that trust each other set
 `offers = "accept"` and use `jig channel share`.
 
+The older peer relay no longer posts into channels: a server refuses any post
+a peer relays into a channel the server orders itself, whether the post names
+the channel or its id. The first refusal per peer and channel is logged at WARN
+with the reason `relayed-into-sequenced-channel`, the rest at DEBUG, and each is
+counted in `jig_federation_relayed_refused_total`. **Share any channel that
+reaches peers only through the relay**; until it is shared, peers' posts to it
+are refused and logged, and their users post on this server.
+
 ---
 
 ## The nameserver
@@ -844,6 +852,11 @@ first post the relay brought across. Any two servers that each have a
 until relayed posts into a channel the receiving server orders are refused
 (#357).
 
+From v0.2.0-alpha.6, a server refuses a post a peer relays into a channel the
+server orders itself (#357), so new relayed posts no longer cause this. A
+channel that stalled before you upgraded stays stalled: upgrading does not
+repair it.
+
 **How to confirm it.**
 
 - `jig-server contracts list` ends with one line per stalled channel:
@@ -865,8 +878,8 @@ it. Deleting it does the same. Your options:
   server has a channel of its own with the same name. If it has, don't share
   that channel yet.
 
-A carried channel that can hold a block this server also holds elsewhere is
-planned for a later release.
+Repairing a stalled channel in place, so a carried channel can hold a block
+this server also holds elsewhere, is planned for a later release.
 
 ## Gotchas worth knowing before they cost you an evening
 

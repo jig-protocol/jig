@@ -137,6 +137,14 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
         IngestError::CarriedChannel { .. } => {
             (StatusCode::FORBIDDEN, "CARRIED_CHANNEL", e.to_string())
         }
+        // 403: a peer's legacy relay posting into a channel this server
+        // sequences (JEP-0014 rule 37). The relay answers nothing, so this is
+        // for the log and anything that classifies a refusal.
+        IngestError::RelayedIntoSequencedChannel { .. } => (
+            StatusCode::FORBIDDEN,
+            "RELAYED_INTO_SEQUENCED_CHANNEL",
+            e.to_string(),
+        ),
         // 403: a follower relayed past its share, or past its grant
         // (JEP-0005 rules 7a, 15).
         IngestError::RelayedOutsideShare { .. } => {
@@ -353,6 +361,10 @@ mod tests {
                 kind: "text-render".to_string(),
                 channel_id: "bafy-carried".to_string(),
                 sequencer: "did:jig:zElsewhere".to_string(),
+            },
+            IngestError::RelayedIntoSequencedChannel {
+                kind: "text-render".to_string(),
+                channel_id: "bafy-ours".to_string(),
             },
             IngestError::RelayedOutsideShare {
                 kind: "text-render".to_string(),

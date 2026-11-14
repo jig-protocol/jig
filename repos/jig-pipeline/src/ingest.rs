@@ -318,6 +318,15 @@ pub enum IngestError {
         channel_id: String,
         sequencer: String,
     },
+    /// A block a peer's legacy relay brought for a channel this server
+    /// sequences (JEP-0014 rule 37, #357). The relay would give the channel's
+    /// posts a second order: a channel crosses servers only by a share, and
+    /// a peer's users post through its grant.
+    #[error(
+        "`{kind}` refused: {RELAYED_INTO_SEQUENCED}: channel {channel_id} is sequenced \
+         here, and a peer's relay does not post to it; share the channel to carry it"
+    )]
+    RelayedIntoSequencedChannel { kind: String, channel_id: String },
     /// A relayed block for a channel the relaying server's share does not
     /// cover (JEP-0005 rule 15).
     #[error("`{kind}` refused: `{via}` relayed it outside its share of channel {channel_id}")]
@@ -670,6 +679,20 @@ pub async fn ingest(
             kind: kind_str.to_string(),
             channel_id: chan.id.clone(),
             sequencer: chan.sequencer_did.clone(),
+        });
+    }
+    // The legacy relay's blocks for a channel this server sequences: a peer
+    // posting into it this way would order the channel's posts a second
+    // time, as its own copy does (#357). A channel crosses servers only by a
+    // share (JEP-0014 rule 37). A channel-create names the channel it makes,
+    // which is not yet here: rule 1 and the sequencer binding judge it.
+    if let IngestSource::FederatedPeer { .. } = &source
+        && kind != BlockKind::ChannelCreate
+        && let Some(chan) = resolved_channel.as_ref()
+    {
+        return Err(IngestError::RelayedIntoSequencedChannel {
+            kind: kind_str.to_string(),
+            channel_id: chan.id.clone(),
         });
     }
 
@@ -1396,6 +1419,58 @@ fn self_join_admitted(
         }
         _ => false,
     }
+}
+
+/// The reason a refusal of a peer-relayed block into a channel this server
+/// sequences is logged under (JEP-0014 rule 37). Stable: operators grep for it.
+pub const RELAYED_INTO_SEQUENCED: &str = "relayed-into-sequenced-channel";
+
+/// The refusal [`ingest`] gives a block the legacy relay brought
+/// ([`IngestSource::FederatedPeer`]) for the channel it names, if it gives
+/// one: an archived channel, an unknown one, one another server sequences,
+/// or one this server sequences (#357). Ingest makes the same checks in the
+/// same order, after admission, so that a caller it will not deal with gets
+/// one answer whatever channel it names. Admission charges the author's rate,
+/// though, so a busy author's relayed posts would spend it on blocks that are
+/// only refused, and once it is spent come back as rate-limited, which the
+/// relay asks for again, rather than refused. The relay answers its peer
+/// nothing, so it asks this first and drops what it names. A `channel-create`
+/// gets `None`: it names a channel not yet here, and ingest judges it.
+pub fn refused_from_a_peer(
+    store: &SqliteStore,
+    server_did: &Did,
+    kind: BlockKind,
+    manifest: &jig_core::BlockManifest,
+    block_cid: &str,
+    source: &IngestSource,
+) -> crate::persist::Result<Option<IngestError>> {
+    if kind == BlockKind::ChannelCreate || !matches!(source, IngestSource::FederatedPeer { .. }) {
+        return Ok(None);
+    }
+    let Some(named) = channel_id_of(store, kind, manifest, block_cid)? else {
+        return Ok(None);
+    };
+    let Some(id) = named.id else {
+        return Ok(requires_existing_channel(kind, source)
+            .then_some(IngestError::UnknownChannel { slug: named.named }));
+    };
+    let Some(chan) = store.get_channel_by_id(&id)? else {
+        return Ok(Some(IngestError::ChannelArchived { slug: named.named }));
+    };
+    if !chan.sequencer_did.is_empty()
+        && crate::effect::canonical_did_string(&chan.sequencer_did)
+            != server_did.to_did_jig_string()
+    {
+        return Ok(Some(IngestError::CarriedChannel {
+            kind: kind.as_str().to_string(),
+            channel_id: chan.id,
+            sequencer: chan.sequencer_did,
+        }));
+    }
+    Ok(Some(IngestError::RelayedIntoSequencedChannel {
+        kind: kind.as_str().to_string(),
+        channel_id: chan.id,
+    }))
 }
 
 /// The channel a block belongs to — the ONE rule shared by the write gate,
