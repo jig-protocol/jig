@@ -255,6 +255,10 @@ Non-goals:
 33. The reference server sets `[auth.admission] unknown_dids = "proof-of-work"` by default, with
     the controller of rule 17 and no floor. Admission is therefore free while the server is idle.
     This default ships only once rule 31 is implemented (D26).
+    - **D26 resolved (DJ, 2026-10-25):** rule 31 is implemented, but the reference server keeps
+      `unknown_dids = "admit"` by default until R2's earned standing (local earned standing,
+      R2.4) lands. The controller of rule 17 ships now, used by any server that opts into
+      `"proof-of-work"`; the default switches to it, with no floor, in the same release as R2.4.
 
 # Security Considerations (Zero-Trust)
 
