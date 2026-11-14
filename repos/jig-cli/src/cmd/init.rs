@@ -19,7 +19,7 @@ use jig_client::Identity;
 use jig_core::naming::{Action, Attestation, Name};
 use serde::Serialize;
 
-use crate::cmd::ns::{Nameserver, Purpose, b64u};
+use crate::cmd::ns::{Nameserver, b64u};
 use crate::config::{self, Config};
 
 /// Parsed flags for `jig init`. Construct directly from `clap`-parsed args
@@ -183,7 +183,7 @@ pub async fn register_with_nameserver(
     ns_url: &str,
     delegations: &jig_client::naming::Delegations,
 ) -> Result<Attestation> {
-    let ns = Nameserver::connect(ns_url, who, delegations, Purpose::Register).await?;
+    let ns = Nameserver::connect(ns_url, who, delegations).await?;
     let name = ns.name().clone();
     let did = id.did_string();
     let alias = name.as_alias();
