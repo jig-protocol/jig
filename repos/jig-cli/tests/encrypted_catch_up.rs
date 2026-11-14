@@ -181,7 +181,7 @@ async fn relay(
 ) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let up = tokio::net::TcpStream::connect(upstream).await?;
-    let (mut from_client, mut to_client) = client.into_split();
+    let (mut from_client, to_client) = client.into_split();
     let (mut from_up, mut to_up) = up.into_split();
     let to_client = Arc::new(tokio::sync::Mutex::new(to_client));
     let responses = to_client.clone();
