@@ -128,7 +128,9 @@ operator's own entry for `jig` replaces it.
 a proof of control: the DID's COSE_Sign1 over the action, the nameserver's DID, the alias
 and that challenge (rule 10). A proof made for one action, name or nameserver does not
 verify for another, and a signature over the bare challenge is refused. The nameserver
-consumes the challenge on the first proof that verifies.
+consumes the challenge only once a request has passed every check before the consume (see
+[Nameserver mechanics](#nameserver-mechanics)): a refusal before it, a busy pool included,
+leaves the challenge usable.
 
 **Rotation by link.** An alias moves to another DID only by a key link
 ([JEP-0012](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0012-key-links.md)) from the old DID to the new one, signed by both
@@ -356,8 +358,9 @@ Until JEP-0003 defines reputation:
 - Reputation is not a protocol security input: no protocol step requires or refuses
   anything because of a score, and handshake reputation fields are informational
   ([OP-10](threat-register.md)).
-- A nameserver uses its own scores to scale proof-of-work, and a server MAY use its own
-  scores in its admission policy. Both are local policy, not protocol.
+- A nameserver scales proof-of-work by its controller, the name's length and penalties, not
+  by any score; standing is 1 until JEP-0009. A server MAY use its own scores in its
+  admission policy (its `[auth.admission] records`). Both are local policy, not protocol.
 
 ### Sybil resistance
 
@@ -652,13 +655,11 @@ A nameserver publishes its policy at three paths:
   `max_difficulty`, `anonymous_min_difficulty`), `rate_limits`, `automation` and
   `reputation`.
 
-DNS SRV records advertise nameserver endpoints:
-
-```
-_jig-ns._tcp.example.com. 3600 IN SRV 10 5 7070 ns1.example.com.
-```
-
-Without an SRV record, a resolver falls back to the domain's addresses on port 7070.
+**Discovery** (JEP-0004): a client finds a suffix's nameservers in its own configured
+delegation, else in the delegation served at
+`https://<suffix>/.well-known/jig-ns-delegation` over a CA-vouched certificate. DNS SRV
+records (`_jig-ns._tcp`) are not used: nothing publishes or resolves them, and there is no
+port fallback. 7070 is only the reference nameserver's default listen port.
 
 ### Federation between nameservers
 
@@ -805,7 +806,8 @@ not yet meet.
 - Pin the DID first seen for a name and surface changes (clients).
 - Keep anonymous keypairs separate from DID keypairs (clients).
 - Allow one appeal against a tribunal decision.
-- Advertise nameservers with `_jig-ns._tcp` SRV records.
+- Advertise nameservers with `_jig-ns._tcp` SRV records *(not yet implemented: discovery
+  uses the delegation)*.
 
 **MAY:**
 
