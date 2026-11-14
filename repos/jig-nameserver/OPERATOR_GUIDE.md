@@ -4,7 +4,7 @@ This guide covers what an operator configures on a v0.0.2 nameserver: the routes
 
 - Normative behaviour: the spec's [Identity and Reputation](../jig-spec/src/identity-and-reputation.md) chapter.
 - Why the parameters work the way they do: [nameserver abuse economics](../../docs/security/nameserver-abuse-economics.md).
-- The [nameserver abuse runbook](../../docs/operations/nameserver-abuse-runbook.md) is historical. It was written for the v0.0.1 surface (proof-of-work challenges, penalties, admin, reputation, tribunal and federation routes), which has been removed.
+- What to do in an incident (a registration flood, closing a suffix, a squatting complaint): the [nameserver abuse runbook](../../docs/operations/nameserver-abuse-runbook.md).
 
 ## Routes
 
