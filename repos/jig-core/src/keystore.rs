@@ -1066,6 +1066,83 @@ mod tests {
         );
     }
 
+    /// Format and KDF freeze at the parameters real keys use
+    /// ([`KdfParams::default`]: 64 MiB, three passes, four lanes), where an
+    /// Argon2 implementation could differ from the one-lane test parameters of
+    /// [`golden_jigkey_opens`]. A failure means existing key files no longer
+    /// open: it is not a fixture to refresh.
+    #[test]
+    fn golden_jigkey_at_the_default_kdf_params_opens() {
+        struct Counter(u8);
+        impl Entropy for Counter {
+            fn bytes<const N: usize>(&mut self) -> [u8; N] {
+                std::array::from_fn(|_| {
+                    self.0 = self.0.wrapping_add(1);
+                    self.0
+                })
+            }
+        }
+        // The passphrase slot's key-encryption key: Argon2id over "golden"
+        // with salt 01..10 at the default parameters.
+        let kek = argon2_kek("golden", &Counter(0).bytes::<16>(), &KdfParams::default()).unwrap();
+        assert_eq!(
+            hex::encode(kek.as_ref()),
+            GOLDEN_DEFAULT_KEK,
+            "Argon2id output changed"
+        );
+
+        let opened = Opened {
+            seed: Zeroizing::new(SEED),
+            data_key: Zeroizing::new(Counter(0x41).bytes()),
+        };
+        let key = JigKey::build(
+            DID,
+            &opened,
+            &[NewSlot::Passphrase {
+                passphrase: Zeroizing::new("golden".into()),
+                params: KdfParams::default(),
+            }],
+            &mut Counter(0),
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(key.to_bytes()),
+            GOLDEN_DEFAULT_JIGKEY,
+            "the writer changed"
+        );
+        let back = JigKey::from_bytes(&hex::decode(GOLDEN_DEFAULT_JIGKEY).unwrap()).unwrap();
+        assert_eq!(
+            back.slots(),
+            vec![SlotKind::Passphrase(KdfParams::default())]
+        );
+        let reopened = back.open(&[offer_pass("golden")]).unwrap();
+        assert_eq!(*reopened.seed, SEED);
+        assert_eq!(*reopened.data_key, *opened.data_key);
+    }
+
+    /// XChaCha20-Poly1305, as every key file and sealed blob uses it, against
+    /// the published vector (draft-irtf-cfrg-xchacha-03, appendix A.3.1).
+    #[test]
+    fn xchacha20_poly1305_matches_the_published_vector() {
+        let key: [u8; 32] = std::array::from_fn(|i| 0x80 + i as u8);
+        let nonce: [u8; NONCE_LEN] = std::array::from_fn(|i| 0x40 + i as u8);
+        let aad = hex::decode("50515253c0c1c2c3c4c5c6c7").unwrap();
+        let plaintext = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+        let expected = concat!(
+            "bd6d179d3e83d43b9576579493c0e939572a1700252bfaccbed2902c21396cbb",
+            "731c7f1b0b4aa6440bf3a82f4eda7e39ae64c6708c54c216cb96b72e1213b452",
+            "2f8c9ba40db5d945b11b69b982c1bb9e3f3fac2bc369488f76b2383565d3fff9",
+            "21f9664c97637da9768812f615c68b13b52e",
+            "c0875924c1c7987947deafd8780acf49",
+        );
+        let sealed = aead_seal(&key, &nonce, &aad, plaintext);
+        assert_eq!(hex::encode(&sealed), expected);
+        assert_eq!(aead_open(&key, &nonce, &aad, &sealed).unwrap(), plaintext);
+    }
+
+    const GOLDEN_DEFAULT_KEK: &str =
+        "8729966ac986c1d8489d1cc272ada008b51223ef6f924770fd6117a6ad8670cc";
+    const GOLDEN_DEFAULT_JIGKEY: &str = "6a69676b65790001320100007b2276223a312c22646964223a226469643a6a69673a7a706732766d6c7570347a6b707371647977656a6f726b6d6c7536696237626a3234326b3335763761346f6971786c6965737a7361222c22736c6f7473223a5b7b226b696e64223a2270617373706872617365222c226b6466223a226172676f6e326964222c226d5f6b6962223a36353533362c2274223a332c2270223a342c2273616c74223a2241514944424155474277674a4367734d4451345045413d3d222c226e6f6e6365223a2245524954464255574678675a4768736348523466494345694979516c4a69636f222c2277726170706564223a223359673978446f32486356634e515835583863505836356c6e46783067564d43796e6a332b4b6a32694a4e544c686f4c57554272596a78314a6b5a5031436d37227d5d7d292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40c0a9c319605a3099dfda52148933267cdc03ce35220da8ee61e3b6f17f1c5e98f995119eaae5f19332ea7fef74aad3bf";
     const GOLDEN_JIGKEY: &str = "6a69676b65790001cf0100007b2276223a312c22646964223a226469643a6a69673a7a706732766d6c7570347a6b707371647977656a6f726b6d6c7536696237626a3234326b3335763761346f6971786c6965737a7361222c22736c6f7473223a5b7b226b696e64223a2270617373706872617365222c226b6466223a226172676f6e326964222c226d5f6b6962223a36342c2274223a312c2270223a312c2273616c74223a2241514944424155474277674a4367734d4451345045413d3d222c226e6f6e6365223a2245524954464255574678675a4768736348523466494345694979516c4a69636f222c2277726170706564223a2267716b2b346b785058434f772f576d3870455151554535576436536b3750414a725375414458646978374e785239363371715a6e63444e646e726e38356a416f227d2c7b226b696e64223a22736563726574222c22736f75726365223a2263726564656e7469616c222c226e6f6e6365223a224b536f724c4330754c7a41784d6a4d304e5459334f446b364f7a7739506a3941222c2277726170706564223a22482b566d4e7635496f35566163755975496f78313778346465644562566368577a7955576272506553774f38634a6d4c6f6d5537493544745779694f74725955227d5d7d4142434445464748494a4b4c4d4e4f5051525354555657588654b22a99928d6c0b3c9b5949e1728fb109e158186598284c09eb630ee7cb03159352f96e08a8feb3a84d9816020b66";
     const GOLDEN_BLOB: &str = "6a69677365616c31090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2062a0376493495b58ee9f45c5a53fd6fdcf402d";
 }

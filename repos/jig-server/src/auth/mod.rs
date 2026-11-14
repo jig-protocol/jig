@@ -18,6 +18,7 @@ pub mod outcome;
 pub mod pools;
 pub mod rate;
 pub mod replay;
+pub mod stamps;
 pub mod state;
 
 pub use admission::{AdmissionPolicy, ReputationSource, ReputationView, admit};
