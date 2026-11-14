@@ -225,6 +225,31 @@ fn continues(chain: &mut ChannelChain, page: &[DeliveredBlock]) -> Result<(), St
     Ok(())
 }
 
+/// Who may sign `channel_id`'s records on `server`, for [`ChannelChain`]: a
+/// channel the server carries for its owner is held to the owner, the DID
+/// its pin proved (`Pins::anchor_channel`), as `jig read` holds it, never
+/// to the server. Any other channel is held to the server's DIDs along the
+/// key links pinned for it, or to the record's own signer when nothing is
+/// pinned.
+fn sequencers_for(
+    pins: Option<&Pins>,
+    server: &str,
+    channel_id: &str,
+    record_sequencer: &str,
+) -> Vec<String> {
+    if let Some(owner) = pins.and_then(|p| p.carried(server).remove(channel_id)) {
+        return vec![owner];
+    }
+    let pinned = pins
+        .and_then(|p| p.server(server).map(|s| s.sequencers()))
+        .unwrap_or_default();
+    if pinned.is_empty() {
+        vec![record_sequencer.to_string()]
+    } else {
+        pinned
+    }
+}
+
 /// Where the block `cid` is in `page`, if it is.
 fn position_of(page: &[DeliveredBlock], cid: &str) -> Option<usize> {
     page.iter()
@@ -681,10 +706,12 @@ impl Secure {
     /// The server's word that it pages forward is unsigned, so every page is
     /// held to the chain from the head before any of it is read: on a
     /// sequenced channel each record must be the next one
-    /// ([`ChannelChain::accept`]). On history with no records, a page holding
-    /// its own cursor is the one sign of a server that ignored `after`. A
-    /// page that fails either ends the walk as [`Forwarded::Broken`], from
-    /// the last block read.
+    /// ([`ChannelChain::accept`]). Where the head has no record (history from
+    /// before records, or a head an older build saved), the block a page
+    /// starts after must be the cursor, asked for with `before=` ([`Self::
+    /// follows`]); once a page's newest block has a record, the chain holds
+    /// the rest. A page that fails either ends the walk as
+    /// [`Forwarded::Broken`], from the last block read.
     ///
     /// Each page is put in MLS order on its own ([`replay_order`]). A message
     /// whose epoch's commit ended the page before is still read: openmls
@@ -692,11 +719,7 @@ impl Secure {
     async fn forward_from(&self, slug: &str, head: &str) -> Result<Forwarded> {
         let mut replayed = Replayed::default();
         let mut cursor = head.to_string();
-        let mut chain = self
-            .session
-            .head_record(&self.server, slug)?
-            .and_then(|h| h.record.clone().map(|r| (h, r)))
-            .map(|(h, r)| ChannelChain::across(&r.channel_id, self.sequencers(&r), Some(h)));
+        let mut chain = self.chain_from_head(slug)?;
         loop {
             let broken = |replayed, why: String| Forwarded::Broken {
                 replayed,
@@ -724,7 +747,7 @@ impl Secure {
                 None if position_of(&page, &cursor).is_some() => {
                     Err("a page after a block holds that block".to_string())
                 }
-                None => Ok(()),
+                None => self.follows(slug, &cursor, &page).await?,
             };
             if let Err(why) = continued {
                 return Ok(broken(replayed, why));
@@ -746,21 +769,61 @@ impl Secure {
             };
             self.move_head(slug, &page)?;
             cursor = last.cid;
+            if chain.is_none() {
+                chain = self.chain_from_head(slug)?;
+            }
+        }
+    }
+
+    /// The channel's chain as this device last read it, from its head's
+    /// record: `None` where the head has none.
+    fn chain_from_head(&self, slug: &str) -> Result<Option<ChannelChain>> {
+        Ok(self
+            .session
+            .head_record(&self.server, slug)?
+            .and_then(|h| h.record.clone().map(|r| (h, r)))
+            .map(|(h, r)| ChannelChain::across(&r.channel_id, self.sequencers(&r), Some(h))))
+    }
+
+    /// Whether `page` starts right after `cursor`, with no chain to say so:
+    /// the block just before the page's first must be `cursor`. A server
+    /// that ignored `after` and sent a later page fails this.
+    async fn follows(
+        &self,
+        slug: &str,
+        cursor: &str,
+        page: &[DeliveredBlock],
+    ) -> Result<Result<(), String>> {
+        let Some(first) = page.first().and_then(|d| open(d).ok()) else {
+            return Ok(Err("a page's first block does not open".into()));
+        };
+        let before = match self.history_page(slug, 1, Page::Before(&first.cid)).await {
+            Ok(before) => before,
+            Err(e)
+                if e.downcast_ref::<Refused>()
+                    .is_some_and(|r| r.code == "BAD_CURSOR") =>
+            {
+                return Ok(Err("it does not know a block it sent".into()));
+            }
+            Err(e) => return Err(e),
+        };
+        if position_of(&before, cursor).is_some() {
+            Ok(Ok(()))
+        } else {
+            Ok(Err("a page after a block does not start after it".into()))
         }
     }
 
     /// The DIDs the sequencer that signed `record` has signed as, along the
     /// key links this device follows; at least `record`'s own.
     fn sequencers(&self, record: &jig_client::chain::IngestRecord) -> Vec<String> {
-        let pinned = Pins::load(&Pins::default_path())
-            .ok()
-            .and_then(|p| p.server(&self.server).map(|s| s.sequencers()))
-            .unwrap_or_default();
-        if pinned.is_empty() {
-            vec![record.sequencer.clone()]
-        } else {
-            pinned
-        }
+        let pins = Pins::load(&Pins::default_path()).ok();
+        sequencers_for(
+            pins.as_ref(),
+            &self.server,
+            &record.channel_id,
+            &record.sequencer,
+        )
     }
 
     /// The blocks after `head`, oldest first, for a server that cannot page
@@ -1175,7 +1238,48 @@ fn pick(
 
 #[cfg(test)]
 mod tests {
-    use super::{ChannelInfo, must_encrypt, pick};
+    use super::{ChannelInfo, must_encrypt, pick, sequencers_for};
+    use jig_client::pins::{ChannelPin, Pins};
+
+    /// A carried channel's records are held to its owner; the server's own
+    /// channels to the server; and with nothing pinned, to the record's
+    /// signer.
+    #[test]
+    fn a_carried_channel_is_held_to_its_owner_and_others_to_the_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pins = Pins::load(&dir.path().join("pins.json")).unwrap();
+        let server = "wss://follower";
+        pins.check_server_did(server, "did:jig:zserver").unwrap();
+        for (slug, cid) in [("#carried", "bafycarried"), ("#own", "bafyown")] {
+            pins.check_channel(
+                server,
+                slug,
+                ChannelPin {
+                    create_cid: cid.to_string(),
+                    suite: "mls".to_string(),
+                    owner_did: "did:jig:zuser".to_string(),
+                    chain_head: None,
+                    sequencer: None,
+                },
+            )
+            .unwrap();
+        }
+        pins.anchor_channel(server, "#carried", "bafycarried", Some("did:jig:zowner"))
+            .unwrap();
+
+        assert_eq!(
+            sequencers_for(Some(&pins), server, "bafycarried", "did:jig:zowner"),
+            vec!["did:jig:zowner".to_string()]
+        );
+        assert_eq!(
+            sequencers_for(Some(&pins), server, "bafyown", "did:jig:zserver"),
+            vec!["did:jig:zserver".to_string()]
+        );
+        assert_eq!(
+            sequencers_for(None, server, "bafyown", "did:jig:zsigner"),
+            vec!["did:jig:zsigner".to_string()]
+        );
+    }
 
     fn listed(id: &str, slug: &str, sequencer: &str) -> ChannelInfo {
         ChannelInfo {

@@ -144,6 +144,9 @@ enum Serves {
     /// Pages forward, but leaves a block out of the middle of the first
     /// forward page: a hole the device must not keep.
     Skipping,
+    /// As [`Serves::Lying`], with no sequencer records in any history page:
+    /// the device's head has none, so no chain says the page is later.
+    LyingWithoutRecords,
 }
 
 /// A proxy in front of `server`, serving as `serves` says, that counts the
@@ -203,7 +206,10 @@ async fn relay(
             responses.lock().await.write_all(&out).await?;
         }
     });
-    let ignore_after = matches!(serves, Serves::Old | Serves::Lying);
+    let ignore_after = matches!(
+        serves,
+        Serves::Old | Serves::Lying | Serves::LyingWithoutRecords
+    );
     let mut skipped = false;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
@@ -255,17 +261,23 @@ async fn relay(
         } else {
             format!("{path}?{}", kept.join("&"))
         };
-        if serves == Serves::Skipping && after && !before && !skipped {
-            // Asked on a connection of its own, so the answer can be cut
+        let edit: Option<fn(&mut Vec<Value>) -> bool> = match serves {
+            Serves::Skipping if after && !before && !skipped => Some(skip_one),
+            Serves::LyingWithoutRecords if path.ends_with("/blocks") => Some(drop_records),
+            _ => None,
+        };
+        if let Some(edit) = edit {
+            // Asked on a connection of its own, so the answer can be changed
             // before the client sees it.
             let request = format!("{method} {target} {version}\r\nconnection: close\r\n{rest}");
-            let page = skip_one(
+            let page = rewrite(
                 upstream,
                 request.as_bytes(),
                 &buf[head_end..head_end + body_len],
+                edit,
             )
             .await?;
-            skipped = page.1;
+            skipped |= serves == Serves::Skipping && page.1;
             to_client.lock().await.write_all(&page.0).await?;
             buf.drain(..head_end + body_len);
             continue;
@@ -283,10 +295,36 @@ async fn relay(
     }
 }
 
+/// Leaves the middle entry out of a page of three or more, and says
+/// whether it did: the page a server that skips a block would send.
+fn skip_one(page: &mut Vec<Value>) -> bool {
+    if page.len() < 3 {
+        return false;
+    }
+    page.remove(page.len() / 2);
+    true
+}
+
+/// Takes every entry's sequencer record out of a page.
+#[allow(clippy::ptr_arg)] // the same edit type as `skip_one`, which removes
+fn drop_records(page: &mut Vec<Value>) -> bool {
+    for entry in page.iter_mut() {
+        if let Some(entry) = entry.as_object_mut() {
+            entry.remove("ingest");
+        }
+    }
+    true
+}
+
 /// Sends `request` (a head with `connection: close`) and `body` upstream,
-/// and returns the answer with the middle entry of its JSON array left out,
-/// and whether one was: the page a server that skips a block would send.
-async fn skip_one(upstream: &str, request: &[u8], body: &[u8]) -> std::io::Result<(Vec<u8>, bool)> {
+/// and returns the answer with `edit` applied to its JSON array, and whether
+/// `edit` changed it.
+async fn rewrite(
+    upstream: &str,
+    request: &[u8],
+    body: &[u8],
+    edit: fn(&mut Vec<Value>) -> bool,
+) -> std::io::Result<(Vec<u8>, bool)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut up = tokio::net::TcpStream::connect(upstream).await?;
     up.write_all(request).await?;
@@ -300,10 +338,9 @@ async fn skip_one(upstream: &str, request: &[u8], body: &[u8]) -> std::io::Resul
     let Ok(Value::Array(mut page)) = serde_json::from_slice::<Value>(&answer[split + 4..]) else {
         return Ok((answer, false));
     };
-    if page.len() < 3 {
+    if !edit(&mut page) {
         return Ok((answer, false));
     }
-    page.remove(page.len() / 2);
     let body = serde_json::to_vec(&page).unwrap();
     let head: Vec<String> = head
         .split("\r\n")
@@ -357,6 +394,19 @@ async fn a_server_that_advertises_after_but_ignores_it_costs_time_not_messages()
     assert_eq!(
         forward_pages, 1,
         "one forward page, refused for breaking the chain, then back"
+    );
+}
+
+/// A server that advertises `after`, ignores it, and serves no records: the
+/// device's head has no record, so there is no chain to show the page is
+/// later than the head. The device asks for the block before the page's
+/// first, finds it is not its head, and reads back instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn without_records_a_page_that_does_not_follow_the_head_is_refused() {
+    let forward_pages = away_and_back(Serves::LyingWithoutRecords).await;
+    assert_eq!(
+        forward_pages, 1,
+        "one forward page, refused for not following the head, then back"
     );
 }
 
