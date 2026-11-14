@@ -106,10 +106,19 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
    channel, with words to the effect of "anyone, including the server operator, can read
    this". A client MUST ask the creator to confirm before it signs a `public`
    `channel-create`. A server MAY refuse `public` channels by policy.
+   - A client that creates a channel without its user naming a tier creates a `private` one
+     (DJ, 2026-11-07).
    - A server MUST refuse a content block in a `public` channel from a connection whose
      `hello` did not request `tiers` (rule 1; `TIER_UNSUPPORTED`). The one request serves both
      rules. An older client cannot show the label, so it
      may read a `public` channel but not post to it.
+   - A request made outside a connection, such as a REST block submission, has no `hello`. It
+     declares the features its client implements in a `Jig-Capabilities` header, a
+     comma-separated list. A server treats a request whose header does not list `tiers` as a
+     connection that did not request it.
+   - The gate applies to blocks from the server's own clients. The server's own blocks and its
+     in-process bridges are exempt. A follower applies the gate to its own clients before it
+     relays their blocks, because the owner cannot see the client's connection.
 6. **System channels are `public`.** The server's own channels under the reserved `#jig/`
    prefix carry what anyone must be able to verify. Today that is the manifest log
    (`#jig/manifest`). Key links stay where they are, at `/.well-known/jig` and in the welcome.
@@ -123,17 +132,25 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
 8. **Every authenticated caller has one server role** on a given server:
    - **`member`**: a DID the server's admission policy records as a member. Until JEP-0009,
      that is local policy: admission `records`, or JEP-0008 rule 21's member pool.
-   - **`guest`**: a DID that has proven possession of its key (JEP-0002 request proofs) and
+   - **`guest`**: a key that has proven possession of itself (JEP-0002 request proofs) and
      that admission lets through, but that is not a member.
-   - **`stranger`**: everyone else, including every `--anon` session key (D20).
+   - **`stranger`**: everyone else: a caller that admission refuses, or that has not proven
+     its key.
+
+   A server cannot tell an `--anon` session key from a freshly admitted DID: both are new keys
+   that prove possession (D20). So `join = guest` admits any admitted key, `--anon` session
+   keys included (DJ, 2026-11-07). A creator who wants only the server's members keeps the
+   default, `join = member`.
 9. **The role is the server's local judgement,** made on its own clock and records, at the
    moment the join is checked. It is not carried to other servers.
 10. **Join roles are not capacity pools.** JEP-0008 rule 21's pools (members, invited and
     strangers) decide how much capacity a caller gets. The roles here decide who may join a
     channel. A `member` is in JEP-0008's member pool. A `guest` is in whichever other pool
     JEP-0008 puts it: the invited pool if it was admitted on an invite, the stranger pool
-    otherwise (JEP-0008 rules 21 and 22). Either way it is a `guest` for joining. A server MUST
-    NOT admit to a join a DID its capacity pools refuse at that moment.
+    otherwise (JEP-0008 rules 21 and 22). Either way it is a `guest` for joining. A key the
+    server has no record of, which covers every `--anon` session key, starts in the stranger
+    pool until it meets JEP-0008's ageing or record rules (rule 21), and is a `guest` for
+    joining. A server MUST NOT admit to a join a DID its capacity pools refuse at that moment.
 
 ## 3. Joining
 
@@ -169,6 +186,12 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
     - The servers whose members may self-join are exactly those holding a `member` grant. The
       grant is signed by the owner per channel and per follower, and changes with a new offer,
       so the creation block lists no servers.
+    - **When a contract ends**, the members whose clients reach the channel through that
+      follower are removed. Nothing yet records where a member's client lives, so the owner's
+      operator finds them by hand (DJ, 2026-11-07):
+      `jig channel members <channel> --via <server-did>` lists the members whose latest block
+      that server relayed. A member's recorded home server replaces this once custodians land
+      (JEP-0005 rule 21).
 14. **`public`:** anyone the server admits reads it. Who may post is the existing write gate
     (membership and roles); nothing is encrypted.
 15. **Leaving and removal** are unchanged: a `member-remove` block, by the member or by a DID
@@ -217,14 +240,16 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
 
     | `visibility` | `suite` | Tier |
     | --- | --- | --- |
-    | any channel under the reserved `#jig/` prefix | `none` | `public` (rule 6) |
+    | `open`, under the reserved `#jig/` prefix | `none` | `public` (rule 6) |
     | `restricted` | `mls` | `private` |
     | `open` | `mls` | `server`, with `join = guest`, which matches today's rule that any caller the server admits may join an open channel |
     | `open` | `none` | **frozen** |
     | `restricted` | `none` | **frozen**, as D25 already does |
 
     The first row is checked first: a server's own system channels, such as `#jig/manifest`, are
-    `open` with `none` and would otherwise be frozen, which would stop the manifest log.
+    `open` with `none` and would otherwise be frozen, which would stop the manifest log. A
+    `restricted` plaintext channel under `#jig/` does not match it, and falls through to the
+    last row: frozen.
 22. **Frozen channels.** A frozen channel keeps its history readable to whoever could read it
     before. A server MUST refuse every new content or membership block in it (`CHANNEL_FROZEN`),
     except an archive by its owner.
@@ -301,11 +326,13 @@ reads no encrypted tier.
       to a `server` or `shared` channel, is authorized by the role check of rule 12 or 13
       instead of the `membership` right. Every other membership block still needs the right.
     - Rule 7a's `member` grant also covers relayed self-joins (rule 13).
-    - The signed server manifest (JEP-0002 rule 12) gains `features`, an array of strings. A
-      server that implements this JEP lists `"tiers"` in it.
-    - An owner MUST NOT offer a `shared` channel to a follower whose manifest does not list
-      `"tiers"` in `features`. Such a follower would read the channel as `open`
-      and relay self-joins without a role check.
+    - An owner MUST NOT offer a `shared` channel to a follower whose `welcome`, on the owner's
+      own connection to it, does not carry the `tiers` feature (rule 1). Such a follower would
+      read the channel as `open` and relay self-joins without a role check.
+    - The signed server manifest (JEP-0002 rule 12) is unchanged. Its decoder refuses unknown
+      keys and any document that does not re-encode to its own bytes, and a client that cannot
+      decode the manifest a `welcome` cites treats it as a contradiction. A new key there would
+      make every older client refuse the server for good.
     - `shared` and `public` channels may be offered under a contract; `private` and `server`
       channels may not.
     - **`public` channels federate under contracts** (DJ, 2026-10-25), once F2's first phase has
@@ -373,8 +400,7 @@ admission).
   them.
 - **Old servers ignore `tier`** and fall back to `visibility`, so a `server` or `shared`
   channel on one would admit any authenticated joiner. Clients and owners therefore create or
-  offer those tiers only to servers whose `welcome` carries `tiers` or whose manifest lists it
-  (rules 1 and 37).
+  offer those tiers only to servers whose `welcome` carries `tiers` (rules 1 and 37).
 - **Old clients and the `welcome`.** A server signs `tiers` into a `welcome` only when the
   `hello` asked for it (rule 1), so an old client's signature check is unchanged.
 
@@ -394,7 +420,8 @@ To be added with the implementation:
 - a legacy-channel mapping table, including `#jig/manifest` mapped to `public`;
 - a `member-add` to a `#dm/` channel: the pair's other DID accepted, a third DID refused;
 - a self-join refused for a role below `join`.
-- a post to a `public` channel refused on a connection whose `hello` did not request `tiers`;
+- a post to a `public` channel refused on a connection whose `hello` did not request `tiers`,
+  and on a REST request whose `Jig-Capabilities` header does not list it;
 - a `welcome` to a `hello` without `tiers`, byte-identical to one from a server without this JEP.
 
 # LLM Influence
