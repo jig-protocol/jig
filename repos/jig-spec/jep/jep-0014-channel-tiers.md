@@ -77,11 +77,13 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
      its sequencer. Otherwise it is refused: `UNKNOWN_TIER`, or `NOT_SEQUENCER` /
      `SEQUENCER_REQUIRED` (the latter added with the sequencer binding). Relayed creates get
      no exemption and no default mapping.
-   - **The one exception is an antipattern flag**:
+   - **The one exception is an antipattern flag, for tests only**:
      `federation.naively_accept_peer_relayed_creates`. It defaults to `false`, and a server
      lists it in `unsafe_options_active` when it is set. With it set, a `channel-create`
      relayed by a configured peer skips both checks, and a tier-less plaintext `open` create
-     is recorded as `public`.
+     is recorded as `public`. Such a copy is a channel the receiving server sequences, so
+     every relayed post into it is refused (rule 37), and clients refuse to read it, because
+     its creation block names another server.
    - A client that implements this JEP requests the `tiers` feature in its `hello`
      (JEP-0002). A server that implements it signs `tiers` into its `welcome` capabilities
      only when the `hello` requested it, after the fields defined before it. A `welcome` to a
@@ -342,15 +344,26 @@ reads no encrypted tier.
       - a server accepts an offer for a `public` channel automatically, even when its peer
         policy is `offers = "hold"`.
 
-      Until then, the legacy relay carries existing `public` channels to listed peers, with
-      catch-up after an outage (#340). A new open channel reaches a peer only by a share,
-      since rule 1 refuses its relayed `channel-create`, unless the receiving server sets
-      `federation.naively_accept_peer_relayed_creates`. Channels that already exist on both
-      sides are unaffected.
-    - **A channel is carried by the relay or by a contract, never both** (#344). Relayed, a
-      channel gets a second sequencer on the receiving server, and that server then refuses
-      the owner's records. So a channel is relayed until it is shared with a peer, and the
-      contract carries it from the accept on.
+      Until then, a `public` channel reaches a peer only by a share, as every other channel
+      does: rule 1 refuses its relayed `channel-create`, and the next bullet refuses relayed
+      posts into it.
+    - **A server refuses a relayed post into a channel it sequences** (DJ, 2026-11-10; #357).
+      A block (other than the `channel-create` that makes it) that a configured peer relays
+      over the legacy relay into a channel this server sequences MUST be refused, whether the
+      block names the channel by slug or by id. Rule 1 and the sequencer binding judge a
+      relayed `channel-create`.
+      - A write relayed under a share's grant (JEP-0005 rule 15) is not a legacy-relay block,
+        and this rule does not apply to it.
+      - The refusal is logged with the reason `relayed-into-sequenced-channel`. It is not a
+        wire code: the legacy relay has no refusal frame. A server MAY count such refusals.
+      - Catch-up (#340) skips the refused record and advances, so one refusal does not stop
+        the link.
+      - A channel that exists on both servers is carried only once it is shared. Until then,
+        each server's posts to it stay on that server.
+    - **A channel is carried by a contract, never by the relay** (#344, #357). Relayed, a
+      channel would get a second sequencer on the receiving server, and that server would then
+      refuse the owner's records. So the relay brings nothing into a channel the receiving
+      server sequences (above), and a contract carries a channel from the accept on.
 
 # Security Considerations (Zero-Trust)
 
