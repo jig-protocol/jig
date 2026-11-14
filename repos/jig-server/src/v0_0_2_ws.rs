@@ -64,6 +64,7 @@ pub mod metrics {
     static CONNECTIONS_ACTIVE: AtomicU64 = AtomicU64::new(0);
     static SUBSCRIBERS_ACTIVE: AtomicU64 = AtomicU64::new(0);
     static BLOCKS_INGESTED: AtomicU64 = AtomicU64::new(0);
+    static RELAYED_INTO_SEQUENCED: AtomicU64 = AtomicU64::new(0);
     /// Cardinality is bounded by the channels this server actually serves,
     /// which is the same bound the block store already carries.
     static CHANNEL_MESSAGES: RwLock<BTreeMap<String, u64>> = RwLock::new(BTreeMap::new());
@@ -106,6 +107,17 @@ pub mod metrics {
         }
     }
 
+    /// Record one post a peer relayed into a channel this server sequences,
+    /// refused (JEP-0014 rule 37, #357).
+    pub fn relayed_into_sequenced() {
+        RELAYED_INTO_SEQUENCED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many [`relayed_into_sequenced`] refusals since start.
+    pub fn relayed_into_sequenced_total() -> u64 {
+        RELAYED_INTO_SEQUENCED.load(Ordering::Relaxed)
+    }
+
     /// Saturating decrement — a gauge that underflows to u64::MAX is worse
     /// than one that is briefly wrong.
     ///
@@ -137,13 +149,22 @@ pub mod metrics {
     /// Prometheus text exposition (format version 0.0.4) of the live counters.
     pub fn render_prometheus() -> String {
         let snap = snapshot();
-        render(
+        let mut out = render(
             snap.connections_active,
             snap.subscribers_active,
             snap.blocks_ingested,
             &snap.channels,
             &jig_pipeline::metrics::ingested_by_source(),
-        )
+        );
+        out.push_str(&format!(
+            "# HELP jig_federation_relayed_refused_total Blocks a peer relayed and this server \
+             refused, by reason.\n\
+             # TYPE jig_federation_relayed_refused_total counter\n\
+             jig_federation_relayed_refused_total{{reason=\"{}\"}} {}\n",
+            jig_pipeline::ingest::RELAYED_INTO_SEQUENCED,
+            relayed_into_sequenced_total()
+        ));
+        out
     }
 
     /// Pure renderer — separated from the globals so its output format is
@@ -2160,13 +2181,17 @@ mod tests {
     }
 
     /// An upgraded connection is still charged to its address, frame by frame:
-    /// past the burst a frame is refused, not processed.
+    /// past the burst a frame is refused, not processed, and the refill lets
+    /// exactly as many more in as it has made.
     #[tokio::test]
     async fn frames_past_the_address_rate_are_refused() {
         let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
         config.auth.rate_limit.per_ip_burst = 3;
         config.auth.rate_limit.per_ip_per_second = 1;
         let state = Arc::new(AppState::for_test_with_config(config).unwrap());
+        // Held still, so a slow runner refills nothing between frames.
+        let clock = crate::auth::rate::ManualClock::new();
+        state.auth.set_rate_clock(&clock);
         let app = Router::new()
             .route("/api/v1/ws", get(ws_handler))
             .with_state(state)
@@ -2175,39 +2200,42 @@ mod tests {
         let url = format!("ws://{}/api/v1/ws", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        // The hello is the first of three. 1/s is the slowest refill there
-        // is, so a slow runner may see one between frames: count frames up to
-        // the first refusal rather than assume exactly two more get in.
-        let start = std::time::Instant::now();
         let mut ws = established(&url).await;
-        let mut processed = 0u32;
-        loop {
-            ws.send(TMessage::Text("not valid json".into()))
-                .await
-                .unwrap();
-            match next_frame(&mut ws).await.frame {
-                Frame::Error {
-                    status,
-                    code,
-                    retry_after_ms,
-                    ..
-                } if code == "RATE_LIMITED" => {
-                    assert_eq!(status, Some(429));
-                    // One token's refill at 1 a second.
-                    assert_eq!(retry_after_ms, Some(1_000));
-                    break;
+        // Frames processed before the first refusal.
+        async fn until_refused(
+            ws: &mut tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        ) -> u32 {
+            let mut processed = 0u32;
+            loop {
+                ws.send(TMessage::Text("not valid json".into()))
+                    .await
+                    .unwrap();
+                match next_frame(ws).await.frame {
+                    Frame::Error {
+                        status,
+                        code,
+                        retry_after_ms,
+                        ..
+                    } if code == "RATE_LIMITED" => {
+                        assert_eq!(status, Some(429));
+                        // One token's refill at 1 a second.
+                        assert_eq!(retry_after_ms, Some(1_000));
+                        return processed;
+                    }
+                    Frame::Error { .. } => processed += 1,
+                    other => panic!("expected an error frame, got {other:?}"),
                 }
-                Frame::Error { .. } => processed += 1,
-                other => panic!("expected an error frame, got {other:?}"),
+                assert!(processed <= 64, "the address was never limited");
             }
-            assert!(processed <= 64, "the address was never limited");
         }
-        let refilled = start.elapsed().as_secs() as u32 + 1;
-        assert!(
-            (2..=2 + refilled).contains(&processed),
-            "{processed} frames after the hello got in over {:?}",
-            start.elapsed()
-        );
+        // The hello was the first of three.
+        assert_eq!(until_refused(&mut ws).await, 2);
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(until_refused(&mut ws).await, 1, "a second refills one");
+        clock.advance(Duration::from_secs(10));
+        assert_eq!(until_refused(&mut ws).await, 3, "and never past the burst");
     }
 
     /// A well-formed frame at a version or suite this server does not speak,

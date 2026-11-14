@@ -24,9 +24,11 @@
 //!   gated the block before it sequenced it, and its order is what a
 //!   follower follows (rule 22a).
 //!
-//! MLS channels are followed in a later slice (JEP-0005 rule 19); a block of
-//! one is refused here, so the stream stops rather than carry what it cannot
-//! validate.
+//! A `shared` MLS channel is followed too (JEP-0005 rule 19): each block the
+//! owner sequenced is judged against this server's mirror of the group's
+//! public state, and a commit or sealed message the mirror refuses stops the
+//! channel, as a fork does. A block of any other suite is refused here, so the
+//! stream stops rather than carry what it cannot validate.
 
 use jig_core::{BlockBundle, BlockKind};
 use rusqlite::{OptionalExtension, params};

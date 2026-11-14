@@ -1326,13 +1326,13 @@ default_time_range = "last_day"  # Options: last_hour, last_day, last_week, last
 # # min_effort x short_name_factor^(short_name_len - length), up to max_effort.
 # [v0_0_2.nameserver.alias_suffixes.pow]
 # alg = 1
-# min_effort = 1048576       # 2^20
-# max_effort = 16777216      # 2^24, about 3 s on one server core
-# max_solve_secs = 10
+# min_effort = 1048576       # 2^20; a 3-letter name pays 16x, 2^24
+# max_effort = 67108864      # 2^26, about 12 s on one server core
+# max_solve_secs = 13
 # short_name_len = 5
 # short_name_factor = 4
 # renew_effort = 1
-# penalty_decay_secs = 600   # a penalty point's life; a repeat doubles it
+# penalty_decay_secs = 600   # one point decays per this; a repeat doubles it
 #
 # # The cap on registrations by DIDs registration_allow does not name. On by
 # # default at the values shown; jig clients wait out 503 REGISTRATION_BUSY

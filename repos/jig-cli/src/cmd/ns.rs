@@ -214,17 +214,8 @@ struct SuffixesResponse {
 #[derive(Debug, Deserialize)]
 struct SuffixInfo {
     suffix: String,
-    registration: String,
     #[serde(default)]
     dns_delegation: bool,
-}
-
-/// Why the CLI is talking to a nameserver: registration is the one action a
-/// closed suffix refuses, so it is refused before a challenge is fetched.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Purpose {
-    Register,
-    Keep,
 }
 
 /// Whose signature a reply must carry.
@@ -270,7 +261,6 @@ impl Nameserver {
         ns_url: &str,
         who: &str,
         delegations: &Delegations,
-        purpose: Purpose,
     ) -> Result<Self> {
         if let Some((_, suffix)) = who.split_once('@') {
             not_refused(delegations, suffix)?;
@@ -313,6 +303,9 @@ impl Nameserver {
             },
         };
         not_refused(delegations, &name.suffix)?;
+        // A closed suffix is not refused here: it still admits the DIDs its
+        // allowlist names, and only the nameserver knows who they are. The
+        // challenge asks it, and its refusal says why (`challenge_for`).
         let Some(info) = served
             .suffixes
             .iter()
@@ -324,9 +317,6 @@ impl Nameserver {
                 served_list(&served.suffixes)
             );
         };
-        if purpose == Purpose::Register && info.registration != "open" {
-            anyhow::bail!("registration on `{}` is closed at {base}", name.suffix);
-        }
 
         let authority = match delegations.config.get(&name.suffix) {
             Some(config) => {
@@ -465,10 +455,23 @@ impl Nameserver {
             );
         }
         if !status.is_success() {
-            anyhow::bail!(
-                "GET {url} returned {status}: {}",
-                jig_client::limits::error_text(resp).await
-            );
+            // Bounded, like every read from a server: a truncated body
+            // simply has no parseable code.
+            let text = jig_client::limits::error_text(resp).await;
+            let code = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| v["code"].as_str().map(str::to_string));
+            if code.as_deref() == Some("REGISTRATION_CLOSED") {
+                anyhow::bail!(
+                    "registration on `{}` is closed at {}: only the DIDs its allowlist names \
+                     can register, and {did} is not listed for `{alias}`. Once the operator \
+                     lists it, run `jig keys register {alias} --nameserver {}`",
+                    name.suffix,
+                    self.base,
+                    self.base
+                );
+            }
+            anyhow::bail!("GET {url} returned {status}: {text}");
         }
         let received = std::time::Instant::now();
         let server_now = resp
@@ -1433,7 +1436,7 @@ mod tests {
         let addr = closed.local_addr().unwrap();
         drop(closed);
         let (base, _) = stub_nameserver(ns, attest_as(key(1), "dj@dj.jig")).await;
-        let ns_conn = Nameserver::connect(&base, "dj@dj.jig", &plaintext(), Purpose::Keep)
+        let ns_conn = Nameserver::connect(&base, "dj@dj.jig", &plaintext())
             .await
             .unwrap();
         let moved = Nameserver {
@@ -1472,7 +1475,7 @@ mod tests {
                 let _ = sock.write_all(resp.as_bytes()).await;
             }
         });
-        let err = Nameserver::connect(&base, "dj", &plaintext(), Purpose::Register)
+        let err = Nameserver::connect(&base, "dj", &plaintext())
             .await
             .err()
             .expect("refused");
@@ -1590,31 +1593,43 @@ mod tests {
         assert_eq!(paths(&seen), ["GET /v1/suffixes"], "no challenge, no proof");
     }
 
+    /// A closed suffix registers the DID its allowlist names, for that name;
+    /// anyone else learns from the nameserver's refusal why, before any
+    /// work or signature. Against the real nameserver: only it knows the
+    /// allowlist.
     #[tokio::test]
-    async fn registration_on_a_closed_suffix_is_refused_before_the_challenge() {
-        let ns = key(1);
-        let closed = serde_json::json!([
-            {"suffix": "jig", "registration": "closed", "dns_delegation": false},
-        ]);
-        let (base, seen) = stub_nameserver_serving(
-            ns.clone(),
-            served(&ns, closed),
-            attest_as(ns.clone(), "dj@jig"),
-        )
-        .await;
+    async fn a_closed_suffix_registers_its_allowlist_and_tells_others_why() {
+        use jig_config::v0_0_2_server::{AllowEntry, PoolPolicy, PowPolicy, Registration};
         let dir = tempdir().unwrap();
-        let me = jig_client::Identity::generate_for_tests(dir.path());
+        let listed = jig_client::Identity::generate_for_tests(dir.path());
+        let other = jig_client::Identity::generate_for_tests(dir.path());
+        let mut suffix = jig_config::v0_0_2_server::SuffixConfig::new("dj.jig");
+        suffix.registration = Registration::Closed;
+        suffix.registration_allow = vec![AllowEntry {
+            did: listed.did_string(),
+            aliases: vec!["deji".to_string()],
+        }];
+        suffix.pow = PowPolicy {
+            min_effort: 1 << 8,
+            ..PowPolicy::recommended()
+        };
+        suffix.pool = PoolPolicy::off();
+        let ns = integration_tests::harness::TestNameserver::start_with_suffix_config(suffix)
+            .await
+            .unwrap();
+        let base = ns.http_url();
 
-        let err = crate::cmd::init::register_with_nameserver(
-            &me,
-            "dj",
-            &base,
-            &jig_authority(&did_of(&ns)),
-        )
-        .await
-        .expect_err("closed");
-        assert!(format!("{err:#}").contains("closed"), "{err:#}");
-        assert_eq!(paths(&seen), ["GET /v1/suffixes"]);
+        let err = crate::cmd::init::register_with_nameserver(&other, "deji", &base, &plaintext())
+            .await
+            .expect_err("not on the allowlist");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("closed") && msg.contains("allowlist"), "{msg}");
+
+        let att = crate::cmd::init::register_with_nameserver(&listed, "deji", &base, &plaintext())
+            .await
+            .expect("the allowlisted DID registers on a closed suffix");
+        assert_eq!(att.did, listed.did_string());
+        assert_eq!(att.alias, "deji@dj.jig");
     }
 
     #[tokio::test]
