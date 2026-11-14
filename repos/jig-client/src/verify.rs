@@ -103,14 +103,16 @@ pub fn verify_with(
     if record.verify(&exec_signer).is_err() {
         return Verification::Unverified("the ingest record is not signed by the server".into());
     }
-    let Some(local) = local_renderer() else {
-        return Verification::Unverified("the text-block component did not compile here".into());
-    };
-    if exec.component != local.component {
+    // The build the server says it ran, if this client has it: the canonical one or another
+    // known build (the next one during a two-step rollout, or the previous one after it).
+    let Some(build) = known_build(&exec.component) else {
         return Verification::Unverified(
             "the server ran a component this client does not have".into(),
         );
-    }
+    };
+    let Some(local) = local_renderer(build) else {
+        return Verification::Unverified("the text-block component did not compile here".into());
+    };
     let Some(input) = jig_pipeline::executor::text_input(&opened.manifest) else {
         return Verification::Unverified("the block has no body".into());
     };
@@ -170,32 +172,68 @@ fn exec_receipt(delivered: &DeliveredBlock) -> Option<(Exec, String, String)> {
 struct LocalRenderer {
     runtime: ComponentRuntime,
     renderer: CompiledRenderer,
-    component: [u8; 32],
 }
 
-/// text-block compiled once per process. The memory cap is this client's default: any cap at or
-/// above the component's own declared maximum gives the same runs (the validator refuses a cap
-/// below it), so it need not match the server's.
-fn local_renderer() -> Option<&'static LocalRenderer> {
-    static LOCAL: OnceLock<Option<LocalRenderer>> = OnceLock::new();
-    LOCAL
+/// One text-block build this client can run: its pinned hash (`None` if the pin does not
+/// parse, so nothing matches it), its bytes, and the renderer, compiled on first use.
+struct Build {
+    hash: Option<[u8; 32]>,
+    bytes: &'static [u8],
+    renderer: OnceLock<Option<LocalRenderer>>,
+}
+
+/// The text-block builds this client can run: the canonical one first, then
+/// [`canonical::OTHER_BUILDS`]. Each is compiled the first time a receipt names it.
+fn builds() -> &'static [Build] {
+    static BUILDS: OnceLock<Vec<Build>> = OnceLock::new();
+    BUILDS.get_or_init(|| {
+        let canonical = *blake3::hash(canonical::CANONICAL_COMPONENT).as_bytes();
+        std::iter::once((Some(canonical), canonical::CANONICAL_COMPONENT))
+            .chain(canonical::OTHER_BUILDS.iter().map(|b| {
+                let hash = b
+                    .blake3
+                    .strip_prefix("blake3:")
+                    .and_then(|hex| blake3::Hash::from_hex(hex).ok())
+                    .map(|h| *h.as_bytes());
+                (hash, b.bytes)
+            }))
+            .map(|(hash, bytes)| Build {
+                hash,
+                bytes,
+                renderer: OnceLock::new(),
+            })
+            .collect()
+    })
+}
+
+/// The index of the build whose hash is `component`, if this client has it.
+fn known_build(component: &[u8; 32]) -> Option<usize> {
+    builds()
+        .iter()
+        .position(|build| build.hash.as_ref() == Some(component))
+}
+
+/// Build `index` compiled once per process. The memory cap is this client's default: any cap at
+/// or above the component's own declared maximum gives the same runs (the validator refuses a
+/// cap below it), so it need not match the server's. A build whose bytes do not hash to its pin
+/// is never run.
+fn local_renderer(index: usize) -> Option<&'static LocalRenderer> {
+    let build = builds().get(index)?;
+    build
+        .renderer
         .get_or_init(|| {
             let config = jig_runtime::RuntimeConfig::default();
             let runtime =
                 ComponentRuntime::with_config(&config, component::Backend::Native).ok()?;
             let renderer = runtime
                 .compile_renderer(
-                    canonical::CANONICAL_COMPONENT,
+                    build.bytes,
                     &jig_core::grant::Grant::empty(),
                     config.limits.memory_max_mb.saturating_mul(16),
                 )
                 .ok()?;
-            let component = component::hash_bytes(renderer.component_hash());
-            Some(LocalRenderer {
-                runtime,
-                renderer,
-                component,
-            })
+            (Some(component::hash_bytes(renderer.component_hash())) == build.hash)
+                .then_some(LocalRenderer { runtime, renderer })
         })
         .as_ref()
 }
@@ -288,6 +326,69 @@ mod tests {
     #[test]
     fn a_client_agrees_with_an_honest_server() {
         let (d, opened, exec) = delivered("hello");
+        let d = with_receipt(d, exec, &server_key());
+        assert_eq!(verify(&d, &opened), Verification::Agree);
+    }
+
+    /// The server's `exec` for `d`, re-run on this client's build `index`, as a server on that
+    /// build would have reported it.
+    fn exec_on_build(d: &DeliveredBlock, opened: &OpenedBlock, base: &Exec, index: usize) -> Exec {
+        let local = local_renderer(index).expect("the build compiles");
+        let input = text_input(&opened.manifest).unwrap();
+        let invocation = text_render_invocation(&input, &opened.cid, d.ingest.as_ref().unwrap());
+        let run = local.runtime.render(
+            &local.renderer,
+            &invocation,
+            &RenderLimits {
+                fuel: base.limits.fuel,
+                timeout: Duration::from_secs(10),
+            },
+        );
+        let mut exec = base.clone();
+        exec.component = builds()[index].hash.unwrap();
+        exec.outcome = run.outcome.to_receipt();
+        exec
+    }
+
+    /// During a two-step rollout a server may already render with the next build. This client
+    /// carries it, so it checks that server's render on that build, not the canonical one: it
+    /// agrees with an honest render, including text the two builds render differently, and
+    /// still catches a forged one.
+    #[test]
+    fn a_server_on_the_next_build_is_checked_on_that_build() {
+        assert!(!canonical::OTHER_BUILDS.is_empty());
+        let next = 1;
+        // U+0558 is newly assigned in Unicode 18 and normalizes only on the next build.
+        for body in ["hello", "armenian \u{0558} letter"] {
+            let (d, opened, canonical_exec) = delivered(body);
+            let exec = exec_on_build(&d, &opened, &canonical_exec, next);
+            if body.contains('\u{0558}') {
+                assert_ne!(
+                    exec.outcome, canonical_exec.outcome,
+                    "the builds differ on {body:?}"
+                );
+            }
+            let honest = with_receipt(d.clone(), exec.clone(), &server_key());
+            assert_eq!(verify(&honest, &opened), Verification::Agree, "{body:?}");
+
+            let mut forged = exec;
+            forged.outcome = Outcome::Ok { hash: [0xee; 32] };
+            let forged = with_receipt(d, forged, &server_key());
+            assert!(
+                matches!(
+                    verify(&forged, &opened),
+                    Verification::Diverge(Divergence::Outcome { .. })
+                ),
+                "{body:?}"
+            );
+        }
+    }
+
+    /// The canonical build's render of text the next build renders differently still agrees
+    /// with a server on the canonical build: the next build is used only when a receipt names it.
+    #[test]
+    fn a_server_on_the_canonical_build_is_still_checked_on_it() {
+        let (d, opened, exec) = delivered("armenian \u{0558} letter");
         let d = with_receipt(d, exec, &server_key());
         assert_eq!(verify(&d, &opened), Verification::Agree);
     }
