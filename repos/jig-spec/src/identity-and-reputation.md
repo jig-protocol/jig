@@ -363,9 +363,11 @@ Until JEP-0003 defines reputation:
 - Reputation is not a protocol security input: no protocol step requires or refuses
   anything because of a score, and handshake reputation fields are informational
   ([OP-10](threat-register.md)).
-- A nameserver scales proof-of-work by its controller, the name's length and penalties, not
-  by any score; standing is 1 until JEP-0009. A server MAY use its own scores in its
-  admission policy (its `[auth.admission] records`). Both are local policy, not protocol.
+- A nameserver scales an ordinary registration's proof-of-work by its controller, the
+  name's length and penalties, not by any score; standing is 1 until JEP-0009. An
+  allowlisted registration pays `min_effort`, and renew and rotate pay the suffix's
+  `renew_effort` (default 1), unscaled. A server MAY use its own scores in its admission
+  policy (its `[auth.admission] records`). Both are local policy, not protocol.
 
 ### Sybil resistance
 
