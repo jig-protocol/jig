@@ -33,8 +33,8 @@
 //! are random.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use chacha20poly1305::XChaCha20Poly1305;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -722,13 +722,13 @@ fn unwrap_slot(
 
 fn aead_seal(key: &[u8; 32], nonce: &[u8; NONCE_LEN], aad: &[u8], msg: &[u8]) -> Vec<u8> {
     XChaCha20Poly1305::new(key.into())
-        .encrypt(XNonce::from_slice(nonce), Payload { msg, aad })
+        .encrypt(nonce.into(), Payload { msg, aad })
         .expect("XChaCha20-Poly1305 encryption does not fail for in-memory buffers")
 }
 
 fn aead_open(key: &[u8; 32], nonce: &[u8; NONCE_LEN], aad: &[u8], ct: &[u8]) -> Option<Vec<u8>> {
     XChaCha20Poly1305::new(key.into())
-        .decrypt(XNonce::from_slice(nonce), Payload { msg: ct, aad })
+        .decrypt(nonce.into(), Payload { msg: ct, aad })
         .ok()
 }
 

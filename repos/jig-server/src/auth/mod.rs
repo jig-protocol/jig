@@ -11,6 +11,7 @@
 //! member" confirms the channel exists.
 //!
 pub mod admission;
+pub mod admission_effort;
 pub mod authenticate;
 pub mod authorize;
 pub mod disclosure;
