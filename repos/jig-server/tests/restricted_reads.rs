@@ -613,6 +613,7 @@ async fn replaying_an_accepted_member_add_does_not_undo_a_revocation() {
     let block = server.member_add_block(&owner, "#private", &member);
     let (status, body) = server.try_submit(&block).await;
     assert_eq!(status, StatusCode::OK, "owner enrols member: {body}");
+    assert!(body["block_cid"].is_string(), "{body}");
     server.settle_member_add(&owner, "#private", &member, &block, true);
     let (status, _) = server
         .send(&server.sign_get(&member, &history_path("#private")))
@@ -621,9 +622,12 @@ async fn replaying_an_accepted_member_add_does_not_undo_a_revocation() {
 
     server.revoke_membership("#private", &member);
 
+    // The replay is answered as the block it is, already held, and applied
+    // to nothing.
+    let cid = body["block_cid"].clone();
     let (status, body) = server.try_submit(&block).await;
-    assert_eq!(status, StatusCode::CONFLICT, "replay: {body}");
-    assert_eq!(body["code"], "DUPLICATE_BLOCK");
+    assert_eq!(status, StatusCode::OK, "replay: {body}");
+    assert_eq!(body["block_cid"], cid, "the held block's CID");
     let (status, body) = server
         .send(&server.sign_get(&member, &history_path("#private")))
         .await;

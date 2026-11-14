@@ -318,19 +318,33 @@ impl Relay {
         conn: &str,
         tiers: bool,
     ) -> Result<String, Refusal> {
+        self.submit_as(
+            IngestSource::LocalClient { conn_id, tiers },
+            manifest_bytes,
+            code_bytes,
+            sig,
+            conn,
+        )
+        .await
+    }
+
+    /// [`Relay::submit`] for a block that reaches this server as `source`:
+    /// ingested here as that, and relayed to the owner, as any client write
+    /// is, if it lands on a channel this server carries.
+    pub async fn submit_as(
+        &self,
+        source: IngestSource,
+        manifest_bytes: &[u8],
+        code_bytes: &[u8],
+        sig: Vec<u8>,
+        conn: &str,
+    ) -> Result<String, Refusal> {
         let bundle = BlockBundle {
             manifest_bytes,
             code_bytes,
             resources: vec![],
         };
-        let refused = match ingest(
-            &self.ctx,
-            bundle,
-            sig.clone(),
-            IngestSource::LocalClient { conn_id, tiers },
-        )
-        .await
-        {
+        let refused = match ingest(&self.ctx, bundle, sig.clone(), source).await {
             Ok(cid) => return Ok(cid),
             Err(e) => e,
         };
@@ -667,6 +681,17 @@ impl Relay {
     }
 }
 
+/// The in-flight key for a REST write from `ip`: the caller's address, so a
+/// caller resubmitting someone else's signed block holds its own relay
+/// slots, not the author's. A request with no address (a router driven
+/// without connection info) falls back to the block's `author`.
+pub fn rest_caller(ip: Option<std::net::IpAddr>, author: &str) -> String {
+    match ip {
+        Some(ip) => format!("rest:ip:{ip}"),
+        None => format!("rest:{author}"),
+    }
+}
+
 /// Post a client's block on `state`'s server: through its [`Relay`], once
 /// the contract runs ([`crate::v0_0_2_contract`]), or straight to ingest.
 /// `conn` names the client's connection for the in-flight cap.
@@ -697,6 +722,34 @@ pub async fn post(
     )
     .await
     .map_err(|e| Refusal::of(&e))
+}
+
+/// [`post`] for a block that reaches this server as `source` rather than
+/// from a client connection: the channel-op routes' `IngestSource::AdminEndpoint`.
+/// On a channel this server carries, it is relayed to the owner like any
+/// client write, under the share's grant. `conn` names the caller for the
+/// in-flight cap.
+pub async fn post_as(
+    state: &crate::v0_0_2::AppState,
+    source: IngestSource,
+    manifest_bytes: &[u8],
+    code_bytes: &[u8],
+    sig: Vec<u8>,
+    conn: &str,
+) -> Result<String, Refusal> {
+    if let Some(relay) = state.relay.get() {
+        return relay
+            .submit_as(source, manifest_bytes, code_bytes, sig, conn)
+            .await;
+    }
+    let bundle = BlockBundle {
+        manifest_bytes,
+        code_bytes,
+        resources: vec![],
+    };
+    ingest(&state.ingest_ctx, bundle, sig, source)
+        .await
+        .map_err(|e| Refusal::of(&e))
 }
 
 fn refused_by(request_id: u64, e: &IngestError) -> Answer {

@@ -324,7 +324,10 @@ pub struct RateLimitSection {
     pub per_did_per_second: u32,
     /// Per remote address: every HTTP request and every WebSocket frame,
     /// signed or not. Behind a reverse proxy every request comes from the
-    /// proxy's address, so raise this or turn it off there.
+    /// proxy's address, so raise this or turn it off there. The same address
+    /// keys a REST write's relay slots (`MAX_IN_FLIGHT` per address), so
+    /// clients behind one proxy share those too; no forwarded header is
+    /// trusted yet (#399).
     pub per_ip_burst: u32,
     pub per_ip_per_second: u32,
     /// Nonces one DID may hold in the replay guard at once. Keeps one

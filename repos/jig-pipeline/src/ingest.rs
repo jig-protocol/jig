@@ -504,6 +504,41 @@ pub async fn ingest(
     check_manifest_dids(&manifest)?;
     let sender = verify_sig(bundle.manifest_bytes, bundle.code_bytes, &manifest, &sig)?;
 
+    // The block's CID, needed this early for the held-block answer below, and
+    // because a channel-create's channel IS that block: its `channel_id` is its
+    // own CID (JEP-0005 rule 1).
+    let block_cid = bundle
+        .block_cid()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|_| "bafy_invalid".to_string());
+
+    // Step 1a: a block this server already holds, submitted again by a client
+    // (or relayed to its owner again), is answered with its CID at once, as an
+    // idempotent success. Before admission: the bundle is public once it has
+    // landed, so anyone can resubmit it, and doing so must not spend its
+    // author's rate, pool share or relay slots. After the signature check: an
+    // unsigned or mis-signed bundle never learns that a block is held. Nothing
+    // is applied, stored or fanned out again. Step 3d still refuses a copy
+    // that lands between this lookup and persist. A peer's or a bridge's
+    // copy keeps its own handling, below. Held means held in the channel the
+    // block names: a block held only in a relayed copy this server set aside
+    // (`quarantine_relayed_copy`) sits under the copy's id, so it goes on to
+    // the channel checks, and on a carried channel to its owner.
+    let resubmittable = matches!(
+        source,
+        IngestSource::LocalClient { .. }
+            | IngestSource::AdminEndpoint
+            | IngestSource::Relayed { .. }
+    );
+    if resubmittable
+        && let Some(kind) = manifest.kind
+        && let Some(held) = ctx.store.get_block(&block_cid)?
+        && held.channel_id
+            == channel_id_of(&ctx.store, kind, &manifest, &block_cid)?.and_then(|c| c.id)
+    {
+        return Ok(block_cid);
+    }
+
     // Step 1b: admission, on the DID the signature just established. Before
     // the identity resolver, the kind whitelist and every channel lookup: a
     // caller this server will not deal with gets exactly one answer, whatever
@@ -578,13 +613,6 @@ pub async fn ingest(
     // no-op once boot or an earlier block has said so).
     let server_did = ctx.server_did.to_did_jig_string();
     ctx.store.adopt_local_sequencer(&server_did)?;
-
-    // The block's CID, needed this early because a channel-create's channel
-    // IS that block: its `channel_id` is its own CID (JEP-0005 rule 1).
-    let block_cid = bundle
-        .block_cid()
-        .map(|c| c.to_string())
-        .unwrap_or_else(|_| "bafy_invalid".to_string());
 
     // Step 3b: channel-existence guard for channel-scoped kinds.
     //
@@ -4377,7 +4405,7 @@ mod tests {
             &[("channel", "#hello"), ("member_did", "did:jig:zDeji")],
         );
 
-        do_ingest(
+        let first = do_ingest(
             &ctx,
             mb.clone(),
             cb.clone(),
@@ -4396,27 +4424,143 @@ mod tests {
                 .unwrap()
         );
 
-        let err = do_ingest(
+        // A client's replay is answered with the block's CID (step 1a), and a
+        // peer's or a bridge's is refused (step 3d). Neither applies it again.
+        let again = do_ingest(
             &ctx,
-            mb,
-            cb,
-            sig,
+            mb.clone(),
+            cb.clone(),
+            sig.clone(),
             IngestSource::LocalClient {
                 conn_id: 1,
                 tiers: true,
             },
         )
         .await
-        .expect_err("the same block a second time must be refused");
+        .expect("a client's replay is answered with the held block's CID");
+        assert_eq!(again, first);
+        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::Bridge)
+            .await
+            .expect_err("a bridge's copy of a held block is refused");
         assert!(
             matches!(err, IngestError::DuplicateBlock { .. }),
             "got {err:?}"
         );
         assert!(
             !ctx.store.is_member("#hello", "did:jig:zDeji").unwrap(),
-            "a refused replay must leave the revocation in place"
+            "a replay must leave the revocation in place"
         );
         assert_eq!(ctx.store.list_members(&channel_id).unwrap().len(), 0);
+    }
+
+    /// Step 1a answers for a block held in the channel it names, and only
+    /// there: a block held only in a relayed copy set aside under another id
+    /// goes on through the channel checks, as before.
+    #[tokio::test]
+    async fn a_block_held_only_in_a_set_aside_copy_is_not_answered_as_held() {
+        let ctx = test_ctx_allowing(&["member-add"]);
+        let owner_key = random_signing_key();
+        seed_channel_owned_by(&ctx, "#hello", &did_of(&owner_key));
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &owner_key,
+            BlockKind::MemberAdd,
+            &[("channel", "#hello"), ("member_did", "did:jig:zDeji")],
+        );
+        let client = || IngestSource::LocalClient {
+            conn_id: 1,
+            tiers: true,
+        };
+        let cid = do_ingest(&ctx, mb.clone(), cb.clone(), sig.clone(), client())
+            .await
+            .expect("first ingest");
+        // What `quarantine_relayed_copy` does to the copy's blocks.
+        ctx.store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE blocks SET channel_id = 'bafkrelayedcopy' WHERE cid = ?1",
+                [&cid],
+            )
+            .unwrap();
+        let err = do_ingest(&ctx, mb, cb, sig, client())
+            .await
+            .expect_err("not held in #hello, so not answered as held");
+        assert!(
+            matches!(err, IngestError::DuplicateBlock { .. }),
+            "falls through to the channel checks and step 3d: {err:?}"
+        );
+    }
+
+    /// Counts the admission checks ingest asks for.
+    #[derive(Default)]
+    struct CountingAdmission(std::sync::atomic::AtomicUsize);
+
+    impl Admission for CountingAdmission {
+        fn admit(&self, _sender_did: &str) -> Result<(), AdmissionRefusal> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// Step 1a: whoever resubmits a block this server holds, its author's
+    /// admission (rate and pool share) is not charged again, and the answer is
+    /// the block's CID. A block that has not landed is charged every time.
+    #[tokio::test]
+    async fn a_held_block_resubmitted_charges_no_admission() {
+        let counted = Arc::new(CountingAdmission::default());
+        let mut ctx = test_ctx_allowing(&["member-add"]);
+        ctx.admission = counted.clone();
+        let owner_key = random_signing_key();
+        seed_channel_owned_by(&ctx, "#hello", &did_of(&owner_key));
+        let charged = || counted.0.load(std::sync::atomic::Ordering::SeqCst);
+        let client = || IngestSource::LocalClient {
+            conn_id: 7,
+            tiers: true,
+        };
+
+        // Refused at the write gate, so never stored: charged each time.
+        let stranger = random_signing_key();
+        let (smb, scb, ssig) = build_bundle_parts_with_meta(
+            &stranger,
+            BlockKind::MemberAdd,
+            &[("channel", "#hello"), ("member_did", "did:jig:zDeji")],
+        );
+        for n in 1..=2 {
+            do_ingest(&ctx, smb.clone(), scb.clone(), ssig.clone(), client())
+                .await
+                .expect_err("a stranger cannot add members");
+            assert_eq!(charged(), n, "a block that never landed is charged");
+        }
+
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &owner_key,
+            BlockKind::MemberAdd,
+            &[("channel", "#hello"), ("member_did", "did:jig:zDeji")],
+        );
+        let cid = do_ingest(&ctx, mb.clone(), cb.clone(), sig.clone(), client())
+            .await
+            .expect("first ingest");
+        assert_eq!(charged(), 3);
+        for source in [client(), IngestSource::AdminEndpoint] {
+            let again = do_ingest(&ctx, mb.clone(), cb.clone(), sig.clone(), source)
+                .await
+                .expect("a held block is answered");
+            assert_eq!(again, cid);
+        }
+        assert_eq!(charged(), 3, "a held block charges its author nothing");
+
+        // A bundle whose signature does not verify never learns the CID.
+        let mut forged = sig.clone();
+        forged[0] ^= 1;
+        let err = do_ingest(&ctx, mb, cb, forged, client())
+            .await
+            .expect_err("a mis-signed copy is refused");
+        assert!(
+            !matches!(err, IngestError::DuplicateBlock { .. }),
+            "refused at the signature, not as a duplicate: {err:?}"
+        );
+        assert_eq!(charged(), 3);
     }
 
     /// Gate 3 for writes runs inside ingest, so every surface gets it. A validly
