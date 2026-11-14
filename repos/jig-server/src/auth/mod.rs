@@ -11,12 +11,15 @@
 //! member" confirms the channel exists.
 //!
 pub mod admission;
+pub mod admission_effort;
 pub mod authenticate;
 pub mod authorize;
 pub mod disclosure;
 pub mod outcome;
+pub mod pools;
 pub mod rate;
 pub mod replay;
+pub mod stamps;
 pub mod state;
 
 pub use admission::{AdmissionPolicy, ReputationSource, ReputationView, admit};
@@ -24,5 +27,6 @@ pub use authenticate::{AuthProof, authenticate};
 pub use authorize::{Visibility, authorize_read};
 pub use disclosure::{DisclosurePolicy, audit_line};
 pub use outcome::{Gate, GateOutcome};
+pub use pools::Pool;
 pub use replay::{ReplayGuard, ReplayRejection};
 pub use state::AuthState;

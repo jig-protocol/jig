@@ -1,8 +1,10 @@
-# Deploying jig on a tailnet VPS
+# Deploying jig on a VPS behind a private network
 
 Systemd units, a config template, and a backup job for running
-`jig-server` + `jig-nameserver` on a single small VPS reachable **only over
-Tailscale**.
+`jig-server` + `jig-nameserver` on a single small VPS reachable **only over a
+private network**. The examples use a tailnet (Tailscale): its `100.x` addresses,
+the `tailscaled` ordering and `tailscale cert`. Any private network that gives the
+host a stable address works the same way.
 
 | File | Purpose |
 | --- | --- |
@@ -64,13 +66,13 @@ Two related traps:
 - Restoring the key onto a *different* host is what you want. Restoring the
   databases without it is not.
 
-Teammates have the same problem one level down: see
-[Teammate onboarding](#teammate-onboarding) — `~/.jig/keys/*.jigkey` is the only
-copy of a person's identity.
+Users have the same problem one level down: `~/.jig/keys/<did>.jigkey` is the only
+copy of a person's identity. Each user should keep a second slot or a recovery kit
+for it (`jig keys protect`, `jig keys --help`).
 
 ---
 
-## Security model: identity in the server, the tailnet as defence in depth
+## Security model: identity in the server, the private network as defence in depth
 
 The server authenticates and authorizes on its own. Network placement is a
 second layer, not the only one — but it is still a layer you want, because the
@@ -88,9 +90,8 @@ the default):
   channels reach any authenticated caller; `restricted` ones reach the owner
   and members only. The listing does not name restricted channels — or their
   owner — to non-members. Live delivery is re-checked on every block, so
-  removing a membership stops an already-open subscription. (There is no
-  `member-remove` block or CLI verb yet: today a removal is the operator
-  deleting the `memberships` row, or archiving the channel.)
+  removing a membership stops an already-open subscription. A removal is a
+  signed `member-remove` block; the owner sends one with `jig channel kick`.
 - **Membership is the owner's to grant.** `member-add` onto a restricted
   channel, or of anyone but yourself onto any channel, must be signed by the
   channel owner; `channel-promote` likewise. Self-join (`jig channel join`)
@@ -136,14 +137,18 @@ the default):
   is no proof to admit — but never for writes.
 
 What it does not enforce yet — the reasons to keep `bind_address` on the
-tailnet:
+private network:
 
 - **No reputation scoring.** Admission consumes scores the operator wrote
   down; nothing computes or exchanges them yet. With the default
   `unknown_dids = "admit"`, anyone who can reach the port can create channels
   and post to open ones, within `[auth.rate_limit]`. `unknown_dids =
   "proof-of-work"` makes each new key do some hashing first, which slows an
-  identity flood but does not stop one.
+  identity flood but does not stop one. What bounds a flood is
+  `[auth.pools]`: strangers share `stranger_share_pct` (20 %) of the
+  server's write capacity, so however many keys a flood brings, members keep
+  the rest. Members are the DIDs in `records` with no negative score, plus
+  those whose admission proof is `local_member_age_secs` old.
 - **Federated peers vouch for their authors.** Blocks relayed from a peer run
   the same admission, write and suite gates as local ones, except that their
   authors are not asked for proof-of-work: they never spoke to this server.
@@ -157,11 +162,12 @@ tailnet:
   all of them. See `docs/RELEASE_READINESS.md` §1.3.
 - The nameserver's `/v1/register` has no auth beyond proof-of-control of a
   self-minted key. Its config default `bind` is `127.0.0.1`, but the unit
-  overrides it with `JIG_NS_BIND` — set that to the tailnet IP, not `0.0.0.0`.
+  overrides it with `JIG_NS_BIND` — set that to the private-network IP, not
+  `0.0.0.0`.
 
-Removing someone from the tailnet still removes their access, and until a
-`member-remove` block exists it is still the operator's only lever short of
-editing the database.
+Removing a device from the private network still removes its access to the
+server altogether. Inside the server, a channel owner removes a member with a
+signed `member-remove` block, and an admission ban refuses a DID everywhere.
 
 ---
 
@@ -211,11 +217,11 @@ the root keys and every section in one file.
 | Check | Command | Expect |
 | --- | --- | --- |
 | Server liveness | `curl -k https://100.x.y.z:7117/healthz` | `200`, body `ok` |
-| Server identity | `curl -k https://100.x.y.z:7117/.well-known/jig` | `server_did`, `tls_binding` and `unsafe_options_active` |
+| Server identity | `curl -k https://100.x.y.z:7117/.well-known/jig` | `server_did` and `tls_binding`. `unsafe_options_active` is absent on a clean server and appears only when an unsafe option is on |
 | Server counters | `curl -k https://100.x.y.z:7117/metrics` | Prometheus text |
 | Channel list | `curl -k https://100.x.y.z:7117/api/v1/channels` | `401` `AUTH_REQUIRED` — reads are signed; use `jig channel list` instead |
 | Nameserver liveness | `curl -k https://100.x.y.z:7070/v1/health` | `{"status":"ok"}` |
-| Nameserver identity | `curl -k https://100.x.y.z:7070/.well-known/jig-ns` | `server_did`, `tls_binding` and `unsafe_options_active` |
+| Nameserver identity | `curl -k https://100.x.y.z:7070/.well-known/jig-ns` | `server_did`, `tls_binding`, and `unsafe_options_active`, which is always present and is `[]` on a clean nameserver |
 | Nameserver alias API | `curl -k https://100.x.y.z:7070/v1/challenge` | `{"challenge":"<64 hex>"}` |
 | Units | `systemctl status jig-server jig-nameserver` | both `active (running)` |
 
@@ -413,88 +419,6 @@ hot reload). Certs are ~90 days, so re-run `tailscale cert` and restart the
 service on a monthly timer. Each restart, the server DID vouches for whatever
 certificate it serves, so `jig` clients follow a renewal without re-pinning.
 Or remove `cert_path`/`key_path` to go back to the self-signed certificate.
-
----
-
-## Teammate onboarding
-
-Do these **in order**. Steps 1–2 are where a group session actually stalls: the
-invite email and the per-device approval click are asynchronous and often cross
-a timezone. Send the invites before anyone builds anything.
-
-| # | Who | Step | Command / action |
-| --- | --- | --- | --- |
-| 1 | You | Send the Tailscale invite | tailnet admin console → Invite external user |
-| 2 | Them | Install Tailscale, sign in, **wait for your approval** | `tailscale up`, then you approve the device |
-| 3 | Them | Confirm they can see the box | `tailscale ping <host>` |
-| 4 | You | Get them the `jig` binary | AirDrop or `tailscale file cp` |
-| 5 | Them | Clear the macOS quarantine flag | `xattr -d com.apple.quarantine ./jig` |
-| 6 | Them | Confirm the server is reachable | `curl -k https://100.x.y.z:7117/healthz` |
-| 7 | Them | Create an identity | `./jig init <nickname>` |
-| 8 | Them | Point at the server | `./jig server set https://100.x.y.z:7117` |
-| 9 | Them | **Back up `~/.jig/keys/*.key`** | copy into a password manager |
-| 10 | Them | Chat | `./jig chat '#gigue'` |
-
-You create `#gigue` once, from any machine: `jig channel create '#gigue'`.
-Teammates do **not** need `jig channel join` for an `open` channel — v0.0.2
-stores membership as derived state for bridge dispatch and does not gate reads
-or sends on it. Run `jig channel join` only for a `restricted` channel.
-
-### Step 5 — macOS Gatekeeper
-
-The `jig` binary is unsigned and unnotarised. Anything that arrives by download
-or AirDrop is tagged `com.apple.quarantine`, and Gatekeeper refuses to run it —
-the failure is a modal dialog, or a bare `zsh: killed`, neither of which says
-"quarantine".
-
-```bash
-xattr -d com.apple.quarantine ./jig
-xattr -l ./jig                       # no com.apple.quarantine line
-```
-
-Build one binary per architecture if anyone is on Intel: `aarch64-apple-darwin`
-for Apple Silicon, `x86_64-apple-darwin` for Intel. A binary of the wrong arch
-fails with `Bad CPU type in executable`, which looks nothing like an arch
-mismatch either. Ship the right one, or ship both under distinct names.
-
-### Step 9 — their key is the only copy
-
-`jig init` writes `~/.jig/keys/<did>.key` (0600) and `~/.jig/cli.toml`. **There
-is no recovery and no key escrow.** Losing that file means losing the identity:
-a new `jig init` produces a new DID, and their message history is attributed to
-a DID nobody controls any more.
-
-```bash
-base64 ~/.jig/keys/*.key    # into 1Password, once, on day one
-```
-
-Restoring means putting the file back at that path with mode 0600 and keeping
-`cli.toml`'s `did` pointed at it.
-
-### Step 10 — staying connected
-
-`jig chat` and `jig tail` do **not** reconnect on their own, but they now *detect*
-a dropped connection: both exit non-zero with `connection lost` instead of hanging
-or returning success. That makes a supervising loop work:
-
-```bash
-scripts/jig-room.sh '#gigue'
-```
-
-which is just `until jig chat "$1"; do sleep 2; done`. Use the same shape for
-`jig tail`. This is the deliberate stand-in for real reconnect-with-backoff, and
-it is load-bearing on the non-zero exit — if a future change makes either command
-exit 0 on disconnect, the loop silently stops retrying.
-
-Three smaller sharp edges:
-
-- `jig tail` prints the raw 61-char DID and raw epoch-millis per line. Nicer rendering
-  (`HH:MM`, a `[contacts]` name map, an inbound bell) is **in flight in this same batch**
-  — check whether `jig-cli/src/cmd/display.rs` is wired up before promising it.
-- `jig --version` is not implemented. Identify a build by its file hash.
-- `--server`, `--config`, and `--did` are honoured by every subcommand,
-  including `init`, `keys`, `server`, and `channel` (they were silently ignored
-  for those four until recently). `--config <path>` requires the file to exist.
 
 ---
 
@@ -744,6 +668,61 @@ new identity.
 
 ---
 
+## Federation: sharing a channel with another server
+
+Two servers federate only if each lists the other under `[[federation.peers]]`
+(see `config.example.toml`), with the other's `/.well-known/jig` `server_did`
+as `expected_did`. Restart both after editing.
+
+To carry a channel on the other server (JEP-0005), so its users can read it
+there in this server's order:
+
+1. **The channel's owner, or an admin with the `share` right**, on this
+   server:
+
+   ```sh
+   jig channel share '#team' did:jig:<other server> --grant read
+   ```
+
+   `--grant` is `read`, `write` or `member` (JEP-0005 rule 7a). The server
+   checks the signer's right, and refuses a share naming a server that is not
+   one of its peers: the refusal shows in the channel as `NOT_A_PEER`.
+2. **The other server's operator** accepts the offer:
+
+   ```sh
+   sudo -u jig /opt/jig/bin/jig-server --config /etc/jig/config.toml contracts list
+   sudo -u jig /opt/jig/bin/jig-server --config /etc/jig/config.toml contracts accept <offer-id>
+   ```
+
+   As `jig`, not root: the command writes to the server's database. The
+   running server acts on it within 5 seconds. Skip this step by setting
+   `offers = "accept"` in that server's peer entry for this one. `contracts
+   refuse <offer-id>` turns an offer down.
+3. **Users of the other server** read the channel by its id, which `jig channel
+   share` prints: `jig read <channel-id>`. A slug names a channel only on the
+   server that orders it, so `jig read '#team'` there finds nothing.
+
+`jig channel unshare '#team' did:jig:<other server>` (or `contracts end
+<offer-id>` on either server) ends the share. This server stops streaming the
+channel's records at once. The other server keeps the copy it holds and lands
+nothing of the channel after, including any block of it the older peer relay
+still forwards.
+
+The server decides which channels may be shared: a channel whose tier keeps it
+on one server is refused (JEP-0014). Under a `write` or `member` grant, the other
+server relays its users' posts back to this one; under `read`, they post on
+this server.
+
+A channel reaches another server only once it is shared. Its creation block
+names the server that orders it, so a peer no longer takes a channel this
+server creates as one of its own. `naively_accept_peer_relayed_creates` (see
+`config.example.toml`) is for tests only: a server with it stores a copy of a
+peer's new channel, but clients refuse to read the copy, because its creation
+block names another server. Servers that trust each other set
+`offers = "accept"` and use `jig channel share`.
+
+---
+
 ## The nameserver
 
 The binary serves the alias API and its discovery documents. The legacy routes
@@ -803,7 +782,7 @@ names this nameserver's DID.
 **Proof-of-work.** Register, renew and rotate can carry JEP-0008
 proof-of-work, set per suffix in `[v0_0_2.nameserver.alias_suffixes.pow]`. It
 is on by default, at the recommended values: 2^20 to register, 4× more per
-letter under 5, at most 2^24, and 1 to renew or rotate. `jig` solves it;
+letter under 5 (2^24 for three letters), at most 2^26, and 1 to renew or rotate. `jig` solves it;
 `min_effort = 0` turns it off. A client asks
 `GET /v1/challenge?action=register|renew|rotate&did=&name=`, and the reply
 states the effort, signed by the nameserver (`pow_offer`). The policy's
@@ -847,8 +826,58 @@ passthrough) without terminating it.
 
 ---
 
+## A stalled carried channel
+
+A channel this server follows for another server (an accepted share) can
+stall. That happens when the owner's chain names a block this server already
+holds in one of **its own** channels. One block belongs to one channel, so the
+owner's record for it cannot land. Nothing is moved and nothing is deleted:
+this server's channel keeps the block and its history, and the carried channel
+takes nothing past that record.
+
+**When it happens.** Both servers have a channel with the same name, say
+`#general`, and they were peered before the share. Clients post by channel
+name, so the federation relay lands each server's posts in the other's
+same-name channel. Share one of them, and the carried channel stalls at the
+first post the relay brought across. Any two servers that each have a
+`#general` and were peered before the share will hit this on its first share,
+until relayed posts into a channel the receiving server orders are refused
+(#357).
+
+**How to confirm it.**
+
+- `jig-server contracts list` ends with one line per stalled channel:
+  `stalled: channel <id> stalled at seq <n>: block <cid> is held in channel <id>`.
+- The log has a WARN, `a carried channel is stalled`, with `channel_id`, `seq`,
+  `block_cid`, `holder` and the owner's DID as `sequencer`. It repeats each time
+  the owner sends that record again.
+
+**What to do.** There is no safe way to fix it in place yet. Moving the block
+into the carried channel breaks your own channel's chain, which still names
+it. Deleting it does the same. Your options:
+
+- **Leave it.** The carried channel shows everything up to the stall. Your own
+  channel is untouched.
+- **End the share** with `jig-server contracts end <offer>` (the offer id is in
+  `contracts list`). This server stops following the channel. What it already
+  carried stays readable.
+- **Avoid it.** Before sharing a channel, ask the peer's operator whether their
+  server has a channel of its own with the same name. If it has, don't share
+  that channel yet.
+
+A carried channel that can hold a block this server also holds elsewhere is
+planned for a later release.
+
 ## Gotchas worth knowing before they cost you an evening
 
+- **Which release is running.** From v0.2.0-alpha.4, the first published release
+  that prints its version, `jig --version`, `jig-server --version` and
+  `jig-nameserver --version` print the release version (`jig 0.2.0-alpha.4`).
+  v0.2.0-alpha.2 and earlier print `0.0.1` whatever the release: identify those
+  by file hash, against that release's `SHA256SUMS`.
+- **`--server`, `--config` and `--did` are honoured by every `jig` subcommand,**
+  including `init`, `keys`, `server` and `channel`. `--config <path>` requires
+  the file to exist.
 - **`jig-nameserver serve --bind/--port` ARE honoured**, and they win over both
   the config file and `JIG_NS_BIND`/`JIG_NS_PORT`. The shipped unit sets the env
   vars instead, which is still correct and still applied after any TOML load.
@@ -888,6 +917,6 @@ passthrough) without terminating it.
   separate blast radius.
 - **Building on the VPS needs a toolchain first.** A fresh box has no rustup, no
   C compiler, and no pkg-config; `ring` needs a C compiler. The workspace MSRV
-  is **1.95** (`jig-runtime` and `jig-server` inherit it), set by wasmtime 48.
+  is **1.97** (`jig-runtime` and `jig-server` inherit it), set by wasmtime 50.
   A 1 vCPU box wants ~2 GB of swap and 45–90 minutes. Cross-building on your Mac
   and copying the binary over is usually the better trade.

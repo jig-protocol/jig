@@ -315,10 +315,16 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         // Channel terms and roles: the same signed block is refused again on
         // retry, so the bridge bounces it.
         ref e @ (IngestError::NotSequencer { .. }
+        | IngestError::SequencerRequired { .. }
         | IngestError::CarriedChannel { .. }
         | IngestError::RelayedOutsideShare { .. }
         | IngestError::GrantRefused { .. }
         | IngestError::InvalidTerms { .. }
+        | IngestError::UnknownTier { .. }
+        | IngestError::TierSuiteMismatch { .. }
+        | IngestError::TierFixed { .. }
+        | IngestError::TierUnsupported { .. }
+        | IngestError::DmIsAPair { .. }
         | IngestError::MissingRight { .. }
         | IngestError::RootOwnerRole { .. }
         | IngestError::UnknownRole { .. }
@@ -362,7 +368,7 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         | IngestError::UnknownSuite { .. }
         | IngestError::SuiteMismatch { .. }
         | IngestError::RestrictedRequiresMls { .. }
-        | IngestError::PlaintextRestrictedFrozen { .. }
+        | IngestError::ChannelFrozen { .. }
         | IngestError::MlsRejected { .. }) => SubmitDenied::PolicyBlocked {
             reason: e.to_string(),
         },
@@ -483,6 +489,7 @@ mod tests {
             fanout: fanout.clone(),
             server_url: "ws://127.0.0.1:0".to_string(),
             naively_allow_unknown_handles_fallback: false,
+            naively_accept_peer_relayed_creates: false,
             executor: Some(BlockExecutor::shared()),
         });
         (store, ingest_ctx, fanout, RouterMount::new())
@@ -659,6 +666,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
         store
@@ -700,7 +708,10 @@ mod tests {
             &ingest_ctx,
             bundle,
             block.sender_sig.clone(),
-            IngestSource::LocalClient { conn_id: 1 },
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
         )
         .await
         .unwrap();

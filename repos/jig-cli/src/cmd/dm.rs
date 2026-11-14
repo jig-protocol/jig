@@ -17,7 +17,7 @@
 use anyhow::{Context, Result};
 use serde_json::json;
 
-use crate::cmd::channel::{create_with, resolve_who};
+use crate::cmd::channel::{TierChoice, create_with, resolve_who};
 use crate::cmd::common::CliContext;
 use crate::cmd::secure::Secure;
 
@@ -52,7 +52,7 @@ pub async fn run(ctx: &CliContext, who: String, message: String) -> Result<()> {
         Some(_) => anyhow::bail!("{slug} exists but is not encrypted; not using it as a DM"),
         None => {
             let meta = json!({"dm": true, "dm_peer": peer});
-            create_with(ctx, &slug, "restricted", true, true, meta).await?;
+            create_with(ctx, &slug, TierChoice::PRIVATE, true, meta).await?;
         }
     }
     // A DM the other side opened reaches this device as a welcome in its

@@ -230,8 +230,10 @@ async fn a_subscribe_by_a_non_canonical_channel_id_is_refused() {
     assert_eq!(server.fanout().local_subscription_count().await, 0);
 }
 
-/// A slug subscribe follows the local channel of that slug, or waits for
-/// one; it never follows a carried channel, which only its id reaches.
+/// A slug subscribe follows the local channel of that slug; it never
+/// follows a carried channel, which only its id reaches. A slug that names
+/// only a carried channel is refused, naming the id, rather than left to
+/// wait for a creation that never comes here.
 #[tokio::test]
 async fn a_slug_subscribe_never_reaches_a_carried_channel() {
     let server = TestServer::authenticated();
@@ -243,7 +245,18 @@ async fn a_slug_subscribe_never_reaches_a_carried_channel() {
     for slug in ["#shared", "#faraway"] {
         let (carried_id, block) = server.carry_channel(slug, &theirs);
         let mut by_slug = WsClient::connect(&url).await;
-        assert!(by_slug.subscribe(&owner, slug).await.is_none());
+        let refusal = by_slug.subscribe(&owner, slug).await;
+        if slug == "#faraway" {
+            match refusal {
+                Some(Frame::Error { code, message, .. }) => {
+                    assert_eq!(code, "CARRIED_CHANNEL");
+                    assert!(message.contains(&carried_id), "{message}");
+                }
+                other => panic!("{slug}: expected a refusal naming the id, got {other:?}"),
+            }
+        } else {
+            assert!(refusal.is_none(), "{refusal:?}");
+        }
         let mut by_id = WsClient::connect(&url).await;
         let refusal = by_id
             .subscribe_scope(

@@ -99,7 +99,7 @@ from `curl` to "hello, world" accepted in `#hello`. CI fails above 60s; see
 
 ## Quickstart
 
-Requires Rust **1.95+** (MSRV is set by wasmtime); `rust-toolchain.toml` pins the exact toolchain CI uses, and rustup picks it up automatically. Build the two binaries:
+Requires Rust **1.97+** (MSRV is set by wasmtime); `rust-toolchain.toml` pins the exact toolchain CI uses, and rustup picks it up automatically. Build the two binaries:
 
 ```bash
 git clone https://github.com/jig-protocol/jig
@@ -137,23 +137,43 @@ slot is the message body. `jig server info` prints the server's advertised
 their own; [`scripts/jig-room.sh`](scripts/jig-room.sh) is the deliberate `until`-loop
 stand-in.
 
-### Encrypted channels and DMs
+### Channel tiers, encrypted channels and DMs
+
+Every channel has a tier, fixed when it is created:
+
+- `private`, the default: end-to-end encrypted, and people join only when its owner adds them.
+- `server`: end-to-end encrypted, and anyone holding the `--join` role on this server
+  (`member` by default, or `guest`) joins it themselves.
+- `shared`: as `server`, carried to other servers by a share (`jig channel share`).
+- `public`: stored in readable form, so anyone who can read the server, its operator
+  included, can read it. `jig` labels it wherever it shows it, and asks you to confirm when
+  you create one (`--yes` confirms without asking).
+
+`jig channel list` marks each channel's tier. A plaintext channel created before tiers is
+frozen: it takes no new posts, but its old messages are still stored in readable form.
+Every message is signed, which proves who wrote it; that is a different thing from
+encryption. Even in an encrypted channel the server sees who posts where and when.
 
 Each person runs `jig init` and `jig server set` once; `server set` publishes the MLS key
 packages others need to add you while you are offline.
 
 ```bash
-jig channel create '#ops' --visibility restricted --encrypted
+jig channel create '#ops'                         # private
 jig channel add '#ops' <did-or-contact-name>      # owner only; commits them into the MLS group
 jig send --channel '#ops' "rotate the keys"       # the server stores ciphertext
 jig channel kick '#ops' <did-or-contact-name>     # they cannot read what follows
 jig channel leave '#ops'                          # anyone but the owner
 jig channel members '#ops'
 jig dm <did-or-contact-name> "just us"            # a locked, encrypted channel for two
+
+jig channel create '#team' --tier server         # members of this server join it themselves
+jig channel join '#team'                          # once, before the first `jig chat`
+jig channel create '#news' --tier public          # readable by anyone; asks you to confirm
 ```
 
-An open encrypted channel (`--visibility open --encrypted`) can be joined with
-`jig channel join`, by MLS external commit; history from before you joined stays sealed.
+`--join guest` lowers the bar to guests, which admits any key the server admits, `--anon`
+session keys included. A `server` or `shared` channel is joined with `jig channel join`, by
+MLS external commit; history from before you joined stays sealed.
 [`scripts/demo-e2ee.sh`](scripts/demo-e2ee.sh) runs all of this against a throwaway server
 with three users and then searches the server's files for what they said.
 
@@ -229,8 +249,7 @@ required check. Jobs that build install the toolchain `rust-toolchain.toml` pins
 | You want to | Read |
 | --- | --- |
 | Run a server on a box you already have | [`deploy/README.md`](deploy/README.md) |
-| Provision that box on GCP | [`docs/deployment/gcp-vps-runbook.md`](docs/deployment/gcp-vps-runbook.md) |
-| Know exactly what shipped and what did not | the STATUS section of [`docs/deployment/internal-dogfood-3day.md`](docs/deployment/internal-dogfood-3day.md) |
+| Know exactly what shipped and what did not | [`docs/RELEASE_READINESS.md`](docs/RELEASE_READINESS.md), and each release's notes in [`.github/release/notes/`](.github/release/notes/) |
 | See where the project is headed, phase by phase | [`docs/ROADMAP.md`](docs/ROADMAP.md) |
 | Find any doc in the repo, with a currency label | [`docs/README.md`](docs/README.md) |
 | Understand why something is shaped the way it is | [`docs/superpowers/`](docs/superpowers/) |

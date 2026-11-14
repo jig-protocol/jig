@@ -288,6 +288,10 @@ pub struct AuthSection {
     /// How fast one identity, or one address, may use this server. See
     /// [`RateLimitSection`].
     pub rate_limit: RateLimitSection,
+
+    /// How the server's write capacity is shared between members, invited
+    /// and strangers. See [`PoolsSection`].
+    pub pools: PoolsSection,
 }
 
 impl Default for AuthSection {
@@ -298,6 +302,7 @@ impl Default for AuthSection {
             replay_capacity: 100_000,
             admission: AdmissionSection::default(),
             rate_limit: RateLimitSection::default(),
+            pools: PoolsSection::default(),
         }
     }
 }
@@ -344,6 +349,54 @@ impl Default for RateLimitSection {
     }
 }
 
+/// `[auth.pools]`: the capacity pools of JEP-0008 rules 21–23. The server's
+/// accepted local writes per second are shared between members, invited and
+/// strangers, so a flood of fresh identities cannot take the capacity members
+/// write with, however many identities it brings.
+///
+/// - **Members** are DIDs with a nonempty `[auth.admission] records` entry
+///   holding no negative score, and DIDs whose admission proof of work is at
+///   least `local_member_age_secs` old.
+/// - **Invited** is empty until invites exist (JEP-0009).
+/// - **Strangers** are everyone else.
+///
+/// The stranger pool gets `stranger_share_pct` of the capacity and the invited
+/// pool `invited_share_pct`; members get the rest. A pool that has had no
+/// demand for a second lends what it holds above half its burst; its first
+/// request takes it back. So members never wait on a flood of strangers, and
+/// a server with no members yet lends their share out.
+///
+/// Blocks a federated peer relays or a bridge submits are not charged here:
+/// the peer pays at its own ingress (JEP-0008 rule 30).
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PoolsSection {
+    /// Accepted local writes per second, all pools together. `0` turns the
+    /// pools off.
+    pub writes_per_second: u32,
+    /// The most writes the pools hold for a burst, all pools together.
+    pub writes_burst: u32,
+    /// Percent of capacity the stranger pool gets (rule 23: 20).
+    pub stranger_share_pct: u8,
+    /// Percent of capacity the invited pool gets (rule 23: 10).
+    pub invited_share_pct: u8,
+    /// How long ago a DID must have done this server's admission proof of
+    /// work to count as a member (rule 21's `local_member_age`).
+    pub local_member_age_secs: u64,
+}
+
+impl Default for PoolsSection {
+    fn default() -> Self {
+        Self {
+            writes_per_second: 1_000,
+            writes_burst: 2_000,
+            stranger_share_pct: 20,
+            invited_share_pct: 10,
+            local_member_age_secs: 7 * 24 * 60 * 60,
+        }
+    }
+}
+
 /// `[auth.admission]` — the operator's policy for who is admitted, evaluated
 /// after a caller has proved possession of their key and before anything is
 /// authorized. Refusing here narrows access, so nothing in this section is a
@@ -363,14 +416,30 @@ pub struct AdmissionSection {
     /// What to do with a DID this server has no relevant record for.
     /// `"admit"` (the default), `"refuse"`, or `"proof-of-work"`. `"refuse"`
     /// with a set of `records` is a members-only server. `"proof-of-work"`
-    /// admits a new DID once it has done `pow_bits` of work for this server
-    /// (`POST /api/v1/admission`); blocks relayed by a peer or submitted by a
-    /// bridge are not asked for it.
+    /// admits a new DID once it has done the work this server asks
+    /// (`POST /api/v1/admission`, JEP-0008's `admit` puzzle); blocks relayed
+    /// by a peer or submitted by a bridge are not asked for it.
     pub unknown_dids: UnknownDidsPolicy,
-    /// Leading zero bits of work a new DID owes under `"proof-of-work"`, 1 to
-    /// 28. Each bit doubles the expected cost; 20 is under a second on a
-    /// laptop.
+    /// Legacy: leading zero bits of work, 1 to 28; `0` (the default) is
+    /// unset. Kept for one release; it means `min_effort = 2^pow_bits`. Set
+    /// this or `min_effort`, not both.
     pub pow_bits: u8,
+    /// The least effort (expected digests) a new DID owes under
+    /// `"proof-of-work"`, whatever the load (JEP-0008 rule 19). `0` asks no
+    /// work while the server is idle (rule 17). Unset: `2^20`, under a second
+    /// on a laptop.
+    pub min_effort: Option<u64>,
+    /// The most effort the controller asks, at most `2^28`. Unset: `2^24`,
+    /// or the legacy `pow_bits` effort if that is higher.
+    pub max_effort: Option<u64>,
+    /// The controller (rule 17): after a window in which more than
+    /// `controller_target` distinct unknown DIDs arrived, the effort asked
+    /// above `min_effort` doubles, starting from `controller_start_effort`;
+    /// after a window with at most half that many, it halves, and below the
+    /// start it drops to zero.
+    pub controller_window_secs: u64,
+    pub controller_target: u32,
+    pub controller_start_effort: u64,
     /// DIDs this server refuses outright, whatever their scores.
     pub banned_dids: Vec<String>,
     /// Reputation floors, evaluated in the order written.
@@ -384,7 +453,12 @@ impl Default for AdmissionSection {
     fn default() -> Self {
         Self {
             unknown_dids: UnknownDidsPolicy::default(),
-            pow_bits: 20,
+            pow_bits: 0,
+            min_effort: None,
+            max_effort: None,
+            controller_window_secs: 60,
+            controller_target: 100,
+            controller_start_effort: 1 << 16,
             banned_dids: Vec::new(),
             floors: Vec::new(),
             records: Vec::new(),
@@ -430,6 +504,15 @@ pub struct FederationSection {
     /// still checked by the signed welcome, but nothing after the welcome is
     /// protected on a plaintext link. Surfaces in `unsafe_options_active`.
     pub dangerously_allow_plaintext_federation: bool,
+    /// For tests only: a `channel-create` a configured peer relays, which
+    /// names another server as its sequencer (or none), is stored as a copy
+    /// this server sequences, as the legacy relay did before creates named
+    /// their sequencer. Clients refuse to read such a copy, because its
+    /// creation block names another server. Off, such a create is refused,
+    /// and a channel reaches a peer only once it is shared (JEP-0005):
+    /// servers that trust each other set `offers = "accept"` and use
+    /// `jig channel share`. Surfaces in `unsafe_options_active`.
+    pub naively_accept_peer_relayed_creates: bool,
     /// The quota for every peer without its own `quota`, published in the
     /// server manifest (JEP-0005 rule 16). Defaults to
     /// [`DEFAULT_PEER_BLOCKS_PER_MIN`] blocks and [`DEFAULT_PEER_BYTES_PER_MIN`]
@@ -475,6 +558,7 @@ impl Default for FederationSection {
             peers: Vec::new(),
             dangerously_disable_federation_tls: false,
             dangerously_allow_plaintext_federation: false,
+            naively_accept_peer_relayed_creates: false,
             default_peer_quota: PeerQuotaConfig {
                 blocks_per_min: DEFAULT_PEER_BLOCKS_PER_MIN,
                 bytes_per_min: DEFAULT_PEER_BYTES_PER_MIN,
@@ -872,8 +956,8 @@ pub struct PowPolicy {
     pub short_name_factor: u64,
     /// What renew and rotate by the holder pay (rule 31). `0` asks none.
     pub renew_effort: u64,
-    /// How long a penalty point lasts; each repeat offence before it lapses
-    /// doubles it (rule 27).
+    /// How long one penalty point takes to decay; each repeat offence while
+    /// points remain doubles it, up to a day (rule 27).
     pub penalty_decay_secs: u64,
 }
 
@@ -884,14 +968,16 @@ impl Default for PowPolicy {
 }
 
 impl PowPolicy {
-    /// The R1 plan's values: 2^20 to register, ×4 per letter under 5, at most
-    /// 2^24 (about 3 s on one server core); 1 to renew or rotate.
+    /// 2^20 to register, ×4 per letter under 5, at most 2^26 (about 12 s on
+    /// one server core, so `max_solve_secs` is 13); 1 to renew or rotate. A
+    /// three-letter name starts at 2^24, so the controller and penalties can
+    /// still raise it fourfold before the cap (DJ, 2026-10-25).
     pub fn recommended() -> Self {
         Self {
             alg: 1,
             min_effort: 1 << 20,
-            max_effort: 1 << 24,
-            max_solve_secs: 10,
+            max_effort: 1 << 26,
+            max_solve_secs: 13,
             short_name_len: 5,
             short_name_factor: 4,
             renew_effort: 1,
@@ -1067,6 +1153,9 @@ impl JigServerConfig {
         }
         if self.federation.dangerously_allow_plaintext_federation {
             active.push("federation.dangerously_allow_plaintext_federation".to_string());
+        }
+        if self.federation.naively_accept_peer_relayed_creates {
+            active.push("federation.naively_accept_peer_relayed_creates".to_string());
         }
         if self.identity.naively_allow_unknown_handles_fallback {
             active.push("identity.naively_allow_unknown_handles_fallback".to_string());
@@ -1309,6 +1398,7 @@ mod tests {
         let cfg = JigServerConfig::default();
         assert!(!cfg.federation.dangerously_disable_federation_tls);
         assert!(!cfg.federation.dangerously_allow_plaintext_federation);
+        assert!(!cfg.federation.naively_accept_peer_relayed_creates);
         assert!(!cfg.identity.naively_allow_unknown_handles_fallback);
         assert!(!cfg.debug.list_handles);
     }
@@ -1355,6 +1445,7 @@ mod tests {
         let mut cfg = JigServerConfig::default();
         cfg.federation.dangerously_disable_federation_tls = true;
         cfg.federation.dangerously_allow_plaintext_federation = true;
+        cfg.federation.naively_accept_peer_relayed_creates = true;
         cfg.identity.naively_allow_unknown_handles_fallback = true;
         cfg.identity.dangerously_allow_plaintext_nameservers = true;
         cfg.debug.list_handles = true;
@@ -1367,6 +1458,7 @@ mod tests {
         assert!(active.contains(&"auth.require_authenticated_reads=false".to_string()));
         assert!(active.contains(&"federation.dangerously_disable_federation_tls".to_string()));
         assert!(active.contains(&"federation.dangerously_allow_plaintext_federation".to_string()));
+        assert!(active.contains(&"federation.naively_accept_peer_relayed_creates".to_string()));
         assert!(active.contains(&"identity.naively_allow_unknown_handles_fallback".to_string()));
         assert!(active.contains(&"identity.dangerously_allow_plaintext_nameservers".to_string()));
         assert!(active.contains(&"debug.list_handles".to_string()));

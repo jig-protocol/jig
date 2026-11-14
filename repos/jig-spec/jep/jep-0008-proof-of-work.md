@@ -205,8 +205,12 @@ Non-goals:
 23. The stranger pool gets at most `stranger_share` of capacity, and the invited pool at most
     `invited_share`. Both are ruleset parameters. The reference values are 20 % and 10 %.
     - Members MUST NOT wait on the other pools.
-    - Capacity a pool leaves unused MAY be lent to another pool while it is idle, and MUST be
-      returned when its owner pool has demand.
+    - Capacity a pool leaves unused MAY be lent to another pool while it is idle, and lending MUST
+      stop at the owner pool's first request.
+    - A pool is idle after `idle_secs` (reference: 1 s) without a request of its own, and lends
+      at most what it holds above half its burst. So an owner pool that resumes has at least half
+      its burst at once, and all of its rate from then on: lent capacity is spent, not recalled,
+      and this reserve is what "MUST NOT wait" guarantees.
     - Within the stranger pool, requests pass per-DID and per-address rate limits first, then wait
       in a queue served highest effort first.
 24. A nameserver applies rules 21–23 to its binding endpoints. `ns-register` is always a stranger
@@ -256,6 +260,10 @@ Non-goals:
 33. The reference server sets `[auth.admission] unknown_dids = "proof-of-work"` by default, with
     the controller of rule 17 and no floor. Admission is therefore free while the server is idle.
     This default ships only once rule 31 is implemented (D26).
+    - **D26 resolved (DJ, 2026-10-25):** rule 31 is implemented, but the reference server keeps
+      `unknown_dids = "admit"` by default until R2's earned standing (local earned standing,
+      R2.4) lands. The controller of rule 17 ships now, used by any server that opts into
+      `"proof-of-work"`; the default switches to it, with no floor, in the same release as R2.4.
 
 # Security Considerations (Zero-Trust)
 

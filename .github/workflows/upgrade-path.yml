@@ -1,0 +1,87 @@
+name: Upgrade path
+
+# Installs v0.2.0-alpha.1, creates the state a beta user has (identities,
+# open, restricted and MLS-encrypted channels, a DM, messages, jig-server's
+# key, a nameserver key and an alias), upgrades it to v0.2.0-alpha.2 and then
+# to this PR's build the way a user does (install.sh again), and checks after
+# each step that all of it survived and still works. Finally rotates
+# jig-server's key and checks that clients follow the key link.
+# scripts/upgrade-path.sh has the details and the known gaps.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - repos/**
+      - install.sh
+      - scripts/upgrade-path.sh
+      - scripts/package-release.sh
+      - .github/workflows/upgrade-path.yml
+  workflow_dispatch:
+    inputs:
+      from:
+        description: Releases to install, in order, before this ref's build (space-separated tags)
+        required: true
+        default: v0.2.0-alpha.1 v0.2.0-alpha.2
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upgrade-path-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  upgrade:
+    name: ${{ inputs.from || 'v0.2.0-alpha.1 v0.2.0-alpha.2' }} → this build
+    # Drafts skip it (about 11 minutes of runner time); marking the PR ready
+    # for review runs it.
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Nothing after checkout needs the token.
+          persist-credentials: false
+      - name: Install Rust toolchain
+        shell: bash
+        working-directory: repos
+        run: rustup toolchain install --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: repos
+          # The same release build as install-smoke's.
+          key: install-smoke
+      - name: Build
+        working-directory: repos
+        env:
+          CARGO_INCREMENTAL: '0'
+        run: |
+          # jig-nameserver alone, so it links no wasmtime (see release.yml).
+          cargo build --release --locked -p jig-server -p jig-cli
+          cargo build --release --locked -p jig-nameserver
+      - name: Package, checksum, sign with a throwaway key, serve
+        id: mirror
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/package-release.sh x86_64-unknown-linux-gnu jig-linux-x86_64 dist
+          cp install.sh dist/
+          key="$RUNNER_TEMP/k"
+          ssh-keygen -q -t ed25519 -N '' -C jig-release -f "$key"
+          (cd dist && sha256sum jig-*.tar.gz install.sh > SHA256SUMS && ssh-keygen -Y sign -q -f "$key" -n jig-release SHA256SUMS)
+          echo "signer=jig-release namespaces=\"jig-release\" $(cut -d' ' -f1,2 "$key.pub")" >> "$GITHUB_OUTPUT"
+          (cd dist && nohup python3 -m http.server 47392 --bind 127.0.0.1 >/dev/null 2>&1 &)
+          for _ in $(seq 1 50); do curl -fsS -o /dev/null http://127.0.0.1:47392/SHA256SUMS && exit 0; sleep 0.1; done
+          exit 1
+      - name: Upgrade path
+        shell: bash
+        env:
+          FROM: ${{ inputs.from || 'v0.2.0-alpha.1 v0.2.0-alpha.2' }}
+          JIG_VERIFY_SIGNATURE: '1'
+          JIG_UPGRADE_MIRROR_SIGNER: ${{ steps.mirror.outputs.signer }}
+        run: |
+          # FROM is word-split on purpose: one tag per step.
+          # shellcheck disable=SC2086
+          scripts/upgrade-path.sh $FROM mirror=http://127.0.0.1:47392

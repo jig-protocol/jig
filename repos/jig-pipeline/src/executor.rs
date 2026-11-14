@@ -207,6 +207,21 @@ impl ExecRun {
     }
 }
 
+/// The render deadline of test servers and the shared test executor: a
+/// backstop against a hung render, not the operator's 250 ms, which a loaded
+/// CI runner can miss on a cheap block (#361, and #342's history test).
+#[cfg(any(test, feature = "test-support"))]
+pub const TEST_RENDER_TIMEOUT_MS: u64 = 10_000;
+
+/// The operator defaults, with the render deadline at [`TEST_RENDER_TIMEOUT_MS`]: the
+/// config of a test executor whose test is not about the deadline.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_runtime_config() -> jig_runtime::RuntimeConfig {
+    let mut config = jig_runtime::RuntimeConfig::default();
+    config.limits.execution_timeout_ms = TEST_RENDER_TIMEOUT_MS;
+    config
+}
+
 /// Holds the compiled canonical components for the lifetime of a server.
 pub struct BlockExecutor {
     runtime: ComponentRuntime,
@@ -341,17 +356,20 @@ impl BlockExecutor {
     /// Tests that measure [`BlockExecutor::in_flight_peak`] must build their own:
     /// `peak` is per-executor, so a shared one accumulates other tests' concurrency
     /// and an assertion on it would not be measuring the test that made it.
+    ///
+    /// Its wall-clock deadline is [`TEST_RENDER_TIMEOUT_MS`], not the operator
+    /// default: a loaded CI runner can take longer than 250 ms to render a
+    /// cheap block, and a test of something else would then fail with
+    /// `RENDER_FAILED`. Tests of the deadline build their own executor.
     #[cfg(any(test, feature = "test-support"))]
     pub fn shared() -> Arc<Self> {
         static SHARED: OnceLock<Arc<BlockExecutor>> = OnceLock::new();
         SHARED
             .get_or_init(|| {
-                Arc::new(
-                    Self::for_tests(jig_runtime::RuntimeConfig::default()).expect(
-                        "the canonical text-block component must compile; it is embedded \
+                Arc::new(Self::for_tests(test_runtime_config()).expect(
+                    "the canonical text-block component must compile; it is embedded \
                      at build time and covered by jig-runtime's component tests",
-                    ),
-                )
+                ))
             })
             .clone()
     }
@@ -621,6 +639,16 @@ mod tests {
         assert!(policy.policy.allow.authors.is_empty());
     }
 
+    /// The shared test executor renders under the test backstop, not the
+    /// operator's 250 ms: a loaded runner must not fail an unrelated test.
+    #[test]
+    fn the_shared_test_executor_has_the_test_render_deadline() {
+        let run = BlockExecutor::shared()
+            .render(&text_invocation(&input("backstop"), String::new(), 0))
+            .expect("renders");
+        assert_eq!(run.exec.limits.timeout_ms, TEST_RENDER_TIMEOUT_MS);
+    }
+
     /// Two servers sign different program manifests for text-block (their own DID as author),
     /// yet their receipts for the same invocation agree: comparison keys on the component.
     #[test]
@@ -830,7 +858,7 @@ mod tests {
 
         // And the same executor at a normal budget succeeds, so the failure above
         // is attributable to the limit rather than to anything else.
-        let ok = BlockExecutor::for_tests(jig_runtime::RuntimeConfig::default())
+        let ok = BlockExecutor::for_tests(test_runtime_config())
             .expect("executor builds")
             .render_text(&input("this render cannot fit in 100 fuel"))
             .expect("a default budget must succeed");

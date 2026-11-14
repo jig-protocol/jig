@@ -8,8 +8,10 @@ should not be read as a status page.
 
 | I want to… | Read |
 | --- | --- |
+| Find my way around the code | [`ARCHITECTURE.md`](ARCHITECTURE.md), then [`CONTRIBUTING.md`](../CONTRIBUTING.md) and [`scripts/dev-setup.sh`](../scripts/dev-setup.sh) |
+| Pick a first change | [`GOOD_FIRST_CONTRIBUTIONS.md`](GOOD_FIRST_CONTRIBUTIONS.md) |
+| Know who reviews what | [`OWNERSHIP.md`](OWNERSHIP.md) |
 | Stand up a server on a box I already have | [`deploy/README.md`](../deploy/README.md) |
-| Get the box first, on GCP | [`docs/deployment/gcp-vps-runbook.md`](deployment/gcp-vps-runbook.md) |
 | Know what actually works today | [What works, what does not](../README.md#what-works-what-does-not) in the root README, and the [threat register](../repos/jig-spec/src/threat-register.md) for security status |
 | Know what is left before a public release | [`RELEASE_READINESS.md`](RELEASE_READINESS.md) |
 | See where the project is headed, phase by phase | [`ROADMAP.md`](ROADMAP.md) |
@@ -21,9 +23,6 @@ should not be read as a status page.
 | Doc | Status | What it is |
 | --- | --- | --- |
 | [`deploy/README.md`](../deploy/README.md) | CURRENT | Operator runbook: systemd units, the strict `/etc/jig/config.toml`, backups, sealing the server key, and the server-key warning. The unit files carry their own rationale in comments; this doc covers sequence. |
-| [`deployment/gcp-vps-runbook.md`](deployment/gcp-vps-runbook.md) | CURRENT | GCP-specific box setup — machine sizing, the build-big-then-shrink recommendation, Tailscale-only reachability. Prices and build times in it are the author's estimates, unverified against the console. |
-| [`deployment/internal-dogfood-3day.md`](deployment/internal-dogfood-3day.md) | HISTORICAL | The internal-MVP plan. Its STATUS section is a snapshot of what had shipped by that batch, not maintained; the plan body predates the implementation and is kept for its reasoning. |
-| [`deployment/internal-dogfood-24h.md`](deployment/internal-dogfood-24h.md) | HISTORICAL | Superseded by the 3-day plan. Retained for its verified state-of-the-union table, which was proven by running binaries rather than reading code. |
 | [`deployment/install-benchmark.md`](deployment/install-benchmark.md) | CURRENT | The 60-second `curl \| bash` install gate: the manual procedure on a $5-class VM, still the only measure on target hardware, and the CI runs (`scripts/install-smoke.sh` in `release.yml` and `install-smoke.yml`) with their first measurements. |
 | [`operations/nameserver-abuse-runbook.md`](operations/nameserver-abuse-runbook.md) | CURRENT | Nameserver incident runbooks: a registration flood (reading the effort, adjusting the pool), closing a suffix, a squatting complaint, harassment reports, a compromised nameserver, a rogue or contradicting nameserver. Steps that need tribunals or operator removal are marked not yet implemented. |
 
@@ -40,6 +39,7 @@ should not be read as a status page.
 | Doc | Status | What it is |
 | --- | --- | --- |
 | [`../SECURITY.md`](../SECURITY.md) | CURRENT | How to report a vulnerability, response targets, disclosure policy and scope. |
+| [`security/audit-scope.md`](security/audit-scope.md) | CURRENT | Scope for the external security audit (D27), split decided 2026-10-25 (one firm, Phase 1 before G3): seven areas by priority, entry points and threat-register rows for each, how to split the work, and what must be code-complete first. |
 | [`security/operator-threat-model.md`](security/operator-threat-model.md) | CURRENT | The model and evidence behind the spec's operator [threat register](../repos/jig-spec/src/threat-register.md). |
 | [`security/encryption.md`](security/encryption.md) | CURRENT | Why encryption is shaped as it is: suite field, refusals, MLS, DMs as locked channels, the DID key as MLS signer, a validating delivery service, the client plaintext cache. |
 | [`security/nameserver-abuse-economics.md`](security/nameserver-abuse-economics.md) | CURRENT | Why nameserver proof-of-work, the registration pool, length scaling and penalties are shaped as they are under JEP-0008: what work buys and does not, decay, griefing, and the known weaknesses the design must close. Rationale for the spec's [Identity and Reputation](../repos/jig-spec/src/identity-and-reputation.md) chapter. |
