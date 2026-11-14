@@ -141,6 +141,9 @@ enum Serves {
     /// Drops `after=` but keeps the advertisement: it says it pages forward
     /// and sends the newest page instead.
     Lying,
+    /// Pages forward, but leaves a block out of the middle of the first
+    /// forward page: a hole the device must not keep.
+    Skipping,
 }
 
 /// A proxy in front of `server`, serving as `serves` says, that counts the
@@ -180,6 +183,8 @@ async fn relay(
     let up = tokio::net::TcpStream::connect(upstream).await?;
     let (mut from_client, mut to_client) = client.into_split();
     let (mut from_up, mut to_up) = up.into_split();
+    let to_client = Arc::new(tokio::sync::Mutex::new(to_client));
+    let responses = to_client.clone();
     tokio::spawn(async move {
         let mut chunk = [0u8; 16 * 1024];
         loop {
@@ -195,10 +200,11 @@ async fn relay(
                     out[at..at + FROM.len()].copy_from_slice(TO);
                 }
             }
-            to_client.write_all(&out).await?;
+            responses.lock().await.write_all(&out).await?;
         }
     });
-    let ignore_after = serves != Serves::Forward;
+    let ignore_after = matches!(serves, Serves::Old | Serves::Lying);
+    let mut skipped = false;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
     loop {
@@ -249,6 +255,21 @@ async fn relay(
         } else {
             format!("{path}?{}", kept.join("&"))
         };
+        if serves == Serves::Skipping && after && !before && !skipped {
+            // Asked on a connection of its own, so the answer can be cut
+            // before the client sees it.
+            let request = format!("{method} {target} {version}\r\nconnection: close\r\n{rest}");
+            let page = skip_one(
+                upstream,
+                request.as_bytes(),
+                &buf[head_end..head_end + body_len],
+            )
+            .await?;
+            skipped = page.1;
+            to_client.lock().await.write_all(&page.0).await?;
+            buf.drain(..head_end + body_len);
+            continue;
+        }
         to_up
             .write_all(format!("{method} {target} {version}\r\n{rest}").as_bytes())
             .await?;
@@ -260,6 +281,43 @@ async fn relay(
             return Ok(());
         }
     }
+}
+
+/// Sends `request` (a head with `connection: close`) and `body` upstream,
+/// and returns the answer with the middle entry of its JSON array left out,
+/// and whether one was: the page a server that skips a block would send.
+async fn skip_one(upstream: &str, request: &[u8], body: &[u8]) -> std::io::Result<(Vec<u8>, bool)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut up = tokio::net::TcpStream::connect(upstream).await?;
+    up.write_all(request).await?;
+    up.write_all(body).await?;
+    let mut answer = Vec::new();
+    up.read_to_end(&mut answer).await?;
+    let Some(split) = answer.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return Ok((answer, false));
+    };
+    let head = String::from_utf8_lossy(&answer[..split]).into_owned();
+    let Ok(Value::Array(mut page)) = serde_json::from_slice::<Value>(&answer[split + 4..]) else {
+        return Ok((answer, false));
+    };
+    if page.len() < 3 {
+        return Ok((answer, false));
+    }
+    page.remove(page.len() / 2);
+    let body = serde_json::to_vec(&page).unwrap();
+    let head: Vec<String> = head
+        .split("\r\n")
+        .map(|l| {
+            if l.to_ascii_lowercase().starts_with("content-length:") {
+                format!("content-length: {}", body.len())
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    let mut out = format!("{}\r\n\r\n", head.join("\r\n")).into_bytes();
+    out.extend_from_slice(&body);
+    Ok((out, true))
 }
 
 /// `jig read` as the device, and its output.
@@ -299,6 +357,19 @@ async fn a_server_that_advertises_after_but_ignores_it_costs_time_not_messages()
     assert_eq!(
         forward_pages, 1,
         "one forward page, refused for breaking the chain, then back"
+    );
+}
+
+/// A server that pages forward but leaves a block out of a page would leave
+/// a hole in the device's history. The page's records skip one, so the
+/// device refuses the page, reads back from its head instead, and misses
+/// nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forward_page_that_skips_a_block_is_refused_and_the_block_is_still_read() {
+    let forward_pages = away_and_back(Serves::Skipping).await;
+    assert_eq!(
+        forward_pages, 1,
+        "one forward page, refused for its gap, then back"
     );
 }
 
