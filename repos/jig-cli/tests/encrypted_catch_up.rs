@@ -147,6 +147,26 @@ enum Serves {
     /// As [`Serves::Lying`], with no sequencer records in any history page:
     /// the device's head has none, so no chain says the page is later.
     LyingWithoutRecords,
+    /// Serves no records until the device has read once, as a server did
+    /// before records, so the device's head has none. Then it pages forward
+    /// with records but leaves out the first block after the head, and,
+    /// asked what comes before the page, names the head: consistent on both
+    /// sides, so only the head's own record can show the gap.
+    SkippingConsistently,
+}
+
+/// What a [`proxy`] counts and carries between its connections.
+#[derive(Default)]
+struct Shared {
+    /// History requests paging forward (`after` without `before`).
+    forward_pages: AtomicUsize,
+    /// For [`Serves::SkippingConsistently`]: serve no records yet.
+    hide_records: std::sync::atomic::AtomicBool,
+    /// For [`Serves::SkippingConsistently`]: the block left out, once it is.
+    skipped: std::sync::Mutex<Option<String>>,
+    /// For [`Serves::SkippingConsistently`]: whether the block before the
+    /// page has been asked for, and the head named instead.
+    covered: std::sync::atomic::AtomicBool,
 }
 
 /// A proxy in front of `server`, serving as `serves` says, that counts the
@@ -158,10 +178,13 @@ enum Serves {
 /// rewritten, responses are copied back (with the advertisement renamed,
 /// keeping its length, for [`Serves::Old`]), and a WebSocket upgrade (the
 /// client's handshake) is passed through untouched from then on.
-async fn proxy(server: &TestJigServer, serves: Serves) -> (String, Arc<AtomicUsize>) {
+async fn proxy(server: &TestJigServer, serves: Serves) -> (String, Arc<Shared>) {
     let upstream = server.http_url().trim_start_matches("http://").to_string();
-    let forward_pages = Arc::new(AtomicUsize::new(0));
-    let counted = forward_pages.clone();
+    let shared = Arc::new(Shared::default());
+    shared
+        .hide_records
+        .store(serves == Serves::SkippingConsistently, Ordering::SeqCst);
+    let counted = shared.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move {
@@ -172,7 +195,7 @@ async fn proxy(server: &TestJigServer, serves: Serves) -> (String, Arc<AtomicUsi
             });
         }
     });
-    (url, forward_pages)
+    (url, shared)
 }
 
 /// One client connection through [`proxy`].
@@ -180,7 +203,7 @@ async fn relay(
     client: tokio::net::TcpStream,
     upstream: &str,
     serves: Serves,
-    counted: &AtomicUsize,
+    shared: &Shared,
 ) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let up = tokio::net::TcpStream::connect(upstream).await?;
@@ -250,17 +273,67 @@ async fn relay(
         let after = params.iter().any(|p| p.starts_with("after="));
         let before = params.iter().any(|p| p.starts_with("before="));
         if after && !before {
-            counted.fetch_add(1, Ordering::SeqCst);
+            shared.forward_pages.fetch_add(1, Ordering::SeqCst);
         }
         let kept: Vec<&str> = params
             .into_iter()
             .filter(|p| !(ignore_after && p.starts_with("after=")))
             .collect();
-        let target = if kept.is_empty() {
+        let mut target = if kept.is_empty() {
             path.to_string()
         } else {
             format!("{path}?{}", kept.join("&"))
         };
+        if serves == Serves::SkippingConsistently && path.ends_with("/blocks") {
+            let hide = shared.hide_records.load(Ordering::SeqCst);
+            let first_forward = after && !before && shared.skipped.lock().unwrap().is_none();
+            if hide || first_forward {
+                let request = format!("{method} {target} {version}\r\nconnection: close\r\n{rest}");
+                let page = rewrite(
+                    upstream,
+                    request.as_bytes(),
+                    &buf[head_end..head_end + body_len],
+                    |page| {
+                        if hide {
+                            return drop_records(page);
+                        }
+                        // The page after the head, without its first block.
+                        if page.len() < 2 {
+                            return false;
+                        }
+                        let left_out = page.remove(0);
+                        *shared.skipped.lock().unwrap() = left_out["delivery_cid"]
+                            .as_str()
+                            .map(|c| c.trim_start_matches("delivery:").to_string());
+                        true
+                    },
+                )
+                .await?;
+                to_client.lock().await.write_all(&page.0).await?;
+                buf.drain(..head_end + body_len);
+                continue;
+            }
+            // Asked what comes before the page: answer as if the left-out
+            // block were not there, by asking what comes before it.
+            let left_out = shared.skipped.lock().unwrap().clone();
+            if let Some(left_out) = left_out
+                && before
+                && !shared.covered.swap(true, Ordering::SeqCst)
+            {
+                let query: Vec<String> = query
+                    .split('&')
+                    .filter(|p| !p.is_empty())
+                    .map(|p| {
+                        if p.starts_with("before=") {
+                            format!("before={left_out}")
+                        } else {
+                            p.to_string()
+                        }
+                    })
+                    .collect();
+                target = format!("{path}?{}", query.join("&"));
+            }
+        }
         let edit: Option<fn(&mut Vec<Value>) -> bool> = match serves {
             Serves::Skipping if after && !before && !skipped => Some(skip_one),
             Serves::LyingWithoutRecords if path.ends_with("/blocks") => Some(drop_records),
@@ -323,7 +396,7 @@ async fn rewrite(
     upstream: &str,
     request: &[u8],
     body: &[u8],
-    edit: fn(&mut Vec<Value>) -> bool,
+    edit: impl FnOnce(&mut Vec<Value>) -> bool,
 ) -> std::io::Result<(Vec<u8>, bool)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut up = tokio::net::TcpStream::connect(upstream).await?;
@@ -410,6 +483,21 @@ async fn without_records_a_page_that_does_not_follow_the_head_is_refused() {
     );
 }
 
+/// A device whose head has no record of its own (saved before records, or
+/// by an older build), on a server that holds records and lies the same way
+/// on both sides: its page after the head leaves out the first block, and
+/// asked what comes before that page, it names the head. The position
+/// checks out; the head's record, which the server sends with it, does not
+/// lead to the page's first, so the device refuses the page and reads back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_consistent_skip_after_a_head_without_a_record_is_refused() {
+    let forward_pages = away_and_back(Serves::SkippingConsistently).await;
+    assert_eq!(
+        forward_pages, 1,
+        "one forward page, refused at the head's own record, then back"
+    );
+}
+
 /// A server that pages forward but leaves a block out of a page would leave
 /// a hole in the device's history. The page's records skip one, so the
 /// device refuses the page, reads back from its head instead, and misses
@@ -428,7 +516,7 @@ async fn a_forward_page_that_skips_a_block_is_refused_and_the_block_is_still_rea
 /// history requests paged forward.
 async fn away_and_back(serves: Serves) -> usize {
     let server = TestJigServer::start().await.expect("start");
-    let (url, forward_pages) = proxy(&server, serves).await;
+    let (url, shared) = proxy(&server, serves).await;
     let owner = Member::new();
 
     let device = tempfile::tempdir().unwrap();
@@ -464,6 +552,7 @@ async fn away_and_back(serves: Serves) -> usize {
 
     // The device joins and reads what there is.
     assert!(read(device.path(), 10).contains("before"));
+    shared.hide_records.store(false, Ordering::SeqCst);
 
     // It is away while the owner says more than a page's worth, with no
     // commit among it: nothing makes it page back to its epoch.
@@ -485,5 +574,5 @@ async fn away_and_back(serves: Serves) -> usize {
         shown.lines().take(5).collect::<Vec<_>>().join("\n")
     );
     assert!(!shown.contains("cannot decrypt"), "{shown}");
-    forward_pages.load(Ordering::SeqCst)
+    shared.forward_pages.load(Ordering::SeqCst)
 }

@@ -747,7 +747,17 @@ impl Secure {
                 None if position_of(&page, &cursor).is_some() => {
                     Err("a page after a block holds that block".to_string())
                 }
-                None => self.follows(slug, &cursor, &page).await?,
+                None => match self.follows(slug, &cursor, &page).await? {
+                    // The cursor's own record, from the server: the chain
+                    // starts there and holds this page as it would have.
+                    Ok(Some(mut anchored)) => {
+                        let held = continues(&mut anchored, &page);
+                        chain = Some(anchored);
+                        held
+                    }
+                    Ok(None) => Ok(()),
+                    Err(why) => Err(why),
+                },
             };
             if let Err(why) = continued {
                 return Ok(broken(replayed, why));
@@ -785,15 +795,23 @@ impl Secure {
             .map(|(h, r)| ChannelChain::across(&r.channel_id, self.sequencers(&r), Some(h))))
     }
 
-    /// Whether `page` starts right after `cursor`, with no chain to say so:
-    /// the block just before the page's first must be `cursor`. A server
-    /// that ignored `after` and sent a later page fails this.
+    /// Whether `page` starts right after `cursor`, with no chain on this
+    /// device to say so: the block just before the page's first must be
+    /// `cursor`. A server that ignored `after` and sent a later page fails
+    /// this.
+    ///
+    /// That alone shows only that the server answers consistently: one that
+    /// skips a block can name the cursor as the block before. So when the
+    /// cursor comes back with its record, the record must be the cursor's
+    /// and signed by the channel's sequencer ([`sequencers_for`]), and the
+    /// chain anchored on it is returned for the page to be held to. Only
+    /// history with no records is taken on the position alone.
     async fn follows(
         &self,
         slug: &str,
         cursor: &str,
         page: &[DeliveredBlock],
-    ) -> Result<Result<(), String>> {
+    ) -> Result<Result<Option<ChannelChain>, String>> {
         let Some(first) = page.first().and_then(|d| open(d).ok()) else {
             return Ok(Err("a page's first block does not open".into()));
         };
@@ -807,10 +825,18 @@ impl Secure {
             }
             Err(e) => return Err(e),
         };
-        if position_of(&before, cursor).is_some() {
-            Ok(Ok(()))
-        } else {
-            Ok(Err("a page after a block does not start after it".into()))
+        let Some(at) = position_of(&before, cursor) else {
+            return Ok(Err("a page after a block does not start after it".into()));
+        };
+        let Some(record) = &before[at].ingest else {
+            return Ok(Ok(None));
+        };
+        let mut chain = ChannelChain::across(&record.channel_id, self.sequencers(record), None);
+        match chain.accept_live(record, Some(cursor)) {
+            Ok(_) => Ok(Ok(Some(chain))),
+            Err(e) => Ok(Err(format!(
+                "the record it sent for this device's last block: {e}"
+            ))),
         }
     }
 
