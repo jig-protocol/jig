@@ -480,6 +480,9 @@ struct ConnState {
     /// The other end of `peer_sender`, for the connection loop to take.
     peer_rx: Option<mpsc::Receiver<Envelope>>,
     peer_registration: Option<crate::v0_0_2_peer::Registration>,
+    /// Whether the hello asked for channel tiers (JEP-0014 rule 5): a client
+    /// that did not may read a `public` channel but not post to it.
+    tiers: bool,
 }
 
 /// A handshake that ends with the dialer's [`Frame::PeerProof`].
@@ -646,7 +649,8 @@ async fn handle_client_frame(
             Ok(()) => {
                 session.peer = jig_core::did::Did::from_did_jig_string(&awaiting.peer_did).ok();
                 if let Some(peer) = session.peer.clone() {
-                    let (sender, rx) = crate::v0_0_2_peer::PeerSender::new(peer);
+                    let (sender, rx) =
+                        crate::v0_0_2_peer::PeerSender::with_tiers(peer, session.tiers);
                     session.peer_registration = Some(state.peers.register(sender.clone()));
                     session.peer_sender = Some(sender);
                     session.peer_rx = Some(rx);
@@ -957,6 +961,7 @@ async fn handle_client_frame(
                 sig,
                 conn_id,
                 &format!("ws:{conn_id}"),
+                session.tiers,
             )
             .await
             {
@@ -973,11 +978,23 @@ async fn handle_client_frame(
                 // apart on the same variant; a hand-copied table here was the
                 // third copy.
                 Err(refusal) => {
+                    // Name the block refused. A client can have a subscribe
+                    // and several submits in flight on one connection, and a
+                    // refused subscribe also answers with an `Error`; the CID
+                    // is what tells this refusal apart (`Ack` carries it too).
+                    let ref_cid = jig_core::BlockBundle {
+                        manifest_bytes: &manifest_bytes,
+                        code_bytes: &code_bytes,
+                        resources: vec![],
+                    }
+                    .block_cid()
+                    .ok()
+                    .map(|cid| cid.to_string());
                     let _ = send_error(
                         socket,
                         Some(refusal.status.as_u16()),
                         &refusal.code,
-                        None,
+                        ref_cid,
                         &refusal.message,
                     )
                     .await;
@@ -1039,6 +1056,9 @@ pub(crate) fn handshake_capabilities(state: &AppState) -> jig_pipeline::handshak
         federation: true,
         // The bound ingest enforces, so the signed claim is the enforced one.
         max_future_skew_ms: state.ingest_ctx.hlc_clock.max_future_skew_ms(),
+        // Implemented; `negotiate` signs it only into a welcome whose hello
+        // asked for it.
+        tiers: true,
     }
 }
 
@@ -1104,6 +1124,7 @@ async fn complete_hello(
                 .await
                 .map_err(|err| err.to_string())?;
             session.handshaken = true;
+            session.tiers = hello.capabilities.tiers;
             if let Some(peer_did) = hello.peer_did {
                 session.awaiting_peer = Some(AwaitingPeer {
                     peer_did,
@@ -1212,6 +1233,11 @@ fn channel_label(state: &AppState, manifest_bytes: &[u8]) -> Option<String> {
 /// The shared metrics label for channels whose slug is not disclosed.
 pub const RESTRICTED_LABEL: &str = "(restricted)";
 
+/// Invariant: every Error answers exactly one client frame (Subscribe or
+/// Submit), and names it by `ref_cid` where it can. The client matches
+/// an unnamed Error to the oldest request still open, so a server-initiated
+/// Error would be taken as that request's answer. None exists today; adding
+/// one needs a code the client (`jig_client::connection::answer`) skips.
 async fn send_error(
     socket: &mut WebSocket,
     status: Option<u16>,
@@ -1363,6 +1389,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
     }
@@ -1400,7 +1427,9 @@ mod tests {
         let reply_env: Envelope = serde_json::from_str(&reply).unwrap();
         match reply_env.frame {
             Frame::Ack { block_cid } => {
-                assert!(!block_cid.is_empty(), "ack must carry a block_cid");
+                // The CID the sender computes: clients match an answer to
+                // its submit by it.
+                assert_eq!(block_cid, block.cid(), "ack must carry the block's CID");
             }
             other => panic!("expected Ack, got {other:?}"),
         }
@@ -1438,8 +1467,14 @@ mod tests {
         };
         let reply_env: Envelope = serde_json::from_str(&reply).unwrap();
         match reply_env.frame {
-            Frame::Error { status, code, .. } => {
+            Frame::Error {
+                status,
+                code,
+                ref_cid,
+                ..
+            } => {
                 assert_eq!(code, "INVALID_SIG");
+                assert_eq!(ref_cid.as_deref(), Some(block.cid().as_str()));
                 // Pins the number actually on the wire. Both Frame::Error
                 // consumers currently drop `status`, so without this nothing in
                 // the system would notice a wrong value.
@@ -1484,10 +1519,13 @@ mod tests {
                 status,
                 code,
                 message,
-                ..
+                ref_cid,
             } => {
                 assert_eq!(code, "UNKNOWN_CHANNEL");
                 assert_eq!(status, Some(404));
+                // Names the block it refuses, so a client can tell this
+                // answer from a refused subscribe's.
+                assert_eq!(ref_cid.as_deref(), Some(block.cid().as_str()));
                 assert!(message.contains("#gigeu"), "must name the slug: {message}");
                 assert!(
                     message.contains("jig channel create"),
@@ -1535,6 +1573,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: "did:jig:zowner".to_string(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
         let mut ws = established(&url).await;
@@ -1902,6 +1941,7 @@ mod tests {
                     suite: "none".to_string(),
                     sequencer_did: String::new(),
                     co_owners: Vec::new(),
+                    tiering: jig_pipeline::persist::ChannelTiering::current(visibility, "none"),
                 })
                 .unwrap();
         }
@@ -1946,6 +1986,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
         let manifest = serde_json::to_vec(&serde_json::json!({
@@ -2034,13 +2075,17 @@ mod tests {
     }
 
     /// An upgraded connection is still charged to its address, frame by frame:
-    /// past the burst a frame is refused, not processed.
+    /// past the burst a frame is refused, not processed, and the refill lets
+    /// exactly as many more in as it has made.
     #[tokio::test]
     async fn frames_past_the_address_rate_are_refused() {
         let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
         config.auth.rate_limit.per_ip_burst = 3;
         config.auth.rate_limit.per_ip_per_second = 1;
         let state = Arc::new(AppState::for_test_with_config(config).unwrap());
+        // Held still, so a slow runner refills nothing between frames.
+        let clock = crate::auth::rate::ManualClock::new();
+        state.auth.set_rate_clock(&clock);
         let app = Router::new()
             .route("/api/v1/ws", get(ws_handler))
             .with_state(state)
@@ -2049,32 +2094,35 @@ mod tests {
         let url = format!("ws://{}/api/v1/ws", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        // The hello is the first of three. 1/s is the slowest refill there
-        // is, so a slow runner may see one between frames: count frames up to
-        // the first refusal rather than assume exactly two more get in.
-        let start = std::time::Instant::now();
         let mut ws = established(&url).await;
-        let mut processed = 0u32;
-        loop {
-            ws.send(TMessage::Text("not valid json".into()))
-                .await
-                .unwrap();
-            match next_frame(&mut ws).await.frame {
-                Frame::Error { status, code, .. } if code == "RATE_LIMITED" => {
-                    assert_eq!(status, Some(429));
-                    break;
+        // Frames processed before the first refusal.
+        async fn until_refused(
+            ws: &mut tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        ) -> u32 {
+            let mut processed = 0u32;
+            loop {
+                ws.send(TMessage::Text("not valid json".into()))
+                    .await
+                    .unwrap();
+                match next_frame(ws).await.frame {
+                    Frame::Error { status, code, .. } if code == "RATE_LIMITED" => {
+                        assert_eq!(status, Some(429));
+                        return processed;
+                    }
+                    Frame::Error { .. } => processed += 1,
+                    other => panic!("expected an error frame, got {other:?}"),
                 }
-                Frame::Error { .. } => processed += 1,
-                other => panic!("expected an error frame, got {other:?}"),
+                assert!(processed <= 64, "the address was never limited");
             }
-            assert!(processed <= 64, "the address was never limited");
         }
-        let refilled = start.elapsed().as_secs() as u32 + 1;
-        assert!(
-            (2..=2 + refilled).contains(&processed),
-            "{processed} frames after the hello got in over {:?}",
-            start.elapsed()
-        );
+        // The hello was the first of three.
+        assert_eq!(until_refused(&mut ws).await, 2);
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(until_refused(&mut ws).await, 1, "a second refills one");
+        clock.advance(Duration::from_secs(10));
+        assert_eq!(until_refused(&mut ws).await, 3, "and never past the burst");
     }
 
     /// A well-formed frame at a version or suite this server does not speak,

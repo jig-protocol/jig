@@ -24,7 +24,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use ed25519_dalek::Signer;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
-use jig_core::BlockManifest;
+use jig_core::{BlockKind, BlockManifest};
 use jig_pipeline::{
     Envelope, Frame, Scope,
     envelope::ReceiptRef,
@@ -396,9 +396,10 @@ pub(crate) async fn connect_and_relay(
     let (mut sink, mut stream) = ws.split();
     // The handshake proved the peer's DID; peer frames on this connection
     // are from it and go to it ([`crate::v0_0_2_peer`]).
-    let (peer_sender, mut peer_out) = crate::v0_0_2_peer::PeerSender::new(
+    let (peer_sender, mut peer_out) = crate::v0_0_2_peer::PeerSender::with_tiers(
         jig_core::did::Did::from_did_jig_string(&welcome.server_did)
             .map_err(|e| anyhow::anyhow!("the peer's welcome DID: {e}"))?,
+        welcome.capabilities.tiers,
     );
     let registration = state.peers.register(peer_sender.clone());
     info!(peer_url = %peer.url, "federation peer connected");
@@ -611,6 +612,57 @@ pub async fn ingest_peer_block(
         .block_cid()
         .map(|c| c.to_string())
         .unwrap_or_default();
+    // A share and the contract's records are the sequencer's business, asked
+    // of it and written by it: from a peer, a share would have this server
+    // act as owner of its relayed copy, offering a channel it does not own.
+    if let Some(
+        kind @ (BlockKind::ChannelShare
+        | BlockKind::ChannelUnshare
+        | BlockKind::ContractAccept
+        | BlockKind::ContractRefuse
+        | BlockKind::ContractEnd),
+    ) = manifest.kind
+    {
+        warn!(peer_url = %peer.url, %delivery_cid, kind = kind.as_str(), "rejecting peer block: shares and contract records are the channel's sequencer's own");
+        return Ok(());
+    }
+    // A channel this server carries by contract takes its blocks from the
+    // owner's stream only: the relay would make it a copy of its own again.
+    if let Some(kind) = manifest.kind
+        && let Some(named) = jig_pipeline::ingest::channel_id_of(
+            &state.ingest_ctx.store,
+            kind,
+            &manifest,
+            &block_cid,
+        )?
+        && let Some(id) = named.id.as_deref().or_else(|| {
+            manifest
+                .metadata
+                .get(jig_pipeline::ingest::CHANNEL_ID_KEY)
+                .and_then(|v| v.as_str())
+        })
+        && state.ingest_ctx.store.is_followed(id)?
+    {
+        debug!(peer_url = %peer.url, %delivery_cid, channel_id = id, "dropping peer block: the channel is carried by contract");
+        return Ok(());
+    }
+    // The owner's relay names its posts in the channel by slug, which here
+    // names only channels this server orders: the same drop, before ingest
+    // refuses each one as naming an unknown channel.
+    if let Some(kind) = manifest.kind
+        && kind != BlockKind::ChannelCreate
+        && !manifest
+            .metadata
+            .contains_key(jig_pipeline::ingest::CHANNEL_ID_KEY)
+        && let Some(slug) = jig_pipeline::ingest::channel_slug_of(kind, &manifest)
+        && let Some(carried) = state.ingest_ctx.store.carried_channel_by_slug(slug)?
+        && jig_pipeline::effect::canonical_did_string(&carried.sequencer_did)
+            == jig_pipeline::effect::canonical_did_string(&peer.expected_did)
+        && state.ingest_ctx.store.is_followed(&carried.id)?
+    {
+        debug!(peer_url = %peer.url, %delivery_cid, channel_id = %carried.id, "dropping peer block: the channel is carried by contract");
+        return Ok(());
+    }
     if let Some(kind) = manifest.kind
         && let Some(named) = jig_pipeline::ingest::channel_id_of(
             &state.ingest_ctx.store,
@@ -955,6 +1007,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
         state
@@ -1060,6 +1113,7 @@ mod tests {
                     suite: suite.into(),
                     sequencer_did: String::new(),
                     co_owners: Vec::new(),
+                    tiering: jig_pipeline::persist::ChannelTiering::current(visibility, suite),
                 })
                 .unwrap();
             let secret: [u8; 32] = rand::random();
@@ -1341,6 +1395,7 @@ mod tests {
                 suite: "none".into(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
         let stranger = ed25519_dalek::SigningKey::from_bytes(&rand::random());
@@ -1390,6 +1445,7 @@ mod tests {
                 suite: "none".into(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
 

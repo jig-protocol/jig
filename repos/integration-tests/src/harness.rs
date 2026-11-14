@@ -106,6 +106,15 @@ impl TestJigServer {
         Self::start().await
     }
 
+    /// Start a server that copies the channels its peers create, under
+    /// `[federation] naively_accept_peer_relayed_creates`: the legacy relay's
+    /// behaviour, for tests of that relay.
+    pub async fn start_copying_peers_channels() -> Result<Self> {
+        let mut config = base_config()?;
+        config.federation.naively_accept_peer_relayed_creates = true;
+        Self::start_with_config(config).await
+    }
+
     /// Start in nameserver mode pointed at the given NS. `alias_suffix` is
     /// the `.jig` namespace the NS is authoritative for (e.g. `"dj.jig"`).
     pub async fn start_with_nameserver(ns: &TestNameserver, _alias_suffix: &str) -> Result<Self> {
@@ -166,7 +175,10 @@ impl TestJigServer {
         let state = Arc::new(jig_server::v0_0_2::AppState::new(
             config,
             db_path,
-            Default::default(),
+            jig_server::runtime::ExecutionConfig {
+                timeout_ms: TEST_RENDER_TIMEOUT_MS,
+                ..Default::default()
+            },
         )?);
         let server_did_string = state.server_did.to_did_jig_string();
 
@@ -280,6 +292,7 @@ impl TestJigServer {
                 suite: "none".to_string(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })?;
         Ok(id)
     }
@@ -304,6 +317,7 @@ impl TestJigServer {
             suite: "none".to_string(),
             sequencer_did: String::new(),
             co_owners: Vec::new(),
+            tiering: jig_pipeline::persist::ChannelTiering::current("restricted", "none"),
         })?;
         store.upsert_membership(&jig_pipeline::persist::StoredMembership {
             channel_id: id.clone(),
@@ -328,7 +342,13 @@ impl TestJigServer {
             logical: 0,
             server_did: owner.did().clone(),
         };
-        let block = jig_client::blocks::build_channel_create(owner, slug, visibility, hlc);
+        let block = jig_client::blocks::build_channel_create(
+            owner,
+            slug,
+            visibility,
+            &self.server_did_string,
+            hlc,
+        );
         let client = reqwest::Client::new();
         let resp = client
             .post(format!("{}/api/v1/channels", self.http_url()))
@@ -363,6 +383,7 @@ impl TestJigServer {
             serde_json::json!({
                 "slug": slug,
                 "visibility": "restricted",
+                "sequencer": self.server_did_string,
                 "suite": "mls",
                 "mls_group_info": b64.encode(&created.group_info),
                 "mls_ratchet_tree": b64.encode(&created.ratchet_tree),
@@ -466,6 +487,8 @@ impl TestJigServer {
         let client = reqwest::Client::new();
         let resp = client
             .post(format!("{}/api/v1/blocks", self.http_url()))
+            // As a current client: it labels `public` channels (JEP-0014).
+            .header("jig-capabilities", "tiers")
             .json(&submission_payload(block))
             .send()
             .await
@@ -956,6 +979,14 @@ fn submission_payload(block: &BuiltBlock) -> serde_json::Value {
     })
 }
 
+/// The wall-clock deadline for each render on a test server, in ms. Fuel
+/// bounds what a render may cost; the deadline is a backstop against a slow
+/// or loaded machine, and the default (250 ms) is shorter than a render can
+/// wait for a CPU on a CI runner busy with the whole test suite. A render
+/// that ran out of time there failed its send with `RENDER_FAILED
+/// deadline-exceeded`, and the test with it.
+const TEST_RENDER_TIMEOUT_MS: u64 = 10_000;
+
 fn base_config() -> Result<JigServerConfig> {
     Ok(JigServerConfig {
         server: ServerSection {
@@ -1035,6 +1066,9 @@ fn build_legacy_routes(
                 "unsafe_options_active": state.config.unsafe_options_active(),
                 "allowed_block_kinds": state.config.server.allowed_block_kinds,
                 "peers": peers,
+                // The v0.0.2 router above pages history forward, as
+                // `jig_server::handler::server_info` advertises.
+                "history_after": true,
             }))
         }
     };

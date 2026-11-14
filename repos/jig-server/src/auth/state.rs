@@ -209,6 +209,14 @@ impl AuthState {
         self.admission.banned_dids.contains(did)
     }
 
+    /// Read both rate limits' time from `clock`: tests hold it still, so a
+    /// rate test sees exactly the configured burst and refill.
+    pub fn set_rate_clock(&self, clock: &super::rate::ManualClock) {
+        for rate in [&self.did_rate, &self.ip_rate].into_iter().flatten() {
+            rate.set_clock(clock.clone());
+        }
+    }
+
     /// Gate 2, then the DID's rate: what every read, subscription and write
     /// runs on the identity gate 1 verified. Admission first, so a refused
     /// caller spends nothing and learns nothing about its rate.
@@ -219,9 +227,7 @@ impl AuthState {
 
     fn charge_did(&self, did: &str) -> Result<(), GateOutcome> {
         match &self.did_rate {
-            Some(rate) if !rate.try_take(did, std::time::Instant::now()) => {
-                Err(GateOutcome::RateLimited)
-            }
+            Some(rate) if !rate.take(did) => Err(GateOutcome::RateLimited),
             _ => Ok(()),
         }
     }
@@ -276,7 +282,7 @@ impl AuthState {
     pub fn charge_ip(&self, ip: std::net::IpAddr) -> bool {
         self.ip_rate
             .as_ref()
-            .is_none_or(|rate| rate.try_take(&ip.to_string(), std::time::Instant::now()))
+            .is_none_or(|rate| rate.take(&ip.to_string()))
     }
 
     /// Gate 2 for `did`, which must be the identity gate 1 VERIFIED — never
@@ -375,6 +381,16 @@ impl jig_pipeline::ingest::Admission for AuthState {
     ) -> Result<(), jig_pipeline::ingest::AdmissionRefusal> {
         self.admit_relayed_and_charge(sender_did)
             .map_err(admission_refusal)
+    }
+
+    /// JEP-0014 rule 8: a `member` is a DID in the member pool (recorded, or
+    /// aged in); anyone else admission let through is a `guest`.
+    fn server_role(&self, sender_did: &str) -> jig_pipeline::ingest::ServerRole {
+        use jig_pipeline::ingest::ServerRole;
+        match self.pool_of(sender_did, chrono::Utc::now().timestamp()) {
+            Pool::Member => ServerRole::Member,
+            _ => ServerRole::Guest,
+        }
     }
 }
 
