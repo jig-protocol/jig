@@ -5,6 +5,7 @@ pub mod error;
 pub mod server;
 pub mod v0_0_2;
 pub mod v0_0_2_handles;
+pub mod v0_0_2_metrics;
 pub mod v0_0_2_policy;
 pub mod v0_0_2_pow_policy;
 #[cfg(test)]

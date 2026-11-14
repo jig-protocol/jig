@@ -870,7 +870,7 @@ names this nameserver's DID.
 **Proof-of-work.** Register, renew and rotate can carry JEP-0008
 proof-of-work, set per suffix in `[v0_0_2.nameserver.alias_suffixes.pow]`. It
 is on by default, at the recommended values: 2^20 to register, 4× more per
-letter under 5, at most 2^24, and 1 to renew or rotate. `jig` solves it;
+letter under 5 (2^24 for three letters), at most 2^26, and 1 to renew or rotate. `jig` solves it;
 `min_effort = 0` turns it off. A client asks
 `GET /v1/challenge?action=register|renew|rotate&did=&name=`, and the reply
 states the effort, signed by the nameserver (`pow_offer`). The policy's
@@ -927,8 +927,10 @@ takes nothing past that record.
 `#general`, and they were peered before the share. Clients post by channel
 name, so the federation relay lands each server's posts in the other's
 same-name channel. Share one of them, and the carried channel stalls at the
-first post the relay brought across. Two servers peered under v0.2.0-alpha.2
-that each have a `#general` will hit this on the first share of it.
+first post the relay brought across. Any two servers that each have a
+`#general` and were peered before the share will hit this on its first share,
+until relayed posts into a channel the receiving server orders are refused
+(#357).
 
 **How to confirm it.**
 
@@ -952,7 +954,7 @@ it. Deleting it does the same. Your options:
   that channel yet.
 
 A carried channel that can hold a block this server also holds elsewhere is
-planned for after v0.2.0-alpha.3.
+planned for a later release.
 
 ## Gotchas worth knowing before they cost you an evening
 
