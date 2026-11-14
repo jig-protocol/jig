@@ -38,7 +38,16 @@ use jig_core::naming::{Action, Attestation, Name};
 use serde::{Deserialize, Serialize};
 
 use crate::cmd::common::CliContext;
-use crate::cmd::ns::{Nameserver, Purpose, b64u};
+use crate::cmd::ns::{Nameserver, b64u};
+
+/// Parsed flags for `jig keys register`.
+#[derive(Debug, Clone)]
+pub struct KeysRegisterArgs {
+    /// The alias to register (`deji@dj.jig`, or bare when unambiguous).
+    pub alias: String,
+    /// Nameserver base URL.
+    pub nameserver: String,
+}
 
 /// Parsed flags for `jig keys renew`.
 #[derive(Debug, Clone)]
@@ -87,6 +96,31 @@ pub(crate) struct RotateRequestBody {
 }
 
 // ============================================================================
+// register
+// ============================================================================
+
+/// Register an alias for the active identity. `jig init --request-alias`
+/// registers the DID it has just made; this registers one that already
+/// exists, such as a DID an operator put on a closed suffix's allowlist.
+pub async fn register(ctx: &CliContext, args: KeysRegisterArgs) -> Result<()> {
+    let id = ctx.identity()?;
+    let delegations = crate::config::delegations(ctx.effective());
+    let attestation = crate::cmd::init::register_with_nameserver(
+        &id,
+        &args.alias,
+        &args.nameserver,
+        &delegations,
+    )
+    .await?;
+    let ttl_days = (attestation.valid_until - attestation.valid_from) / 86_400;
+    println!(
+        "alias attestation verified: {} (valid {ttl_days}d, ns={})",
+        attestation.alias, attestation.ns_did
+    );
+    Ok(())
+}
+
+// ============================================================================
 // renew
 // ============================================================================
 
@@ -116,7 +150,7 @@ pub async fn renew_with_nameserver(
     delegations: &jig_client::naming::Delegations,
 ) -> Result<Attestation> {
     parse_full_name(alias)?;
-    let ns = Nameserver::connect(ns_url, alias, delegations, Purpose::Keep).await?;
+    let ns = Nameserver::connect(ns_url, alias, delegations).await?;
     let name = ns.name().clone();
     let did = id.did_string();
     let full = name.as_alias();
@@ -265,7 +299,7 @@ pub async fn rotate_with_nameserver(
     delegations: &jig_client::naming::Delegations,
 ) -> Result<Result<Attestation>> {
     parse_full_name(alias)?;
-    let ns = Nameserver::connect(ns_url, alias, delegations, Purpose::Keep).await?;
+    let ns = Nameserver::connect(ns_url, alias, delegations).await?;
     let name = ns.name().clone();
     let (old_did, new_did) = (old_id.did_string(), new_id.did_string());
     let full = name.as_alias();

@@ -5,9 +5,10 @@
 //! for this server and itself, signed with its key. The proof is recorded and
 //! the DID is known from then on.
 //!
-//! The work is JEP-0008's `admit` puzzle (`{did, pow, sig_b64}`), at effort
-//! `2^pow_bits`. The legacy `jig-admission-pow-v1` form (`{did, nonce,
-//! sig_b64}`) is accepted for one release ([`jig_core::admission_pow`]).
+//! The work is JEP-0008's `admit` puzzle (`{did, pow, sig_b64}`), at the
+//! effort the admission controller asks ([`crate::auth::admission_effort`]).
+//! The legacy `jig-admission-pow-v1` form (`{did, nonce, sig_b64}`) is
+//! accepted for one release ([`jig_core::admission_pow`]).
 //! Either way the work is checked before the signature (JEP-0008 rule 10).
 
 use std::sync::Arc;
@@ -18,6 +19,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use jig_core::admission_pow;
 use serde::{Deserialize, Serialize};
 
+use crate::auth::admission_effort::bits_at_least;
 use crate::v0_0_2::AppState;
 use crate::v0_0_2_blocks::ErrorBody;
 
@@ -35,14 +37,10 @@ pub struct AdmissionStatus {
     pub proven: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pow_bits: Option<u8>,
-    /// The same work as a JEP-0008 effort, `2^pow_bits`.
+    /// The exact JEP-0008 effort this server asks now. `pow_bits` is the
+    /// least bit count whose effort is at least this.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<u64>,
-}
-
-/// The effort a `pow_bits` setting asks for.
-pub fn effort(bits: Option<u8>) -> Option<u64> {
-    bits.map(|b| admission_pow::effort_for_bits(b).get())
 }
 
 /// `GET /api/v1/admission`, signed: the caller's own standing. Gate 1, then
@@ -86,11 +84,10 @@ async fn status(
         Err(crate::auth::GateOutcome::AdmissionProofRequired { .. }) => false,
         Err(outcome) => return Err(disclose(&outcome)),
     };
-    let bits = state.auth.pow_bits();
     Ok(Json(AdmissionStatus {
         proven,
-        pow_bits: bits,
-        effort: effort(bits),
+        pow_bits: state.auth.pow_bits(),
+        effort: state.auth.admission_effort().map(|e| e.get()),
         did,
     }))
 }
@@ -165,15 +162,18 @@ async fn prove(
     let did = jig_core::Did::from_ed25519_pubkey(&key_bytes).to_did_jig_string();
     let server = state.server_did.to_did_jig_string();
 
-    let bits = state.auth.pow_bits();
+    // Checked against the least effort asked within an offer's lifetime, so
+    // a rise while the client solved does not refuse it. `None`: no work has
+    // been asked lately, and none is checked or recorded.
+    let floor = state.auth.admission_floor();
 
     // The work first: one digest, before the signature or any store read
     // (JEP-0008 rule 10). Work done for another server or another key fails
     // here, whoever signed it.
-    if let Some(bits) = bits {
+    if let Some(floor) = floor {
         match &proof {
             Proof::Pow { pow, .. } => admission_pow::puzzle(&server, &did)
-                .check(pow, admission_pow::effort_for_bits(bits))
+                .check(pow, floor)
                 .map_err(|e| {
                     refuse(
                         StatusCode::BAD_REQUEST,
@@ -182,6 +182,7 @@ async fn prove(
                     )
                 })?,
             Proof::Legacy { nonce, .. } => {
+                let bits = bits_at_least(floor);
                 if !admission_pow::meets(&server, &did, nonce, bits) {
                     return Err(refuse(
                         StatusCode::BAD_REQUEST,
@@ -198,7 +199,7 @@ async fn prove(
             admission_pow::proof_message(&server, &did, pow),
         ),
         Proof::Legacy { nonce, .. } => (
-            bits.unwrap_or(0),
+            floor.map_or(0, bits_at_least),
             admission_pow::signed_message(&server, &did, nonce),
         ),
     };
@@ -234,15 +235,17 @@ async fn prove(
         ));
     }
 
-    // A server that asks for no work records none and needs none.
-    let Some(bits) = bits else {
+    // A server that asks for no work records none and needs none: a proof
+    // recorded while idle would let anyone stock proven keys for free ahead
+    // of a flood.
+    if floor.is_none() {
         return Ok(Json(AdmissionStatus {
             proven: state.auth.proven(&did),
             pow_bits: None,
             effort: None,
             did,
         }));
-    };
+    }
 
     state.auth.record_proof(&did, proof_bits).map_err(|e| {
         tracing::error!(
@@ -259,7 +262,7 @@ async fn prove(
     Ok(Json(AdmissionStatus {
         did,
         proven: true,
-        pow_bits: Some(bits),
-        effort: effort(Some(bits)),
+        pow_bits: state.auth.pow_bits(),
+        effort: state.auth.admission_effort().map(|e| e.get()),
     }))
 }

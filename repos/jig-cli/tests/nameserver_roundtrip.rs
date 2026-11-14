@@ -1,4 +1,4 @@
-//! `jig init --request-alias`, `jig keys renew` and `jig keys rotate` against
+//! `jig init --request-alias`, `jig keys register`, `renew` and `rotate` against
 //! a real `jig-nameserver`.
 //!
 //! The CLI and the nameserver sign and check each other's proofs and
@@ -149,6 +149,34 @@ async fn register_renew_and_rotate_against_the_real_nameserver() {
     let keys = home.path().join(".jig").join("keys");
     assert!(keys.join(format!("{second}.jigkey")).exists());
     assert!(keys.join(format!("{first}.jigkey.rotated")).exists());
+}
+
+/// `jig keys register` registers the identity `jig init` already made, not a
+/// new one: the way a DID a closed suffix's allowlist names gets its name.
+#[tokio::test(flavor = "multi_thread")]
+async fn keys_register_names_the_existing_identity() {
+    let ns = TestNameserver::start_tls_with_suffix("dj.jig")
+        .await
+        .unwrap();
+    let url = ns.http_url();
+    let name = format!("deji@{}", ns.alias_suffix);
+    let home = tempfile::tempdir().unwrap();
+    let (ok, out) = jig(home.path(), &["init", "dj"]).await;
+    assert!(ok, "{out}");
+    let did = configured_did(home.path());
+
+    let (ok, out) = jig(
+        home.path(),
+        &["keys", "register", &name, "--nameserver", &url],
+    )
+    .await;
+    assert!(ok, "jig keys register: {out}");
+    assert!(
+        out.contains(&format!("alias attestation verified: {name}")),
+        "{out}"
+    );
+    assert_eq!(resolved(&ns, &name).await.did, did, "the existing DID");
+    assert_eq!(configured_did(home.path()), did, "no new identity");
 }
 
 #[tokio::test(flavor = "multi_thread")]

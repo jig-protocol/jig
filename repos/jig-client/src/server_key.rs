@@ -34,13 +34,14 @@ pub enum ServerKeyError {
         "{path:?} is a raw {role} key, stored in clear, and keys are now sealed. Seal it in \
          place with `{tool} keys seal --keyfile {path:?} --slot credential:PATH` (or --slot \
          env:NAME, or --slot passphrase with JIG_KEY_PASSPHRASE set): the {role} keeps its DID, \
-         and the raw file is removed. Then set [keys] unlock to the same slot. Or set [keys] \
-         storage = \"plaintext\" to keep running it in clear"
+         and the raw file is removed. Then set {section} unlock to the same slot. Or set \
+         {section} storage = \"plaintext\" to keep running it in clear"
     )]
     RawRefused {
         path: PathBuf,
         role: &'static str,
         tool: &'static str,
+        section: &'static str,
     },
     #[error(
         "{raw:?} and {sealed:?} both exist, and neither is used while both are there: {verdict}"
@@ -53,17 +54,22 @@ pub enum ServerKeyError {
     #[error("{0:?} already exists; it is never overwritten")]
     Exists(PathBuf),
     #[error(
-        "no {role} key at {path:?}, and nothing to seal a new one with: set [keys] unlock to \
-         credential:PATH, env:NAME or passphrase, or set JIG_KEY_UNLOCK or JIG_KEY_PASSPHRASE"
+        "no {role} key at {path:?}, and nothing to seal a new one with: set {section} unlock \
+         to credential:PATH, env:NAME or passphrase, or set JIG_KEY_UNLOCK or JIG_KEY_PASSPHRASE"
     )]
-    NoWayToSeal { role: &'static str, path: PathBuf },
+    NoWayToSeal {
+        role: &'static str,
+        path: PathBuf,
+        section: &'static str,
+    },
     #[error(
         "cannot open the {role} key at {path:?}: it has {slots}, and nothing offered opens \
-         one. Set [keys] unlock, JIG_KEY_UNLOCK or JIG_KEY_PASSPHRASE for one of them{skipped}"
+         one. Set {section} unlock, JIG_KEY_UNLOCK or JIG_KEY_PASSPHRASE for one of them{skipped}"
     )]
     Locked {
         role: &'static str,
         path: PathBuf,
+        section: &'static str,
         slots: String,
         /// For an operator command: what was configured but could not be read.
         skipped: String,
@@ -103,9 +109,14 @@ pub enum ServerKeyError {
     BadLink { path: PathBuf, reason: String },
     #[error(
         "{path:?} is outside $CREDENTIALS_DIRECTORY ({dir:?}): under a unit with credentials, \
-         [keys] unlock names one of them, not a file beside the key"
+         {named_by} names one of them, not a file beside the key"
     )]
-    NotACredential { path: PathBuf, dir: PathBuf },
+    NotACredential {
+        path: PathBuf,
+        dir: PathBuf,
+        /// What named the file: `[keys] unlock`, `JIG_KEY_UNLOCK`, ...
+        named_by: &'static str,
+    },
     #[error("keyfile {path:?} has insecure permissions {mode:o} (must be 0600)")]
     InsecurePermissions { path: PathBuf, mode: u32 },
     #[error("keyfile {path:?} is malformed: expected 32 bytes, got {len}")]
@@ -133,19 +144,50 @@ pub struct ServerKeyOptions {
     pub role: &'static str,
     /// The binary an operator runs to seal a key: `jig-server`, `jig-nameserver`.
     pub tool: &'static str,
-    /// `[keys] unlock`.
+    /// Where this binary's config keeps `unlock` and `storage`, for messages.
+    pub section: KeysTable,
+    /// `unlock` in [`Self::section`].
     pub unlock: Option<String>,
-    /// `[keys] storage = "plaintext"`: run with a raw key, warning on every boot.
+    /// `storage = "plaintext"` in [`Self::section`]: run with a raw key,
+    /// warning on every boot.
     pub plaintext: bool,
     /// Argon2id cost for a new passphrase slot.
     pub kdf: KdfParams,
 }
 
+/// The config table that holds a binary's key settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeysTable {
+    /// jig-server's `[keys]`.
+    Keys,
+    /// jig-nameserver's `[v0_0_2.keys]`.
+    V002Keys,
+}
+
+impl KeysTable {
+    pub fn name(self) -> &'static str {
+        match self {
+            KeysTable::Keys => "[keys]",
+            KeysTable::V002Keys => "[v0_0_2.keys]",
+        }
+    }
+
+    /// Its `unlock` key, as messages name it.
+    pub fn unlock(self) -> &'static str {
+        match self {
+            KeysTable::Keys => "[keys] unlock",
+            KeysTable::V002Keys => "[v0_0_2.keys] unlock",
+        }
+    }
+}
+
 impl ServerKeyOptions {
+    /// Options for a binary whose key settings are in `[keys]`.
     pub fn new(role: &'static str, tool: &'static str) -> Self {
         Self {
             role,
             tool,
+            section: KeysTable::Keys,
             unlock: None,
             plaintext: false,
             kdf: KdfParams::default(),
@@ -268,7 +310,11 @@ fn credential_path(path: &str, source: &'static str, used: Use) -> Result<PathBu
                     dir.canonicalize().is_ok_and(|dir| real.starts_with(dir))
                 }) =>
             {
-                return Err(ServerKeyError::NotACredential { path: given, dir });
+                return Err(ServerKeyError::NotACredential {
+                    path: given,
+                    dir,
+                    named_by: source,
+                });
             }
             Some(_) => {}
             None => tracing::warn!(
@@ -291,7 +337,7 @@ fn configured(opts: &ServerKeyOptions, used: Use) -> Result<(Vec<Spec>, String)>
     let given = opts
         .unlock
         .iter()
-        .map(|s| ("[keys] unlock", s.clone()))
+        .map(|s| (opts.section.unlock(), s.clone()))
         .chain(
             std::env::var("JIG_KEY_UNLOCK")
                 .ok()
@@ -329,6 +375,7 @@ fn open_with(
         KeystoreError::NoSlotOpened => ServerKeyError::Locked {
             role: opts.role,
             path: path.to_path_buf(),
+            section: opts.section.name(),
             slots: describe_slots(&key.slots()),
             skipped,
         },
@@ -412,6 +459,7 @@ pub fn load_or_create(path: &Path, opts: &ServerKeyOptions) -> Result<SigningKey
             path: raw.to_path_buf(),
             role: opts.role,
             tool: opts.tool,
+            section: opts.section.name(),
         }),
         (false, None) if opts.plaintext => {
             let raw = raw.unwrap_or(path);
@@ -1516,6 +1564,7 @@ fn create_sealed(path: &Path, opts: &ServerKeyOptions) -> Result<SigningKey> {
         .ok_or_else(|| ServerKeyError::NoWayToSeal {
             role: opts.role,
             path: path.to_path_buf(),
+            section: opts.section.name(),
         })?;
     let signing = jig_core::crypto::ed25519::generate_signing_key();
     let seed = Zeroizing::new(signing.to_bytes());
@@ -1603,8 +1652,9 @@ fn read_raw_seed(path: &Path) -> Result<Zeroizing<[u8; 32]>> {
 
 fn warn_plaintext(path: &Path, opts: &ServerKeyOptions) {
     tracing::warn!(
-        "[keys] storage = \"plaintext\": the {} key at {} is stored in clear. Anyone who can \
+        "{} storage = \"plaintext\": the {} key at {} is stored in clear. Anyone who can \
          read the file or a backup of it can sign as this {}. Seal it with `{} keys seal`",
+        opts.section.name(),
         opts.role,
         path.display(),
         opts.role,
@@ -1660,6 +1710,27 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::write(path, seed).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// Each binary's messages name the table its own config keeps the key
+    /// settings in: a nameserver's strict config refuses a `[keys]` table.
+    #[cfg(unix)]
+    #[test]
+    fn messages_name_the_binarys_own_keys_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("raw.key");
+        write_raw(&raw, [3; 32]);
+        for (table, named, other) in [
+            (KeysTable::Keys, "[keys]", "[v0_0_2.keys]"),
+            (KeysTable::V002Keys, "[v0_0_2.keys]", "set [keys]"),
+        ] {
+            let mut opts = opts(None);
+            opts.section = table;
+            let err = load_or_create(&raw, &opts).unwrap_err().to_string();
+            assert!(err.contains(&format!("set {named} unlock")), "{err}");
+            assert!(err.contains(&format!("{named} storage")), "{err}");
+            assert!(!err.contains(other), "{err}");
+        }
     }
 
     #[test]
