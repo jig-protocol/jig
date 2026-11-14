@@ -773,17 +773,17 @@ a high-sec ruleset group, cross-checked.
   later post (`channels.suite`,
   [`jig-pipeline/src/mls_gate.rs`](../../repos/jig-pipeline/src/mls_gate.rs),
   [spec: Encryption](../../repos/jig-spec/src/encryption.md#channels)).
-- **Partial: only open, unencrypted channels federate.** `DeliveryPolicy::federates` is true
-  only for an open channel with suite `none`
-  ([`jig-pipeline/src/fanout.rs`](../../repos/jig-pipeline/src/fanout.rs)). Restricted and
-  encrypted channels' blocks never leave their server, and a relayed block for a local
-  restricted or encrypted channel is refused.
-- **Built: relayed blocks pass the gates a local block passes, with two exceptions.** A
+- **Partial: a channel reaches another server only by a share.** Under the federation
+  contract (JEP-0005, JEP-0014) a `shared` channel is carried as ciphertext, and `private`
+  and `server` channels never leave the server that orders them. The legacy relay carries
+  only open, unencrypted channels (`DeliveryPolicy::federates`,
+  [`jig-pipeline/src/fanout.rs`](../../repos/jig-pipeline/src/fanout.rs)), and a relayed
+  block for a local channel that does not federate is refused.
+- **Built: relayed blocks pass the gates a local block passes, with one exception.** A
   relayed block runs through `ingest` like a local submission: author signature, version and
   suite gates, admission, the write gate, effects, and the receiving server's own execution
-  and receipt (OP-09). Its author is not asked for admission proof-of-work, and a relayed
-  `text-render` may name a channel the receiving server has no record of. Only open, unencrypted channels federate because the federation contract (D12)
-  does not yet say how one MLS group spans two servers.
+  and receipt (OP-09). Its author is not asked for admission proof-of-work. A relayed
+  `channel-create` that names another server as its sequencer is refused.
 - **Built: peers are pinned and listed.** A server accepts relayed blocks only over a
   connection it dialed to a listed peer whose welcome is signed by that peer's configured
   DID, and only listed peers may subscribe to its federation stream. Peer connections use
@@ -1301,7 +1301,7 @@ gap.
 | Security levels belong to servers and ruleset groups; servers declare their ruleset, signed | Partial: per-server building blocks; no declaration | Ruleset document, declaration in the welcome, joining and leaving |
 | High-sec nameservers cross-register; no single nameserver decides a group-wide claim | None: nameservers do not coordinate | Replicated registry, thresholds, operator independence (NS-03) |
 | Anchors are opt-in with no veto (D19) | None | Structural "no veto"; anchor replacement |
-| Federation is a data contract fixing the channel's suite (D12) | Partial: suite fixed per channel; relay of open, unencrypted channels only | Contract contents and signed acceptance |
+| Federation is a data contract fixing the channel's suite (D12) | Partial: suite fixed per channel; channels cross only by a share, `shared` ones as ciphertext | Contract contents and signed acceptance |
 | One owning server per channel (D24) | None: each server keeps its own channel state | Cross-server writes: survey XMPP MUC, IRC, Matrix, ActivityPub groups |
 | A peer is a transport; relayed blocks pass every gate | Built: relayed blocks run through `ingest` and the write gate (authors not asked for admission proof-of-work); peers listed and pinned in configuration | Peer DID in the contract; per-peer limits |
 | Pluggable suites, MLS default and first (D1, D13) | Built: MLS per channel; validating delivery service | Non-MLS plug-in shape (D13); per-suite conformance |

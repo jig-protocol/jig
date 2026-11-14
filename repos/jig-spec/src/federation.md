@@ -5,14 +5,15 @@
 > **Mostly not implemented: most of this page's MUSTs are unbuilt.** The reference server
 > federates by dialing the peers its configuration lists, over TLS by default, and refuses
 > a welcome not signed by the DID configured for that peer. [Relayed Blocks](#relayed-blocks)
-> is implemented, with two exceptions: a relayed block's author is not asked for admission
-> proof-of-work, and a relayed `text-render` may name a channel this server does not have. Not built: DNS SRV
+> is implemented, with one exception: a relayed block's author is not asked for admission
+> proof-of-work. Not built: DNS SRV
 > discovery, X.509 mutual TLS, the signed per-message federation envelope, reputation
 > tiers, receipt exchange and billing, retry backoff and per-peer quotas. The `.well-known`
 > document below is not the real one (see
-> [Transports](transports.md#server-certificates)). Only open, unencrypted channels
-> federate until the federation data contract (D12) is specified. This page is being
-> rewritten under JEP-0005 (the channel contract).
+> [Transports](transports.md#server-certificates)). A channel reaches another server
+> only by a share under the channel contract (JEP-0005, JEP-0014): a `shared` channel is
+> carried as ciphertext, and `private` and `server` channels never leave their server. This
+> page is being rewritten under JEP-0005.
 
 ---
 
