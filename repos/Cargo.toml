@@ -78,7 +78,7 @@ multihash-codetable = { version = "0.2", default-features = false, features = ["
 # Storage
 # Bundled SQLite 3.54.1 (libsqlite3-sys 0.39). Nothing else in the graph `links = "sqlite3"`,
 # so this pin no longer has to track another crate's libsqlite3-sys.
-rusqlite = { version = "0.41", features = ["bundled"] }
+rusqlite = { version = "0.42", features = ["bundled"] }
 
 # CLI
 clap = { version = "4.0", features = ["derive", "env"] }
