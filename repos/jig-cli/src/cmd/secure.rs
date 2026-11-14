@@ -7,10 +7,12 @@
 //! after the server accepts the block carrying it, and dropped if it refuses.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use jig_client::blocks::BuiltBlock;
+use jig_client::chain::{ChannelChain, Step};
 use jig_client::limits;
 use jig_client::open::open;
 use jig_client::pins::{
@@ -167,6 +169,98 @@ pub struct Synced {
     pub deliveries: Vec<String>,
 }
 
+/// Which page of a channel's history to fetch.
+#[derive(Clone, Copy)]
+enum Page<'a> {
+    /// The newest blocks.
+    Newest,
+    /// The blocks just older than this one.
+    Before(&'a str),
+    /// The blocks just newer than this one.
+    After(&'a str),
+}
+
+/// What a replay has found so far, over one page of history or several.
+#[derive(Default)]
+struct Replayed {
+    lines: Vec<DecodedBlock>,
+    /// Members who left and may need tidying, until one is seen back.
+    left: Vec<String>,
+    cids: std::collections::HashSet<String>,
+    deliveries: Vec<String>,
+}
+
+/// How a forward walk through history ended.
+enum Forwarded {
+    /// At the newest block.
+    Done(Replayed),
+    /// At a page that does not continue from `head`, the last block read,
+    /// for `why`. Everything up to `head` is in `replayed`.
+    Broken {
+        replayed: Replayed,
+        head: String,
+        why: String,
+    },
+    /// At history with no sequencer records, from `head` on: it is ordered
+    /// by its authors' clocks, so a message can come after the commits that
+    /// left its epoch, and only replaying it with them puts it back in MLS
+    /// order ([`replay_order`]). A page at a time could seal it for good.
+    Unsequenced { replayed: Replayed, head: String },
+}
+
+/// Hold `page` to `chain`: each block's record must be the next one after
+/// the chain's head. Moves the head along as it goes.
+fn continues(chain: &mut ChannelChain, page: &[DeliveredBlock]) -> Result<(), String> {
+    for d in page {
+        let Some(record) = &d.ingest else {
+            return Err(format!("block {} has no sequencer record", d.delivery_cid));
+        };
+        let cid = open(d).ok().map(|o| o.cid);
+        match chain.accept(record, cid.as_deref()) {
+            Ok(Step::Next) => {}
+            Ok(Step::Gap { from, to }) => {
+                return Err(format!("records {from} to {} are missing", to - 1));
+            }
+            Ok(Step::Behind) => {
+                return Err(format!("record {} is not after this device's", record.seq));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(())
+}
+
+/// Who may sign `channel_id`'s records on `server`, for [`ChannelChain`]: a
+/// channel the server carries for its owner is held to the owner, the DID
+/// its pin proved (`Pins::anchor_channel`), as `jig read` holds it, never
+/// to the server. Any other channel is held to the server's DIDs along the
+/// key links pinned for it, or to the record's own signer when nothing is
+/// pinned.
+fn sequencers_for(
+    pins: Option<&Pins>,
+    server: &str,
+    channel_id: &str,
+    record_sequencer: &str,
+) -> Vec<String> {
+    if let Some(owner) = pins.and_then(|p| p.carried(server).remove(channel_id)) {
+        return vec![owner];
+    }
+    let pinned = pins
+        .and_then(|p| p.server(server).map(|s| s.sequencers()))
+        .unwrap_or_default();
+    if pinned.is_empty() {
+        vec![record_sequencer.to_string()]
+    } else {
+        pinned
+    }
+}
+
+/// Where the block `cid` is in `page`, if it is.
+fn position_of(page: &[DeliveredBlock], cid: &str) -> Option<usize> {
+    page.iter()
+        .position(|d| open(d).is_ok_and(|o| o.cid == cid))
+}
+
 /// One identity's encrypted-channel state, bound to one server.
 pub struct Secure {
     pub session: Arc<Session>,
@@ -178,6 +272,11 @@ pub struct Secure {
     /// Set once this process has held the server to its pin
     /// ([`Self::ensure_pinned`]).
     pinned: tokio::sync::OnceCell<()>,
+    /// Whether the server advertises paging history forward (`after=`),
+    /// once asked ([`Self::pages_forward`]).
+    forward: tokio::sync::OnceCell<bool>,
+    /// Set when a forward page broke the chain: not again this process.
+    forward_broken: std::sync::atomic::AtomicBool,
 }
 
 impl Secure {
@@ -191,6 +290,8 @@ impl Secure {
             base: base_http_url(&server),
             server,
             pinned: tokio::sync::OnceCell::new(),
+            forward: tokio::sync::OnceCell::new(),
+            forward_broken: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -537,32 +638,252 @@ impl Secure {
     /// pages until history reaches back to this device's epoch
     /// ([`history_reaches`]) or to the start of the channel.
     pub async fn sync(&self, slug: &str) -> Result<Synced> {
-        let delivered = match self.session.head(&self.server, slug)? {
-            Some(head) => self.since(slug, &head).await?,
-            None => self.newest_to_epoch(slug).await?,
+        let Some(head) = self.session.head(&self.server, slug)? else {
+            let delivered = self.newest_to_epoch(slug).await?;
+            return self.process(slug, &delivered);
         };
-        let synced = self.replay(slug, &delivered);
-        if let Some(newest) = delivered.iter().rev().find_map(|d| open(d).ok()) {
-            self.session.set_head(&self.server, slug, &newest.cid)?;
+        // Usually the device is a few blocks behind, if any.
+        let newest = self
+            .history_page(slug, SINCE_HEAD_FIRST_PAGE, Page::Newest)
+            .await?;
+        if let Some(at) = position_of(&newest, &head) {
+            return self.process(slug, &newest[at + 1..]);
         }
+        if !self.pages_forward().await? {
+            let delivered = self.back_to(slug, &head, newest).await?;
+            return self.process(slug, &delivered);
+        }
+        match self.forward_from(slug, &head).await? {
+            Forwarded::Done(replayed) => Ok(self.finish(slug, replayed)),
+            Forwarded::Broken {
+                mut replayed,
+                head,
+                why,
+            } => {
+                eprintln!(
+                    "warning: {}'s history of {slug} does not continue from this device's \
+                     last block ({why}); reading it back instead",
+                    self.server
+                );
+                // Not again in this process: a server that advertises `after`
+                // and breaks it costs a little time, never a message.
+                self.forward_broken.store(true, Ordering::Relaxed);
+                self.read_back(slug, &mut replayed, &head).await?;
+                Ok(self.finish(slug, replayed))
+            }
+            Forwarded::Unsequenced { mut replayed, head } => {
+                self.read_back(slug, &mut replayed, &head).await?;
+                Ok(self.finish(slug, replayed))
+            }
+        }
+    }
+
+    /// Read what came after `head` the way a server without `after` is read
+    /// (#348), all at once, into `replayed`, and move the head past it.
+    async fn read_back(&self, slug: &str, replayed: &mut Replayed, head: &str) -> Result<()> {
+        let newest = self
+            .history_page(slug, SINCE_HEAD_FIRST_PAGE, Page::Newest)
+            .await?;
+        let delivered = match position_of(&newest, head) {
+            Some(at) => newest[at + 1..].to_vec(),
+            None => self.back_to(slug, head, newest).await?,
+        };
+        self.replay_into(slug, replayed, &delivered);
+        self.move_head(slug, &delivered)
+    }
+
+    /// Replay `delivered` and move the head to its newest block.
+    fn process(&self, slug: &str, delivered: &[DeliveredBlock]) -> Result<Synced> {
+        let synced = self.replay(slug, delivered);
+        self.move_head(slug, delivered)?;
         Ok(synced)
     }
 
-    /// The blocks after `head`, oldest first. Pages back until a page holds
-    /// `head`: never on a page's length, which a server's byte budget can cut
-    /// short.
-    async fn since(&self, slug: &str, head: &str) -> Result<Vec<DeliveredBlock>> {
-        let at_head = |page: &[DeliveredBlock]| {
-            page.iter()
-                .position(|d| open(d).is_ok_and(|o| o.cid == head))
+    /// Move the head to the newest block of `delivered`, with its record.
+    fn move_head(&self, slug: &str, delivered: &[DeliveredBlock]) -> Result<()> {
+        if let Some((d, newest)) = delivered
+            .iter()
+            .rev()
+            .find_map(|d| open(d).ok().map(|o| (d, o)))
+        {
+            self.session
+                .set_head(&self.server, slug, &newest.cid, d.ingest.as_ref())?;
+        }
+        Ok(())
+    }
+
+    /// Read forward from `head` a page at a time, oldest first, until a page
+    /// comes back empty. Each page is processed and the head moved past it
+    /// before the next is fetched, so one page is held at a time and a sync
+    /// cut short resumes where it stopped. No cap on how far: nothing is
+    /// skipped however long the device was away.
+    ///
+    /// The server's word that it pages forward is unsigned, so every page is
+    /// held to the chain from the head before any of it is read: on a
+    /// sequenced channel each record must be the next one
+    /// ([`ChannelChain::accept`]). Where the head has no record (history from
+    /// before records, or a head an older build saved), the block a page
+    /// starts after must be the cursor, asked for with `before=` ([`Self::
+    /// follows`]); once a page's newest block has a record, the chain holds
+    /// the rest. A page that fails either ends the walk as
+    /// [`Forwarded::Broken`], from the last block read.
+    ///
+    /// Each page is put in MLS order on its own ([`replay_order`]). A message
+    /// whose epoch's commit ended the page before is still read: openmls
+    /// keeps past epochs (`max_past_epochs`).
+    async fn forward_from(&self, slug: &str, head: &str) -> Result<Forwarded> {
+        let mut replayed = Replayed::default();
+        let mut cursor = head.to_string();
+        let mut chain = self.chain_from_head(slug)?;
+        loop {
+            let broken = |replayed, why: String| Forwarded::Broken {
+                replayed,
+                head: cursor.clone(),
+                why,
+            };
+            let page = match self
+                .history_page(slug, MAX_HISTORY_PAGE, Page::After(&cursor))
+                .await
+            {
+                Ok(page) => page,
+                Err(e)
+                    if e.downcast_ref::<Refused>()
+                        .is_some_and(|r| r.code == "BAD_CURSOR") =>
+                {
+                    return Ok(broken(replayed, "it does not know that block".into()));
+                }
+                Err(e) => return Err(e),
+            };
+            if page.is_empty() {
+                return Ok(Forwarded::Done(replayed));
+            }
+            let continued = match chain.as_mut() {
+                Some(chain) => continues(chain, &page),
+                None if position_of(&page, &cursor).is_some() => {
+                    Err("a page after a block holds that block".to_string())
+                }
+                None => match self.follows(slug, &cursor, &page).await? {
+                    // The cursor's own record, from the server: the chain
+                    // starts there and holds this page as it would have.
+                    Ok(Some(mut anchored)) => {
+                        let held = continues(&mut anchored, &page);
+                        chain = Some(anchored);
+                        held
+                    }
+                    // No records to page by: read it back, as one replay.
+                    Ok(None) => {
+                        return Ok(Forwarded::Unsequenced {
+                            replayed,
+                            head: cursor,
+                        });
+                    }
+                    Err(why) => Err(why),
+                },
+            };
+            if let Err(why) = continued {
+                return Ok(broken(replayed, why));
+            }
+            // Whatever the chain says, a walk forward never meets a block
+            // twice: one that does would never end.
+            if page
+                .iter()
+                .any(|d| open(d).is_ok_and(|o| replayed.cids.contains(&o.cid)))
+            {
+                return Ok(broken(
+                    replayed,
+                    "a page repeats blocks already read".into(),
+                ));
+            }
+            self.replay_into(slug, &mut replayed, &page);
+            let Some(last) = page.iter().rev().find_map(|d| open(d).ok()) else {
+                return Ok(Forwarded::Done(replayed));
+            };
+            self.move_head(slug, &page)?;
+            cursor = last.cid;
+            if chain.is_none() {
+                chain = self.chain_from_head(slug)?;
+            }
+        }
+    }
+
+    /// The channel's chain as this device last read it, from its head's
+    /// record: `None` where the head has none.
+    fn chain_from_head(&self, slug: &str) -> Result<Option<ChannelChain>> {
+        Ok(self
+            .session
+            .head_record(&self.server, slug)?
+            .and_then(|h| h.record.clone().map(|r| (h, r)))
+            .map(|(h, r)| ChannelChain::across(&r.channel_id, self.sequencers(&r), Some(h))))
+    }
+
+    /// Whether `page` starts right after `cursor`, with no chain on this
+    /// device to say so: the block just before the page's first must be
+    /// `cursor`. A server that ignored `after` and sent a later page fails
+    /// this.
+    ///
+    /// That alone shows only that the server answers consistently: one that
+    /// skips a block can name the cursor as the block before. So when the
+    /// cursor comes back with its record, the record must be the cursor's
+    /// and signed by the channel's sequencer ([`sequencers_for`]), and the
+    /// chain anchored on it is returned for the page to be held to. With no
+    /// record, `None`: the history has none to page by, and is read back.
+    async fn follows(
+        &self,
+        slug: &str,
+        cursor: &str,
+        page: &[DeliveredBlock],
+    ) -> Result<Result<Option<ChannelChain>, String>> {
+        let Some(first) = page.first().and_then(|d| open(d).ok()) else {
+            return Ok(Err("a page's first block does not open".into()));
         };
-        let mut delivered = self.history_page(slug, SINCE_HEAD_FIRST_PAGE, None).await?;
-        let mut found = at_head(&delivered);
+        let before = match self.history_page(slug, 1, Page::Before(&first.cid)).await {
+            Ok(before) => before,
+            Err(e)
+                if e.downcast_ref::<Refused>()
+                    .is_some_and(|r| r.code == "BAD_CURSOR") =>
+            {
+                return Ok(Err("it does not know a block it sent".into()));
+            }
+            Err(e) => return Err(e),
+        };
+        let Some(at) = position_of(&before, cursor) else {
+            return Ok(Err("a page after a block does not start after it".into()));
+        };
+        let Some(record) = &before[at].ingest else {
+            return Ok(Ok(None));
+        };
+        let mut chain = ChannelChain::across(&record.channel_id, self.sequencers(record), None);
+        match chain.accept_live(record, Some(cursor)) {
+            Ok(_) => Ok(Ok(Some(chain))),
+            Err(e) => Ok(Err(format!(
+                "the record it sent for this device's last block: {e}"
+            ))),
+        }
+    }
+
+    /// The DIDs the sequencer that signed `record` has signed as, along the
+    /// key links this device follows; at least `record`'s own.
+    fn sequencers(&self, record: &jig_client::chain::IngestRecord) -> Vec<String> {
+        let pins = Pins::load(&Pins::default_path()).ok();
+        sequencers_for(
+            pins.as_ref(),
+            &self.server,
+            &record.channel_id,
+            &record.sequencer,
+        )
+    }
+
+    /// The blocks after `head`, oldest first, for a server that cannot page
+    /// forward: pages back from `newest` until a page holds `head`. Never
+    /// stops on a page's length, which a server's byte budget can cut short.
+    async fn back_to(
+        &self,
+        slug: &str,
+        head: &str,
+        mut delivered: Vec<DeliveredBlock>,
+    ) -> Result<Vec<DeliveredBlock>> {
         let mut pages = 1;
         loop {
-            if let Some(at) = found {
-                return Ok(delivered.split_off(at + 1));
-            }
             if pages == MAX_CATCH_UP_PAGES {
                 // About ten thousand blocks: past that, the blocks before
                 // this window are skipped, and MLS will refuse them later.
@@ -579,7 +900,7 @@ impl Secure {
                 return Ok(delivered);
             };
             let mut older = self
-                .history_page(slug, MAX_HISTORY_PAGE, Some(&oldest.cid))
+                .history_page(slug, MAX_HISTORY_PAGE, Page::Before(&oldest.cid))
                 .await?;
             if older.is_empty() {
                 // The head is not in this history: the server dropped it, or
@@ -592,17 +913,38 @@ impl Secure {
             }
             // Only the new page is searched; it goes in front, so an index
             // into it is an index into the whole.
-            found = at_head(&older);
+            let found = position_of(&older, head);
             older.append(&mut delivered);
             delivered = older;
             pages += 1;
+            if let Some(at) = found {
+                return Ok(delivered.split_off(at + 1));
+            }
         }
+    }
+
+    /// Whether to page history forward on this server: it advertises
+    /// `history_after` in `/.well-known/jig` (#349), and no page it sent
+    /// in this process broke the chain. Read once per process.
+    async fn pages_forward(&self) -> Result<bool> {
+        if self.forward_broken.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        self.forward
+            .get_or_try_init(|| async {
+                let info: serde_json::Value = self.get_json("/.well-known/jig").await?;
+                Ok::<_, anyhow::Error>(info["history_after"].as_bool() == Some(true))
+            })
+            .await
+            .copied()
     }
 
     /// A first catch-up: the newest page, and older pages until history
     /// reaches back to this device's epoch.
     async fn newest_to_epoch(&self, slug: &str) -> Result<Vec<DeliveredBlock>> {
-        let mut delivered = self.history_page(slug, DEFAULT_HISTORY_LIMIT, None).await?;
+        let mut delivered = self
+            .history_page(slug, DEFAULT_HISTORY_LIMIT, Page::Newest)
+            .await?;
         // Only an empty page ends the history. A server may send fewer
         // blocks than asked, to keep a page within a byte budget, so a short
         // page is not the start of the channel.
@@ -623,7 +965,7 @@ impl Secure {
                 break;
             };
             let mut older = self
-                .history_page(slug, MAX_HISTORY_PAGE, Some(&oldest.cid))
+                .history_page(slug, MAX_HISTORY_PAGE, Page::Before(&oldest.cid))
                 .await?;
             more = !older.is_empty();
             older.append(&mut delivered);
@@ -640,7 +982,7 @@ impl Secure {
     pub async fn recent(&self, slug: &str, limit: usize) -> Result<Synced> {
         let synced = self.sync(slug).await?;
         let mut delivered = self
-            .history_page(slug, limit.min(MAX_HISTORY_PAGE), None)
+            .history_page(slug, limit.min(MAX_HISTORY_PAGE), Page::Newest)
             .await?;
         while delivered.len() < limit {
             let Some(oldest) = delivered.first().and_then(|d| open(d).ok()) else {
@@ -650,7 +992,7 @@ impl Secure {
                 .history_page(
                     slug,
                     (limit - delivered.len()).min(MAX_HISTORY_PAGE),
-                    Some(&oldest.cid),
+                    Page::Before(&oldest.cid),
                 )
                 .await?;
             if older.is_empty() {
@@ -667,19 +1009,21 @@ impl Secure {
     }
 
     /// One page of the channel's history, oldest first: the newest `limit`
-    /// blocks, or those just older than the block `before`.
+    /// blocks, or those just older or just newer than a block.
     async fn history_page(
         &self,
         slug: &str,
         limit: usize,
-        before: Option<&str>,
+        page: Page<'_>,
     ) -> Result<Vec<DeliveredBlock>> {
         // This is the one path that pages on until an empty page, so the one
         // that may ask the server to cut a page at its byte budget. A server
         // that predates the budget ignores it.
         let mut url = history_url(&self.server, slug, limit) + "&budget=1";
-        if let Some(cid) = before {
-            url.push_str(&format!("&before={cid}"));
+        match page {
+            Page::Newest => {}
+            Page::Before(cid) => url.push_str(&format!("&before={cid}")),
+            Page::After(cid) => url.push_str(&format!("&after={cid}")),
         }
         let path = url.strip_prefix(&self.base).unwrap_or(&url).to_string();
         let body: serde_json::Value = self
@@ -721,6 +1065,13 @@ impl Secure {
 
     /// [`Secure::sync`] over blocks already fetched.
     pub fn replay(&self, reference: &str, delivered: &[DeliveredBlock]) -> Synced {
+        let mut replayed = Replayed::default();
+        self.replay_into(reference, &mut replayed, delivered);
+        self.finish(reference, replayed)
+    }
+
+    /// Process `delivered`, in MLS order, into what a replay has found.
+    fn replay_into(&self, reference: &str, r: &mut Replayed, delivered: &[DeliveredBlock]) {
         let mut opened = Vec::with_capacity(delivered.len());
         let mut receipts = std::collections::HashMap::new();
         for d in delivered {
@@ -732,9 +1083,9 @@ impl Secure {
                 Err(e) => eprintln!("[dropped history block {}: {e}]", d.delivery_cid),
             }
         }
-        let cids = opened.iter().map(|o| o.cid.clone()).collect();
-        let mut lines = Vec::new();
-        let mut left = Vec::new();
+        r.cids.extend(opened.iter().map(|o| o.cid.clone()));
+        r.deliveries
+            .extend(delivered.iter().map(|d| d.delivery_cid.clone()));
         let (id, slug) = self.names(reference);
         let channel = ReadIn {
             key: reference,
@@ -744,29 +1095,32 @@ impl Secure {
         for o in replay_order(opened) {
             let seen = self.session.observe_in(&self.server, Some(&channel), &o);
             match &seen {
-                Seen::Left { member, tidy: true } => left.push(member.clone()),
+                Seen::Left { member, tidy: true } => r.left.push(member.clone()),
                 // Back again since they left: nothing to tidy.
-                Seen::Added { member } => left.retain(|d| d != member),
+                Seen::Added { member } => r.left.retain(|d| d != member),
                 _ => {}
             }
-            let r = receipts.get(&o.cid).cloned().unwrap_or_default();
-            if let Some(line) = present(&o, &r, &seen) {
-                lines.push(line);
+            let receipts = receipts.get(&o.cid).cloned().unwrap_or_default();
+            if let Some(line) = present(&o, &receipts, &seen) {
+                r.lines.push(line);
             }
         }
+    }
+
+    /// What a replay found, once every page has been processed.
+    fn finish(&self, reference: &str, r: Replayed) -> Synced {
         // Only those still in the tree once everything has been replayed: a
         // later block in the same history may already have removed them.
         let still = self
             .session
             .group_members(&self.server, reference)
             .unwrap_or_default();
-        let tidy = left.into_iter().filter(|d| still.contains(d)).collect();
-        let deliveries = delivered.iter().map(|d| d.delivery_cid.clone()).collect();
+        let tidy = r.left.into_iter().filter(|d| still.contains(d)).collect();
         Synced {
-            lines,
+            lines: r.lines,
             tidy,
-            cids,
-            deliveries,
+            cids: r.cids,
+            deliveries: r.deliveries,
         }
     }
 
@@ -931,7 +1285,48 @@ fn pick(
 
 #[cfg(test)]
 mod tests {
-    use super::{ChannelInfo, must_encrypt, pick};
+    use super::{ChannelInfo, must_encrypt, pick, sequencers_for};
+    use jig_client::pins::{ChannelPin, Pins};
+
+    /// A carried channel's records are held to its owner; the server's own
+    /// channels to the server; and with nothing pinned, to the record's
+    /// signer.
+    #[test]
+    fn a_carried_channel_is_held_to_its_owner_and_others_to_the_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pins = Pins::load(&dir.path().join("pins.json")).unwrap();
+        let server = "wss://follower";
+        pins.check_server_did(server, "did:jig:zserver").unwrap();
+        for (slug, cid) in [("#carried", "bafycarried"), ("#own", "bafyown")] {
+            pins.check_channel(
+                server,
+                slug,
+                ChannelPin {
+                    create_cid: cid.to_string(),
+                    suite: "mls".to_string(),
+                    owner_did: "did:jig:zuser".to_string(),
+                    chain_head: None,
+                    sequencer: None,
+                },
+            )
+            .unwrap();
+        }
+        pins.anchor_channel(server, "#carried", "bafycarried", Some("did:jig:zowner"))
+            .unwrap();
+
+        assert_eq!(
+            sequencers_for(Some(&pins), server, "bafycarried", "did:jig:zowner"),
+            vec!["did:jig:zowner".to_string()]
+        );
+        assert_eq!(
+            sequencers_for(Some(&pins), server, "bafyown", "did:jig:zserver"),
+            vec!["did:jig:zserver".to_string()]
+        );
+        assert_eq!(
+            sequencers_for(None, server, "bafyown", "did:jig:zsigner"),
+            vec!["did:jig:zsigner".to_string()]
+        );
+    }
 
     fn listed(id: &str, slug: &str, sequencer: &str) -> ChannelInfo {
         ChannelInfo {
