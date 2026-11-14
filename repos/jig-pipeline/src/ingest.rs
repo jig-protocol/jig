@@ -520,14 +520,22 @@ pub async fn ingest(
     // unsigned or mis-signed bundle never learns that a block is held. Nothing
     // is applied, stored or fanned out again. Step 3d still refuses a copy
     // that lands between this lookup and persist. A peer's or a bridge's
-    // copy keeps its own handling, below.
+    // copy keeps its own handling, below. Held means held in the channel the
+    // block names: a block held only in a relayed copy this server set aside
+    // (`quarantine_relayed_copy`) sits under the copy's id, so it goes on to
+    // the channel checks, and on a carried channel to its owner.
     let resubmittable = matches!(
         source,
         IngestSource::LocalClient { .. }
             | IngestSource::AdminEndpoint
             | IngestSource::Relayed { .. }
     );
-    if resubmittable && ctx.store.get_block(&block_cid)?.is_some() {
+    if resubmittable
+        && let Some(kind) = manifest.kind
+        && let Some(held) = ctx.store.get_block(&block_cid)?
+        && held.channel_id
+            == channel_id_of(&ctx.store, kind, &manifest, &block_cid)?.and_then(|c| c.id)
+    {
         return Ok(block_cid);
     }
 
@@ -4443,6 +4451,45 @@ mod tests {
             "a replay must leave the revocation in place"
         );
         assert_eq!(ctx.store.list_members(&channel_id).unwrap().len(), 0);
+    }
+
+    /// Step 1a answers for a block held in the channel it names, and only
+    /// there: a block held only in a relayed copy set aside under another id
+    /// goes on through the channel checks, as before.
+    #[tokio::test]
+    async fn a_block_held_only_in_a_set_aside_copy_is_not_answered_as_held() {
+        let ctx = test_ctx_allowing(&["member-add"]);
+        let owner_key = random_signing_key();
+        seed_channel_owned_by(&ctx, "#hello", &did_of(&owner_key));
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &owner_key,
+            BlockKind::MemberAdd,
+            &[("channel", "#hello"), ("member_did", "did:jig:zDeji")],
+        );
+        let client = || IngestSource::LocalClient {
+            conn_id: 1,
+            tiers: true,
+        };
+        let cid = do_ingest(&ctx, mb.clone(), cb.clone(), sig.clone(), client())
+            .await
+            .expect("first ingest");
+        // What `quarantine_relayed_copy` does to the copy's blocks.
+        ctx.store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE blocks SET channel_id = 'bafkrelayedcopy' WHERE cid = ?1",
+                [&cid],
+            )
+            .unwrap();
+        let err = do_ingest(&ctx, mb, cb, sig, client())
+            .await
+            .expect_err("not held in #hello, so not answered as held");
+        assert!(
+            matches!(err, IngestError::DuplicateBlock { .. }),
+            "falls through to the channel checks and step 3d: {err:?}"
+        );
     }
 
     /// Counts the admission checks ingest asks for.
