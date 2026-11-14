@@ -8,6 +8,9 @@ should not be read as a status page.
 
 | I want to… | Read |
 | --- | --- |
+| Find my way around the code | [`ARCHITECTURE.md`](ARCHITECTURE.md), then [`CONTRIBUTING.md`](../CONTRIBUTING.md) and [`scripts/dev-setup.sh`](../scripts/dev-setup.sh) |
+| Pick a first change | [`GOOD_FIRST_CONTRIBUTIONS.md`](GOOD_FIRST_CONTRIBUTIONS.md) |
+| Know who reviews what | [`OWNERSHIP.md`](OWNERSHIP.md) |
 | Stand up a server on a box I already have | [`deploy/README.md`](../deploy/README.md) |
 | Get the box first, on GCP | [`docs/deployment/gcp-vps-runbook.md`](deployment/gcp-vps-runbook.md) |
 | Know what actually works today | [What works, what does not](../README.md#what-works-what-does-not) in the root README, and the [threat register](../repos/jig-spec/src/threat-register.md) for security status |

@@ -197,6 +197,9 @@ pub fn build_app_parts(cfg: &NameServerConfig) -> Result<NameServerApp> {
         .merge(crate::v0_0_2_resolve::build_resolve_router(
             v0_0_2_state.clone(),
         ))
+        .merge(crate::v0_0_2_metrics::build_metrics_router(
+            v0_0_2_state.clone(),
+        ))
         .merge(
             crate::v0_0_2_rotate_renew::build_rotate_renew_router(v0_0_2_state.clone())
                 .layer(rate_limited),

@@ -82,6 +82,8 @@ crossterm = "0.29"
 [dev-dependencies]
 # `TestNameserver`: the real nameserver router, for `tests/nameserver_roundtrip.rs`.
 integration-tests = { path = "../integration-tests" }
+# The suffix policy the real nameserver in those tests serves.
+jig-config = { path = "../jig-config" }
 # Lets tests resolve `@jig` under the placeholder authority; never in a build.
 jig-core = { path = "../jig-core", features = ["test-default-authority"] }
 tempfile = "3.8"
