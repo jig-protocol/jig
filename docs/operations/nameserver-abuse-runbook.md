@@ -119,9 +119,9 @@ What a closed suffix does:
 - Existing names still resolve, renew and rotate.
 - The nameserver still takes `registration_allow` entries, at `min_effort`, past the pool,
   and logs each one.
-- But `jig` reads `/v1/suffixes` and stops on a closed suffix before it asks for a
-  challenge, allowlisted or not. With today's CLI, an allowlisted DID cannot register while
-  the suffix is closed.
+- `jig` asks for the challenge even on a closed suffix, so an allowlisted DID registers
+  as usual. Any other DID gets the refusal, with a hint to run `jig keys register` once
+  the operator lists it.
 
 To reopen, set `registration = "open"` and restart. Consider lowering `strangers_per_hour`
 for the first days.
