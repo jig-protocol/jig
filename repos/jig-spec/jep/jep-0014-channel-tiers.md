@@ -357,7 +357,7 @@ reads no encrypted tier.
       - The refusal is logged with the reason `relayed-into-sequenced-channel`. It is not a
         wire code: the legacy relay has no refusal frame. A server MAY count such refusals.
       - Catch-up (#340) skips the refused record and advances, so one refusal does not stop
-        the link.
+        the link, and resumes past it on reconnect.
       - A channel that exists on both servers is carried only once it is shared. Until then,
         each server's posts to it stay on that server.
     - **A channel is carried by a contract, never by the relay** (#344, #357). Relayed, a
