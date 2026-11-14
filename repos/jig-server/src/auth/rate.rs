@@ -74,6 +74,11 @@ impl RateLimiter {
         })
     }
 
+    /// The longest a key with an empty bucket waits for its next token.
+    pub fn refill_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs_f64(1.0 / self.per_second)
+    }
+
     /// Read the time from `clock` instead of the real one. Once only: false
     /// if a clock was already set.
     pub fn set_clock(&self, clock: ManualClock) -> bool {

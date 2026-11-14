@@ -297,6 +297,12 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ref_cid: Option<String>,
         message: String,
+        /// For a refusal that waiting changes (`RATE_LIMITED`,
+        /// `RELAY_RATE_LIMITED`, `OWNER_UNREACHABLE`): how long to wait before
+        /// sending again, in milliseconds. Absent when the server gives no
+        /// time, or predates the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_ms: Option<u64>,
     },
 }
 
@@ -661,6 +667,7 @@ mod tests {
             code: "INVALID_SIG".into(),
             ref_cid: None,
             message: "signature verification failed".into(),
+            retry_after_ms: None,
         });
         let json = serde_json::to_string(&env).unwrap();
         let parsed: Envelope = serde_json::from_str(&json).unwrap();
@@ -671,6 +678,7 @@ mod tests {
             code: "DISALLOWED_BLOCK_KIND".into(),
             ref_cid: Some("bafy123".into()),
             message: "block kind not in allow list".into(),
+            retry_after_ms: None,
         });
         let json2 = serde_json::to_string(&env_with_ref).unwrap();
         let parsed2: Envelope = serde_json::from_str(&json2).unwrap();
@@ -701,6 +709,7 @@ mod tests {
             code: "NOT_CHANNEL_OWNER".into(),
             ref_cid: None,
             message: "not the owner".into(),
+            retry_after_ms: None,
         });
         let json = serde_json::to_string(&env).unwrap();
         assert!(
@@ -720,6 +729,7 @@ mod tests {
             code: "INVALID_SIG".into(),
             ref_cid: None,
             message: "nope".into(),
+            retry_after_ms: None,
         });
         let json = serde_json::to_string(&env).unwrap();
         // Parse rather than substring-scan the document: `!json.contains("status")`
@@ -730,5 +740,42 @@ mod tests {
             parsed.get("status").is_none(),
             "absent status must be omitted, not serialized as null: {json}"
         );
+    }
+
+    /// `retry_after_ms` is additive: absent from the JSON when there is no
+    /// wait, and a frame from a peer that predates it still parses.
+    #[test]
+    fn an_error_frame_carries_its_wait_only_when_it_has_one() {
+        let error = |retry_after_ms| {
+            Envelope::new(Frame::Error {
+                status: Some(429),
+                code: "RATE_LIMITED".into(),
+                ref_cid: None,
+                message: "slow down".into(),
+                retry_after_ms,
+            })
+        };
+        let with = serde_json::to_string(&error(Some(1_000))).unwrap();
+        assert!(with.contains(r#""retry_after_ms":1000"#), "{with}");
+        let parsed: Envelope = serde_json::from_str(&with).unwrap();
+        assert!(matches!(
+            parsed.frame,
+            Frame::Error {
+                retry_after_ms: Some(1_000),
+                ..
+            }
+        ));
+
+        let without = serde_json::to_string(&error(None)).unwrap();
+        assert!(!without.contains("retry_after_ms"), "{without}");
+        let older = r#"{"v":1,"suite":"none","op":"error","status":429,"code":"RATE_LIMITED","message":"slow down"}"#;
+        let parsed: Envelope = serde_json::from_str(older).unwrap();
+        assert!(matches!(
+            parsed.frame,
+            Frame::Error {
+                retry_after_ms: None,
+                ..
+            }
+        ));
     }
 }
