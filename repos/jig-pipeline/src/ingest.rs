@@ -73,6 +73,12 @@ pub trait Admission: Send + Sync {
         self.admit(sender_did)
     }
 
+    /// When `sender_did`, refused as [`AdmissionRefusal::RateLimited`], may
+    /// write again, in milliseconds. `None` when this server cannot say.
+    fn retry_after_ms(&self, _sender_did: &str) -> Option<u64> {
+        None
+    }
+
     /// `sender_did`'s server role here (JEP-0014 rule 8), for a self-join.
     /// A policy that cannot say makes it a stranger, who joins nothing.
     fn server_role(&self, _sender_did: &str) -> ServerRole {
