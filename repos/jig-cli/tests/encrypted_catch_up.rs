@@ -147,6 +147,9 @@ enum Serves {
     /// As [`Serves::Lying`], with no sequencer records in any history page:
     /// the device's head has none, so no chain says the page is later.
     LyingWithoutRecords,
+    /// Pages forward honestly, with no sequencer records in any history
+    /// page: history from before records, ordered by its authors' clocks.
+    WithoutRecords,
     /// Serves no records until the device has read once, as a server did
     /// before records, so the device's head has none. Then it pages forward
     /// with records but leaves out the first block after the head, and,
@@ -336,7 +339,9 @@ async fn relay(
         }
         let edit: Option<fn(&mut Vec<Value>) -> bool> = match serves {
             Serves::Skipping if after && !before && !skipped => Some(skip_one),
-            Serves::LyingWithoutRecords if path.ends_with("/blocks") => Some(drop_records),
+            Serves::LyingWithoutRecords | Serves::WithoutRecords if path.ends_with("/blocks") => {
+                Some(drop_records)
+            }
             _ => None,
         };
         if let Some(edit) = edit {
@@ -495,6 +500,19 @@ async fn a_consistent_skip_after_a_head_without_a_record_is_refused() {
     assert_eq!(
         forward_pages, 1,
         "one forward page, refused at the head's own record, then back"
+    );
+}
+
+/// History with no records is ordered by its authors' clocks, so a message
+/// can come after the commits that left its epoch, and a page at a time
+/// could seal it for good. The device asks for one page, finds no record
+/// to page by, and reads the rest back as one replay.
+#[tokio::test(flavor = "multi_thread")]
+async fn history_without_records_is_read_back_not_paged_forward() {
+    let forward_pages = away_and_back(Serves::WithoutRecords).await;
+    assert_eq!(
+        forward_pages, 1,
+        "one forward page, set aside for having no records, then back"
     );
 }
 

@@ -201,6 +201,11 @@ enum Forwarded {
         head: String,
         why: String,
     },
+    /// At history with no sequencer records, from `head` on: it is ordered
+    /// by its authors' clocks, so a message can come after the commits that
+    /// left its epoch, and only replaying it with them puts it back in MLS
+    /// order ([`replay_order`]). A page at a time could seal it for good.
+    Unsequenced { replayed: Replayed, head: String },
 }
 
 /// Hold `page` to `chain`: each block's record must be the next one after
@@ -663,18 +668,28 @@ impl Secure {
                 // Not again in this process: a server that advertises `after`
                 // and breaks it costs a little time, never a message.
                 self.forward_broken.store(true, Ordering::Relaxed);
-                let newest = self
-                    .history_page(slug, SINCE_HEAD_FIRST_PAGE, Page::Newest)
-                    .await?;
-                let delivered = match position_of(&newest, &head) {
-                    Some(at) => newest[at + 1..].to_vec(),
-                    None => self.back_to(slug, &head, newest).await?,
-                };
-                self.replay_into(slug, &mut replayed, &delivered);
-                self.move_head(slug, &delivered)?;
+                self.read_back(slug, &mut replayed, &head).await?;
+                Ok(self.finish(slug, replayed))
+            }
+            Forwarded::Unsequenced { mut replayed, head } => {
+                self.read_back(slug, &mut replayed, &head).await?;
                 Ok(self.finish(slug, replayed))
             }
         }
+    }
+
+    /// Read what came after `head` the way a server without `after` is read
+    /// (#348), all at once, into `replayed`, and move the head past it.
+    async fn read_back(&self, slug: &str, replayed: &mut Replayed, head: &str) -> Result<()> {
+        let newest = self
+            .history_page(slug, SINCE_HEAD_FIRST_PAGE, Page::Newest)
+            .await?;
+        let delivered = match position_of(&newest, head) {
+            Some(at) => newest[at + 1..].to_vec(),
+            None => self.back_to(slug, head, newest).await?,
+        };
+        self.replay_into(slug, replayed, &delivered);
+        self.move_head(slug, &delivered)
     }
 
     /// Replay `delivered` and move the head to its newest block.
@@ -755,7 +770,13 @@ impl Secure {
                         chain = Some(anchored);
                         held
                     }
-                    Ok(None) => Ok(()),
+                    // No records to page by: read it back, as one replay.
+                    Ok(None) => {
+                        return Ok(Forwarded::Unsequenced {
+                            replayed,
+                            head: cursor,
+                        });
+                    }
                     Err(why) => Err(why),
                 },
             };
@@ -804,8 +825,8 @@ impl Secure {
     /// skips a block can name the cursor as the block before. So when the
     /// cursor comes back with its record, the record must be the cursor's
     /// and signed by the channel's sequencer ([`sequencers_for`]), and the
-    /// chain anchored on it is returned for the page to be held to. Only
-    /// history with no records is taken on the position alone.
+    /// chain anchored on it is returned for the page to be held to. With no
+    /// record, `None`: the history has none to page by, and is read back.
     async fn follows(
         &self,
         slug: &str,
