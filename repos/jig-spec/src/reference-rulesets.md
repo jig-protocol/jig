@@ -46,15 +46,15 @@ half-life in epochs, written as its per-epoch fraction in ppm.
 
 | Parameter | `jig-reference` | `high-sec` | `community` | `null-sec` |
 | --- | --- | --- | --- | --- |
-| `established_ppm` | 300 000 | 500 000 | 200 000 | unreachable (999 999) |
+| `established` | 300 000 | 500 000 | 200 000 | unreachable (999 999) |
 | `min_age_epochs` | 30 | 60 | 14 | 0 |
 | `max_idle_epochs` | 14 | 7 | 7 | none |
 | `accrual_per_period` | 1 unit | 1 unit | 1 unit | 0 |
 | `per_reporter_cap` (positive) | 4 units | 2 units | 4 units | 4 units |
 | `per_reporter_neg_cap` | 25 units | 50 units | 15 units | 25 units |
-| `unknown_reporter_weight_ppm` | 0 | 0 | 250 000 | 0 |
-| `r` half-life (`lambda_pos_ppm`) | 90 epochs (7 672) | 180 epochs (3 843) | 60 epochs (11 486) | none (0) |
-| `s` half-life (`lambda_neg_ppm`) | 30 epochs (22 840) | 90 epochs (7 672) | 14 epochs (48 305) | 30 epochs (22 840) |
+| `unknown_reporter_weight` | 0 | 0 | 250 000 | 0 |
+| `r` half-life (`lambda_pos`) | 90 epochs (7 672) | 180 epochs (3 843) | 60 epochs (11 486) | none (0) |
+| `s` half-life (`lambda_neg`) | 30 epochs (22 840) | 90 epochs (7 672) | 14 epochs (48 305) | 30 epochs (22 840) |
 | `minor` | 1 unit | 1 unit | 2 units | 1 unit |
 | `admit_age_epochs` (rule 49) | 7 | none | 3 | 7 |
 | `receipt_positions` | 4 096 | 1 024 | 4 096 | 4 096 |

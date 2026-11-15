@@ -96,16 +96,16 @@
     },
     "standing": {
       "accrual_per_period": 1000000,
-      "established_ppm": 500000,
-      "lambda_neg_ppm": 7672,
-      "lambda_pos_ppm": 3843,
+      "established": 500000,
+      "lambda_neg": 7672,
+      "lambda_pos": 3843,
       "max_idle_epochs": 7,
       "min_age_epochs": 60,
       "minor": 1000000,
       "per_reporter_cap": 2000000,
       "per_reporter_neg_cap": 50000000,
       "receipt_positions": 1024,
-      "unknown_reporter_weight_ppm": 0
+      "unknown_reporter_weight": 0
     }
   },
   "tribunal": {
@@ -131,7 +131,7 @@
       "validate": 200000,
       "witness": 100000
     },
-    "credit_cap_per_period_ppm": 500000,
+    "credit_cap_per_period": 500000,
     "dispute_retention_epochs": 90,
     "fraud_weight": -5000000,
     "k": {
@@ -158,12 +158,12 @@
       "witness": 5
     },
     "n_escalate": 11,
-    "reexecute_rate_ppm": 1000,
+    "reexecute_rate": 1000,
     "retrievability_epochs": 7,
     "retrieve_samples": 16,
     "reveal_positions": 2048,
     "same_subject_cooldown_epochs": 30,
-    "sample_rate_ppm": 1000
+    "sample_rate": 1000
   },
   "v": 1,
   "version": 1

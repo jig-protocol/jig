@@ -84,16 +84,16 @@
     "standing": {
       "accrual_per_period": 1000000,
       "admit_age_epochs": 7,
-      "established_ppm": 300000,
-      "lambda_neg_ppm": 22840,
-      "lambda_pos_ppm": 7672,
+      "established": 300000,
+      "lambda_neg": 22840,
+      "lambda_pos": 7672,
       "max_idle_epochs": 14,
       "min_age_epochs": 30,
       "minor": 1000000,
       "per_reporter_cap": 4000000,
       "per_reporter_neg_cap": 25000000,
       "receipt_positions": 4096,
-      "unknown_reporter_weight_ppm": 0
+      "unknown_reporter_weight": 0
     }
   },
   "tribunal": null,

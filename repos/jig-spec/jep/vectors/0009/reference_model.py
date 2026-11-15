@@ -33,11 +33,11 @@ def consequences(penalty, member_by_age):
         {"band": "unknown", "score_ppm": None, "pool": "member" if member_by_age else "stranger",
          "effort": "m_standing = 1", "join": "guest",
          "note": "member only by aged proof (rule 49)" if member_by_age else "stranger"},
-        {"band": "below-established", "score_ppm": [0, "established_ppm - 1"],
+        {"band": "below-established", "score_ppm": [0, "established - 1"],
          "pool": "member" if member_by_age else "stranger",
          "effort": "m_standing = 1", "join": "guest",
          "note": "member only by aged proof (rule 49)" if member_by_age else "stranger"},
-        {"band": "established", "score_ppm": ["established_ppm", PPM - 1], "pool": "member",
+        {"band": "established", "score_ppm": ["established", PPM - 1], "pool": "member",
          "effort": "m_standing falls linearly to 1 / max_standing_discount", "join": "member"},
     ]
     if penalty:
@@ -65,10 +65,10 @@ RULESETS = {
     "jig-reference": ruleset(
         "jig-reference",
         epoch={"epoch_secs": 86_400, "witness_threshold": 0},
-        standing={"established_ppm": 300_000, "min_age_epochs": 30,
+        standing={"established": 300_000, "min_age_epochs": 30,
                   "accrual_per_period": 1 * U, "per_reporter_cap": 4 * U, "per_reporter_neg_cap": 25 * U, "max_idle_epochs": 14,
-                  "unknown_reporter_weight_ppm": 0, "lambda_pos_ppm": 7_672,
-                  "lambda_neg_ppm": 22_840, "minor": 1 * U, "admit_age_epochs": 7,
+                  "unknown_reporter_weight": 0, "lambda_pos": 7_672,
+                  "lambda_neg": 22_840, "minor": 1 * U, "admit_age_epochs": 7,
                   "receipt_positions": 4_096},
         events=REF_EVENTS,
         pow_=POW_REF,
@@ -80,10 +80,10 @@ RULESETS = {
     "high-sec": ruleset(
         "high-sec",
         epoch={"epoch_secs": 86_400, "witness_threshold": 3},
-        standing={"established_ppm": 500_000, "min_age_epochs": 60,
+        standing={"established": 500_000, "min_age_epochs": 60,
                   "accrual_per_period": 1 * U, "per_reporter_cap": 2 * U, "per_reporter_neg_cap": 50 * U, "max_idle_epochs": 7,
-                  "unknown_reporter_weight_ppm": 0, "lambda_pos_ppm": 3_843,
-                  "lambda_neg_ppm": 7_672, "minor": 1 * U, "admit_age_epochs": None,
+                  "unknown_reporter_weight": 0, "lambda_pos": 3_843,
+                  "lambda_neg": 7_672, "minor": 1 * U, "admit_age_epochs": None,
                   "receipt_positions": 1_024, "vouch_min_epochs": None, "vouch_cap": None},
         events={**{k: v * 2 if v < 0 else v for k, v in REF_EVENTS.items()},
                 "useful-work-fraud": -5 * U, "beacon-withheld": -10 * U},
@@ -99,7 +99,7 @@ RULESETS = {
                      "n": {"witness": 5, "validate": 5, "reexecute": 5, "retrieve": 5},
                      "k": {"witness": 3, "validate": 3, "reexecute": 3, "retrieve": 3},
                      "n_escalate": 11, "k_escalate": 7,
-                     "sample_rate_ppm": 1_000, "reexecute_rate_ppm": 1_000,
+                     "sample_rate": 1_000, "reexecute_rate": 1_000,
                      "retrieve_samples": 16,
                      "beacon_reveal_positions": 1_024, "beacon_min_reveals": 3,
                      "beacon_exclusion_epochs": 7, "beacon_withheld_weight": -10 * U,
@@ -109,7 +109,7 @@ RULESETS = {
                      "retrievability_epochs": 7, "dispute_retention_epochs": 90,
                      "credit": {"witness": 100_000, "validate": 200_000, "reexecute": 200_000,
                                 "retrieve": 100_000},
-                     "credit_cap_per_period_ppm": 500_000,
+                     "credit_cap_per_period": 500_000,
                      "fraud_weight": -5 * U},
         invites={"invites_per_window": 1, "invite_window_epochs": 30,
                  "invite_start": 1 * U},
@@ -117,10 +117,10 @@ RULESETS = {
     "community": ruleset(
         "community",
         epoch={"epoch_secs": 86_400, "witness_threshold": 1},
-        standing={"established_ppm": 200_000, "min_age_epochs": 14,
+        standing={"established": 200_000, "min_age_epochs": 14,
                   "accrual_per_period": 1 * U, "per_reporter_cap": 4 * U, "per_reporter_neg_cap": 15 * U, "max_idle_epochs": 7,
-                  "unknown_reporter_weight_ppm": 250_000, "lambda_pos_ppm": 11_486,
-                  "lambda_neg_ppm": 48_305, "minor": 2 * U, "admit_age_epochs": 3,
+                  "unknown_reporter_weight": 250_000, "lambda_pos": 11_486,
+                  "lambda_neg": 48_305, "minor": 2 * U, "admit_age_epochs": 3,
                   "receipt_positions": 4_096, "vouch_min_epochs": 30, "vouch_cap": 2 * U},
         events={"good-standing-interval": 1 * U, "quota-breach": -500_000,
                 "invalid-proof": -1 * U, "spam-confirmed": -5 * U,
@@ -136,11 +136,11 @@ RULESETS = {
     "null-sec": ruleset(
         "null-sec",
         epoch={"epoch_secs": 86_400, "witness_threshold": 0},
-        standing={"established_ppm": PPM - 1, "min_age_epochs": 0,
+        standing={"established": PPM - 1, "min_age_epochs": 0,
                   "accrual_per_period": 0, "per_reporter_cap": 4 * U,
                   "per_reporter_neg_cap": 25 * U, "max_idle_epochs": None,
-                  "unknown_reporter_weight_ppm": 0, "lambda_pos_ppm": 0,
-                  "lambda_neg_ppm": 22_840, "minor": 1 * U, "admit_age_epochs": 7,
+                  "unknown_reporter_weight": 0, "lambda_pos": 0,
+                  "lambda_neg": 22_840, "minor": 1 * U, "admit_age_epochs": 7,
                   "receipt_positions": 4_096},
         events={"good-standing-interval": 0, "quota-breach": 0, "invalid-proof": -1 * U,
                 "spam-confirmed": 0, "signed-contradiction": -25 * U, "verdict-applied": 0,
@@ -162,7 +162,7 @@ def step(rs, state, epoch, events, reporters_established, lone_owner):
     """One epoch of f. events: list of (reporter, subject, code, count)."""
     p = rs["parameters"]["standing"]
     uw = rs["useful_work"]
-    lp, ln = p["lambda_pos_ppm"], p["lambda_neg_ppm"]
+    lp, ln = p["lambda_pos"], p["lambda_neg"]
     out = {}
     subjects = set(state) | {e[1] for e in events}
     for subj in sorted(subjects):
@@ -194,7 +194,7 @@ def step(rs, state, epoch, events, reporters_established, lone_owner):
             if lone_owner:
                 wt = PPM
             else:
-                wt = PPM if reporters_established.get(rep) else p["unknown_reporter_weight_ppm"]
+                wt = PPM if reporters_established.get(rep) else p["unknown_reporter_weight"]
             pos += min(d["pos"], cap) * wt // PPM
             pos_uw += min(d["uw"], cap) * wt // PPM
             neg += min(d["neg"], p["per_reporter_neg_cap"]) * wt // PPM
@@ -204,7 +204,7 @@ def step(rs, state, epoch, events, reporters_established, lone_owner):
         if subj not in state or not view(rs, state[subj], epoch - 1)["established"]:
             pos_uw = 0
         if uw:
-            pos_uw = min(pos_uw, uw["credit_cap_per_period_ppm"] * acc // PPM)
+            pos_uw = min(pos_uw, uw["credit_cap_per_period"] * acc // PPM)
         positive = min(pos + pos_uw, acc)
         # 4. add
         st["r"] += positive
@@ -231,7 +231,7 @@ def view(rs, st, epoch):
     active = idle is None or epoch - st["last_epoch"] < idle
     return {"r": st["r"], "s": st["s"], "score_ppm": sc, "age_epochs": age,
             "last_epoch": st["last_epoch"],
-            "established": sc >= p["established_ppm"] and age >= p["min_age_epochs"]
+            "established": sc >= p["established"] and age >= p["min_age_epochs"]
             and active}
 
 EPOCHS = 70
@@ -297,11 +297,11 @@ def main(root):
     os.makedirs(os.path.join(d, "rulesets"), exist_ok=True)
     for name, rs in RULESETS.items():
         rs = json.loads(json.dumps(rs))
-        est = rs["parameters"]["standing"]["established_ppm"]
+        est = rs["parameters"]["standing"]["established"]
         for row in rs["consequences"]:
             if row["score_ppm"]:
-                row["score_ppm"] = [est if x == "established_ppm" else
-                                    est - 1 if x == "established_ppm - 1" else x
+                row["score_ppm"] = [est if x == "established" else
+                                    est - 1 if x == "established - 1" else x
                                     for x in row["score_ppm"]]
         for blk in (rs["parameters"]["standing"], rs["events"], rs["useful_work"] or {}):
             for k in [k for k, v in blk.items() if v is None]:
