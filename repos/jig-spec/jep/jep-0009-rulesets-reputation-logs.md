@@ -474,7 +474,11 @@ binds R3 (rules 7–22) as well: R3's nameservers and R2.4's single server compu
     This is the verifiable form of a server's proof-age membership today: the proof's position
     and its age in epochs are in the log. An `admit-proof` adds no evidence. It never moves `r`,
     `s`, the score or the age (rule 39), so proof of work never becomes standing (JEP-0016
-    rule 1). Operator `records` stay local policy, outside `R`. A
+    rule 1).
+
+    Aged-proof membership can be farmed: one proof per DID, solved in parallel, and one wait
+    for all of them. The wait does not grow with the farm. Aged-proof members therefore draw
+    from their own sub-share of the member pool (JEP-0008 rule 23's `aged_share`). Operator `records` stay local policy, outside `R`. A
     server MAY treat a recorded DID as a member. That membership is not part of `R` and is never a
     protocol input (rule 20).
 50. **Consequences are local.** `f` outputs the score and whether the subject is established,

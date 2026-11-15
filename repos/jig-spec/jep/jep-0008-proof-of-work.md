@@ -205,6 +205,11 @@ Non-goals:
 23. The stranger pool gets at most `stranger_share` of capacity, and the invited pool at most
     `invited_share`. Both are ruleset parameters. The reference values are 20 % and 10 %.
     - Members MUST NOT wait on the other pools.
+    - **Aged-proof members** (JEP-0009 rule 49) draw from at most `aged_share` of the member pool
+      (ruleset parameter; reference 25 %). Established members draw from all of it. A farm
+      that solves many admission proofs at once and waits out their age once becomes members
+      together, so the bound is on capacity, not on count: it cannot crowd out members who
+      earned their standing.
     - Capacity a pool leaves unused MAY be lent to another pool while it is idle, and lending MUST
       stop at the owner pool's first request.
     - A pool is idle after `idle_secs` (reference: 1 s) without a request of its own, and lends
