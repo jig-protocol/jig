@@ -647,10 +647,15 @@ impl Secure {
             .history_page(slug, SINCE_HEAD_FIRST_PAGE, Page::Newest)
             .await?;
         if let Some(at) = position_of(&newest, &head) {
-            return self.process(slug, &newest[at + 1..]);
+            let delivered = &newest[at + 1..];
+            self.hold_to_head(slug, delivered)?;
+            return self.process(slug, delivered);
         }
         if !self.pages_forward().await? {
-            let delivered = self.back_to(slug, &head, newest).await?;
+            let (delivered, reached) = self.back_to(slug, &head, newest).await?;
+            if reached {
+                self.hold_to_head(slug, &delivered)?;
+            }
             return self.process(slug, &delivered);
         }
         match self.forward_from(slug, &head).await? {
@@ -684,10 +689,13 @@ impl Secure {
         let newest = self
             .history_page(slug, SINCE_HEAD_FIRST_PAGE, Page::Newest)
             .await?;
-        let delivered = match position_of(&newest, head) {
-            Some(at) => newest[at + 1..].to_vec(),
+        let (delivered, reached) = match position_of(&newest, head) {
+            Some(at) => (newest[at + 1..].to_vec(), true),
             None => self.back_to(slug, head, newest).await?,
         };
+        if reached {
+            self.hold_to_head(slug, &delivered)?;
+        }
         self.replay_into(slug, replayed, &delivered);
         self.move_head(slug, &delivered)
     }
@@ -861,6 +869,23 @@ impl Secure {
         }
     }
 
+    /// Hold `delivered`, the blocks after the head however they were read,
+    /// to the chain from the head, and warn when it breaks. Nothing is
+    /// left to read it from instead: the blocks are still processed, and a
+    /// message the server left out may never be readable on this device.
+    fn hold_to_head(&self, slug: &str, delivered: &[DeliveredBlock]) -> Result<()> {
+        if let Some(mut chain) = self.chain_from_head(slug)?
+            && let Err(why) = continues(&mut chain, delivered)
+        {
+            eprintln!(
+                "warning: {}'s history of {slug} after this device's last block is not \
+                 whole ({why}); a message in it may never be readable on this device",
+                self.server
+            );
+        }
+        Ok(())
+    }
+
     /// The DIDs the sequencer that signed `record` has signed as, along the
     /// key links this device follows; at least `record`'s own.
     fn sequencers(&self, record: &jig_client::chain::IngestRecord) -> Vec<String> {
@@ -876,12 +901,14 @@ impl Secure {
     /// The blocks after `head`, oldest first, for a server that cannot page
     /// forward: pages back from `newest` until a page holds `head`. Never
     /// stops on a page's length, which a server's byte budget can cut short.
+    /// Also says whether a page held `head`: when none did, what is returned
+    /// does not start after it.
     async fn back_to(
         &self,
         slug: &str,
         head: &str,
         mut delivered: Vec<DeliveredBlock>,
-    ) -> Result<Vec<DeliveredBlock>> {
+    ) -> Result<(Vec<DeliveredBlock>, bool)> {
         let mut pages = 1;
         loop {
             if pages == MAX_CATCH_UP_PAGES {
@@ -894,10 +921,10 @@ impl Secure {
                     delivered.len(),
                     delivered.len()
                 );
-                return Ok(delivered);
+                return Ok((delivered, false));
             }
             let Some(oldest) = delivered.first().and_then(|d| open(d).ok()) else {
-                return Ok(delivered);
+                return Ok((delivered, false));
             };
             let mut older = self
                 .history_page(slug, MAX_HISTORY_PAGE, Page::Before(&oldest.cid))
@@ -909,7 +936,7 @@ impl Secure {
                     "warning: {slug}'s history no longer holds the last block this \
                      device read; reading it from the start"
                 );
-                return Ok(delivered);
+                return Ok((delivered, false));
             }
             // Only the new page is searched; it goes in front, so an index
             // into it is an index into the whole.
@@ -918,7 +945,7 @@ impl Secure {
             delivered = older;
             pages += 1;
             if let Some(at) = found {
-                return Ok(delivered.split_off(at + 1));
+                return Ok((delivered.split_off(at + 1), true));
             }
         }
     }

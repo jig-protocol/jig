@@ -156,6 +156,9 @@ enum Serves {
     /// asked what comes before the page, names the head: consistent on both
     /// sides, so only the head's own record can show the gap.
     SkippingConsistently,
+    /// As [`Serves::Old`], and leaves a block out of the middle of the
+    /// first page back: a hole there is nothing to refill from.
+    SkippingBack,
 }
 
 /// What a [`proxy`] counts and carries between its connections.
@@ -222,7 +225,7 @@ async fn relay(
                 return Ok::<_, std::io::Error>(());
             }
             let mut out = chunk[..n].to_vec();
-            if serves == Serves::Old {
+            if matches!(serves, Serves::Old | Serves::SkippingBack) {
                 const FROM: &[u8] = b"\"history_after\":true";
                 const TO: &[u8] = b"\"history_gone_\":true";
                 while let Some(at) = out.windows(FROM.len()).position(|w| w == FROM) {
@@ -234,7 +237,7 @@ async fn relay(
     });
     let ignore_after = matches!(
         serves,
-        Serves::Old | Serves::Lying | Serves::LyingWithoutRecords
+        Serves::Old | Serves::Lying | Serves::LyingWithoutRecords | Serves::SkippingBack
     );
     let mut skipped = false;
     let mut buf = Vec::new();
@@ -339,6 +342,7 @@ async fn relay(
         }
         let edit: Option<fn(&mut Vec<Value>) -> bool> = match serves {
             Serves::Skipping if after && !before && !skipped => Some(skip_one),
+            Serves::SkippingBack if before && !skipped => Some(skip_one),
             Serves::LyingWithoutRecords | Serves::WithoutRecords if path.ends_with("/blocks") => {
                 Some(drop_records)
             }
@@ -355,7 +359,7 @@ async fn relay(
                 edit,
             )
             .await?;
-            skipped |= serves == Serves::Skipping && page.1;
+            skipped |= matches!(serves, Serves::Skipping | Serves::SkippingBack) && page.1;
             to_client.lock().await.write_all(&page.0).await?;
             buf.drain(..head_end + body_len);
             continue;
@@ -437,12 +441,20 @@ async fn rewrite(
 
 /// `jig read` as the device, and its output.
 fn read(home: &Path, limit: usize) -> String {
+    read_with_warnings(home, limit).0
+}
+
+/// [`read`], with what `jig read` printed to stderr.
+fn read_with_warnings(home: &Path, limit: usize) -> (String, String) {
     let out = jig(home)
         .args(["read", "#sec", "--limit", &limit.to_string()])
         .output()
         .unwrap();
     assert!(out.status.success(), "jig read: {out:?}");
-    String::from_utf8_lossy(&out.stdout).into_owned()
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -529,10 +541,43 @@ async fn a_forward_page_that_skips_a_block_is_refused_and_the_block_is_still_rea
     );
 }
 
+/// A server that pages back but leaves a block out of a page leaves a hole
+/// with nothing to refill it from. The device holds the blocks after its
+/// head to the chain from it, whichever way they were read, and says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_back_that_skips_a_block_is_named_as_a_hole() {
+    let (_, _, warnings) = away(Serves::SkippingBack).await;
+    assert!(
+        warnings.contains("is not whole") && warnings.contains("are missing"),
+        "the hole must be named; stderr:\n{warnings}"
+    );
+}
+
 /// The device joins, reads, is away for [`AWAY`] messages, and reads again:
 /// every message must show, and none fail to decrypt. Returns how many
 /// history requests paged forward.
 async fn away_and_back(serves: Serves) -> usize {
+    let (forward_pages, shown, warnings) = away(serves).await;
+    let missing: Vec<String> = (0..AWAY)
+        .map(|i| format!("away-{i:04}"))
+        .filter(|m| !shown.contains(m.as_str()))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{} of {AWAY} messages unreadable, from {:?}; output:\n{}",
+        missing.len(),
+        missing.first(),
+        shown.lines().take(5).collect::<Vec<_>>().join("\n")
+    );
+    assert!(!shown.contains("cannot decrypt"), "{shown}");
+    assert!(!warnings.contains("is not whole"), "{warnings}");
+    forward_pages
+}
+
+/// The device joins, reads, and is away for [`AWAY`] messages, then reads
+/// again. Returns how many history requests paged forward, and what the
+/// second read printed to stdout and stderr.
+async fn away(serves: Serves) -> (usize, String, String) {
     let server = TestJigServer::start().await.expect("start");
     let (url, shared) = proxy(&server, serves).await;
     let owner = Member::new();
@@ -579,18 +624,6 @@ async fn away_and_back(serves: Serves) -> usize {
     }
 
     // Back: the next read catches up, and scrolling back shows every message.
-    let shown = read(device.path(), AWAY + 10);
-    let missing: Vec<String> = (0..AWAY)
-        .map(|i| format!("away-{i:04}"))
-        .filter(|m| !shown.contains(m.as_str()))
-        .collect();
-    assert!(
-        missing.is_empty(),
-        "{} of {AWAY} messages unreadable, from {:?}; output:\n{}",
-        missing.len(),
-        missing.first(),
-        shown.lines().take(5).collect::<Vec<_>>().join("\n")
-    );
-    assert!(!shown.contains("cannot decrypt"), "{shown}");
-    shared.forward_pages.load(Ordering::SeqCst)
+    let (shown, warnings) = read_with_warnings(device.path(), AWAY + 10);
+    (shared.forward_pages.load(Ordering::SeqCst), shown, warnings)
 }
