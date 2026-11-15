@@ -576,7 +576,7 @@ mod tests {
             &did_of(4),
             channel(),
             &ours(&state),
-            [1; 16],
+            rand::random(),
             now(),
         );
         req.requester = did_of(5);
