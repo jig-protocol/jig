@@ -31,7 +31,8 @@ shellexpand  = "3"
 
 # Async runtime
 tokio = { workspace = true }
-tokio-util = "0.7"
+# `rt` for `TaskTracker`: graceful shutdown waits on the connections it tracks.
+tokio-util = { version = "0.7", features = ["rt"] }
 futures = "0.3"
 
 # Web framework

@@ -356,6 +356,13 @@ server_did_keyfile = "{keyfile}"
 # To restrict it, uncomment that line and remove kinds. A list here is fixed:
 # kinds added in later releases stay refused until you add them.
 
+# On SIGTERM or SIGINT the server stops accepting connections, closes each
+# WebSocket session with 1001 (going away) so clients reconnect, and gives the
+# requests in flight this long to finish before it exits. A second signal cuts
+# the wait short. install.sh waits 10 s for a server it replaces to stop, so
+# keep this under that. 0 cuts at once; at most 300000.
+# shutdown_drain_ms = 5000
+
 # Behind a TLS-passthrough proxy (TCP or SNI passthrough), every client has the
 # proxy's address unless the proxy sends PROXY protocol v2 (HAProxy:
 # `send-proxy-v2`; nginx stream: `proxy_protocol on`). List the proxy here and
