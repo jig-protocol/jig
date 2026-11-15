@@ -87,7 +87,6 @@ async fn main() -> anyhow::Result<()> {
     let out = args.get(5).cloned();
 
     let http = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
         .pool_max_idle_per_host(writers)
         .build()?;
     let info: Value = http
