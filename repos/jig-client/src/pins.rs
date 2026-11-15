@@ -2196,4 +2196,49 @@ mod tests {
         assert!(pins.carried(server).is_empty());
         assert_eq!(pins.channel_by_ref(server, &x.channel_id), None);
     }
+
+    /// #388: on a follower, one of the server's own channels and a channel
+    /// it carries for another server may share a slug (JEP-0005 allows both,
+    /// reached by id). The device pins both, as `jig` does for each: the
+    /// creation block proven, then the carried one anchored to its owner.
+    /// Neither replaces the other, the carried one is found by its id, and
+    /// the server's own keeps the slug.
+    #[test]
+    fn a_carried_channel_and_the_servers_own_may_share_a_slug() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        let mut pins = Pins::load(&path).unwrap();
+        let server = "wss://follower";
+        pins.check_server_did(server, "did:jig:zFollower").unwrap();
+        let pin = |cid: &str| ChannelPin {
+            create_cid: cid.into(),
+            suite: "mls".into(),
+            owner_did: "did:jig:zUser".into(),
+            chain_head: None,
+            sequencer: None,
+        };
+
+        pins.check_channel(server, "#team", pin("bafyOwn")).unwrap();
+        pins.check_channel(server, "#team", pin("bafyCarried"))
+            .expect("the carried #team does not replace the server's own #team");
+        pins.anchor_channel(server, "#team", "bafyCarried", Some("did:jig:zOwner"))
+            .unwrap();
+
+        for pins in [&pins, &Pins::load(&path).unwrap()] {
+            let (_, carried) = pins.channel_by_ref(server, "bafyCarried").unwrap();
+            assert_eq!(carried.create_cid, "bafyCarried");
+            assert_eq!(carried.sequencer.as_deref(), Some("did:jig:zOwner"));
+            let (_, own) = pins.channel_by_ref(server, "bafyOwn").unwrap();
+            assert_eq!(own.sequencer, None);
+            assert_eq!(
+                pins.channel(server, "#team").map(|c| c.create_cid.as_str()),
+                Some("bafyOwn"),
+                "the slug names the channel this server orders"
+            );
+            assert_eq!(
+                pins.carried(server).get("bafyCarried").map(String::as_str),
+                Some("did:jig:zOwner")
+            );
+        }
+    }
 }
