@@ -366,7 +366,7 @@ fn sequenced_window_sql(with_before: bool, select: Select) -> String {
     let columns = select.list("b.");
     let bound = if with_before { "AND r.seq < ?3" } else { "" };
     format!(
-        "SELECT {columns} FROM ingest_records r JOIN blocks b ON b.cid = r.block_cid \
+        "SELECT {columns} FROM chain_records r JOIN blocks b ON b.cid = r.block_cid \
          WHERE r.channel_id = ?1 {bound} ORDER BY r.seq DESC LIMIT ?2"
     )
 }
@@ -382,7 +382,7 @@ fn sequenced_history_after_sql() -> String {
 fn sequenced_after_window_sql(select: Select) -> String {
     let columns = select.list("b.");
     format!(
-        "SELECT {columns} FROM ingest_records r JOIN blocks b ON b.cid = r.block_cid \
+        "SELECT {columns} FROM chain_records r JOIN blocks b ON b.cid = r.block_cid \
          WHERE r.channel_id = ?1 AND r.seq > ?3 ORDER BY r.seq ASC LIMIT ?2"
     )
 }
@@ -899,7 +899,7 @@ fn role_blocks_before_on(
     let rows: Vec<(String, Vec<u8>)> = {
         let mut stmt = conn.prepare(
             "SELECT b.block_kind, b.bundle_bytes
-               FROM ingest_records r JOIN blocks b ON b.cid = r.block_cid
+               FROM chain_records r JOIN blocks b ON b.cid = r.block_cid
               WHERE r.channel_id = ?1 AND r.seq < ?2
                 AND b.block_kind IN ('role-assign', 'role-unassign')
               ORDER BY r.seq ASC",
@@ -1412,7 +1412,7 @@ impl SqliteStore {
         let limit = limit.min(MAX_HISTORY_LIMIT) as i64;
         let conn = self.conn.lock().expect("poisoned");
         let mut stmt = conn.prepare(
-            "SELECT record FROM ingest_records WHERE channel_id = ?1 AND seq >= ?2
+            "SELECT record FROM chain_records WHERE channel_id = ?1 AND seq >= ?2
              ORDER BY seq ASC LIMIT ?3",
         )?;
         let rows = stmt
@@ -1548,7 +1548,7 @@ impl SqliteStore {
     /// Whether the channel's history is sequenced, and so ordered by `seq`.
     fn is_sequenced(conn: &Connection, channel_id: &str) -> Result<bool> {
         Ok(conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM ingest_records WHERE channel_id = ?)",
+            "SELECT EXISTS(SELECT 1 FROM chain_records WHERE channel_id = ?)",
             [channel_id],
             |r| r.get(0),
         )?)

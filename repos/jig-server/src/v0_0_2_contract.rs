@@ -2475,6 +2475,135 @@ mod tests {
         );
     }
 
+    /// A carried channel an older relay stalled (#357, #427): the owner's
+    /// slug-named post sits in the follower's own `#general`, under a record
+    /// the follower signed. The share now lands it in the carried channel
+    /// too: the block stays in the follower's channel, whose chain is
+    /// unchanged; the carried chain names it under the owner's record, byte
+    /// for byte; and the carried channel's subscribers get it live, the
+    /// follower's own channel's do not.
+    #[tokio::test]
+    async fn a_channel_an_older_relay_stalled_lands_beside_the_followers_own() {
+        use jig_pipeline::fanout::{SubscriberIdentity, SubscriptionScope};
+        let p = pair(OfferPolicy::Accept).await;
+        let ours = post(
+            &p.follower,
+            &SigningKey::from_bytes(&rand::random()),
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#general", "tier": "public"}),
+        )
+        .await
+        .unwrap();
+        let channel = post(
+            &p.owner,
+            &p.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#general", "tier": "public"}),
+        )
+        .await
+        .unwrap();
+        let text = post(
+            &p.owner,
+            &p.user,
+            BlockKind::TextRender,
+            serde_json::json!({"channel": "#general", "body": "by slug"}),
+        )
+        .await
+        .unwrap();
+        // As an older relay left it, signed into the follower's own chain by
+        // the backfill an upgrade runs at boot.
+        let store = &p.follower.ingest_ctx.store;
+        let block = p.owner.ingest_ctx.store.get_block(&text).unwrap().unwrap();
+        store
+            .insert_block(&StoredBlock {
+                channel_id: Some(ours.clone()),
+                origin_server: p.owner.server_url.clone(),
+                federated_from: Some(p.owner.server_url.clone()),
+                ..block
+            })
+            .unwrap();
+        store
+            .backfill_ingest_records(&p.follower.ingest_ctx.server_key)
+            .unwrap();
+        let ours_chain = || {
+            (0..3)
+                .map(|seq| store.ingest_record_bytes(&ours, seq).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let before = ours_chain();
+        assert!(before[1].is_some(), "the follower's record of the post");
+
+        let fanout = &p.follower.ingest_ctx.fanout;
+        let reader = SubscriberIdentity::Did(did_of(&SigningKey::from_bytes(&rand::random())));
+        let (to_carried, mut carried_rx) = tokio::sync::mpsc::unbounded_channel();
+        fanout
+            .subscribe_local(
+                SubscriptionScope::Channel(channel.clone()),
+                reader.clone(),
+                to_carried,
+            )
+            .await;
+        let (to_ours, mut ours_rx) = tokio::sync::mpsc::unbounded_channel();
+        fanout
+            .subscribe_local(SubscriptionScope::Channel(ours.clone()), reader, to_ours)
+            .await;
+
+        p.share(&channel, "read").await;
+        p.both(&channel, OfferState::Accepted).await;
+        p.follows.stream.pull_all();
+        let want = p.caught_up(&channel).await;
+
+        assert!(store.carried_stalls().unwrap().is_empty(), "nothing stalls");
+        assert_eq!(
+            ours_chain(),
+            before,
+            "the follower's own chain is unchanged"
+        );
+        assert_eq!(
+            store
+                .get_block(&text)
+                .unwrap()
+                .unwrap()
+                .channel_id
+                .as_deref(),
+            Some(ours.as_str()),
+            "the block stays in the follower's channel"
+        );
+        for seq in 0..=want {
+            assert_eq!(
+                store.ingest_record_bytes(&channel, seq).unwrap(),
+                p.owner
+                    .ingest_ctx
+                    .store
+                    .ingest_record_bytes(&channel, seq)
+                    .unwrap(),
+                "seq {seq}"
+            );
+        }
+        let carried: Vec<String> = store
+            .list_blocks_by_channel_id(&channel, 50, None)
+            .unwrap()
+            .into_iter()
+            .map(|b| b.cid)
+            .collect();
+        assert!(carried.contains(&text), "{carried:?}");
+
+        let mut live = Vec::new();
+        while let Ok((block, _)) = carried_rx.try_recv() {
+            live.push((block.cid, block.channel_id));
+        }
+        assert!(
+            live.contains(&(text.clone(), Some(channel.clone()))),
+            "the carried channel's subscribers get it: {live:?}"
+        );
+        while let Ok((block, _)) = ours_rx.try_recv() {
+            assert_ne!(
+                block.cid, text,
+                "the follower's own channel does not get it again"
+            );
+        }
+    }
+
     /// A follower lists a channel it carries as ordered by its owner, with
     /// the owner's offer: what lets a client hold the channel's records to
     /// the owner without taking the follower's word for it.
