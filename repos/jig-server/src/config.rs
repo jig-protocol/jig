@@ -358,13 +358,15 @@ server_did_keyfile = "{keyfile}"
 
 # Behind a TLS-passthrough proxy (TCP or SNI passthrough), every client has the
 # proxy's address unless the proxy sends PROXY protocol v2 (HAProxy:
-# `send-proxy-v2`; nginx stream: `proxy_protocol on`). List the proxy here and
+# `send-proxy-v2`; nginx 1.31.4+ stream: `proxy_protocol v2`, since `on` sends
+# v1, which is refused). List the proxy here and
 # its connections are served under the client address the header names: the
 # per-address rate limit and relay slots then count each client. It fails
 # closed: a connection from a listed proxy that does not open with a valid v2
 # header within header_timeout_ms is closed. That includes no header, v1 text,
 # and a header over 536 bytes (a load balancer that adds many TLVs can exceed
-# it). A connection from any other address is served as before, and a PROXY
+# it). A valid LOCAL header (the proxy's own health check) keeps the proxy's
+# address. A connection from any other address is served as before, and a PROXY
 # header from it is never read. No forwarded HTTP header is trusted.
 # [server.proxy_protocol]
 # trusted = ["10.0.0.5", "10.0.1.0/24"]
