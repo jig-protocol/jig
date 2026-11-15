@@ -476,9 +476,9 @@ mod tests {
                 .map_err(|e| e.to_string())
         };
         assert!(with(1 << 20, 10).is_ok(), "the recommended values boot");
-        // 10 s to solve plus 51 s queued is past the 60 s challenge.
-        assert!(with(1 << 20, 51).unwrap_err().contains("queue_wait_secs"));
-        assert!(with(1 << 20, 50).is_ok());
+        // 13 s to solve plus 48 s queued is past the 60 s challenge.
+        assert!(with(1 << 20, 48).unwrap_err().contains("queue_wait_secs"));
+        assert!(with(1 << 20, 47).is_ok());
         // With no work asked, the whole lifetime is the queue's.
         assert!(with(0, 60).is_ok());
         assert!(with(0, 61).unwrap_err().contains("queue_wait_secs"));

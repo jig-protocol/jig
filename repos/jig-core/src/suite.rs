@@ -209,11 +209,11 @@ pub mod test_aead {
 
     /// Seal `plaintext` for `slug` from `sender`, under `nonce`.
     pub fn seal(slug: &str, sender: &str, nonce: &[u8; NONCE_LEN], plaintext: &[u8]) -> Vec<u8> {
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&KEY));
+        let cipher = ChaCha20Poly1305::new(&Key::from(KEY));
         let aad = aad(slug, sender);
         let ct = cipher
             .encrypt(
-                Nonce::from_slice(nonce),
+                nonce.into(),
                 Payload {
                     msg: plaintext,
                     aad: &aad,
@@ -232,11 +232,10 @@ pub mod test_aead {
             return None;
         }
         let (nonce, ct) = payload.split_at(NONCE_LEN);
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&KEY));
+        let nonce = Nonce::try_from(nonce).ok()?;
+        let cipher = ChaCha20Poly1305::new(&Key::from(KEY));
         let aad = aad(slug, sender);
-        cipher
-            .decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad: &aad })
-            .ok()
+        cipher.decrypt(&nonce, Payload { msg: ct, aad: &aad }).ok()
     }
 
     #[cfg(test)]

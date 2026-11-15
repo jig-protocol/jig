@@ -203,8 +203,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// but an exit code. Log through BOTH `tracing` and stderr, then exit non-zero.
 async fn serve(config: Option<&std::path::Path>, bind: Option<String>, port: Option<u16>) {
     if let Err(e) = run_http_server(config, bind, port).await {
-        tracing::error!("jig-nameserver failed to start: {e}");
-        eprintln!("error: jig-nameserver failed to start: {e}");
+        tracing::error!("jig-nameserver failed to start: {e:#}");
+        eprintln!("error: jig-nameserver failed to start: {e:#}");
         std::process::exit(1);
     }
 }

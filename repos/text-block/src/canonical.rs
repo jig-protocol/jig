@@ -43,6 +43,32 @@ pub const MODULE_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[cfg(not(target_arch = "wasm32"))]
 pub const CANONICAL_COMPONENT: &[u8] = include_bytes!("../artifacts/text_block.component.wasm");
 
+/// A build of this component other than [`CANONICAL_COMPONENT`], with the BLAKE3 hash it is
+/// pinned to.
+#[derive(Debug, Clone, Copy)]
+pub struct KnownBuild {
+    /// `blake3:<hex>`, as a receipt's component hash names it.
+    pub blake3: &'static str,
+    pub bytes: &'static [u8],
+}
+
+/// Builds a client may also verify against, besides [`CANONICAL_COMPONENT`]. Servers never
+/// render with these.
+///
+/// A text-block change that alters render output ships in two steps. In release N the next
+/// build is listed here, so clients can verify a server that has moved to it, while servers
+/// keep rendering with the canonical one. In N+1 servers switch, and the previous canonical
+/// build may stay here for servers that have not. A build here cannot be rebuilt from this
+/// tree, whose crate matches the canonical build. It is pinned by its hash (checked below) and
+/// by its block-ABI vectors' outcome hashes (`jig-spec/vectors/block-abi`).
+#[cfg(not(target_arch = "wasm32"))]
+pub const OTHER_BUILDS: &[KnownBuild] = &[KnownBuild {
+    // The canonical build through v0.2.0-alpha.6: unicode-normalization 0.1.25 (Unicode 17),
+    // wit-bindgen 0.57. Kept so this client verifies servers that have not switched yet.
+    blake3: "blake3:8ab0a9ebe0261c63973cccabdbb5c5f04ac703486e8de890518bb2c91175b179",
+    bytes: include_bytes!("../artifacts/text_block.prev.component.wasm"),
+}];
+
 /// Media type of the component's output body: the postcard-encoded [`crate::Output`].
 pub const COMPONENT_OUTPUT_MEDIA_TYPE: &str = "application/x.jig-text-render+postcard";
 
@@ -67,6 +93,22 @@ mod tests {
             CANONICAL_COMPONENT.starts_with(b"\0asm\x0d\0\x01\0"),
             "embedded artifact is not a Wasm component — check artifacts/text_block.component.wasm"
         );
+    }
+
+    /// Each other build is exactly the bytes it is pinned to, is a component, and is not the
+    /// canonical build.
+    #[test]
+    fn other_builds_match_their_pinned_hashes() {
+        let canonical = format!("blake3:{}", blake3::hash(CANONICAL_COMPONENT).to_hex());
+        for build in OTHER_BUILDS {
+            assert_eq!(
+                format!("blake3:{}", blake3::hash(build.bytes).to_hex()),
+                build.blake3,
+                "an other build's bytes moved"
+            );
+            assert!(build.bytes.starts_with(b"\0asm\x0d\0\x01\0"));
+            assert_ne!(build.blake3, canonical);
+        }
     }
 
     #[test]

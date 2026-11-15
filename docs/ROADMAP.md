@@ -126,7 +126,7 @@ reserve the hooks for encryption so that turning it on in v0.2 changes a value, 
 | 15 | `publish = false` on crates not meant for crates.io | Open |
 | 16 | CI: macOS job, clippy on every crate, federation and bridge counters in `/metrics`, scope jobs by changed paths (note below) | Partial (macOS covered by the install smoke test only). Clippy runs on every crate, and `/metrics` counts federation and bridge ingest (`jig_blocks_ingested_total`, #121). Scoping done: pull requests skip the build jobs when only docs change or while a draft, and the merge queue runs everything |
 | 17 | Collapse the hybrid server config into one struct with `deny_unknown_fields` | Done (#199): one `ServerConfig`, every table denies unknown fields, removed keys fail with a message naming them |
-| 18 | Run federated blocks through the write gate; "trusted peer" becomes explicit config | Done: relayed blocks go through `ingest`, peers are pinned and listed. Encrypted and restricted channels still do not federate (D12) |
+| 18 | Run federated blocks through the write gate; "trusted peer" becomes explicit config | Done: relayed blocks go through `ingest`, peers are pinned and listed. Channels now cross servers only by a share, `shared` ones as ciphertext (JEP-0014) |
 | 19 | Discovery JEP stub | Done ([JEP-0003](../repos/jig-spec/jep/jep-0003-server-discovery.md)) |
 | 20 | Reserve `jig-*` package names (crates.io, npm, Homebrew, container registries) | Open, low priority |
 | 21 | Move the Riverdance GUI out of the protocol monorepo | Done (it now lives in its own repository) |

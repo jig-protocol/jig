@@ -324,7 +324,10 @@ pub struct RateLimitSection {
     pub per_did_per_second: u32,
     /// Per remote address: every HTTP request and every WebSocket frame,
     /// signed or not. Behind a reverse proxy every request comes from the
-    /// proxy's address, so raise this or turn it off there.
+    /// proxy's address, so raise this or turn it off there. The same address
+    /// keys a REST write's relay slots (`MAX_IN_FLIGHT` per address), so
+    /// clients behind one proxy share those too; no forwarded header is
+    /// trusted yet (#399).
     pub per_ip_burst: u32,
     pub per_ip_per_second: u32,
     /// Nonces one DID may hold in the replay guard at once. Keeps one
@@ -416,14 +419,30 @@ pub struct AdmissionSection {
     /// What to do with a DID this server has no relevant record for.
     /// `"admit"` (the default), `"refuse"`, or `"proof-of-work"`. `"refuse"`
     /// with a set of `records` is a members-only server. `"proof-of-work"`
-    /// admits a new DID once it has done `pow_bits` of work for this server
-    /// (`POST /api/v1/admission`); blocks relayed by a peer or submitted by a
-    /// bridge are not asked for it.
+    /// admits a new DID once it has done the work this server asks
+    /// (`POST /api/v1/admission`, JEP-0008's `admit` puzzle); blocks relayed
+    /// by a peer or submitted by a bridge are not asked for it.
     pub unknown_dids: UnknownDidsPolicy,
-    /// Leading zero bits of work a new DID owes under `"proof-of-work"`, 1 to
-    /// 28. Each bit doubles the expected cost; 20 is under a second on a
-    /// laptop.
+    /// Legacy: leading zero bits of work, 1 to 28; `0` (the default) is
+    /// unset. Kept for one release; it means `min_effort = 2^pow_bits`. Set
+    /// this or `min_effort`, not both.
     pub pow_bits: u8,
+    /// The least effort (expected digests) a new DID owes under
+    /// `"proof-of-work"`, whatever the load (JEP-0008 rule 19). `0` asks no
+    /// work while the server is idle (rule 17). Unset: `2^20`, under a second
+    /// on a laptop.
+    pub min_effort: Option<u64>,
+    /// The most effort the controller asks, at most `2^28`. Unset: `2^24`,
+    /// or the legacy `pow_bits` effort if that is higher.
+    pub max_effort: Option<u64>,
+    /// The controller (rule 17): after a window in which more than
+    /// `controller_target` distinct unknown DIDs arrived, the effort asked
+    /// above `min_effort` doubles, starting from `controller_start_effort`;
+    /// after a window with at most half that many, it halves, and below the
+    /// start it drops to zero.
+    pub controller_window_secs: u64,
+    pub controller_target: u32,
+    pub controller_start_effort: u64,
     /// DIDs this server refuses outright, whatever their scores.
     pub banned_dids: Vec<String>,
     /// Reputation floors, evaluated in the order written.
@@ -437,7 +456,12 @@ impl Default for AdmissionSection {
     fn default() -> Self {
         Self {
             unknown_dids: UnknownDidsPolicy::default(),
-            pow_bits: 20,
+            pow_bits: 0,
+            min_effort: None,
+            max_effort: None,
+            controller_window_secs: 60,
+            controller_target: 100,
+            controller_start_effort: 1 << 16,
             banned_dids: Vec::new(),
             floors: Vec::new(),
             records: Vec::new(),
@@ -935,8 +959,8 @@ pub struct PowPolicy {
     pub short_name_factor: u64,
     /// What renew and rotate by the holder pay (rule 31). `0` asks none.
     pub renew_effort: u64,
-    /// How long a penalty point lasts; each repeat offence before it lapses
-    /// doubles it (rule 27).
+    /// How long one penalty point takes to decay; each repeat offence while
+    /// points remain doubles it, up to a day (rule 27).
     pub penalty_decay_secs: u64,
 }
 
@@ -947,14 +971,16 @@ impl Default for PowPolicy {
 }
 
 impl PowPolicy {
-    /// The R1 plan's values: 2^20 to register, ×4 per letter under 5, at most
-    /// 2^24 (about 3 s on one server core); 1 to renew or rotate.
+    /// 2^20 to register, ×4 per letter under 5, at most 2^26 (about 12 s on
+    /// one server core, so `max_solve_secs` is 13); 1 to renew or rotate. A
+    /// three-letter name starts at 2^24, so the controller and penalties can
+    /// still raise it fourfold before the cap (DJ, 2026-10-25).
     pub fn recommended() -> Self {
         Self {
             alg: 1,
             min_effort: 1 << 20,
-            max_effort: 1 << 24,
-            max_solve_secs: 10,
+            max_effort: 1 << 26,
+            max_solve_secs: 13,
             short_name_len: 5,
             short_name_factor: 4,
             renew_effort: 1,
