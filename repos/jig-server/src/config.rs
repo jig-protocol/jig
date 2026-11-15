@@ -400,7 +400,9 @@ banned_dids = []
 # and every write it authors) and per remote address (every request and every
 # WebSocket frame). A bucket holds `*_burst` and refills at `*_per_second`;
 # a rate of 0 turns that limit off. Behind a reverse proxy every request has
-# the proxy's address: raise the per-IP limit or turn it off there.
+# the proxy's address: raise the per-IP limit or turn it off there. The address
+# also keys a REST write's relay slots on a carried channel, so clients behind
+# one proxy share those too; forwarded headers are not trusted yet (#399).
 [auth.rate_limit]
 per_did_burst = {per_did_burst}
 per_did_per_second = {per_did_per_second}

@@ -46,6 +46,10 @@ pub struct SubmitResult {
 pub struct ErrorBody {
     pub code: String,
     pub message: String,
+    /// How long to wait before posting again, for a refusal waiting changes:
+    /// the REST counterpart of the `Error` frame's `retry_after_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
 }
 
 pub(crate) fn err(
@@ -58,6 +62,7 @@ pub(crate) fn err(
         Json(ErrorBody {
             code: code.to_string(),
             message: msg.into(),
+            retry_after_ms: None,
         }),
     )
 }
@@ -71,6 +76,7 @@ fn refusal_response(refusal: crate::v0_0_2_relay::Refusal) -> (StatusCode, Json<
         Json(ErrorBody {
             code: refusal.code,
             message: refusal.message,
+            retry_after_ms: refusal.retry_after_ms,
         }),
     )
 }
@@ -92,6 +98,7 @@ pub(crate) fn map_ingest_error(
 pub async fn submit_block(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
+    extensions: axum::http::Extensions,
     Json(body): Json<SubmitBody>,
 ) -> Result<Json<SubmitResult>, (StatusCode, Json<ErrorBody>)> {
     let bundle_bytes = base64::engine::general_purpose::STANDARD
@@ -125,7 +132,7 @@ pub async fn submit_block(
         })?;
 
     // conn_id 0 signals REST origin — no persistent WebSocket connection, so
-    // the relay's in-flight cap counts per author instead.
+    // the relay's in-flight cap counts per caller address instead.
     let author = serde_json::from_slice::<jig_core::BlockManifest>(&manifest_bytes)
         .ok()
         .and_then(|m| m.authors.first().map(|a| a.did.to_string()))
@@ -136,7 +143,7 @@ pub async fn submit_block(
         &code_bytes,
         sig,
         0,
-        &format!("rest:{author}"),
+        &crate::v0_0_2_relay::rest_caller(crate::v0_0_2_ws::client_ip(&extensions), &author),
         declares_feature(&headers, jig_core::tier::TIERS_FEATURE),
     )
     .await

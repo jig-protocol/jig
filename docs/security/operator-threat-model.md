@@ -169,8 +169,11 @@ each block to the ones before it. A signed per-channel sequence does that for on
 comparison across servers and members covers a server that signs two different chains. The
 sequence is built: the server signs it and clients check it (#169); comparison is design work.
 
-**Status evidence.** `IngestError::DuplicateBlock` refuses a CID seen before, which also
-stops replay of control-plane blocks. Read proofs go through a
+**Status evidence.** A CID seen before is never applied, stored or fanned out again, which
+also stops replay of control-plane blocks. Resubmitted by a client (or relayed to its
+owner again), a held block is answered with its CID before admission, so a replay
+charges its author nothing (#396). From a peer or a bridge it is refused
+(`IngestError::DuplicateBlock`). Read proofs go through a
 `ReplayGuard` (`jig-server/src/auth/`). The manifest's `hlc_ts` is set by the block's
 author (TM-02), not the server. Since #161 the server signs an `ingest` record for every
 block of a channel it holds: `seq`, `prev` (the hash of the record before) and its own clock
@@ -244,7 +247,11 @@ manifest gates, admission, the kind allowlist, archived channels, the write gate
 suite gate, effects, and the server's own execution and receipt. Before that it drops
 encrypted content, a peer's shares and contract records (they are the sequencer's own),
 blocks for a channel this server carries by contract, and blocks for a local channel that
-does not federate. Relayed receipts are not kept. A `text-render`, membership, role,
+does not federate. It also drops every block other than a `channel-create` that names a
+channel this server sequences, by slug or by id (JEP-0014 rule 37, #357): a channel crosses
+servers only by a share, so the relay cannot give it a second order. These are logged
+under `relayed-into-sequenced-channel` and counted, and the drop comes before admission, so
+a refused post spends none of its author's rate. Relayed receipts are not kept. A `text-render`, membership, role,
 promote, archive, share or contract block that names a channel this server has no row for
 is refused, from any source. A relayed `channel-create` must name this server as its sequencer
 (`SEQUENCER_REQUIRED`, `NOT_SEQUENCER`), so a peer's new channel is never taken as this

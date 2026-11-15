@@ -73,6 +73,12 @@ pub trait Admission: Send + Sync {
         self.admit(sender_did)
     }
 
+    /// When `sender_did`, refused as [`AdmissionRefusal::RateLimited`], may
+    /// write again, in milliseconds. `None` when this server cannot say.
+    fn retry_after_ms(&self, _sender_did: &str) -> Option<u64> {
+        None
+    }
+
     /// `sender_did`'s server role here (JEP-0014 rule 8), for a self-join.
     /// A policy that cannot say makes it a stranger, who joins nothing.
     fn server_role(&self, _sender_did: &str) -> ServerRole {
@@ -253,7 +259,13 @@ pub enum IngestError {
     /// a legitimate message — visible and loud, rather than a quietly degraded
     /// receipt.
     #[error("executing the `{kind}` module failed: {detail}")]
-    RenderFailed { kind: String, detail: String },
+    RenderFailed {
+        kind: String,
+        /// Why, as far as the client's next move is concerned: retry, change the block, or
+        /// neither.
+        cause: RenderCause,
+        detail: String,
+    },
     /// A control-plane block was signed by someone the channel does not
     /// answer to. See [`crate::authorize_write`] for the rules.
     #[error("`{kind}` on `{slug}` refused: `{sender}` is not the channel owner")]
@@ -318,6 +330,15 @@ pub enum IngestError {
         channel_id: String,
         sequencer: String,
     },
+    /// A block a peer's legacy relay brought for a channel this server
+    /// sequences (JEP-0014 rule 37, #357). The relay would give the channel's
+    /// posts a second order: a channel crosses servers only by a share, and
+    /// a peer's users post through its grant.
+    #[error(
+        "`{kind}` refused: {RELAYED_INTO_SEQUENCED}: channel {channel_id} is sequenced \
+         here, and a peer's relay does not post to it; share the channel to carry it"
+    )]
+    RelayedIntoSequencedChannel { kind: String, channel_id: String },
     /// A relayed block for a channel the relaying server's share does not
     /// cover (JEP-0005 rule 15).
     #[error("`{kind}` refused: `{via}` relayed it outside its share of channel {channel_id}")]
@@ -504,6 +525,41 @@ pub async fn ingest(
     check_manifest_dids(&manifest)?;
     let sender = verify_sig(bundle.manifest_bytes, bundle.code_bytes, &manifest, &sig)?;
 
+    // The block's CID, needed this early for the held-block answer below, and
+    // because a channel-create's channel IS that block: its `channel_id` is its
+    // own CID (JEP-0005 rule 1).
+    let block_cid = bundle
+        .block_cid()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|_| "bafy_invalid".to_string());
+
+    // Step 1a: a block this server already holds, submitted again by a client
+    // (or relayed to its owner again), is answered with its CID at once, as an
+    // idempotent success. Before admission: the bundle is public once it has
+    // landed, so anyone can resubmit it, and doing so must not spend its
+    // author's rate, pool share or relay slots. After the signature check: an
+    // unsigned or mis-signed bundle never learns that a block is held. Nothing
+    // is applied, stored or fanned out again. Step 3d still refuses a copy
+    // that lands between this lookup and persist. A peer's or a bridge's
+    // copy keeps its own handling, below. Held means held in the channel the
+    // block names: a block held only in a relayed copy this server set aside
+    // (`quarantine_relayed_copy`) sits under the copy's id, so it goes on to
+    // the channel checks, and on a carried channel to its owner.
+    let resubmittable = matches!(
+        source,
+        IngestSource::LocalClient { .. }
+            | IngestSource::AdminEndpoint
+            | IngestSource::Relayed { .. }
+    );
+    if resubmittable
+        && let Some(kind) = manifest.kind
+        && let Some(held) = ctx.store.get_block(&block_cid)?
+        && held.channel_id
+            == channel_id_of(&ctx.store, kind, &manifest, &block_cid)?.and_then(|c| c.id)
+    {
+        return Ok(block_cid);
+    }
+
     // Step 1b: admission, on the DID the signature just established. Before
     // the identity resolver, the kind whitelist and every channel lookup: a
     // caller this server will not deal with gets exactly one answer, whatever
@@ -578,13 +634,6 @@ pub async fn ingest(
     // no-op once boot or an earlier block has said so).
     let server_did = ctx.server_did.to_did_jig_string();
     ctx.store.adopt_local_sequencer(&server_did)?;
-
-    // The block's CID, needed this early because a channel-create's channel
-    // IS that block: its `channel_id` is its own CID (JEP-0005 rule 1).
-    let block_cid = bundle
-        .block_cid()
-        .map(|c| c.to_string())
-        .unwrap_or_else(|_| "bafy_invalid".to_string());
 
     // Step 3b: channel-existence guard for channel-scoped kinds.
     //
@@ -670,6 +719,20 @@ pub async fn ingest(
             kind: kind_str.to_string(),
             channel_id: chan.id.clone(),
             sequencer: chan.sequencer_did.clone(),
+        });
+    }
+    // The legacy relay's blocks for a channel this server sequences: a peer
+    // posting into it this way would order the channel's posts a second
+    // time, as its own copy does (#357). A channel crosses servers only by a
+    // share (JEP-0014 rule 37). A channel-create names the channel it makes,
+    // which is not yet here: rule 1 and the sequencer binding judge it.
+    if let IngestSource::FederatedPeer { .. } = &source
+        && kind != BlockKind::ChannelCreate
+        && let Some(chan) = resolved_channel.as_ref()
+    {
+        return Err(IngestError::RelayedIntoSequencedChannel {
+            kind: kind_str.to_string(),
+            channel_id: chan.id.clone(),
         });
     }
 
@@ -1396,6 +1459,58 @@ fn self_join_admitted(
         }
         _ => false,
     }
+}
+
+/// The reason a refusal of a peer-relayed block into a channel this server
+/// sequences is logged under (JEP-0014 rule 37). Stable: operators grep for it.
+pub const RELAYED_INTO_SEQUENCED: &str = "relayed-into-sequenced-channel";
+
+/// The refusal [`ingest`] gives a block the legacy relay brought
+/// ([`IngestSource::FederatedPeer`]) for the channel it names, if it gives
+/// one: an archived channel, an unknown one, one another server sequences,
+/// or one this server sequences (#357). Ingest makes the same checks in the
+/// same order, after admission, so that a caller it will not deal with gets
+/// one answer whatever channel it names. Admission charges the author's rate,
+/// though, so a busy author's relayed posts would spend it on blocks that are
+/// only refused, and once it is spent come back as rate-limited, which the
+/// relay asks for again, rather than refused. The relay answers its peer
+/// nothing, so it asks this first and drops what it names. A `channel-create`
+/// gets `None`: it names a channel not yet here, and ingest judges it.
+pub fn refused_from_a_peer(
+    store: &SqliteStore,
+    server_did: &Did,
+    kind: BlockKind,
+    manifest: &jig_core::BlockManifest,
+    block_cid: &str,
+    source: &IngestSource,
+) -> crate::persist::Result<Option<IngestError>> {
+    if kind == BlockKind::ChannelCreate || !matches!(source, IngestSource::FederatedPeer { .. }) {
+        return Ok(None);
+    }
+    let Some(named) = channel_id_of(store, kind, manifest, block_cid)? else {
+        return Ok(None);
+    };
+    let Some(id) = named.id else {
+        return Ok(requires_existing_channel(kind, source)
+            .then_some(IngestError::UnknownChannel { slug: named.named }));
+    };
+    let Some(chan) = store.get_channel_by_id(&id)? else {
+        return Ok(Some(IngestError::ChannelArchived { slug: named.named }));
+    };
+    if !chan.sequencer_did.is_empty()
+        && crate::effect::canonical_did_string(&chan.sequencer_did)
+            != server_did.to_did_jig_string()
+    {
+        return Ok(Some(IngestError::CarriedChannel {
+            kind: kind.as_str().to_string(),
+            channel_id: chan.id,
+            sequencer: chan.sequencer_did,
+        }));
+    }
+    Ok(Some(IngestError::RelayedIntoSequencedChannel {
+        kind: kind.as_str().to_string(),
+        channel_id: chan.id,
+    }))
 }
 
 /// The channel a block belongs to — the ONE rule shared by the write gate,
@@ -2317,6 +2432,48 @@ async fn exec_receipt(
     match **executor {}
 }
 
+/// Why a render did not produce a usable result.
+///
+/// jig-pipeline's own copy of the runtime's `IncompleteReason`, so that [`IngestError`] exists
+/// in builds without the `executor` feature (the nameserver links no wasmtime).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderCause {
+    /// The wall-clock deadline passed. This host was too slow or too loaded this time; the
+    /// same block may well render on a retry.
+    DeadlineExceeded,
+    /// The block needs more fuel than this server allows. It does every time.
+    FuelExhausted,
+    /// The block needs more stack than this server allows. It does every time.
+    StackExhausted,
+    /// The host failed: the engine reported a fault, the render task died, or the executor
+    /// refused. Nothing about the block says whether a retry helps.
+    HostFault,
+}
+
+impl RenderCause {
+    /// Whether the block itself exceeds this server's limits, so that resending it unchanged
+    /// cannot succeed.
+    pub fn is_too_expensive(self) -> bool {
+        matches!(
+            self,
+            RenderCause::FuelExhausted | RenderCause::StackExhausted
+        )
+    }
+}
+
+#[cfg(feature = "executor")]
+impl From<&jig_runtime::component::IncompleteReason> for RenderCause {
+    fn from(reason: &jig_runtime::component::IncompleteReason) -> Self {
+        use jig_runtime::component::IncompleteReason;
+        match reason {
+            IncompleteReason::DeadlineExceeded => RenderCause::DeadlineExceeded,
+            IncompleteReason::FuelExhausted => RenderCause::FuelExhausted,
+            IncompleteReason::StackExhausted => RenderCause::StackExhausted,
+            IncompleteReason::HostFault(_) => RenderCause::HostFault,
+        }
+    }
+}
+
 /// The receipt of a landed `text-render` block, whatever happens while rendering it.
 ///
 /// Once the block and its record have landed, ingest must not report it as refused: it is in the
@@ -2334,6 +2491,7 @@ async fn receipt_after_landing(
     let rendered = if FAIL_AFTER_LANDING.with(|f| f.replace(false)) {
         Err(IngestError::RenderFailed {
             kind: "text-render".into(),
+            cause: RenderCause::HostFault,
             detail: "injected by a test".into(),
         })
     } else {
@@ -2386,10 +2544,12 @@ async fn run_text_render(
         // A join error points at the host (a panic, a pool shut down), not the block.
         .map_err(|e| IngestError::RenderFailed {
             kind: kind.clone(),
+            cause: RenderCause::HostFault,
             detail: format!("render task did not complete: {e}"),
         })?
         .map_err(|e| IngestError::RenderFailed {
             kind,
+            cause: RenderCause::HostFault,
             detail: e.to_string(),
         })
 }
@@ -2435,6 +2595,7 @@ async fn check_render_complete(
     if let jig_runtime::component::RunOutcome::Incomplete(reason) = &run.outcome {
         return Err(IngestError::RenderFailed {
             kind: BlockKind::TextRender.as_str().to_string(),
+            cause: RenderCause::from(reason),
             detail: format!("the render is incomplete: {}", reason.as_str()),
         });
     }
@@ -3002,6 +3163,39 @@ mod tests {
         );
     }
 
+    /// Each runtime reason maps to the cause the client is told about; only fuel and stack say
+    /// the block itself is too expensive.
+    #[test]
+    fn each_incomplete_reason_maps_to_its_render_cause() {
+        use jig_runtime::component::IncompleteReason;
+        let cases = [
+            (
+                IncompleteReason::DeadlineExceeded,
+                RenderCause::DeadlineExceeded,
+                false,
+            ),
+            (
+                IncompleteReason::FuelExhausted,
+                RenderCause::FuelExhausted,
+                true,
+            ),
+            (
+                IncompleteReason::StackExhausted,
+                RenderCause::StackExhausted,
+                true,
+            ),
+            (
+                IncompleteReason::HostFault("trap".to_string()),
+                RenderCause::HostFault,
+                false,
+            ),
+        ];
+        for (reason, cause, too_expensive) in cases {
+            assert_eq!(RenderCause::from(&reason), cause, "{reason:?}");
+            assert_eq!(cause.is_too_expensive(), too_expensive, "{cause:?}");
+        }
+    }
+
     /// A render that runs out of fuel is refused before the block lands: nothing is stored,
     /// sequenced or fanned out.
     #[tokio::test]
@@ -3031,7 +3225,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            matches!(&err, IngestError::RenderFailed { detail, .. } if detail.contains("fuel-exhausted")),
+            matches!(&err, IngestError::RenderFailed { cause: RenderCause::FuelExhausted, detail, .. } if detail.contains("fuel-exhausted")),
             "{err:?}"
         );
         assert!(
@@ -4377,7 +4571,7 @@ mod tests {
             &[("channel", "#hello"), ("member_did", "did:jig:zDeji")],
         );
 
-        do_ingest(
+        let first = do_ingest(
             &ctx,
             mb.clone(),
             cb.clone(),
@@ -4396,27 +4590,143 @@ mod tests {
                 .unwrap()
         );
 
-        let err = do_ingest(
+        // A client's replay is answered with the block's CID (step 1a), and a
+        // peer's or a bridge's is refused (step 3d). Neither applies it again.
+        let again = do_ingest(
             &ctx,
-            mb,
-            cb,
-            sig,
+            mb.clone(),
+            cb.clone(),
+            sig.clone(),
             IngestSource::LocalClient {
                 conn_id: 1,
                 tiers: true,
             },
         )
         .await
-        .expect_err("the same block a second time must be refused");
+        .expect("a client's replay is answered with the held block's CID");
+        assert_eq!(again, first);
+        let err = do_ingest(&ctx, mb, cb, sig, IngestSource::Bridge)
+            .await
+            .expect_err("a bridge's copy of a held block is refused");
         assert!(
             matches!(err, IngestError::DuplicateBlock { .. }),
             "got {err:?}"
         );
         assert!(
             !ctx.store.is_member("#hello", "did:jig:zDeji").unwrap(),
-            "a refused replay must leave the revocation in place"
+            "a replay must leave the revocation in place"
         );
         assert_eq!(ctx.store.list_members(&channel_id).unwrap().len(), 0);
+    }
+
+    /// Step 1a answers for a block held in the channel it names, and only
+    /// there: a block held only in a relayed copy set aside under another id
+    /// goes on through the channel checks, as before.
+    #[tokio::test]
+    async fn a_block_held_only_in_a_set_aside_copy_is_not_answered_as_held() {
+        let ctx = test_ctx_allowing(&["member-add"]);
+        let owner_key = random_signing_key();
+        seed_channel_owned_by(&ctx, "#hello", &did_of(&owner_key));
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &owner_key,
+            BlockKind::MemberAdd,
+            &[("channel", "#hello"), ("member_did", "did:jig:zDeji")],
+        );
+        let client = || IngestSource::LocalClient {
+            conn_id: 1,
+            tiers: true,
+        };
+        let cid = do_ingest(&ctx, mb.clone(), cb.clone(), sig.clone(), client())
+            .await
+            .expect("first ingest");
+        // What `quarantine_relayed_copy` does to the copy's blocks.
+        ctx.store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE blocks SET channel_id = 'bafkrelayedcopy' WHERE cid = ?1",
+                [&cid],
+            )
+            .unwrap();
+        let err = do_ingest(&ctx, mb, cb, sig, client())
+            .await
+            .expect_err("not held in #hello, so not answered as held");
+        assert!(
+            matches!(err, IngestError::DuplicateBlock { .. }),
+            "falls through to the channel checks and step 3d: {err:?}"
+        );
+    }
+
+    /// Counts the admission checks ingest asks for.
+    #[derive(Default)]
+    struct CountingAdmission(std::sync::atomic::AtomicUsize);
+
+    impl Admission for CountingAdmission {
+        fn admit(&self, _sender_did: &str) -> Result<(), AdmissionRefusal> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// Step 1a: whoever resubmits a block this server holds, its author's
+    /// admission (rate and pool share) is not charged again, and the answer is
+    /// the block's CID. A block that has not landed is charged every time.
+    #[tokio::test]
+    async fn a_held_block_resubmitted_charges_no_admission() {
+        let counted = Arc::new(CountingAdmission::default());
+        let mut ctx = test_ctx_allowing(&["member-add"]);
+        ctx.admission = counted.clone();
+        let owner_key = random_signing_key();
+        seed_channel_owned_by(&ctx, "#hello", &did_of(&owner_key));
+        let charged = || counted.0.load(std::sync::atomic::Ordering::SeqCst);
+        let client = || IngestSource::LocalClient {
+            conn_id: 7,
+            tiers: true,
+        };
+
+        // Refused at the write gate, so never stored: charged each time.
+        let stranger = random_signing_key();
+        let (smb, scb, ssig) = build_bundle_parts_with_meta(
+            &stranger,
+            BlockKind::MemberAdd,
+            &[("channel", "#hello"), ("member_did", "did:jig:zDeji")],
+        );
+        for n in 1..=2 {
+            do_ingest(&ctx, smb.clone(), scb.clone(), ssig.clone(), client())
+                .await
+                .expect_err("a stranger cannot add members");
+            assert_eq!(charged(), n, "a block that never landed is charged");
+        }
+
+        let (mb, cb, sig) = build_bundle_parts_with_meta(
+            &owner_key,
+            BlockKind::MemberAdd,
+            &[("channel", "#hello"), ("member_did", "did:jig:zDeji")],
+        );
+        let cid = do_ingest(&ctx, mb.clone(), cb.clone(), sig.clone(), client())
+            .await
+            .expect("first ingest");
+        assert_eq!(charged(), 3);
+        for source in [client(), IngestSource::AdminEndpoint] {
+            let again = do_ingest(&ctx, mb.clone(), cb.clone(), sig.clone(), source)
+                .await
+                .expect("a held block is answered");
+            assert_eq!(again, cid);
+        }
+        assert_eq!(charged(), 3, "a held block charges its author nothing");
+
+        // A bundle whose signature does not verify never learns the CID.
+        let mut forged = sig.clone();
+        forged[0] ^= 1;
+        let err = do_ingest(&ctx, mb, cb, forged, client())
+            .await
+            .expect_err("a mis-signed copy is refused");
+        assert!(
+            !matches!(err, IngestError::DuplicateBlock { .. }),
+            "refused at the signature, not as a duplicate: {err:?}"
+        );
+        assert_eq!(charged(), 3);
     }
 
     /// Gate 3 for writes runs inside ingest, so every surface gets it. A validly
