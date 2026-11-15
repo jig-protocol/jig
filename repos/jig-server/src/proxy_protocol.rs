@@ -150,11 +150,19 @@ impl ProxyProtocol {
         &self.trusted
     }
 
-    /// Whether `ip` is a trusted proxy. An IPv4 peer on a dual-stack socket
-    /// arrives as `::ffff:a.b.c.d` and matches its IPv4 entry.
+    /// Whether `ip` is a trusted proxy. An IPv4 peer matches an entry written
+    /// in either form: `10.0.0.5`, or its IPv4-mapped `::ffff:10.0.0.5` (and
+    /// the CIDRs of each). The peer can arrive in either form too, since a
+    /// dual-stack socket reports IPv4 peers as `::ffff:a.b.c.d`.
     pub fn trusts(&self, ip: IpAddr) -> bool {
         let ip = ip.to_canonical();
-        self.trusted.iter().any(|net| net.contains(&ip))
+        let mapped = match ip {
+            IpAddr::V4(v4) => IpAddr::V6(v4.to_ipv6_mapped()),
+            IpAddr::V6(_) => ip,
+        };
+        self.trusted
+            .iter()
+            .any(|net| net.contains(&ip) || net.contains(&mapped))
     }
 
     /// The address to serve `io` under. For a trusted `peer`, read its PROXY
@@ -314,6 +322,18 @@ pub(crate) mod tests {
         assert!(p.trusts("::ffff:10.0.0.5".parse().unwrap()), "v4-mapped");
         assert!(p.trusts("2001:db8:0:1::9".parse().unwrap()));
         assert!(!p.trusts("10.0.0.6".parse().unwrap()));
+        // Entries in IPv4-mapped form match an IPv4 peer in either form.
+        let mapped = proxy(&["::ffff:10.0.0.5", "::ffff:10.0.1.0/120"]);
+        for peer in [
+            "10.0.0.5",
+            "::ffff:10.0.0.5",
+            "10.0.1.200",
+            "::ffff:10.0.1.200",
+        ] {
+            assert!(mapped.trusts(peer.parse().unwrap()), "{peer}");
+        }
+        assert!(!mapped.trusts("10.0.0.6".parse().unwrap()));
+        assert!(!mapped.trusts("10.0.2.1".parse().unwrap()));
 
         let client: SocketAddr = "198.51.100.7:40000".parse().unwrap();
         let header = v2_header(client, "192.0.2.1:443".parse().unwrap(), 0);

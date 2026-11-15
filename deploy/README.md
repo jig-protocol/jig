@@ -247,7 +247,8 @@ the root keys and every section in one file.
 > **Behind a passthrough proxy, enable PROXY protocol on both sides**, or every
 > client has the proxy's address and shares one per-address rate bucket and one
 > set of REST relay slots. Have the proxy send PROXY protocol **v2**
-> (HAProxy: `send-proxy-v2`; nginx `stream`: `proxy_protocol on`), and list it in
+> (HAProxy: `send-proxy-v2`; nginx 1.31.4+ `stream`: `proxy_protocol v2`. nginx's
+> `proxy_protocol on` sends v1, which jig-server refuses), and list it in
 > jig-server's config:
 >
 > ```toml
