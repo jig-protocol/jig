@@ -101,6 +101,15 @@ Draft. Field names are provisional. The design behind this revision is
    A client MUST treat a signed `refusal` that omits a suite it pinned for that server
    as a contradiction, not as an incompatibility.
 
+   An ordinary error that waiting may change (a rate limit, a busy host, an owner not
+   connected) MAY carry `retry_after_ms`: how long to wait before trying again.
+   - A server that picks the wait itself, rather than computing it from a rate limit,
+     SHOULD draw it uniformly from half to one and a half times its nominal value, so
+     that clients refused in one burst do not return in the next one together.
+   - A client that tries again SHOULD wait `retry_after_ms` plus a random extra time,
+     drawn uniformly from zero to half of it. It SHOULD NOT try sooner: a rate limit's
+     wait is when a token is back, so an earlier attempt is refused again.
+
 ## Checking behaviour against the welcome
 
 8. A client MUST treat each of these as a contradiction:

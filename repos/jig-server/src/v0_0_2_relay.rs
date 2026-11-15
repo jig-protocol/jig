@@ -62,7 +62,8 @@ pub const RELAY_TIMEOUT: Duration = Duration::from_secs(10);
 /// The most relays one client connection may have waiting on the owner.
 pub const MAX_IN_FLIGHT: usize = 4;
 
-/// What a client is told to wait when the owner is not connected.
+/// What a client is told to wait when the owner is not connected, before
+/// [`crate::v0_0_2_ingest_error::jitter`].
 pub const UNREACHABLE_RETRY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,10 +213,12 @@ impl Refusal {
 
     /// The refusal for an ingest error, as every surface classifies it.
     pub fn of(e: &IngestError) -> Self {
-        let (status, code, message) = crate::v0_0_2_ingest_error::classify_ingest_error(e);
+        use crate::v0_0_2_ingest_error::{classify_with_wait, jitter, millis, retry_after};
+        // One draw, said in the message and carried in the field.
+        let wait = retry_after(e).map(jitter);
+        let (status, code, message) = classify_with_wait(e, wait);
         Refusal {
-            retry_after_ms: crate::v0_0_2_ingest_error::retry_after(e)
-                .map(|wait| u64::try_from(wait.as_millis()).unwrap_or(u64::MAX).max(1)),
+            retry_after_ms: wait.map(millis),
             ..Refusal::new(status, code, message)
         }
     }
@@ -223,7 +226,7 @@ impl Refusal {
     /// A refusal with when to post again: in `retry_after_ms`, and in the
     /// message for whoever reads it.
     fn retry(status: StatusCode, code: &str, message: &str, wait: Duration) -> Self {
-        let ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX).max(1);
+        let ms = crate::v0_0_2_ingest_error::millis(wait);
         Refusal {
             retry_after_ms: Some(ms),
             ..Refusal::new(
@@ -480,7 +483,7 @@ impl Relay {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "OWNER_UNREACHABLE",
                 &format!("channel {channel_id}'s owner `{owner}` is not connected"),
-                UNREACHABLE_RETRY,
+                crate::v0_0_2_ingest_error::jitter(UNREACHABLE_RETRY),
             )
         };
         let Some(sender) = self.peers.sender_for(&owner_did) else {
@@ -862,7 +865,15 @@ mod tests {
         };
         let refusal = Refusal::of(&render_failed(RenderCause::DeadlineExceeded));
         assert_eq!(refusal.status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(refusal.retry_after_ms, Some(1000));
+        let wait = refusal.retry_after_ms.expect("a wait");
+        assert!((500..=1500).contains(&wait), "{wait}");
+        assert!(
+            refusal
+                .message
+                .ends_with(&format!("(retry_after_ms={wait})")),
+            "{}",
+            refusal.message
+        );
         let refusal = Refusal::of(&render_failed(RenderCause::FuelExhausted));
         assert_eq!(refusal.code, "BLOCK_TOO_EXPENSIVE");
         assert_eq!(refusal.retry_after_ms, None);
