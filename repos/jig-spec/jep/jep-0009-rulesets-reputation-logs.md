@@ -478,7 +478,9 @@ binds R3 (rules 7–22) as well: R3's nameservers and R2.4's single server compu
 
     Aged-proof membership can be farmed: one proof per DID, solved in parallel, and one wait
     for all of them. The wait does not grow with the farm. Aged-proof members therefore draw
-    from their own sub-share of the member pool (JEP-0008 rule 23's `aged_share`). Operator `records` stay local policy, outside `R`. A
+    from their own sub-share of the member pool (JEP-0008 rule 23's `aged_share`). The bound
+    protects established members only. A farm can still fill `aged_share` and crowd out honest
+    newcomers who are members by aged proof. Operator `records` stay local policy, outside `R`. A
     server MAY treat a recorded DID as a member. That membership is not part of `R` and is never a
     protocol input (rule 20).
 50. **Consequences are local.** `f` outputs the score and whether the subject is established,
