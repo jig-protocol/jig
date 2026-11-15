@@ -27,6 +27,7 @@ pub const OFFER_DOMAIN: &str = "jig-contract-offer-v1";
 pub const ACCEPT_DOMAIN: &str = "jig-contract-accept-v1";
 pub const REFUSE_DOMAIN: &str = "jig-contract-refuse-v1";
 pub const END_DOMAIN: &str = "jig-contract-end-v1";
+pub const KP_REQUEST_DOMAIN: &str = "jig-kp-request-v1";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ContractError {
@@ -590,6 +591,97 @@ impl ContractEnd {
     }
 }
 
+/// A request for one of `did`'s key packages, sent to one of its custodians
+/// (rule 21). Signed by the requester, it names the channel the package is
+/// for and the custodian it is addressed to, so a custodian can neither be
+/// asked on another's behalf nor replay the request to another custodian as
+/// a fresh one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KpRequest {
+    /// The DID asking, which signs: the member adding `did`.
+    pub requester: String,
+    /// The DID whose key package is asked for.
+    pub did: String,
+    pub channel_id: Cid,
+    /// The custodian's server DID.
+    pub custodian: String,
+    /// Fresh per request, so two requests never share bytes.
+    pub nonce: [u8; 16],
+    /// When the requester signed it, in Unix seconds on its clock.
+    pub issued_at: i64,
+    /// `requester`'s COSE_Sign1 over [`KpRequest::payload`].
+    pub envelope: Vec<u8>,
+}
+
+impl KpRequest {
+    const WHAT: &'static str = "key-package request";
+
+    pub fn payload(&self) -> Vec<u8> {
+        encode(Value::text_map([
+            ("domain", Value::text(KP_REQUEST_DOMAIN)),
+            ("requester", Value::text(self.requester.clone())),
+            ("did", Value::text(self.did.clone())),
+            ("channel_id", Value::Bytes(self.channel_id.to_bytes())),
+            ("custodian", Value::text(self.custodian.clone())),
+            ("nonce", Value::Bytes(self.nonce.to_vec())),
+            ("issued_at", Value::int(self.issued_at)),
+        ]))
+    }
+
+    pub fn sign(
+        requester_key: &SigningKey,
+        did: &str,
+        channel_id: Cid,
+        custodian: &str,
+        nonce: [u8; 16],
+        issued_at: i64,
+    ) -> Self {
+        let mut req = Self {
+            requester: did_of(requester_key),
+            did: did.to_string(),
+            channel_id,
+            custodian: custodian.to_string(),
+            nonce,
+            issued_at,
+            envelope: Vec::new(),
+        };
+        req.envelope = cose::sign1(requester_key, &req.payload());
+        req
+    }
+
+    pub fn from_envelope(envelope: &[u8]) -> Result<Self, ContractError> {
+        let p = open(envelope, KP_REQUEST_DOMAIN, Self::WHAT)?;
+        let nonce = bytes(&p, "nonce", Self::WHAT)?
+            .try_into()
+            .map_err(|_| ContractError::BadPayload(Self::WHAT))?;
+        let issued_at = field(&p, "issued_at", Self::WHAT)?
+            .as_i64()
+            .ok_or(ContractError::BadPayload(Self::WHAT))?;
+        let req = Self {
+            requester: text(&p, "requester", Self::WHAT)?,
+            did: text(&p, "did", Self::WHAT)?,
+            channel_id: cid(&p, "channel_id", Self::WHAT)?,
+            custodian: text(&p, "custodian", Self::WHAT)?,
+            nonce,
+            issued_at,
+            envelope: envelope.to_vec(),
+        };
+        req.verify()?;
+        Ok(req)
+    }
+
+    /// The requester signed exactly these fields, and the two DIDs it names
+    /// are keys in their canonical spelling.
+    pub fn verify(&self) -> Result<(), ContractError> {
+        for did in [&self.did, &self.custodian] {
+            if !is_canonical_did(did) {
+                return Err(ContractError::BadDid(did.clone()));
+            }
+        }
+        verify_envelope(&self.envelope, &self.payload(), &self.requester)
+    }
+}
+
 fn answers(
     offer_id: [u8; 32],
     channel_id: Cid,
@@ -1112,6 +1204,92 @@ mod tests {
             serde_json::from_str(include_str!("../../jig-spec/jep/vectors/0005/vectors.json"))
                 .unwrap();
         assert_eq!(vectors(), v);
+    }
+
+    fn kp_request() -> KpRequest {
+        KpRequest::sign(
+            &key(3),
+            &did_of(&key(4)),
+            canonical_cid::of(b"channel-create"),
+            &did_of(&key(5)),
+            [7; 16],
+            1_800_000_000,
+        )
+    }
+
+    #[test]
+    fn a_kp_request_round_trips_and_names_what_it_was_signed_for() {
+        let r = kp_request();
+        let back = KpRequest::from_envelope(&r.envelope).unwrap();
+        assert_eq!(back, r);
+        assert_eq!(back.requester, did_of(&key(3)));
+    }
+
+    #[test]
+    fn a_kp_request_signed_by_anyone_but_its_requester_is_refused() {
+        let mut r = kp_request();
+        r.requester = did_of(&key(9));
+        r.envelope = cose::sign1(&key(3), &r.payload());
+        assert!(matches!(
+            KpRequest::from_envelope(&r.envelope),
+            Err(ContractError::BadSignature(_))
+        ));
+    }
+
+    #[test]
+    fn a_kp_request_naming_a_non_canonical_did_is_refused() {
+        let mut r = kp_request();
+        r.custodian = "did:jig:not-a-key".into();
+        r.envelope = cose::sign1(&key(3), &r.payload());
+        assert!(matches!(
+            KpRequest::from_envelope(&r.envelope),
+            Err(ContractError::BadDid(_))
+        ));
+    }
+
+    #[test]
+    fn a_kp_request_under_another_domain_is_not_a_kp_request() {
+        let e = ContractEnd::sign(&key(3), canonical_cid::of(b"c"), [1; 32]);
+        assert!(matches!(
+            KpRequest::from_envelope(&e.envelope),
+            Err(ContractError::BadPayload(_))
+        ));
+    }
+
+    fn kp_request_vectors() -> serde_json::Value {
+        let r = kp_request();
+        serde_json::json!({
+            "comment": "A jig-kp-request-v1 (JEP-0005 rule 21). payload_hex is the deterministic CBOR payload; cose_sign1_hex is the envelope.",
+            "keys": {
+                "comment": "Ed25519 seeds: every byte set to the given value",
+                "requester": {"seed_byte": 3, "did": did_of(&key(3))},
+                "did": {"seed_byte": 4, "did": did_of(&key(4))},
+                "custodian": {"seed_byte": 5, "did": did_of(&key(5))},
+            },
+            "request": {
+                "payload_hex": hex::encode(r.payload()),
+                "cose_sign1_hex": hex::encode(&r.envelope),
+            },
+        })
+    }
+
+    #[test]
+    fn kp_request_bytes_match_the_committed_vectors() {
+        let v: serde_json::Value = serde_json::from_str(include_str!(
+            "../../jig-spec/jep/vectors/0005/kp-request.json"
+        ))
+        .unwrap();
+        assert_eq!(kp_request_vectors(), v);
+    }
+
+    /// `cargo test -p jig-core --features ed25519 contract::tests::print_kp_request_vectors -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn print_kp_request_vectors() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&kp_request_vectors()).unwrap()
+        );
     }
 
     /// `cargo test -p jig-core --features ed25519 contract::tests::print_vectors -- --ignored --nocapture`
