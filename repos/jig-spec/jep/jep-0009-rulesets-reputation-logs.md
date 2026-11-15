@@ -471,16 +471,15 @@ binds R3 (rules 7–22) as well: R3's nameservers and R2.4's single server compu
     observer's own ruleset, computed from the events and fraud proofs in that observer's epoch
     log. No party holds a global score for a server.
 52. **Units.** Every parameter that `f` reads (the `standing`, `events` and `useful_work`
-    blocks) has one of these units, named in its key:
+    blocks) is an integer in one of these units, which the JEP that names the parameter fixes:
     - evidence and weights: micro-units (rule 40);
-    - fractions: parts per million, keys ending in `_ppm`;
-    - counts of epochs, keys ending in `_epochs`;
-    - counts of log positions, keys ending in `_positions`;
-    - `epoch_secs`, the only time parameter, measured on epoch time (rule 36).
+    - fractions and scores: parts per million;
+    - counts of epochs, of log positions or of items;
+    - `epoch_secs`, the only time `f` uses, measured on epoch time (rule 36).
 
-    A ruleset document in which such a parameter has any other unit is invalid. Parameters `f`
-    does not read (`pow`, `pools`, `tribunal`) keep the names and units their own JEPs give
-    them.
+    No such parameter is a float or a wall-clock duration, and a ruleset document that has one
+    is invalid. Parameters `f` does not read (`pow`, `pools`, `tribunal`) keep the names and
+    units their own JEPs give them.
 
 # Security Considerations (Zero-Trust)
 
