@@ -1046,6 +1046,16 @@ fn build_legacy_routes(
         let state = state_for_handler.clone();
         let bound = bound_str.clone();
         async move {
+            // The admission work this server asks of a new DID, as
+            // `jig_server::handler::server_info` advertises it.
+            let pow_bits = state.auth.pow_bits();
+            let admission_pow = pow_bits.map(|bits| {
+                serde_json::json!({
+                    "alg": jig_core::pow::Alg::Blake3,
+                    "effort": jig_core::admission_pow::effort_for_bits(bits).get(),
+                    "salt_id": jig_core::pow::EMPTY_SALT_ID,
+                })
+            });
             let peers: Vec<serde_json::Value> = state
                 .config
                 .federation
@@ -1069,6 +1079,8 @@ fn build_legacy_routes(
                 // The v0.0.2 router above pages history forward, as
                 // `jig_server::handler::server_info` advertises.
                 "history_after": true,
+                "admission_pow_bits": pow_bits,
+                "admission_pow": admission_pow,
             }))
         }
     };

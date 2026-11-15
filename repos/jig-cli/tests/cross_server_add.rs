@@ -168,3 +168,82 @@ async fn a_server_the_member_does_not_list_is_no_custodian_and_nothing_is_commit
     let members = ok(owner_home.path(), &["channel", "members", "#sec"]);
     assert!(!members.contains(&member), "{members}");
 }
+
+/// A server that asks DIDs it does not know for proof of work.
+async fn pow_server() -> TestJigServer {
+    use jig_config::v0_0_2_server::{AdmissionSection, JigServerConfig, UnknownDidsPolicy};
+    let mut config = JigServerConfig::default();
+    config.auth.admission = AdmissionSection {
+        unknown_dids: UnknownDidsPolicy::ProofOfWork,
+        pow_bits: 8,
+        ..AdmissionSection::default()
+    };
+    TestJigServer::start_with_config(config).await.unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_custodian_that_asks_for_proof_of_work_gets_it_from_the_adder() {
+    let (a, b) = (TestJigServer::start().await.unwrap(), pow_server().await);
+    let member_home = tempfile::tempdir().unwrap();
+    let member = person(member_home.path(), &b);
+    let owner_home = tempfile::tempdir().unwrap();
+    let owner = person(owner_home.path(), &a);
+    // Only the member has done B's work.
+    let proven = |did: &str| b.state.auth.proven(did);
+    assert!(proven(&member));
+    assert!(!proven(&owner));
+    // Read B's store directly: B would ask a test identity for work too.
+    let stocked = || {
+        b.state
+            .ingest_ctx
+            .store
+            .key_package_stock(&member)
+            .unwrap()
+            .0
+    };
+    let on_b = stocked();
+    assert!(on_b > 0);
+
+    ok(owner_home.path(), &["channel", "create", "#sec"]);
+    ok(
+        owner_home.path(),
+        &["channel", "add", "#sec", &member, "--via", &b.http_url()],
+    );
+    assert!(proven(&owner), "the adder did B's work before asking it");
+    assert_eq!(stocked(), on_b - 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_who_opts_out_publishes_no_record_and_has_no_custodian() {
+    let (a, b) = (
+        TestJigServer::start().await.unwrap(),
+        TestJigServer::start().await.unwrap(),
+    );
+    let member_home = tempfile::tempdir().unwrap();
+    ok(member_home.path(), &["init", "me"]);
+    let path = member_home.path().join(".jig").join("cli.toml");
+    let mut cfg: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    cfg["server"]
+        .as_table_mut()
+        .unwrap()
+        .insert("publish_reachability".into(), toml::Value::Boolean(false));
+    std::fs::write(&path, toml::to_string(&cfg).unwrap()).unwrap();
+    ok(member_home.path(), &["server", "set", &b.http_url()]);
+    let member = cfg["user"]["did"].as_str().unwrap().to_string();
+
+    // Packages are stocked as before; only the record is withheld.
+    assert!(stock(&b, &member).await.0 > 0);
+    let (status, _) = get(&b, &test_identity(), &format!("/api/v1/reach/{member}")).await;
+    assert_eq!(status, 404);
+
+    let owner_home = tempfile::tempdir().unwrap();
+    person(owner_home.path(), &a);
+    ok(owner_home.path(), &["channel", "create", "#sec"]);
+    let out = run(
+        owner_home.path(),
+        &["channel", "add", "#sec", &member, "--via", &b.http_url()],
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("NO_CUSTODY"), "{stderr}");
+}

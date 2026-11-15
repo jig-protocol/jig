@@ -349,6 +349,8 @@ pub struct Secure {
     server: String,
     /// The same server as an `http(s)://` base for REST.
     base: String,
+    /// `[server] publish_reachability` ([`Self::ensure_reachable`]).
+    publish_reachability: bool,
     /// Set once this process has held the server to its pin
     /// ([`Self::ensure_pinned`]).
     pinned: tokio::sync::OnceCell<()>,
@@ -369,6 +371,7 @@ impl Secure {
             identity: ctx.identity()?,
             base: base_http_url(&server),
             server,
+            publish_reachability: ctx.effective().server.publishes_reachability(),
             pinned: tokio::sync::OnceCell::new(),
             forward: tokio::sync::OnceCell::new(),
             forward_broken: std::sync::atomic::AtomicBool::new(false),
@@ -687,7 +690,11 @@ impl Secure {
     /// rule 21), so members of other servers can ask it for our key packages
     /// ([`Self::key_package_from_custodians`]). Servers the record kept here
     /// already listed stay listed; this server is put first.
+    /// Nothing, with `[server] publish_reachability = false`.
     pub async fn ensure_reachable(&self) -> Result<()> {
+        if !self.publish_reachability {
+            return Ok(());
+        }
         let did = self.session.did().to_string();
         let server_did = self.server_did().await?;
         let here = (server_did.clone(), self.base.clone());
