@@ -37,6 +37,58 @@ pub enum PersistError {
 
 pub type Result<T> = std::result::Result<T, PersistError>;
 
+/// What [`SqliteStore::release_key_package`] is asked: one verified request,
+/// and the limits to hold it to.
+#[derive(Debug, Clone)]
+pub struct ReleaseAsk<'a> {
+    pub did: &'a str,
+    pub requester: &'a str,
+    pub channel_id: &'a str,
+    /// A digest of the signed request, unique per request.
+    pub request_hash: &'a [u8],
+    /// The signed request, kept in the log.
+    pub request: &'a [u8],
+    pub now: i64,
+    /// Seconds within which the same requester, DID and channel get the
+    /// package they were already given.
+    pub repeat_window: i64,
+    /// Most releases of one DID per hour.
+    pub per_did: u64,
+    /// Most releases to one requester per hour.
+    pub per_requester: u64,
+}
+
+/// Which hourly limit a release hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitHit {
+    Did,
+    Requester,
+}
+
+/// What [`SqliteStore::release_key_package`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Release {
+    /// A package released now, and logged.
+    Released { package: Vec<u8>, last_resort: bool },
+    /// The package this requester was already given for this DID and
+    /// channel, again; nothing new was consumed or logged.
+    Again { package: Vec<u8>, last_resort: bool },
+    /// Nothing released: a limit was reached.
+    Limited(LimitHit),
+    /// The DID has no package here at all.
+    Empty,
+}
+
+/// One entry of a custodian's release log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseLogEntry {
+    pub requester: String,
+    pub channel_id: String,
+    pub last_resort: bool,
+    pub request: Vec<u8>,
+    pub released_at: i64,
+}
+
 /// SQLite-backed store. Internally serializes all access via `Mutex<Connection>`.
 /// For higher concurrency in v0.0.3+ consider replacing with a connection pool.
 pub struct SqliteStore {
@@ -1215,6 +1267,34 @@ impl SqliteStore {
             );
             CREATE INDEX IF NOT EXISTS mls_key_packages_did
                 ON mls_key_packages(did, consumed_at, last_resort);
+
+            -- Reachability records (JEP-0004 rule 21) of DIDs that list this
+            -- server: the highest `seq` each DID signed. The envelope is the
+            -- DID's own COSE_Sign1, served back unchanged.
+            CREATE TABLE IF NOT EXISTS reachability_records (
+                did        TEXT PRIMARY KEY,
+                seq        INTEGER NOT NULL,
+                envelope   BLOB NOT NULL,
+                stored_at  INTEGER NOT NULL
+            );
+
+            -- Every key package this server released as a custodian
+            -- (JEP-0005 rule 21), with the signed request it answered. Also
+            -- what the per-DID and per-requester limits count.
+            CREATE TABLE IF NOT EXISTS kp_releases (
+                request_hash  BLOB PRIMARY KEY,
+                did           TEXT NOT NULL,
+                requester     TEXT NOT NULL,
+                channel_id    TEXT NOT NULL,
+                reference     BLOB NOT NULL,
+                last_resort   INTEGER NOT NULL,
+                request       BLOB NOT NULL,
+                released_at   INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS kp_releases_did
+                ON kp_releases(did, released_at);
+            CREATE INDEX IF NOT EXISTS kp_releases_requester
+                ON kp_releases(requester, released_at);
 
             -- DIDs that did this server's admission proof of work, and how
             -- much. Kept for good: the work was the price of being known.
@@ -2575,6 +2655,173 @@ impl SqliteStore {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Keep `envelope`, `did`'s reachability record at `seq`, unless a record
+    /// with this `seq` or a higher one is kept already. Returns whether it was
+    /// stored. The caller verifies the record.
+    pub fn put_reachability(&self, did: &str, seq: u64, envelope: &[u8], now: i64) -> Result<bool> {
+        // SQLite integers are signed; a record past i64::MAX is clamped
+        // there, so it still outranks every lower one.
+        let seq = i64::try_from(seq).unwrap_or(i64::MAX);
+        let changed = self.conn.lock().expect("poisoned").execute(
+            "INSERT INTO reachability_records (did, seq, envelope, stored_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(did) DO UPDATE
+                SET seq = excluded.seq, envelope = excluded.envelope,
+                    stored_at = excluded.stored_at
+              WHERE excluded.seq > reachability_records.seq",
+            params![did, seq, envelope, now],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// `did`'s kept reachability record, as its envelope.
+    pub fn reachability(&self, did: &str) -> Result<Option<Vec<u8>>> {
+        self.conn
+            .lock()
+            .expect("poisoned")
+            .query_row(
+                "SELECT envelope FROM reachability_records WHERE did = ?",
+                [did],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Release one of `ask.did`'s key packages to `ask.requester` as a
+    /// custodian, in one transaction with its log entry and the limits:
+    ///
+    /// - the same requester asking again for the same DID and channel within
+    ///   `ask.repeat_window` seconds, or resending the same request, gets the
+    ///   package it was already given, so a lost answer costs no second
+    ///   package;
+    /// - otherwise, at `ask.per_did` releases of the DID or `ask.per_requester`
+    ///   releases to the requester in the hour before `ask.now`, nothing is
+    ///   released;
+    /// - otherwise the oldest ordinary package is consumed, or failing that
+    ///   the newest last-resort one is handed out and kept.
+    pub fn release_key_package(&self, ask: &ReleaseAsk<'_>) -> Result<Release> {
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        let earlier: Option<(Vec<u8>, bool)> = tx
+            .query_row(
+                "SELECT k.package, r.last_resort
+                   FROM kp_releases r JOIN mls_key_packages k ON k.reference = r.reference
+                  WHERE r.request_hash = ?5
+                     OR (r.did = ?1 AND r.requester = ?2 AND r.channel_id = ?3
+                         AND r.released_at > ?4)
+                  ORDER BY r.released_at DESC LIMIT 1",
+                params![
+                    ask.did,
+                    ask.requester,
+                    ask.channel_id,
+                    ask.now - ask.repeat_window,
+                    ask.request_hash
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((package, last_resort)) = earlier {
+            return Ok(Release::Again {
+                package,
+                last_resort,
+            });
+        }
+        let hour_ago = ask.now - 3600;
+        let by_did: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM kp_releases WHERE did = ?1 AND released_at > ?2",
+            params![ask.did, hour_ago],
+            |r| r.get(0),
+        )?;
+        if by_did as u64 >= ask.per_did {
+            return Ok(Release::Limited(LimitHit::Did));
+        }
+        let by_requester: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM kp_releases WHERE requester = ?1 AND released_at > ?2",
+            params![ask.requester, hour_ago],
+            |r| r.get(0),
+        )?;
+        if by_requester as u64 >= ask.per_requester {
+            return Ok(Release::Limited(LimitHit::Requester));
+        }
+        let ordinary: Option<(Vec<u8>, Vec<u8>)> = tx
+            .query_row(
+                "SELECT reference, package FROM mls_key_packages
+                  WHERE did = ? AND consumed_at IS NULL AND last_resort = 0
+                  ORDER BY published_at ASC, reference ASC LIMIT 1",
+                [ask.did],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (reference, package, last_resort) = match ordinary {
+            Some((reference, package)) => {
+                tx.execute(
+                    "UPDATE mls_key_packages SET consumed_at = ? WHERE reference = ?",
+                    params![ask.now, reference],
+                )?;
+                (reference, package, false)
+            }
+            None => {
+                let resort: Option<(Vec<u8>, Vec<u8>)> = tx
+                    .query_row(
+                        "SELECT reference, package FROM mls_key_packages
+                          WHERE did = ? AND last_resort = 1
+                          ORDER BY published_at DESC, reference DESC LIMIT 1",
+                        [ask.did],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                match resort {
+                    Some((reference, package)) => (reference, package, true),
+                    None => return Ok(Release::Empty),
+                }
+            }
+        };
+        tx.execute(
+            "INSERT INTO kp_releases
+                (request_hash, did, requester, channel_id, reference, last_resort,
+                 request, released_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                ask.request_hash,
+                ask.did,
+                ask.requester,
+                ask.channel_id,
+                reference,
+                last_resort,
+                ask.request,
+                ask.now
+            ],
+        )?;
+        tx.commit()?;
+        Ok(Release::Released {
+            package,
+            last_resort,
+        })
+    }
+
+    /// The custodian's log of `did`'s releases, newest first, at most `limit`.
+    pub fn key_package_releases(&self, did: &str, limit: u32) -> Result<Vec<ReleaseLogEntry>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT requester, channel_id, last_resort, request, released_at
+               FROM kp_releases WHERE did = ?1
+              ORDER BY released_at DESC, request_hash ASC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![did, limit], |r| {
+                Ok(ReleaseLogEntry {
+                    requester: r.get(0)?,
+                    channel_id: r.get(1)?,
+                    last_resort: r.get(2)?,
+                    request: r.get(3)?,
+                    released_at: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Whether `did` has done this server's admission proof of work.
@@ -4464,6 +4711,159 @@ mod tests {
                 .is_none(),
             "a commit from a passed epoch writes nothing"
         );
+    }
+
+    fn ask<'a>(did: &'a str, requester: &'a str, hash: &'a [u8], now: i64) -> ReleaseAsk<'a> {
+        ReleaseAsk {
+            did,
+            requester,
+            channel_id: "chan",
+            request_hash: hash,
+            request: b"signed request",
+            now,
+            repeat_window: 600,
+            per_did: 3,
+            per_requester: 2,
+        }
+    }
+
+    #[test]
+    fn a_custodian_releases_once_repeats_the_same_answer_and_logs_it() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let did = "did:jig:zD";
+        store
+            .insert_key_package(b"r1", did, b"kp1", false, 1)
+            .unwrap();
+        store
+            .insert_key_package(b"r2", did, b"kp2", false, 2)
+            .unwrap();
+        store
+            .insert_key_package(b"lr", did, b"kpL", true, 3)
+            .unwrap();
+        assert_eq!(
+            store
+                .release_key_package(&ask(did, "did:jig:zA", b"h1", 100))
+                .unwrap(),
+            Release::Released {
+                package: b"kp1".to_vec(),
+                last_resort: false
+            }
+        );
+        // A second request from the same requester, for the same DID and
+        // channel, within the window: the same package, nothing consumed.
+        assert_eq!(
+            store
+                .release_key_package(&ask(did, "did:jig:zA", b"h2", 200))
+                .unwrap(),
+            Release::Again {
+                package: b"kp1".to_vec(),
+                last_resort: false
+            }
+        );
+        // The same request resent much later is still answered the same way.
+        assert_eq!(
+            store
+                .release_key_package(&ask(did, "did:jig:zA", b"h1", 5000))
+                .unwrap(),
+            Release::Again {
+                package: b"kp1".to_vec(),
+                last_resort: false
+            }
+        );
+        assert_eq!(store.key_package_stock(did).unwrap(), (1, true));
+        let log = store.key_package_releases(did, 10).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].requester, "did:jig:zA");
+        assert_eq!(log[0].request, b"signed request");
+    }
+
+    #[test]
+    fn a_custodian_hands_out_last_resort_without_consuming_it() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let did = "did:jig:zD";
+        store
+            .insert_key_package(b"lr", did, b"kpL", true, 3)
+            .unwrap();
+        for (i, who) in ["did:jig:zA", "did:jig:zB"].into_iter().enumerate() {
+            let hash = [i as u8];
+            assert_eq!(
+                store
+                    .release_key_package(&ask(did, who, &hash, 100))
+                    .unwrap(),
+                Release::Released {
+                    package: b"kpL".to_vec(),
+                    last_resort: true
+                }
+            );
+        }
+        assert_eq!(store.key_package_stock(did).unwrap(), (0, true));
+        assert_eq!(
+            store
+                .release_key_package(&ask("did:jig:zNobody", "did:jig:zA", b"x", 100))
+                .unwrap(),
+            Release::Empty
+        );
+    }
+
+    #[test]
+    fn a_custodian_holds_releases_to_the_hourly_limits() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let did = "did:jig:zD";
+        for i in 0..10u8 {
+            store
+                .insert_key_package(&[b'r', i], did, &[b'k', i], false, i64::from(i))
+                .unwrap();
+        }
+        // per_requester is 2: a third DID-and-channel pair from one requester
+        // is refused, though the DID has packages left.
+        let mut a = ask(did, "did:jig:zA", b"a1", 100);
+        a.channel_id = "c1";
+        assert!(matches!(
+            store.release_key_package(&a).unwrap(),
+            Release::Released { .. }
+        ));
+        a.channel_id = "c2";
+        a.request_hash = b"a2";
+        assert!(matches!(
+            store.release_key_package(&a).unwrap(),
+            Release::Released { .. }
+        ));
+        a.channel_id = "c3";
+        a.request_hash = b"a3";
+        assert_eq!(
+            store.release_key_package(&a).unwrap(),
+            Release::Limited(LimitHit::Requester)
+        );
+        // per_did is 3: one more requester is served, the next is not.
+        let b = ask(did, "did:jig:zB", b"b1", 100);
+        assert!(matches!(
+            store.release_key_package(&b).unwrap(),
+            Release::Released { .. }
+        ));
+        let c = ask(did, "did:jig:zC", b"c1", 100);
+        assert_eq!(
+            store.release_key_package(&c).unwrap(),
+            Release::Limited(LimitHit::Did)
+        );
+        // An hour later the limits have room again.
+        let c = ask(did, "did:jig:zC", b"c2", 100 + 3601);
+        assert!(matches!(
+            store.release_key_package(&c).unwrap(),
+            Release::Released { .. }
+        ));
+    }
+
+    #[test]
+    fn a_reachability_record_is_replaced_only_by_a_higher_seq() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let did = "did:jig:zD";
+        assert_eq!(store.reachability(did).unwrap(), None);
+        assert!(store.put_reachability(did, 5, b"five", 1).unwrap());
+        assert!(!store.put_reachability(did, 5, b"other five", 2).unwrap());
+        assert!(!store.put_reachability(did, 4, b"four", 3).unwrap());
+        assert_eq!(store.reachability(did).unwrap().unwrap(), b"five");
+        assert!(store.put_reachability(did, 6, b"six", 4).unwrap());
+        assert_eq!(store.reachability(did).unwrap().unwrap(), b"six");
     }
 
     #[test]

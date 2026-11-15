@@ -5,8 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use jig_config::v0_0_2_server::{
-    AuthSection, BridgesSection, DebugSection, FederationSection, IdentitySection, JigServerConfig,
-    KeysSection, LimitsSection, NameserverSection, ServerSection,
+    AuthSection, BridgesSection, CustodySection, DebugSection, FederationSection, IdentitySection,
+    JigServerConfig, KeysSection, LimitsSection, NameserverSection, ServerSection,
 };
 
 use crate::runtime::ExecutionConfig;
@@ -64,6 +64,8 @@ pub struct ServerConfig {
     pub keys: KeysSection,
     #[serde(default)]
     pub limits: LimitsSection,
+    #[serde(default)]
+    pub custody: CustodySection,
 }
 
 /// Keys jig-server once accepted and no longer does, as a dotted path and the
@@ -138,6 +140,7 @@ impl Default for ServerConfig {
             auth: AuthSection::default(),
             keys: KeysSection::default(),
             limits: LimitsSection::default(),
+            custody: CustodySection::default(),
         }
     }
 }
@@ -191,6 +194,7 @@ impl ServerConfig {
             auth: self.auth.clone(),
             keys: self.keys.clone(),
             limits: self.limits.clone(),
+            custody: self.custody.clone(),
         }
     }
 
@@ -441,11 +445,28 @@ list_handles = {list_handles}
 # max_request_body_bytes = {envelope}
 # max_ws_message_bytes = {envelope}
 # max_ws_frame_bytes = {envelope}
+
+[custody]
+# Key packages this server releases, as a custodian, to members of other
+# servers adding one of its users to a channel. Only users whose signed
+# reachability record lists this server are served. `open` releases to any
+# signed request this server admits, within the limits; `closed` to none.
+release = "{custody_release}"
+per_member_per_hour = {custody_per_member}
+per_requester_per_hour = {custody_per_requester}
+request_window_secs = {custody_window}
 "#,
         listen = listen,
         keyfile = defaults.server.server_did_keyfile,
         require_auth = defaults.auth.require_authenticated_reads,
         replay_window_ms = defaults.auth.replay_window_ms,
+        custody_release = match defaults.custody.release {
+            jig_config::v0_0_2_server::ReleasePolicy::Open => "open",
+            jig_config::v0_0_2_server::ReleasePolicy::Closed => "closed",
+        },
+        custody_per_member = defaults.custody.per_member_per_hour,
+        custody_per_requester = defaults.custody.per_requester_per_hour,
+        custody_window = defaults.custody.request_window_secs,
         replay_capacity = defaults.auth.replay_capacity,
         per_did_burst = defaults.auth.rate_limit.per_did_burst,
         per_did_per_second = defaults.auth.rate_limit.per_did_per_second,
