@@ -82,8 +82,38 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
      frame, or HTTP 403.
 
    Both checks run before admission, so a refused submission is never charged to anyone.
+4a. **Rule 4 runs before the held-block answer.** A server answers a resubmitted block it
+   already holds in its channel with that block's CID, before admission (ingest step 1a).
+   For a local submission, the rule 4 checks run first, straight after the block's
+   signature is verified.
+   - A local submission of a held block with no submitter is refused with `AUTH_REQUIRED`,
+     and one whose signer is not the submitter with `SIGNER_MISMATCH`. Neither learns the
+     block's CID or that the server holds it.
+   - The signer resubmitting its own held block gets the CID, and spends no rate, pool share
+     or relay slot, as before.
+   - Relayed writes (rule 12) are not local submissions. A relayed copy of a held block is
+     answered with its CID as before.
+
+   This is a choice. The other order, the held-block answer first, would spend nothing
+   either way. But it would tell a caller with no proven DID that this server holds a
+   given block in a given channel. The caller already holds the bytes, so that is a small
+   leak. The choice is still made here so that implementations agree and the vectors can
+   test it.
 5. **Admission, rate limits, proof-of-work and ruleset penalties for a local submission
    apply to the submitter.** By rule 4 that is also the signer.
+   - **Per-address limits still apply.** A DID costs nothing to make (OP-10, AB-05), so a
+     limit keyed only on the submitter is no bound on one client minting DIDs. A server
+     keeps its per-address limits on local submissions as well.
+   - **Relay slots.** A follower's slots for writes waiting on the owner (JEP-0005
+     rule 15) are counted per submitter once the submitter is proven. They are bounded
+     per client address too.
+     - Today REST writes have no submitter, so their slots are keyed by client address
+       alone (#396).
+     - WebSocket slots are per connection. Under rule 7 that is also per submitter.
+   - **The client address** is the one per-address limits use: the connection's address.
+     Behind a proxy that passes TLS through, that is the proxy's address, so clients
+     behind it share one key. This holds until the server can trust a proxy to report
+     the client's address (#399, not yet specified).
 
 ## 3. WebSocket
 
@@ -133,11 +163,17 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
     - a block a listed peer relays on legacy peering (`IngestSource::FederatedPeer`).
 
     The connection carrying them is proven by `peer_proof`, and the share or peer listing
-    answers for them (AB-07, OP-09).
+    answers for them (AB-07, OP-09). The owner records a relayed write against the
+    follower's proven DID as well as its author (`IngestSource::Relayed`'s `via`).
 13. **A follower applies this JEP before it relays.** It MUST apply rules 4 to 10 to the
     client that submitted to it, and MUST NOT relay a block whose signer is not that
     client's submitter. The owner relies on this, as it relies on the follower's admission
     (JEP-0005 rule 15).
+    - This covers the REST channel operations as well as `submit` and `POST /api/v1/blocks`.
+      On a follower, a member-add for a channel it carries is relayed to the owner under
+      the follower's share (#396). A share with a `read` or `write` grant refuses it with
+      `GRANT_REFUSED`.
+    - The follower applies rules 4 to 10 before either outcome.
 14. **Server-originated blocks** are signed in-process by the server's own DID and are not
     local submissions. These are the manifest log, the server's own contract and share
     blocks, and its system channels.
@@ -199,8 +235,13 @@ OP-09 (federation abuse), GV-03 (penalty propagation without consent or evidence
   the server verifies, so admission, limits and penalties fall on that DID (rule 5).
 - **What it does not bind.**
   - Blocks that arrive by contract or relay are attributed to the relaying server as well
-    as to their author (JEP-0005 rule 15). Their author's session is the follower's
-    business, under rule 13.
+    as to their author (JEP-0005 rule 15, rule 12 here). Their author's session is the
+    follower's business, under rule 13.
+- **Held blocks.** A caller with no proven DID cannot use a resubmission to learn whether a
+  server holds a block (rule 4a).
+- **Shared addresses.** Per-address limits stay, because DIDs are free (rule 5). Clients
+  behind one proxy share them unless the server trusts the proxy to report client addresses
+  (#399).
   - A hostile follower can still relay what it should not. It answers for that through its
     share (AB-07).
 - **Transcript binding.** `client_proof` signs over `tls_exporter`, so a TLS terminator in
@@ -242,12 +283,18 @@ To be added with the implementation:
 - a `client_proof` over a known transcript;
 - a REST write proof over a known request;
 - a `submit` refused for no submitter, and one refused for a signer mismatch;
-- a relayed block accepted without a client proof at the owner.
+- a relayed block accepted without a client proof at the owner;
+- the held-block order of rule 4a, over one block already held in its channel:
+  - submitted with no submitter: `AUTH_REQUIRED`, and no CID in the answer;
+  - submitted by a proven submitter that is not its signer: `SIGNER_MISMATCH`, and no CID;
+  - submitted by its signer: its CID, with no rate, pool share or relay slot spent;
+  - relayed to the owner again: its CID.
 
 # LLM Influence
 
 Drafted with an LLM coding assistant from DJ's decisions of 2026-10-26 and the code on
-`main` (873bfd4), and reviewed by the author.
+`main` (873bfd4), and reviewed by the author. Revised against `main` (c2ceeaa) after #396:
+rules 4a and 5, rule 12's `via`, rule 13's REST channel operations, and open question 5.
 
 # Rejected Alternatives
 
@@ -280,6 +327,13 @@ Drafted with an LLM coding assistant from DJ's decisions of 2026-10-26 and the c
    canonical bytes it received, a server could add fields that old clients ignore while
    still checking the signature. Later features would not need this step. That is a change
    to JEP-0002 rule 2 and its implementation, outside this JEP.
+5. **Limits per in-process bridge.** Rule 15 bounds which DIDs an in-process bridge may sign
+   as, not how much it submits.
+   - Per-DID limits apply to each of its DIDs separately. A bridge with many shadow DIDs
+     therefore has no limit across all of them (AB-03: no limit is kept per bridge).
+   - Rule 16 charges an out-of-process bridge as well as the signer, but that does not
+     cover in-process bridges.
+   - Open: whether a server keeps a limit per bridge, and how it relates to rule 16.
 
 # Copyright
 
