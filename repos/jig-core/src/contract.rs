@@ -1209,8 +1209,10 @@ mod tests {
     fn kp_request() -> KpRequest {
         // Derived, not a literal: CodeQL reads a literal nonce as a
         // hard-coded cryptographic value. Fixed all the same, for the vectors.
-        let mut nonce = [0; 16];
-        nonce.copy_from_slice(&blake3::hash(b"kp-request vector: nonce").as_bytes()[..16]);
+        let digest = blake3::hash(b"kp-request vector: nonce");
+        let nonce: [u8; 16] = digest.as_bytes()[..16]
+            .try_into()
+            .expect("a blake3 digest is 32 bytes");
         KpRequest::sign(
             &key(3),
             &did_of(&key(4)),
