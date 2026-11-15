@@ -252,9 +252,10 @@ pub async fn ws_handler(
 /// it. `None` for a server started without connection info (tests driving
 /// the router directly). What [`per_ip_rate`] charges and what a REST write's
 /// relay slots are keyed by (`v0_0_2_relay::rest_caller`). Behind a
-/// passthrough proxy every client has the proxy's address, so they share one
-/// bucket and one set of relay slots; no forwarded header is trusted yet
-/// (#399).
+/// TLS-passthrough proxy every client has the proxy's address, unless
+/// `[server.proxy_protocol]` lists it: the listener then sets this to the
+/// client the PROXY header names (`crate::proxy_protocol`). No forwarded HTTP
+/// header is trusted.
 pub fn client_ip(extensions: &axum::http::Extensions) -> Option<std::net::IpAddr> {
     extensions
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()

@@ -3158,6 +3158,7 @@ dependencies = [
  "humantime-serde",
  "hyper",
  "hyper-util",
+ "ipnet",
  "jig-bridge-core",
  "jig-bridge-email",
  "jig-client",

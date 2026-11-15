@@ -51,6 +51,8 @@ cid.workspace = true
 # Error handling
 anyhow = "1.0"
 thiserror = "2.0"
+# CIDRs for `[server.proxy_protocol] trusted`; already in the tree through hickory.
+ipnet = "2"
 
 # Logging
 tracing = "0.1"
