@@ -369,7 +369,8 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
     rule 14), inside `accrual_per_period` (JEP-0009 rule 17), and within that inside
     `credit_cap_per_period`, a fraction of `accrual_per_period` in ppm.
     - The cap is `⌊credit_cap_per_period × accrual_per_period / 10^6⌋`, rounded down as in
-      rule 12.
+      rule 12. `accrual_per_period` is in micro-units (JEP-0009 rule 40; one unit is
+      1 000 000), so the cap is in micro-units too.
     - R2.1 reference: at most half, i.e. 500 000.
     - Useful work lets an established subject keep or regain standing. It cannot buy standing
       faster than time allows.
