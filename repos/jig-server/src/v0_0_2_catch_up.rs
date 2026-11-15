@@ -44,22 +44,17 @@
 //! The frames are peer frames ([`crate::v0_0_2_peer`]) on the dialer's
 //! connection, deterministic CBOR like the stream's.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
 use jig_config::v0_0_2_server::{FederationPeer, FederationSection, PeerQuotaConfig};
 use jig_core::dcbor::{self, Value};
-use jig_core::did::Did;
-use jig_pipeline::fanout::DeliveryPolicy;
-use jig_pipeline::ingest::IngestContext;
 use jig_pipeline::persist::SqliteStore;
 use tokio::time::Instant;
 
 use crate::v0_0_2::AppState;
 use crate::v0_0_2_peer::{CloseReason, PeerSender};
-use crate::v0_0_2_stream::RequestLimit;
 
 /// The dialer's request for the blocks after a cursor.
 pub const CATCH_UP_FRAME: &str = "federation-catch-up";
@@ -83,6 +78,7 @@ pub const STORE_RETRY: Duration = Duration::from_secs(5);
 /// The most block and signature bytes a page packs, unless its first block
 /// fills it alone: one largest bundle. Base64 on the wire, a page then fits
 /// `jig_core::bundle::MAX_ENVELOPE_BYTES`.
+#[cfg(test)]
 const PAGE_BUDGET: usize = jig_core::bundle::MAX_BUNDLE_BYTES;
 
 /// The dialer's request: the blocks after `after` (empty: from the start),
@@ -134,6 +130,7 @@ impl Ask {
         .expect("text keys never repeat")
     }
 
+    #[cfg(test)]
     pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
         let value = dcbor::decode(bytes).ok()?;
         let [after, overlap] = fields(&value, &["after", "overlap"])?[..] else {
@@ -147,6 +144,7 @@ impl Ask {
 }
 
 impl Page {
+    #[cfg(test)]
     pub(crate) fn encode(&self) -> Vec<u8> {
         let entries = self
             .entries
@@ -196,6 +194,7 @@ impl Page {
 }
 
 impl Later {
+    #[cfg(test)]
     fn encode(&self) -> Vec<u8> {
         dcbor::encode(&Value::text_map([
             ("after", Value::text(&self.ask.after)),
@@ -228,158 +227,6 @@ fn violation(why: &str) -> CloseReason {
         reason: format!("catch-up: {why}"),
     }
 }
-
-// ---- The dialed side: answering ---------------------------------------------
-
-/// The dialed side of catch-up: pages of this server's federating blocks for
-/// the configured peers that ask. Clones share one limit.
-#[derive(Clone)]
-pub struct Replay {
-    ctx: Arc<IngestContext>,
-    federation: Arc<FederationSection>,
-    requests: Arc<RequestLimit>,
-}
-
-impl Replay {
-    pub fn new(ctx: Arc<IngestContext>, federation: Arc<FederationSection>) -> Self {
-        let requests = Arc::new(RequestLimit::new(federation.records_from));
-        Replay {
-            ctx,
-            federation,
-            requests,
-        }
-    }
-
-    /// Handle a [`CATCH_UP_FRAME`] from `peer`, or `None` for a frame of
-    /// another kind. A frame that does not parse closes the connection.
-    pub fn on_peer_frame(
-        &self,
-        peer: &Did,
-        kind: &str,
-        body: &[u8],
-        out: &PeerSender,
-    ) -> Option<Result<(), CloseReason>> {
-        (kind == CATCH_UP_FRAME).then(|| self.on_ask(peer, body, out))
-    }
-
-    fn on_ask(&self, peer: &Did, body: &[u8], out: &PeerSender) -> Result<(), CloseReason> {
-        let ask = Ask::decode(body).ok_or_else(|| violation("a malformed federation-catch-up"))?;
-        let peer = peer.to_did_jig_string();
-        // The federation subscription's own gate: configured peers only.
-        let configured = self
-            .federation
-            .peers
-            .iter()
-            .any(|p| jig_pipeline::effect::canonical_did_string(&p.expected_did) == peer);
-        if !configured {
-            tracing::debug!(peer, "catch-up from a server that is not a configured peer");
-            return Ok(());
-        }
-        if let Err(wait) = self
-            .requests
-            .take(&peer, "federation", tokio::time::Instant::now())
-        {
-            let later = Later {
-                ask,
-                retry_after_ms: u64::try_from(wait.as_millis()).unwrap_or(u64::MAX).max(1),
-            };
-            if let Err(e) = out.send(LATER_FRAME, later.encode()) {
-                tracing::info!(peer, "federation-later not sent: {e}");
-            }
-            return Ok(());
-        }
-        match self.page(&ask) {
-            Ok(page) => {
-                if let Err(e) = out.send(BLOCKS_FRAME, page.encode()) {
-                    tracing::info!(peer, "federation-blocks not sent: {e}");
-                }
-            }
-            Err(e) => tracing::warn!(peer, "catch-up not answered: {e:#}"),
-        }
-        Ok(())
-    }
-
-    /// The page after `ask`'s cursor.
-    pub(crate) fn page(&self, ask: &Ask) -> anyhow::Result<Page> {
-        let store = &self.ctx.store;
-        let start = match ask.after.as_str() {
-            "" => 0,
-            after => match store.block_position(after)? {
-                Some(at) => at.saturating_sub(ask.overlap.min(OVERLAP) as i64).max(0),
-                // Not a block this server holds: from the start.
-                None => 0,
-            },
-        };
-        // Positions and channels only: a block's bytes are read once it is
-        // known to federate, so a page holds at most its budget and one
-        // block more in memory.
-        let rows = store.block_ids_after(start, SCAN)?;
-        let scanned_all = rows.len() < SCAN;
-        let mut federates = Federates::new(store);
-        let mut page = Page {
-            entries: Vec::new(),
-            last: ask.after.clone(),
-            more: false,
-        };
-        let mut size = 0;
-        for (_, cid, channel_id) in rows {
-            if federates.check(channel_id.as_deref())?
-                && let Some(block) = store.get_block(&cid)?
-            {
-                let len = block.bundle_bytes.len() + block.sender_sig.len();
-                let full = page.entries.len() == MAX_ENTRIES
-                    || (!page.entries.is_empty() && size + len > PAGE_BUDGET);
-                if full {
-                    page.more = true;
-                    return Ok(page);
-                }
-                size += len;
-                page.entries.push(Entry {
-                    bundle: block.bundle_bytes,
-                    sig: block.sender_sig,
-                });
-            }
-            page.last = cid;
-        }
-        page.more = !scanned_all;
-        Ok(page)
-    }
-}
-
-/// Whether blocks federate, as the live subscription decides it, with each
-/// channel looked up once per page.
-struct Federates<'a> {
-    store: &'a SqliteStore,
-    channels: HashMap<String, bool>,
-}
-
-impl<'a> Federates<'a> {
-    fn new(store: &'a SqliteStore) -> Self {
-        Federates {
-            store,
-            channels: HashMap::new(),
-        }
-    }
-
-    /// A block federates only in a channel whose policy federates: the live
-    /// path sends nothing with no channel policy.
-    fn check(&mut self, channel_id: Option<&str>) -> anyhow::Result<bool> {
-        let Some(id) = channel_id else {
-            return Ok(false);
-        };
-        if let Some(known) = self.channels.get(id) {
-            return Ok(*known);
-        }
-        let federates = self
-            .store
-            .get_channel_by_id_including_archived(id)?
-            .is_some_and(|chan| DeliveryPolicy::for_channel(&chan, vec![]).federates);
-        self.channels.insert(id.to_string(), federates);
-        Ok(federates)
-    }
-}
-
-// ---- The dialing side: asking -----------------------------------------------
 
 /// One connection's catch-up from the peer it dialed: the request it last
 /// made, and what it took in the current minute against its quota for the
@@ -687,7 +534,6 @@ fn save(store: &SqliteStore, peer: &FederationPeer, after: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jig_config::v0_0_2_server::RateLimit;
 
     fn page_of(entries: Vec<Entry>) -> Page {
         Page {
@@ -873,103 +719,5 @@ mod tests {
         let mut c = catching();
         assert_eq!(c.take(quota, 500), Ok(()));
         assert!(c.take(quota, 1).is_err());
-    }
-
-    fn replay_for(peer: &Did, limit: RateLimit) -> Replay {
-        let state = AppState::for_test().unwrap();
-        let mut federation = state.config.federation.clone();
-        federation.records_from = limit;
-        federation.peers = vec![FederationPeer {
-            url: "ws://127.0.0.1:1".to_string(),
-            expected_did: peer.to_did_jig_string(),
-            alias: None,
-            publish: false,
-            quota: None,
-            offers: Default::default(),
-        }];
-        Replay::new(state.ingest_ctx.clone(), Arc::new(federation))
-    }
-
-    fn a_did() -> Did {
-        let key = ed25519_dalek::SigningKey::from_bytes(&rand::random());
-        Did::from_ed25519_pubkey(key.verifying_key().as_bytes())
-    }
-
-    fn sent(
-        rx: &mut tokio::sync::mpsc::Receiver<jig_pipeline::envelope::Envelope>,
-    ) -> Vec<(String, Vec<u8>)> {
-        let mut out = Vec::new();
-        while let Ok(envelope) = rx.try_recv() {
-            if let jig_pipeline::envelope::Frame::Peer { kind, body } = envelope.frame {
-                out.push((kind, body));
-            }
-        }
-        out
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_peer_asking_past_the_limit_is_told_when_to_ask_again() {
-        let peer = a_did();
-        let replay = replay_for(
-            &peer,
-            RateLimit {
-                burst: 2,
-                per_min: 6,
-            },
-        );
-        let (out, mut rx) = PeerSender::new(peer.clone());
-        let ask = Ask {
-            after: String::new(),
-            overlap: 0,
-        };
-        for _ in 0..3 {
-            replay
-                .on_peer_frame(&peer, CATCH_UP_FRAME, &ask.encode(), &out)
-                .unwrap()
-                .unwrap();
-        }
-        let frames = sent(&mut rx);
-        let kinds: Vec<&str> = frames.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(kinds, [BLOCKS_FRAME, BLOCKS_FRAME, LATER_FRAME]);
-        let later = Later::decode(&frames[2].1).unwrap();
-        assert_eq!(later.ask, ask, "the request it refused, to make again");
-        assert_eq!(later.retry_after_ms, 10_000);
-    }
-
-    #[tokio::test]
-    async fn only_a_configured_peer_is_answered_and_a_bad_frame_closes() {
-        let peer = a_did();
-        let replay = replay_for(
-            &peer,
-            RateLimit {
-                burst: 10,
-                per_min: 60,
-            },
-        );
-        let stranger = a_did();
-        let (out, mut rx) = PeerSender::new(stranger.clone());
-        let ask = Ask {
-            after: String::new(),
-            overlap: 0,
-        }
-        .encode();
-        replay
-            .on_peer_frame(&stranger, CATCH_UP_FRAME, &ask, &out)
-            .unwrap()
-            .unwrap();
-        assert!(sent(&mut rx).is_empty());
-
-        let (out, _rx) = PeerSender::new(peer.clone());
-        assert!(
-            replay
-                .on_peer_frame(&peer, CATCH_UP_FRAME, b"not cbor", &out)
-                .unwrap()
-                .is_err()
-        );
-        assert!(
-            replay
-                .on_peer_frame(&peer, "another-frame", &ask, &out)
-                .is_none()
-        );
     }
 }

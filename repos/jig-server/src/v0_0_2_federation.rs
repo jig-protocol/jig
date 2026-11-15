@@ -25,14 +25,7 @@ use base64::Engine as _;
 use ed25519_dalek::Signer;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use jig_core::{BlockKind, BlockManifest};
-use jig_pipeline::{
-    Envelope, Frame, Scope,
-    envelope::ReceiptRef,
-    fanout::DeliveryPolicy,
-    ingest::IngestError,
-    persist::{StoredBlock, StoredReceipt},
-};
-use tokio::sync::mpsc;
+use jig_pipeline::{Envelope, Frame, Scope, fanout::DeliveryPolicy, ingest::IngestError};
 use tokio_tungstenite::{
     Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config, tungstenite::Message,
 };
@@ -404,7 +397,9 @@ pub(crate) async fn connect_and_relay(
     let registration = state.peers.register(peer_sender.clone());
     info!(peer_url = %peer.url, "federation peer connected");
 
-    // 1. Subscribe federation scope so the peer pushes us their block stream.
+    // 1. Subscribe federation scope, so a peer on a release before this one
+    //    pushes us its relayed blocks. A peer on this release answers it with
+    //    `FEDERATION_STREAM_RETIRED` and sends nothing.
     //
     // Signed with this server's OWN identity. A peer that requires
     // authentication refuses an unsigned subscribe, so federation between two
@@ -425,17 +420,9 @@ pub(crate) async fn connect_and_relay(
     //    ([`crate::v0_0_2_catch_up`]).
     let mut catching = crate::v0_0_2_catch_up::CatchingUp::start(state, peer, &peer_sender)?;
 
-    // 3. Register a peer subscriber on our Fanout so OUR locally-ingested
-    //    blocks are pushed out to this peer.
-    let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<(StoredBlock, StoredReceipt)>();
-    state
-        .ingest_ctx
-        .fanout
-        .register_peer(peer.url.clone(), peer_tx)
-        .await;
-
-    // 4. Main relay loop (inlined to avoid generic sink/stream lifetime issues).
-    //    Forward outbound deliveries to peer; persist inbound blocks locally.
+    // 3. Main loop (inlined to avoid generic sink/stream lifetime issues).
+    //    This server sends the peer no blocks of its own: a channel reaches
+    //    another server only by a share, whose stream goes out as peer frames.
     let result = loop {
         tokio::select! {
             // Inbound from peer
@@ -484,23 +471,11 @@ pub(crate) async fn connect_and_relay(
                 }
             }
 
-            // Outbound from our local fanout
-            delivery = peer_rx.recv() => {
-                let Some((block, receipt)) = delivery else {
-                    // Channel closed (server shutdown).
-                    break Ok(());
-                };
-                if let Err(e) = forward_outbound(&mut sink, &block, &receipt).await {
-                    warn!(peer_url = %peer.url, "outbound forward error: {e}");
-                    break Err(e);
-                }
-            }
         }
     };
 
-    // 5. On loop exit (peer disconnect, error, or task cancellation), unregister
-    //    the peer from Fanout so we don't accumulate dead senders.
-    state.ingest_ctx.fanout.unregister_peer(&peer.url).await;
+    // 4. On loop exit (peer disconnect, error, or task cancellation), drop the
+    //    peer's registration so no dead sender stays behind.
     state.peers.unregister(registration);
 
     result
@@ -839,32 +814,6 @@ pub fn subscription_refusal(text: &str) -> Option<String> {
         Frame::Error { code, message, .. } if code == "NOT_A_PEER" => Some(message),
         _ => None,
     }
-}
-
-async fn forward_outbound(
-    sink: &mut (impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
-    block: &StoredBlock,
-    receipt: &StoredReceipt,
-) -> anyhow::Result<()> {
-    let frame = Envelope::new(Frame::Block {
-        bundle_b64: base64::engine::general_purpose::STANDARD.encode(&block.bundle_bytes),
-        sig_b64: if block.sender_sig.is_empty() {
-            None
-        } else {
-            Some(base64::engine::general_purpose::STANDARD.encode(&block.sender_sig))
-        },
-        receipts: vec![ReceiptRef {
-            server_did: receipt.server_id.clone(),
-            render_hash: receipt.render_hash.clone(),
-            receipt_bytes_b64: base64::engine::general_purpose::STANDARD
-                .encode(&receipt.receipt_bytes),
-        }],
-        delivery_cid: format!("delivery:{}", block.cid),
-        ingest: None,
-    });
-    let json = serde_json::to_string(&frame)?;
-    sink.send(Message::Text(json.into())).await?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
