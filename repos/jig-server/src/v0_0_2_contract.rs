@@ -2469,6 +2469,32 @@ mod tests {
         );
     }
 
+    /// The dialer still subscribes to the federation stream, as one on a
+    /// release before this does; this server answers `FEDERATION_STREAM_RETIRED`
+    /// and registers nothing. The dialer logs it and keeps the connection,
+    /// over which a share is then offered, accepted and streamed.
+    #[tokio::test]
+    async fn a_dialer_told_the_stream_is_retired_keeps_its_link() {
+        let p = pair(OfferPolicy::Accept).await;
+        // The subscribe and its answer have crossed before anything else.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            p.follower
+                .ingest_ctx
+                .fanout
+                .local_subscription_count()
+                .await,
+            0,
+            "the follower registers no federation subscription"
+        );
+        assert!(!p.dial.is_finished(), "the dialer keeps its connection");
+
+        let channel = p.shared(1).await;
+        p.follows.stream.pull_all();
+        p.caught_up(&channel).await;
+        assert!(!p.dial.is_finished());
+    }
+
     /// A follower lists a channel it carries as ordered by its owner, with
     /// the owner's offer: what lets a client hold the channel's records to
     /// the owner without taking the follower's word for it.

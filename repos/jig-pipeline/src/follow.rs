@@ -1577,6 +1577,38 @@ mod tests {
         }
     }
 
+    /// A block whose manifest names an author its signature is not by is
+    /// refused, even under a record the owner signed: the owner's word places
+    /// a block, it does not author one. (What `integration-tests` H3 held a
+    /// relayed block to, on the path a block now crosses by.)
+    #[tokio::test]
+    async fn a_block_signed_by_another_than_its_author_is_refused() {
+        use ed25519_dalek::Signer as _;
+        let owner = Owner::new().await;
+        let follower = owner.follower();
+        take(&follower, &owner, &owner.sent[0]).await.unwrap();
+
+        let alice = SigningKey::from_bytes(&rand::random());
+        let bob = SigningKey::from_bytes(&rand::random());
+        let meta = serde_json::json!({"channel_id": owner.channel, "body": "as bob"});
+        let mut parts = signed(&bob, BlockKind::TextRender, meta);
+        parts.2 = alice
+            .sign(&serde_json::to_vec(&(&parts.0, &parts.1)).unwrap())
+            .to_bytes()
+            .to_vec();
+        let prev = IngestRecord::decode(&owner.sent[0].record).unwrap().hash();
+        let forged = Sent {
+            record: owner.sign_at(&parts, 1, prev),
+            parts,
+        };
+        assert!(matches!(
+            take(&follower, &owner, &forged).await,
+            Err(FollowError::Block(IngestError::InvalidSignature))
+        ));
+        let cid = bundle(&forged.parts).block_cid().unwrap().to_string();
+        assert!(follower.store.get_block(&cid).unwrap().is_none());
+    }
+
     #[tokio::test]
     async fn only_the_owners_signature_places_a_block() {
         let mut owner = Owner::new().await;
