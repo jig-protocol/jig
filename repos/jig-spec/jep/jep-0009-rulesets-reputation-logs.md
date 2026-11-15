@@ -470,14 +470,17 @@ binds R3 (rules 7–22) as well: R3's nameservers and R2.4's single server compu
 51. **Servers' standing.** A server's standing is `R` about the server's DID under each
     observer's own ruleset, computed from the events and fraud proofs in that observer's epoch
     log. No party holds a global score for a server.
-52. **Units.** Every ruleset parameter has one of these units, named in its key:
+52. **Units.** Every parameter that `f` reads (the `standing`, `events` and `useful_work`
+    blocks) has one of these units, named in its key:
     - evidence and weights: micro-units (rule 40);
     - fractions: parts per million, keys ending in `_ppm`;
     - counts of epochs, keys ending in `_epochs`;
     - counts of log positions, keys ending in `_positions`;
     - `epoch_secs`, the only time parameter, measured on epoch time (rule 36).
 
-    A ruleset document with a parameter of any other unit is invalid.
+    A ruleset document in which such a parameter has any other unit is invalid. Parameters `f`
+    does not read (`pow`, `pools`, `tribunal`) keep the names and units their own JEPs give
+    them.
 
 # Security Considerations (Zero-Trust)
 
