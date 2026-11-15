@@ -138,8 +138,10 @@ Non-goals:
 
 12. Each of the group's nameservers computes every subject's **net change** per period from the
     reports it holds:
-    - each reporter's contribution per (subject, period) is capped at `per_reporter_cap` evidence
-      units;
+    - each reporter's positive contribution per (subject, period) is capped at
+      `per_reporter_cap` evidence units, and its negative contribution at
+      `per_reporter_neg_cap`. A lying reporter's reach is bounded, and one evidence-backed
+      offence still outweighs a period of good standing;
     - each contribution is weighted by the reporter's own standing under the ruleset, with a
       reporter that has no standing weighted `unknown_reporter_weight` (reference: 0);
     - the subject's own reports about itself are ignored.
@@ -317,7 +319,9 @@ binds R3 (rules 7–22) as well: R3's nameservers and R2.4's single server compu
 39. **State.** For each subject, `R` holds
     `{r, s, first_epoch, last_epoch, pinned: [{amount, until_epoch}], applied}`:
     - `r` and `s` are the fixed-point evidence of rule 40;
-    - `first_epoch` is the epoch of the first leaf `f` applied about the subject;
+    - `first_epoch` is the first epoch in which `f` added evidence about the subject, and
+      `last_epoch` the latest. A report that weighs nothing, such as one from an unknown reporter
+      weighted 0, adds no evidence, creates no state and starts no clock;
     - `pinned` holds verdict penalties that do not decay before their term ends (rule 14);
     - `applied` is a hash chain over the positions of the leaves `f` applied to the subject,
       continued from the previous epoch's `applied`.
@@ -333,19 +337,27 @@ binds R3 (rules 7–22) as well: R3's nameservers and R2.4's single server compu
       1. **Decay:** `r ← r − ⌊r · λ_pos / 10⁶⌋`, and `s ← s − ⌊s · λ_neg / 10⁶⌋`. Pinned amounts do
          not decay, and leave `pinned` for `s` at `until_epoch`.
       2. **Per reporter:** sum each reporter's `weight(code) × count` for the subject. Cap the
-         positive part and the negative part each at `per_reporter_cap` (rule 12). Multiply by
+         positive part at `per_reporter_cap` and the negative part at `per_reporter_neg_cap`
+         (rule 12). Multiply by
          the reporter's weight, `w = 10⁶` if the reporter was established in `R_(N−1)`, else
          `unknown_reporter_weight`, then divide by 10⁶. Reporter weight comes from the previous
          epoch, so no epoch's result depends on itself. On an epoch log outside any group, the
          log's owner is the only reporter and weighs 10⁶.
-      3. **Accrual cap:** cap `useful-work` credit at `credit_cap_per_period × accrual_per_period
-         / 10⁶` (JEP-0016 rule 31), then all positive evidence at `accrual_per_period` (rule 17).
-         Negative evidence is not capped by accrual.
+      3. **Accrual cap:** `useful-work` credit counts only for a subject established at `N − 1`.
+         It keeps or regains standing and never builds it (JEP-0016 rules 8 and 31). Cap it at
+         `credit_cap_per_period × accrual_per_period / 10⁶`, then all positive evidence at
+         `accrual_per_period` (rule 17). Negative evidence is not capped by accrual.
       4. **Add:** `r ← r + positive`, and `s ← s + negative`.
     - **Score**, in parts per million:
       `score = ⌊(r − s) · 10⁶ / (r + s + 2 · 10⁶)⌋`. It lies strictly between −10⁶ and 10⁶.
 41. **Age is counted in epochs:** `age = N − first_epoch + 1`. A subject is established at `N`
-    when `score ≥ established` and `age ≥ min_age_epochs` (rule 16).
+    when all of these hold (rule 16):
+    - `score ≥ established`;
+    - `age ≥ min_age_epochs`;
+    - `N − last_epoch < max_idle_epochs`, unless the ruleset sets no `max_idle_epochs`.
+
+    The idle limit stops a key that earned standing once from keeping it while dormant, to be
+    used or sold later (AB-07).
 
 ### Checkpoints and fraud proofs
 
