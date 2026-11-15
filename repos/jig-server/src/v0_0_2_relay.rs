@@ -195,6 +195,9 @@ pub struct Refusal {
     pub status: StatusCode,
     pub code: String,
     pub message: String,
+    /// How long to wait before posting again, for a refusal waiting changes:
+    /// the client's `Error` frame carries it as `retry_after_ms`.
+    pub retry_after_ms: Option<u64>,
 }
 
 impl Refusal {
@@ -203,24 +206,32 @@ impl Refusal {
             status,
             code: code.to_string(),
             message: message.into(),
+            retry_after_ms: None,
         }
     }
 
     /// The refusal for an ingest error, as every surface classifies it.
     pub fn of(e: &IngestError) -> Self {
         let (status, code, message) = crate::v0_0_2_ingest_error::classify_ingest_error(e);
-        Refusal::new(status, code, message)
+        Refusal {
+            retry_after_ms: crate::v0_0_2_ingest_error::retry_after(e)
+                .map(|wait| u64::try_from(wait.as_millis()).unwrap_or(u64::MAX).max(1)),
+            ..Refusal::new(status, code, message)
+        }
     }
 
-    /// `message`, with the wait in it: the client-facing error frames carry no
-    /// retry field.
+    /// A refusal with when to post again: in `retry_after_ms`, and in the
+    /// message for whoever reads it.
     fn retry(status: StatusCode, code: &str, message: &str, wait: Duration) -> Self {
-        let ms = wait.as_millis().max(1);
-        Refusal::new(
-            status,
-            code,
-            format!("{message}; try again in {ms} ms (retry_after_ms={ms})"),
-        )
+        let ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX).max(1);
+        Refusal {
+            retry_after_ms: Some(ms),
+            ..Refusal::new(
+                status,
+                code,
+                format!("{message}; try again in {ms} ms (retry_after_ms={ms})"),
+            )
+        }
     }
 }
 
@@ -316,20 +327,35 @@ impl Relay {
         sig: Vec<u8>,
         conn_id: u64,
         conn: &str,
+        tiers: bool,
+    ) -> Result<String, Refusal> {
+        self.submit_as(
+            IngestSource::LocalClient { conn_id, tiers },
+            manifest_bytes,
+            code_bytes,
+            sig,
+            conn,
+        )
+        .await
+    }
+
+    /// [`Relay::submit`] for a block that reaches this server as `source`:
+    /// ingested here as that, and relayed to the owner, as any client write
+    /// is, if it lands on a channel this server carries.
+    pub async fn submit_as(
+        &self,
+        source: IngestSource,
+        manifest_bytes: &[u8],
+        code_bytes: &[u8],
+        sig: Vec<u8>,
+        conn: &str,
     ) -> Result<String, Refusal> {
         let bundle = BlockBundle {
             manifest_bytes,
             code_bytes,
             resources: vec![],
         };
-        let refused = match ingest(
-            &self.ctx,
-            bundle,
-            sig.clone(),
-            IngestSource::LocalClient { conn_id },
-        )
-        .await
-        {
+        let refused = match ingest(&self.ctx, bundle, sig.clone(), source).await {
             Ok(cid) => return Ok(cid),
             Err(e) => e,
         };
@@ -339,12 +365,74 @@ impl Relay {
             sequencer,
         } = &refused
         else {
-            return Err(Refusal::of(&refused));
+            return Err(refusal_of(&self.ctx, &refused));
         };
+        self.check_self_join(manifest_bytes, channel_id)?;
         let canonical = serde_json::to_vec(&(manifest_bytes, code_bytes))
             .map_err(|e| Refusal::of(&IngestError::BundleMalformed(e.to_string())))?;
         self.relay(&refused, kind, channel_id, sequencer, canonical, sig, conn)
             .await
+    }
+
+    /// A self-join to a carried `shared` channel is relayed only if this
+    /// server's roles count for it (`join_servers = granted`) and the
+    /// joiner's role here meets its `join` (JEP-0014 rule 13). The owner
+    /// cannot check that role: it is this server's judgement, and the
+    /// owner's `member` grant is its trust in it. Any other block is the
+    /// relay's to judge as before.
+    fn check_self_join(&self, manifest_bytes: &[u8], channel_id: &str) -> Result<(), Refusal> {
+        use jig_core::tier::{JoinServers, StoredTier, Tier};
+        let Ok(manifest) = serde_json::from_slice::<jig_core::BlockManifest>(manifest_bytes) else {
+            return Ok(());
+        };
+        let canonical = jig_pipeline::effect::canonical_did_string;
+        let sender = manifest
+            .authors
+            .first()
+            .map(|a| canonical(&a.did.to_string()));
+        let adds_self = manifest.kind == Some(BlockKind::MemberAdd)
+            && manifest
+                .metadata
+                .get("member_did")
+                .and_then(|v| v.as_str())
+                .map(canonical)
+                .is_some_and(|member| Some(&member) == sender.as_ref());
+        let Some(sender) = sender.filter(|_| adds_self) else {
+            return Ok(());
+        };
+        let Some(channel) = self
+            .ctx
+            .store
+            .get_channel_by_id(channel_id)
+            .map_err(|e| Refusal::of(&IngestError::Persist(e)))?
+        else {
+            return Ok(());
+        };
+        let tiering = &channel.tiering;
+        if !tiering.takes_self_join() {
+            return Ok(());
+        }
+        let refused =
+            |message: String| Err(Refusal::new(StatusCode::FORBIDDEN, "JOIN_REFUSED", message));
+        if tiering.tier != StoredTier::Tier(Tier::Shared)
+            || tiering.join_servers != Some(JoinServers::Granted)
+        {
+            return refused(format!(
+                "channel {channel_id} takes self-joins only on the server that orders it, \
+                 `{}`: join there",
+                channel.sequencer_did
+            ));
+        }
+        let role = self.ctx.admission.server_role(&sender);
+        match tiering.join {
+            Some(join) if role.may_join(join) => Ok(()),
+            join => refused(format!(
+                "your role on this server ({}) is below the one channel {channel_id} \
+                 needs to join ({})",
+                role.as_str(),
+                join.map_or("none", |j| j.as_str())
+            )),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -367,7 +455,7 @@ impl Relay {
             .pop();
         // No live share: the channel is carried, nothing more.
         let Some(share) = share else {
-            return Err(Refusal::of(refused));
+            return Err(refusal_of(&self.ctx, refused));
         };
         let relays = kind
             .parse::<BlockKind>()
@@ -599,9 +687,39 @@ impl Relay {
             Ok(cid) => Answer::accepted(id, cid),
             // Taken by a concurrent copy of the same request.
             Err(IngestError::DuplicateBlock { cid }) => Answer::accepted(id, cid),
-            Err(e) => refused_by(id, &e),
+            // An author refused for its rate here is told this server's wait,
+            // not the follower's.
+            Err(e) => Answer {
+                retry_after_ms: refusal_of(&self.ctx, &e).retry_after_ms.unwrap_or(0),
+                ..refused_by(id, &e)
+            },
         }
     }
+}
+
+/// The in-flight key for a REST write from `ip`: the caller's address, so a
+/// caller resubmitting someone else's signed block holds its own relay
+/// slots, not the author's. A request with no address (a router driven
+/// without connection info) falls back to the block's `author`.
+pub fn rest_caller(ip: Option<std::net::IpAddr>, author: &str) -> String {
+    match ip {
+        Some(ip) => format!("rest:ip:{ip}"),
+        None => format!("rest:{author}"),
+    }
+}
+
+/// [`Refusal::of`] for a refusal on this server, saying when an author
+/// refused for its rate or its pool may post again.
+fn refusal_of(ctx: &IngestContext, e: &IngestError) -> Refusal {
+    let mut refusal = Refusal::of(e);
+    if let IngestError::NotAdmitted {
+        sender,
+        refusal: jig_pipeline::ingest::AdmissionRefusal::RateLimited,
+    } = e
+    {
+        refusal.retry_after_ms = ctx.admission.retry_after_ms(sender);
+    }
+    refusal
 }
 
 /// Post a client's block on `state`'s server: through its [`Relay`], once
@@ -614,10 +732,56 @@ pub async fn post(
     sig: Vec<u8>,
     conn_id: u64,
     conn: &str,
+    tiers: bool,
+) -> Result<String, Refusal> {
+    let posted = match state.relay.get() {
+        Some(relay) => {
+            relay
+                .submit(manifest_bytes, code_bytes, sig, conn_id, conn, tiers)
+                .await
+        }
+        None => {
+            let bundle = BlockBundle {
+                manifest_bytes,
+                code_bytes,
+                resources: vec![],
+            };
+            ingest(
+                &state.ingest_ctx,
+                bundle,
+                sig,
+                IngestSource::LocalClient { conn_id, tiers },
+            )
+            .await
+            .map_err(|e| refusal_of(&state.ingest_ctx, &e))
+        }
+    };
+    // An author an owner refused for its rate, with no time given, gets a
+    // token back within one refill of this server's rate.
+    posted.map_err(|mut refusal| {
+        if refusal.code == "RATE_LIMITED" && refusal.retry_after_ms.is_none() {
+            refusal.retry_after_ms = state.auth.did_retry_after_ms();
+        }
+        refusal
+    })
+}
+
+/// [`post`] for a block that reaches this server as `source` rather than
+/// from a client connection: the channel-op routes' `IngestSource::AdminEndpoint`.
+/// On a channel this server carries, it is relayed to the owner like any
+/// client write, under the share's grant. `conn` names the caller for the
+/// in-flight cap.
+pub async fn post_as(
+    state: &crate::v0_0_2::AppState,
+    source: IngestSource,
+    manifest_bytes: &[u8],
+    code_bytes: &[u8],
+    sig: Vec<u8>,
+    conn: &str,
 ) -> Result<String, Refusal> {
     if let Some(relay) = state.relay.get() {
         return relay
-            .submit(manifest_bytes, code_bytes, sig, conn_id, conn)
+            .submit_as(source, manifest_bytes, code_bytes, sig, conn)
             .await;
     }
     let bundle = BlockBundle {
@@ -625,14 +789,9 @@ pub async fn post(
         code_bytes,
         resources: vec![],
     };
-    ingest(
-        &state.ingest_ctx,
-        bundle,
-        sig,
-        IngestSource::LocalClient { conn_id },
-    )
-    .await
-    .map_err(|e| Refusal::of(&e))
+    ingest(&state.ingest_ctx, bundle, sig, source)
+        .await
+        .map_err(|e| refusal_of(&state.ingest_ctx, &e))
 }
 
 fn refused_by(request_id: u64, e: &IngestError) -> Answer {
@@ -690,8 +849,27 @@ mod tests {
         assert_eq!(Answer::decode(&bytes), None, "trailing bytes");
     }
 
+    /// A render that missed its deadline tells the client when to post again,
+    /// in the field as well as the message; a block too expensive to render
+    /// is given no wait, because waiting does not change the answer.
     #[test]
-    fn a_wait_rides_in_the_message() {
+    fn a_missed_render_deadline_carries_its_wait() {
+        use jig_pipeline::ingest::RenderCause;
+        let render_failed = |cause| IngestError::RenderFailed {
+            kind: "text-render".to_string(),
+            cause,
+            detail: "the render is incomplete".to_string(),
+        };
+        let refusal = Refusal::of(&render_failed(RenderCause::DeadlineExceeded));
+        assert_eq!(refusal.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refusal.retry_after_ms, Some(1000));
+        let refusal = Refusal::of(&render_failed(RenderCause::FuelExhausted));
+        assert_eq!(refusal.code, "BLOCK_TOO_EXPENSIVE");
+        assert_eq!(refusal.retry_after_ms, None);
+    }
+
+    #[test]
+    fn a_wait_rides_in_its_field_and_the_message() {
         let refusal = Refusal::retry(
             StatusCode::SERVICE_UNAVAILABLE,
             "OWNER_UNREACHABLE",
@@ -699,10 +877,42 @@ mod tests {
             Duration::from_millis(1_500),
         );
         assert_eq!(refusal.code, "OWNER_UNREACHABLE");
+        assert_eq!(refusal.retry_after_ms, Some(1_500));
         assert!(
             refusal.message.ends_with("(retry_after_ms=1500)"),
             "{}",
             refusal.message
         );
+    }
+
+    /// An author refused for its rate is told when it may post again: one
+    /// token's refill of this server's rate.
+    #[tokio::test]
+    async fn an_author_over_its_rate_is_told_when_to_post_again() {
+        let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
+        config.auth.rate_limit.per_did_burst = 1;
+        config.auth.rate_limit.per_did_per_second = 4;
+        let state = crate::v0_0_2::AppState::for_test_with_config(config).unwrap();
+        let author = jig_client::Identity::generate_for_tests(&tempfile::tempdir().unwrap().keep());
+        let mut refusals = Vec::new();
+        for body in ["first", "second"] {
+            let hlc = jig_core::HlcTimestamp::now_wall(author.did().clone());
+            let block = jig_client::blocks::build_text_render(&author, "#nowhere", body, hlc);
+            let posted = post(
+                &state,
+                &block.manifest_bytes,
+                &block.code_bytes,
+                block.sender_sig.clone(),
+                1,
+                "ws:1",
+                true,
+            )
+            .await;
+            refusals.push(posted.unwrap_err());
+        }
+        assert_ne!(refusals[0].code, "RATE_LIMITED", "{:?}", refusals[0]);
+        assert_eq!(refusals[0].retry_after_ms, None);
+        assert_eq!(refusals[1].code, "RATE_LIMITED", "{:?}", refusals[1]);
+        assert_eq!(refusals[1].retry_after_ms, Some(250));
     }
 }

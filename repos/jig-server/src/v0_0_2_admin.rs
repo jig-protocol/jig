@@ -86,6 +86,27 @@ fn same_channel(
     })
 }
 
+/// The channel a bundle names, as ingest reads it: its id under
+/// `channel_id`, else its slug under `channel`. A client names a channel it
+/// was given by id under `channel_id` (`jig_client::blocks`).
+fn bundle_channel<'a>(
+    manifest: &'a BlockManifest,
+    kind: &str,
+) -> Result<&'a str, (StatusCode, Json<AdminError>)> {
+    manifest
+        .metadata
+        .get(jig_pipeline::ingest::CHANNEL_ID_KEY)
+        .or_else(|| manifest.metadata.get("channel"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            err(
+                StatusCode::BAD_REQUEST,
+                "MISSING_CHANNEL",
+                format!("{kind} bundle metadata names no channel (`channel` or `channel_id`)"),
+            )
+        })
+}
+
 /// Decode a BundleSubmission into (manifest_bytes, code_bytes, sig).
 #[allow(clippy::type_complexity)]
 fn decode_submission(
@@ -187,6 +208,7 @@ pub async fn create_channel(
 pub async fn add_member(
     State(state): State<Arc<AppState>>,
     Path(channel_ref): Path<String>,
+    extensions: axum::http::Extensions,
     Json(body): Json<BundleSubmission>,
 ) -> Result<Json<AdminResult>, (StatusCode, Json<AdminError>)> {
     let (manifest_bytes, code_bytes, sig) = decode_submission(&body)?;
@@ -203,17 +225,7 @@ pub async fn add_member(
     // Defense in depth: the bundle's metadata `channel` must match the URL slug.
     // Prevents accidentally submitting a bundle for the wrong channel via an
     // authoritative-looking URL.
-    let bundle_slug = manifest
-        .metadata
-        .get("channel")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            err(
-                StatusCode::BAD_REQUEST,
-                "MISSING_CHANNEL",
-                "member-add bundle metadata missing `channel`",
-            )
-        })?;
+    let bundle_slug = bundle_channel(&manifest, "member-add")?;
     if !same_channel(&state, &channel_ref, bundle_slug)? {
         return Err(err(
             StatusCode::BAD_REQUEST,
@@ -222,15 +234,33 @@ pub async fn add_member(
         ));
     }
 
-    let bundle = BlockBundle {
-        manifest_bytes: &manifest_bytes,
-        code_bytes: &code_bytes,
-        resources: vec![],
-    };
-
-    let cid = ingest(&state.ingest_ctx, bundle, sig, IngestSource::AdminEndpoint)
-        .await
-        .map_err(map_ingest_error)?;
+    // A member-add for a channel this server carries goes on to its owner
+    // through the relay, under this server's share (JEP-0005 rules 7a and
+    // 15): a `member` grant relays it, `read` and `write` refuse it
+    // `GRANT_REFUSED`. Everywhere else it is ingested here, as before.
+    let author = manifest
+        .authors
+        .first()
+        .map(|a| a.did.to_string())
+        .unwrap_or_default();
+    let cid = crate::v0_0_2_relay::post_as(
+        &state,
+        IngestSource::AdminEndpoint,
+        &manifest_bytes,
+        &code_bytes,
+        sig,
+        &crate::v0_0_2_relay::rest_caller(crate::v0_0_2_ws::client_ip(&extensions), &author),
+    )
+    .await
+    .map_err(|refusal| {
+        (
+            refusal.status,
+            Json(AdminError {
+                code: refusal.code,
+                message: refusal.message,
+            }),
+        )
+    })?;
 
     Ok(Json(AdminResult { block_cid: cid }))
 }
@@ -272,17 +302,7 @@ pub async fn archive_channel(
 
     // Defense in depth, as for member-add: the URL must agree with the bundle
     // so an authoritative-looking URL can't retire a different channel.
-    let bundle_slug = manifest
-        .metadata
-        .get("channel")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            err(
-                StatusCode::BAD_REQUEST,
-                "MISSING_CHANNEL",
-                "channel-archive bundle metadata missing `channel`",
-            )
-        })?;
+    let bundle_slug = bundle_channel(&manifest, "channel-archive")?;
     if !same_channel(&state, &channel_ref, bundle_slug)? {
         return Err(err(
             StatusCode::BAD_REQUEST,
@@ -392,6 +412,7 @@ mod tests {
             fanout,
             server_url: server_url.clone(),
             naively_allow_unknown_handles_fallback: false,
+            naively_accept_peer_relayed_creates: false,
             executor: Some(BlockExecutor::shared()),
         });
 
@@ -453,7 +474,13 @@ mod tests {
 
         let id = test_identity();
         let hlc = test_hlc(&id);
-        let block = build_channel_create(&id, "#hello", "open", hlc);
+        let block = build_channel_create(
+            &id,
+            "#hello",
+            "open",
+            &state.server_did.to_did_jig_string(),
+            hlc,
+        );
 
         let (status, body) = post_json(router, "/api/v1/channels", submission_from(&block)).await;
         assert_eq!(status, StatusCode::OK, "body={body}");
@@ -490,7 +517,13 @@ mod tests {
         let hlc = test_hlc(&id);
 
         // First create the channel
-        let create_block = build_channel_create(&id, "#room", "open", hlc.clone());
+        let create_block = build_channel_create(
+            &id,
+            "#room",
+            "open",
+            &state.server_did.to_did_jig_string(),
+            hlc.clone(),
+        );
         let (status, _) = post_json(
             router.clone(),
             "/api/v1/channels",
@@ -524,6 +557,48 @@ mod tests {
         );
     }
 
+    /// A channel given by its id is named under `channel_id` in the bundle,
+    /// and the route takes it, for an add and an archive alike.
+    #[tokio::test]
+    async fn add_member_and_archive_take_a_channel_named_by_its_id() {
+        let state = state_with_channel_kinds_allowed();
+        let router = build_channel_ops_router(state.clone());
+        let id = test_identity();
+        let create_block = build_channel_create(
+            &id,
+            "#room",
+            "open",
+            &state.server_did.to_did_jig_string(),
+            test_hlc(&id),
+        );
+        let channel = create_block.cid();
+        let (status, _) = post_json(
+            router.clone(),
+            "/api/v1/channels",
+            submission_from(&create_block),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let add_block = build_member_add(&id, &channel, "did:jig:zMember", test_hlc(&id));
+        let (status, body) = post_json(
+            router.clone(),
+            &format!("/api/v1/channels/{channel}/members"),
+            submission_from(&add_block),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+
+        let archive = build_channel_archive(&id, &channel, test_hlc(&id));
+        let (status, body) = post_json(
+            router,
+            &format!("/api/v1/channels/{channel}/archive"),
+            submission_from(&archive),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+    }
+
     #[tokio::test]
     async fn add_member_rejects_slug_mismatch() {
         let state = state_with_channel_kinds_allowed();
@@ -548,8 +623,9 @@ mod tests {
 
     /// Create `slug` owned by `owner` and return the router used to do it.
     async fn router_with_channel(state: Arc<AppState>, owner: &Identity, slug: &str) -> Router {
+        let sequencer = state.server_did.to_did_jig_string();
         let router = build_channel_ops_router(state);
-        let create = build_channel_create(owner, slug, "open", test_hlc(owner));
+        let create = build_channel_create(owner, slug, "open", &sequencer, test_hlc(owner));
         let (status, body) =
             post_json(router.clone(), "/api/v1/channels", submission_from(&create)).await;
         assert_eq!(status, StatusCode::OK, "setup create failed: {body}");
@@ -644,7 +720,22 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
 
-        let again = build_channel_archive(&owner, "#scratch", test_hlc(&owner));
+        // The same block again is the block already held: its CID, and
+        // nothing applied twice.
+        let (status, body) = post_json(
+            router.clone(),
+            &archive_path("#scratch"),
+            submission_from(&first),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+
+        // A second archive is refused: the channel is already archived.
+        let later = HlcTimestamp {
+            logical: 1,
+            ..test_hlc(&owner)
+        };
+        let again = build_channel_archive(&owner, "#scratch", later);
         let (status, body) =
             post_json(router, &archive_path("#scratch"), submission_from(&again)).await;
         assert_eq!(status, StatusCode::GONE, "body={body}");
@@ -784,11 +875,17 @@ mod tests {
     #[tokio::test]
     async fn create_channel_rejects_invalid_signature() {
         let state = state_with_channel_kinds_allowed();
-        let router = build_channel_ops_router(state);
+        let router = build_channel_ops_router(state.clone());
 
         let id = test_identity();
         let hlc = test_hlc(&id);
-        let block = build_channel_create(&id, "#hello", "open", hlc);
+        let block = build_channel_create(
+            &id,
+            "#hello",
+            "open",
+            &state.server_did.to_did_jig_string(),
+            hlc,
+        );
 
         // Corrupt the signature — all zeros
         let submission = serde_json::json!({

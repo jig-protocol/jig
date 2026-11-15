@@ -949,6 +949,7 @@ impl Client {
                         code: code.clone(),
                         ref_cid: None,
                         message: message.clone(),
+                        retry_after_ms: None,
                     });
                     contradicted(
                         &self.contradiction,
@@ -1185,6 +1186,7 @@ mod tests {
                 code: "RATE_LIMITED".into(),
                 ref_cid: None,
                 message: String::new(),
+                retry_after_ms: None,
             },
         );
         answer(
@@ -1590,6 +1592,7 @@ mod tests {
             code: code.to_string(),
             ref_cid,
             message: format!("refused: {code}"),
+            retry_after_ms: None,
         })
     }
 
@@ -1717,6 +1720,7 @@ mod tests {
                     code: "INVALID_SIG".to_string(),
                     ref_cid: None,
                     message: "signature verification failed".to_string(),
+                    retry_after_ms: None,
                 })],
                 _ => vec![],
             }
@@ -1946,6 +1950,7 @@ mod tests {
                 code: "UNSUPPORTED_VERSION".to_string(),
                 ref_cid: None,
                 message: "server speaks envelope v1".to_string(),
+                retry_after_ms: None,
             }))
             .unwrap()
         })
@@ -2293,6 +2298,7 @@ mod tests {
                     code: "DISALLOWED_BLOCK_KIND".to_string(),
                     ref_cid: None,
                     message: "kind not in allow list: text-render".to_string(),
+                    retry_after_ms: None,
                 })],
                 _ => vec![],
             }

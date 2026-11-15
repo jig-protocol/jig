@@ -15,7 +15,26 @@
 //! than an HTTP status.
 
 use axum::http::StatusCode;
-use jig_pipeline::ingest::IngestError;
+use jig_pipeline::ingest::{IngestError, RenderCause};
+use std::time::Duration;
+
+/// How long a client refused for a render deadline is told to wait. The
+/// deadline (250 ms by default) passed because this host was loaded; one
+/// second lets a burst drain without the client giving up.
+pub const RENDER_DEADLINE_RETRY: Duration = Duration::from_secs(1);
+
+/// How long the client should wait before posting again, for the ingest
+/// failures that waiting changes. Every surface carries it as
+/// `retry_after_ms`; the classifier's message says it too.
+pub fn retry_after(e: &IngestError) -> Option<Duration> {
+    match e {
+        IngestError::RenderFailed {
+            cause: RenderCause::DeadlineExceeded,
+            ..
+        } => Some(RENDER_DEADLINE_RETRY),
+        _ => None,
+    }
+}
 
 /// Classify an ingest failure into `(status, error_code, message)`. Callers
 /// wrap this triple in whatever JSON body type their endpoint uses.
@@ -68,8 +87,30 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
             "NO_EXECUTOR",
             e.to_string(),
         ),
-        // 500: the block was acceptable and executing it failed here. May be
-        // transient, so the message says so rather than implying a bad request.
+        // 422: the block needs more fuel or stack than this server allows, and it
+        // will every time. Resending it unchanged cannot help, so nothing here says
+        // it might.
+        IngestError::RenderFailed { cause, .. } if cause.is_too_expensive() => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "BLOCK_TOO_EXPENSIVE",
+            format!("{e}; the block exceeds this server's render limits"),
+        ),
+        // 503: the render ran out of wall-clock time, which is this host's load,
+        // not the block. Same code as a host fault, so a client that matches on it
+        // still does; the status and the wait say this one is worth retrying.
+        IngestError::RenderFailed {
+            cause: RenderCause::DeadlineExceeded,
+            ..
+        } => {
+            let ms = RENDER_DEADLINE_RETRY.as_millis();
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "RENDER_FAILED",
+                format!("{e}; this server is busy, try again in {ms} ms (retry_after_ms={ms})"),
+            )
+        }
+        // 500: the host failed (an engine fault, a render task that died, an
+        // executor that refused). The block may be fine, so a retry may work.
         IngestError::RenderFailed { .. } => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "RENDER_FAILED",
@@ -124,6 +165,10 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
         // rule 5). Policy, not a malformed request: the same block is fine
         // on the server it names.
         IngestError::NotSequencer { .. } => (StatusCode::FORBIDDEN, "NOT_SEQUENCER", e.to_string()),
+        // 400: the block itself lacks a field this server requires.
+        IngestError::SequencerRequired { .. } => {
+            (StatusCode::BAD_REQUEST, "SEQUENCER_REQUIRED", e.to_string())
+        }
         IngestError::BundleTooLarge { .. } => (
             StatusCode::PAYLOAD_TOO_LARGE,
             "BUNDLE_TOO_LARGE",
@@ -133,6 +178,14 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
         IngestError::CarriedChannel { .. } => {
             (StatusCode::FORBIDDEN, "CARRIED_CHANNEL", e.to_string())
         }
+        // 403: a peer's legacy relay posting into a channel this server
+        // sequences (JEP-0014 rule 37). The relay answers nothing, so this is
+        // for the log and anything that classifies a refusal.
+        IngestError::RelayedIntoSequencedChannel { .. } => (
+            StatusCode::FORBIDDEN,
+            "RELAYED_INTO_SEQUENCED_CHANNEL",
+            e.to_string(),
+        ),
         // 403: a follower relayed past its share, or past its grant
         // (JEP-0005 rules 7a, 15).
         IngestError::RelayedOutsideShare { .. } => {
@@ -179,9 +232,27 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
         ),
         // 409: the block is fine, the channel's state refuses it, and no
         // retry will change that.
-        IngestError::PlaintextRestrictedFrozen { .. } => {
+        IngestError::ChannelFrozen { .. } => {
             (StatusCode::CONFLICT, "CHANNEL_FROZEN", e.to_string())
         }
+        // 400: the block names no tier this server knows, or an old client
+        // asked for a plaintext channel it cannot label (JEP-0014 rule 1).
+        IngestError::UnknownTier { .. } => (StatusCode::BAD_REQUEST, "UNKNOWN_TIER", e.to_string()),
+        // 400: the tier and the suite contradict each other (rule 3).
+        IngestError::TierSuiteMismatch { .. } => (
+            StatusCode::BAD_REQUEST,
+            "TIER_SUITE_MISMATCH",
+            e.to_string(),
+        ),
+        // 409: the block is well formed; the channel's tier is fixed (rule 2).
+        IngestError::TierFixed { .. } => (StatusCode::CONFLICT, "TIER_FIXED", e.to_string()),
+        // 403: the client may read the channel, not post to it, until it
+        // supports tiers (rule 5).
+        IngestError::TierUnsupported { .. } => {
+            (StatusCode::FORBIDDEN, "TIER_UNSUPPORTED", e.to_string())
+        }
+        // 409: the block is well formed; a 1:1 adds nobody (rule 18).
+        IngestError::DmIsAPair { .. } => (StatusCode::CONFLICT, "DM_IS_A_PAIR", e.to_string()),
         // 409: someone else committed first. The client catches up and
         // rebuilds; nothing about the request itself was wrong.
         IngestError::StaleEpoch { .. } => (StatusCode::CONFLICT, "STALE_EPOCH", e.to_string()),
@@ -247,6 +318,22 @@ mod tests {
             },
             IngestError::RenderFailed {
                 kind: "text-render".to_string(),
+                cause: RenderCause::DeadlineExceeded,
+                detail: "boom".to_string(),
+            },
+            IngestError::RenderFailed {
+                kind: "text-render".to_string(),
+                cause: RenderCause::FuelExhausted,
+                detail: "boom".to_string(),
+            },
+            IngestError::RenderFailed {
+                kind: "text-render".to_string(),
+                cause: RenderCause::StackExhausted,
+                detail: "boom".to_string(),
+            },
+            IngestError::RenderFailed {
+                kind: "text-render".to_string(),
+                cause: RenderCause::HostFault,
                 detail: "boom".to_string(),
             },
             IngestError::NotChannelOwner {
@@ -289,8 +376,26 @@ mod tests {
             IngestError::RestrictedRequiresMls {
                 slug: "#private".to_string(),
             },
-            IngestError::PlaintextRestrictedFrozen {
+            IngestError::ChannelFrozen {
                 slug: "#old".to_string(),
+            },
+            IngestError::UnknownTier {
+                tier: "none".to_string(),
+            },
+            IngestError::TierSuiteMismatch {
+                tier: "public",
+                suite: "mls".to_string(),
+            },
+            IngestError::TierFixed {
+                kind: "channel-promote".to_string(),
+                slug: "#team".to_string(),
+            },
+            IngestError::TierUnsupported {
+                slug: "#news".to_string(),
+            },
+            IngestError::DmIsAPair {
+                slug: "#dm/0123456789abcdef".to_string(),
+                member: "did:jig:zThird".to_string(),
             },
             IngestError::StaleEpoch {
                 slug: "#sealed".to_string(),
@@ -306,10 +411,17 @@ mod tests {
                 sequencer: "did:jig:zElsewhere".to_string(),
                 server: "did:jig:zHere".to_string(),
             },
+            IngestError::SequencerRequired {
+                server: "did:jig:zHere".to_string(),
+            },
             IngestError::CarriedChannel {
                 kind: "text-render".to_string(),
                 channel_id: "bafy-carried".to_string(),
                 sequencer: "did:jig:zElsewhere".to_string(),
+            },
+            IngestError::RelayedIntoSequencedChannel {
+                kind: "text-render".to_string(),
+                channel_id: "bafy-ours".to_string(),
             },
             IngestError::RelayedOutsideShare {
                 kind: "text-render".to_string(),
@@ -352,6 +464,67 @@ mod tests {
                 reason: "uppercase".to_string(),
             },
         ]
+    }
+
+    fn render_failed(cause: RenderCause) -> IngestError {
+        IngestError::RenderFailed {
+            kind: "text-render".to_string(),
+            cause,
+            detail: "the render is incomplete".to_string(),
+        }
+    }
+
+    /// A block too expensive for this server is a 422 that never suggests a
+    /// retry; a missed deadline is a 503 that says how long to wait; a host
+    /// fault keeps the 500 it always had.
+    #[test]
+    fn a_render_failure_is_classified_by_its_cause() {
+        for cause in [RenderCause::FuelExhausted, RenderCause::StackExhausted] {
+            let (status, code, message) = classify_ingest_error(&render_failed(cause));
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{cause:?}");
+            assert_eq!(code, "BLOCK_TOO_EXPENSIVE", "{cause:?}");
+            assert!(
+                !message.contains("transient") && !message.contains("retry"),
+                "{cause:?}: {message}"
+            );
+        }
+
+        let (status, code, message) =
+            classify_ingest_error(&render_failed(RenderCause::DeadlineExceeded));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "RENDER_FAILED");
+        assert!(message.ends_with("(retry_after_ms=1000)"), "{message}");
+        assert_eq!(
+            retry_after(&render_failed(RenderCause::DeadlineExceeded)),
+            Some(RENDER_DEADLINE_RETRY)
+        );
+        for cause in [
+            RenderCause::FuelExhausted,
+            RenderCause::StackExhausted,
+            RenderCause::HostFault,
+        ] {
+            assert_eq!(retry_after(&render_failed(cause)), None, "{cause:?}");
+        }
+        // REST carries the wait in its body, as WS does in its Error frame.
+        let (_, body) = blocks_map_ingest_error(render_failed(RenderCause::DeadlineExceeded));
+        assert_eq!(body.0.retry_after_ms, Some(1000));
+        let (_, body) = blocks_map_ingest_error(render_failed(RenderCause::FuelExhausted));
+        assert_eq!(body.0.retry_after_ms, None);
+
+        let (status, code, message) = classify_ingest_error(&render_failed(RenderCause::HostFault));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(code, "RENDER_FAILED");
+        assert!(message.contains("may be transient"), "{message}");
+    }
+
+    #[test]
+    fn a_dm_that_would_grow_is_a_conflict() {
+        let (status, code, _) = classify_ingest_error(&IngestError::DmIsAPair {
+            slug: "#dm/0123456789abcdef".to_string(),
+            member: "did:jig:zThird".to_string(),
+        });
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(code, "DM_IS_A_PAIR");
     }
 
     /// The property this module exists to guarantee: the REST (`v0_0_2_blocks`)

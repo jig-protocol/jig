@@ -315,10 +315,17 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         // Channel terms and roles: the same signed block is refused again on
         // retry, so the bridge bounces it.
         ref e @ (IngestError::NotSequencer { .. }
+        | IngestError::SequencerRequired { .. }
         | IngestError::CarriedChannel { .. }
+        | IngestError::RelayedIntoSequencedChannel { .. }
         | IngestError::RelayedOutsideShare { .. }
         | IngestError::GrantRefused { .. }
         | IngestError::InvalidTerms { .. }
+        | IngestError::UnknownTier { .. }
+        | IngestError::TierSuiteMismatch { .. }
+        | IngestError::TierFixed { .. }
+        | IngestError::TierUnsupported { .. }
+        | IngestError::DmIsAPair { .. }
         | IngestError::MissingRight { .. }
         | IngestError::RootOwnerRole { .. }
         | IngestError::UnknownRole { .. }
@@ -362,15 +369,22 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         | IngestError::UnknownSuite { .. }
         | IngestError::SuiteMismatch { .. }
         | IngestError::RestrictedRequiresMls { .. }
-        | IngestError::PlaintextRestrictedFrozen { .. }
+        | IngestError::ChannelFrozen { .. }
         | IngestError::MlsRejected { .. }) => SubmitDenied::PolicyBlocked {
             reason: e.to_string(),
         },
         // Someone else committed first; rebuilding against the new epoch may
         // well succeed.
         IngestError::StaleEpoch { .. } => SubmitDenied::Unavailable,
-        // Unavailable, not PolicyBlocked: the block is fine and execution failed
-        // on this host, so a retry may well succeed.
+        // PolicyBlocked: the block needs more fuel or stack than this server
+        // allows, every time, so a bridge retrying it would retry forever.
+        ref e @ IngestError::RenderFailed { cause, .. } if cause.is_too_expensive() => {
+            SubmitDenied::PolicyBlocked {
+                reason: e.to_string(),
+            }
+        }
+        // Unavailable, not PolicyBlocked: a missed deadline or a host fault says
+        // nothing against the block, so a retry may well succeed.
         IngestError::RenderFailed { .. } => SubmitDenied::Unavailable,
         IngestError::Persist(_) | IngestError::Other(_) => SubmitDenied::Unavailable,
     }
@@ -483,6 +497,7 @@ mod tests {
             fanout: fanout.clone(),
             server_url: "ws://127.0.0.1:0".to_string(),
             naively_allow_unknown_handles_fallback: false,
+            naively_accept_peer_relayed_creates: false,
             executor: Some(BlockExecutor::shared()),
         });
         (store, ingest_ctx, fanout, RouterMount::new())
@@ -659,6 +674,7 @@ mod tests {
                 suite: "none".to_string(),
                 sequencer_did: String::new(),
                 co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
         store
@@ -700,7 +716,10 @@ mod tests {
             &ingest_ctx,
             bundle,
             block.sender_sig.clone(),
-            IngestSource::LocalClient { conn_id: 1 },
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
         )
         .await
         .unwrap();
@@ -712,6 +731,35 @@ mod tests {
             1,
             "managed DID member should trigger exactly one outbound"
         );
+    }
+
+    /// A bridge is told to give up on a block too expensive to render, and to
+    /// retry one that missed its deadline or hit a host fault.
+    #[test]
+    fn a_render_failure_is_permanent_only_when_the_block_is_too_expensive() {
+        use jig_pipeline::ingest::{IngestError, RenderCause};
+        let denied = |cause| {
+            map_ingest_err(IngestError::RenderFailed {
+                kind: "text-render".to_string(),
+                cause,
+                detail: "the render is incomplete".to_string(),
+            })
+        };
+        for cause in [RenderCause::FuelExhausted, RenderCause::StackExhausted] {
+            assert!(
+                matches!(
+                    denied(cause),
+                    jig_bridge_core::SubmitDenied::PolicyBlocked { .. }
+                ),
+                "{cause:?}"
+            );
+        }
+        for cause in [RenderCause::DeadlineExceeded, RenderCause::HostFault] {
+            assert!(
+                matches!(denied(cause), jig_bridge_core::SubmitDenied::Unavailable),
+                "{cause:?}"
+            );
+        }
     }
 
     #[tokio::test]

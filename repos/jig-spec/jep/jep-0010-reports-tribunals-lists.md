@@ -6,7 +6,7 @@ type = "Standards Track"
 category = "Security"
 authors = ["DJ <dev@jig.onl>"]
 created = "2026-10-18"
-requires = ["0001", "0004", "0005", "0009"]
+requires = ["0001", "0004", "0005", "0009", "0016"]
 replaces = []
 superseded_by = []
 discussions_to = "https://github.com/jig-protocol/jig/issues"
@@ -186,8 +186,8 @@ here is appended to the issuing nameserver's log (JEP-0009 rule 31).
 ## Panels and verdicts
 
 20. A panel is drawn by verifiable randomness from the seats not involved in the case.
-    - The seed is the hash of the group log's witnessed checkpoint at case opening (JEP-0009
-      rule 33) and the `case_id`.
+    - The seed is the hash of the `case_id` and the witness beacon (JEP-0016 section 12) of
+      the first epoch that has one after the case opened.
     - The size and the majority needed are ruleset parameters (reference: 5 seats, 4 to sustain).
     - Each seat on a panel acts through a person.
 21. A **verdict** record is `{v, case_id, outcome, penalty?, measures?, term?, evidence: [CID],
@@ -267,7 +267,7 @@ here is appended to the issuing nameserver's log (JEP-0009 rule 31).
   The recipient's check at decrypt (rule 7) stops a sender from making a message unreportable.
 - **GV-01, capture.**
   - One seat per operator.
-  - Panels are drawn at random from a witnessed checkpoint.
+  - Panels are drawn at random from the witness beacon (JEP-0016 section 12).
   - The appeal panel is disjoint from the first.
   - A disagreeing seat agent is evidence against its seat.
   - Each group is its own scope.

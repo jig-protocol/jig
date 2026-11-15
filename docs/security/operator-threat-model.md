@@ -169,8 +169,11 @@ each block to the ones before it. A signed per-channel sequence does that for on
 comparison across servers and members covers a server that signs two different chains. The
 sequence is built: the server signs it and clients check it (#169); comparison is design work.
 
-**Status evidence.** `IngestError::DuplicateBlock` refuses a CID seen before, which also
-stops replay of control-plane blocks. Read proofs go through a
+**Status evidence.** A CID seen before is never applied, stored or fanned out again, which
+also stops replay of control-plane blocks. Resubmitted by a client (or relayed to its
+owner again), a held block is answered with its CID before admission, so a replay
+charges its author nothing (#396). From a peer or a bridge it is refused
+(`IngestError::DuplicateBlock`). Read proofs go through a
 `ReplayGuard` (`jig-server/src/auth/`). The manifest's `hlc_ts` is set by the block's
 author (TM-02), not the server. Since #161 the server signs an `ingest` record for every
 block of a channel it holds: `seq`, `prev` (the hash of the record before) and its own clock
@@ -231,29 +234,53 @@ peer.
 
 **Decision rationale.** A relayed block is ingested like a submitted one; a peer is a
 transport, not a source of authority. Listing a peer is what trusts it: the server dials
-it, pins its DID, and lets only listed DIDs read its federation stream. v0.2 still
-federates only open, unencrypted channels, because an MLS group spanning two servers needs
-the federation contract (D12).
+it, pins its DID, and lets only listed DIDs read its federation stream. A channel reaches
+another server only by a share under the federation contract (JEP-0005, JEP-0014): a
+`shared` channel is carried as ciphertext, and `private` and `server` channels never leave
+the server that orders them. The legacy relay carries only open, unencrypted channels.
 
-**Status evidence.** `ingest_peer_block` runs every relayed block through `ingest` with
-`IngestSource::FederatedPeer`: signature, manifest gates, admission, the kind allowlist,
-archived channels, the write gate, the suite gate, effects, and the server's own execution
-and receipt. Relayed receipts are not kept. Only a federated `text-render` may name a
-channel the server has no row for; a relayed member-add, member-remove, promote or archive
-for an unknown channel is refused, since there is no owner to authorize it against. The
-dialer pins each peer's `expected_did` in the handshake, and a federation-scope subscribe
-must come from a listed peer's DID, authenticated even where reads are not. A `ws://`
-peer is a boot error, and is never dialed, unless `dangerously_allow_plaintext_federation`
-is set (advertised in `unsafe_options_active`): the pin covers the handshake, not what
-follows it on an unprotected link. The
-`naively_trust_peer_authored_blocks` flag is gone. The relay still drops blocks for local
-channels that do not federate, and `DeliveryPolicy::federates` keeps restricted and
-encrypted channels' blocks off outbound links. Peers actually receive a server's blocks
-through the federation-scope subscription they hold on their connection to it, not through
-the server's own dial (whose block frames the peer ignores); until the fix below that
-subscription was filtered by `permits` alone, so an open encrypted channel's commits,
-welcomes and ciphertext reached every peer. `federates` now gates both paths. It derives block CIDs the way `ingest` does
-(before v0.2 it used a different scheme, so one block had two identities).
+**Status evidence.**
+
+*The legacy relay.* `ingest_peer_block` runs every block a peer relays for a channel that
+has not been shared through `ingest` with `IngestSource::FederatedPeer`: signature,
+manifest gates, admission, the kind allowlist, archived channels, the write gate, the
+suite gate, effects, and the server's own execution and receipt. Before that it drops
+encrypted content, a peer's shares and contract records (they are the sequencer's own),
+blocks for a channel this server carries by contract, and blocks for a local channel that
+does not federate. It also drops every block other than a `channel-create` that names a
+channel this server sequences, by slug or by id (JEP-0014 rule 37, #357): a channel crosses
+servers only by a share, so the relay cannot give it a second order. These are logged
+under `relayed-into-sequenced-channel` and counted, and the drop comes before admission, so
+a refused post spends none of its author's rate. Relayed receipts are not kept. A `text-render`, membership, role,
+promote, archive, share or contract block that names a channel this server has no row for
+is refused, from any source. A relayed `channel-create` must name this server as its sequencer
+(`SEQUENCER_REQUIRED`, `NOT_SEQUENCER`), so a peer's new channel is never taken as this
+server's own; `naively_accept_peer_relayed_creates`, for tests only and advertised in
+`unsafe_options_active`, stores such a create as a copy that clients refuse to read.
+
+*The contract.* A channel reaches a peer only once its owner shares it (#368, #339), and a
+follower takes a block only under an accepted share of its channel with that sequencer. A
+follower stores the owner's blocks and signed `ingest` records as they arrived, checks
+each record against the channel's sequencer and its chain, and signs nothing (JEP-0005
+rule 12, `jig-pipeline/src/follow.rs`). It executes nothing, so it keeps no receipt of its
+own; it checks the author's signature, and leaves the write gate to the owner, which ran
+it before sequencing the block (rule 22a). For a `shared` MLS channel it judges each commit
+and sealed message against its mirror of the group's public state and stores ciphertext,
+never plaintext (#373).
+
+*Links.* The dialer pins each peer's `expected_did` in the handshake, and a
+federation-scope subscribe must come from a listed peer's DID, authenticated even where
+reads are not. A `ws://` peer is a boot error, and is never dialed, unless
+`dangerously_allow_plaintext_federation` is set (advertised in `unsafe_options_active`):
+the pin covers the handshake, not what follows it on an unprotected link. The
+`naively_trust_peer_authored_blocks` flag is gone. `DeliveryPolicy::federates` keeps
+restricted and encrypted channels' blocks off the legacy relay's outbound links. Peers
+actually receive a server's blocks through the federation-scope subscription they hold on
+their connection to it, not through the server's own dial (whose block frames the peer
+ignores); until the fix below that subscription was filtered by `permits` alone, so an open
+encrypted channel's commits, welcomes and ciphertext reached every peer. `federates` now
+gates both paths. It derives block CIDs the way `ingest` does (before v0.2 it used a
+different scheme, so one block had two identities).
 
 ### OP-10: discovery and reputation gaming
 
