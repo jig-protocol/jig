@@ -51,6 +51,16 @@ pub enum PinError {
         presented: String,
     },
     #[error(
+        "{server} lists channel {id} as {listed}, but this device pinned it as {pinned}: \
+         a server cannot move a channel to another slug"
+    )]
+    SlugMoved {
+        server: String,
+        id: String,
+        pinned: String,
+        listed: String,
+    },
+    #[error(
         "{server} names itself {presented}, but this device pinned it as {pinned} (if its key \
          really changed, `jig server forget` drops the pin)"
     )]
@@ -413,6 +423,20 @@ fn rekey(file: &mut PinFile) -> bool {
 /// Channel pins keyed by slug, as before #388, rekeyed by channel id with
 /// the slug kept as data. A pin with no creation block recorded stays where
 /// it is: there is no id to file it under.
+/// A pin under one slug is never taken for a listing under another. A pin
+/// with no slug (an old file entry without one) says nothing either way.
+fn check_slug(server: &str, pinned: &ChannelPin, slug: &str) -> Result<(), PinError> {
+    if pinned.slug.is_empty() || pinned.slug == slug {
+        return Ok(());
+    }
+    Err(PinError::SlugMoved {
+        server: server.to_string(),
+        id: pinned.create_cid.clone(),
+        pinned: pinned.slug.clone(),
+        listed: slug.to_string(),
+    })
+}
+
 fn rekey_channels(channels: &mut BTreeMap<String, ChannelPin>) -> bool {
     let legacy: Vec<String> = channels
         .iter()
@@ -701,6 +725,7 @@ impl Pins {
         self.update(|file| {
             let pin = file.servers.entry(server_key(server)).or_default();
             if let Some(pinned) = pin.channels.get(&proven.create_cid) {
+                check_slug(server, pinned, slug)?;
                 return Ok((pinned.clone(), false));
             }
             if let Some(pinned) = pin
@@ -719,6 +744,23 @@ impl Pins {
                 .insert(proven.create_cid.clone(), proven.clone());
             Ok((proven, true))
         })
+    }
+
+    /// The pin of channel `id` on `server`, when the server lists it as
+    /// `slug`: `None` if it is not pinned, an error if it is pinned under
+    /// another slug. A channel is found by its id, so without this a server
+    /// could list one pinned channel under another's slug (#388).
+    pub fn channel_listed_as(
+        &self,
+        server: &str,
+        id: &str,
+        slug: &str,
+    ) -> Result<Option<&ChannelPin>, PinError> {
+        let Some(pin) = self.server(server).and_then(|p| p.channels.get(id)) else {
+            return Ok(None);
+        };
+        check_slug(server, pin, slug)?;
+        Ok(Some(pin))
     }
 
     /// Move the pinned chain head of `reference` (an id, or a slug as
@@ -2432,5 +2474,49 @@ mod tests {
             Some(7)
         );
         assert_eq!(pins.channel(server, "#team").unwrap().chain_head, None);
+    }
+
+    /// Found by id, a pinned channel still keeps its slug: a server that
+    /// lists one pinned channel under another's slug is refused, whether the
+    /// listing is checked against the pin or proven again.
+    #[test]
+    fn a_pinned_channel_listed_under_another_slug_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pins = Pins::load(&dir.path().join("pins.json")).unwrap();
+        let server = "wss://host";
+        let pin = |cid: &str| ChannelPin {
+            create_cid: cid.into(),
+            slug: String::new(),
+            suite: "mls".into(),
+            owner_did: "did:jig:zUser".into(),
+            chain_head: None,
+            sequencer: None,
+        };
+        pins.check_channel(server, "#alpha", pin("bafyA")).unwrap();
+        pins.check_channel(server, "#beta", pin("bafyB")).unwrap();
+
+        assert!(matches!(
+            pins.channel_listed_as(server, "bafyB", "#alpha"),
+            Err(PinError::SlugMoved { id, pinned, listed, .. })
+                if id == "bafyB" && pinned == "#beta" && listed == "#alpha"
+        ));
+        assert!(matches!(
+            pins.check_channel(server, "#alpha", pin("bafyB")),
+            Err(PinError::SlugMoved { .. })
+        ));
+        // Listed as pinned: found. Not pinned: nothing.
+        assert_eq!(
+            pins.channel_listed_as(server, "bafyB", "#beta")
+                .unwrap()
+                .map(|p| p.slug.as_str()),
+            Some("#beta")
+        );
+        assert!(
+            pins.channel_listed_as(server, "bafyC", "#alpha")
+                .unwrap()
+                .is_none()
+        );
+        // #alpha still names A.
+        assert_eq!(pins.channel(server, "#alpha").unwrap().create_cid, "bafyA");
     }
 }

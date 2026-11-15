@@ -483,9 +483,8 @@ impl Secure {
     /// same block, else fetched, verified and pinned.
     async fn proven(&self, info: &ChannelInfo) -> Result<ChannelPin> {
         let mut pins = Pins::load(&Pins::default_path())?;
-        if let Some(pin) = pins.channel(&self.server, &info.id)
-            && pin.create_cid == info.id
-        {
+        // Pinned by id, and listed under the slug it was pinned as.
+        if let Some(pin) = pins.channel_listed_as(&self.server, &info.id, &info.slug)? {
             return Ok(pin.clone());
         }
         if info.id.is_empty() {
