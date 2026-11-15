@@ -5065,6 +5065,30 @@ mod tests {
         );
     }
 
+    // ---- bundled SQLite ----------------------------------------------------
+
+    /// The bundled SQLite must be at least 3.54.1, the release that carries
+    /// the CVE-2026-119375 / RUSTSEC-2026-0459 fix (#381). The workspace pins
+    /// rusqlite with `bundled`, so a later rusqlite or libsqlite3-sys bump that
+    /// shipped an older SQLite would regress that fix with nothing else failing.
+    /// Every crate here links this one SQLite, so one check covers them all.
+    #[test]
+    fn bundled_sqlite_carries_the_381_fix() {
+        const FLOOR: i32 = 3_054_001;
+        let linked = rusqlite::version_number();
+        assert!(
+            linked >= FLOOR,
+            "bundled SQLite {} is older than 3.54.1 ({FLOOR}); see #381",
+            rusqlite::version(),
+        );
+        // The engine a connection actually runs, not only the library constant.
+        let conn = rusqlite::Connection::open_in_memory().expect("open");
+        let reported: String = conn
+            .query_row("SELECT sqlite_version()", [], |row| row.get(0))
+            .expect("sqlite_version()");
+        assert_eq!(reported, rusqlite::version());
+    }
+
     // ---- connection pragmas ---------------------------------------------
 
     #[test]
