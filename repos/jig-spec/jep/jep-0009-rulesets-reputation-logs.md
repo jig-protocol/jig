@@ -277,6 +277,10 @@ binds R3 (rules 7–22) as well: R3's nameservers and R2.4's single server compu
       first checkpoint.
     - A checkpoint's epoch time is the `witness_threshold`-th smallest timestamp among its valid
       cosignatures. A minority of witnesses cannot move it earlier.
+    - An epoch never closes inside a window it opened. The closing checkpoint is also at or after
+      the end of every commit, reveal and beacon-reveal window that opened in the epoch
+      (JEP-0016 rules 16, 17 and 38). A quiet epoch runs long rather than cutting a window
+      short, so nobody misses a window because time ran out.
     - `f` never reads a clock. Time enters only as cosignature timestamps already in the log, so
       every recomputation finds the same boundaries.
     - Every period in this JEP, JEP-0008 and JEP-0016 is an epoch.
