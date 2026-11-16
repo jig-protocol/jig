@@ -22,7 +22,7 @@ multihash-codetable.workspace = true
 hex = "0.4"
 base64 = "0.23"
 thiserror = "2.0"
-wasmparser = "0.261"
+wasmparser = "0.262"
 
 # Optional cryptography/signing helpers
 ed25519-dalek = { version = "3.0", optional = true, features = ["serde"] }
@@ -41,7 +41,7 @@ proptest = "1.0"
 wat = "1.0"
 # Parses the jig:block WIT package in tests/wit_package.rs. 0.261 matches the wasm-tools
 # release wasmtime 50 already pulls in, so it adds no new crates to the lockfile.
-wit-parser = "0.261"
+wit-parser = "0.263"
 
 [[bench]]
 name = "pow"
