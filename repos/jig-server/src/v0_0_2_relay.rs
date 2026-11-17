@@ -692,10 +692,7 @@ impl Relay {
             Err(IngestError::DuplicateBlock { cid }) => Answer::accepted(id, cid),
             // An author refused for its rate here is told this server's wait,
             // not the follower's.
-            Err(e) => Answer {
-                retry_after_ms: refusal_of(&self.ctx, &e).retry_after_ms.unwrap_or(0),
-                ..refused_by(id, &e)
-            },
+            Err(e) => answer_of(id, refusal_of(&self.ctx, &e)),
         }
     }
 }
@@ -798,8 +795,17 @@ pub async fn post_as(
 }
 
 fn refused_by(request_id: u64, e: &IngestError) -> Answer {
-    let (status, code, message) = crate::v0_0_2_ingest_error::classify_ingest_error(e);
-    Answer::refused(request_id, status, code, message)
+    answer_of(request_id, Refusal::of(e))
+}
+
+/// The answer that carries `refusal` back to the follower: one refusal, so
+/// its message and its `retry_after_ms` name the same wait, however that
+/// wait was drawn.
+fn answer_of(request_id: u64, refusal: Refusal) -> Answer {
+    Answer {
+        retry_after_ms: refusal.retry_after_ms.unwrap_or(0),
+        ..Answer::refused(request_id, refusal.status, &refusal.code, refusal.message)
+    }
 }
 
 fn violation(why: &str) -> CloseReason {
@@ -874,6 +880,18 @@ mod tests {
             "{}",
             refusal.message
         );
+        // The owner's answer to a follower says the same wait in both, on
+        // every draw.
+        for _ in 0..50 {
+            let answer = refused_by(7, &render_failed(RenderCause::DeadlineExceeded));
+            assert!((500..=1500).contains(&answer.retry_after_ms), "{answer:?}");
+            assert!(
+                answer
+                    .message
+                    .ends_with(&format!("(retry_after_ms={})", answer.retry_after_ms)),
+                "{answer:?}"
+            );
+        }
         let refusal = Refusal::of(&render_failed(RenderCause::FuelExhausted));
         assert_eq!(refusal.code, "BLOCK_TOO_EXPENSIVE");
         assert_eq!(refusal.retry_after_ms, None);
