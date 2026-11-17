@@ -92,6 +92,22 @@ version = 2
 # feature -> picky, and are not yanked.)
 yanked = "deny"
 ignore = [
+    # RUSTSEC-2026-0543: chrono is unmaintained (no known vulnerability). Not
+    # build-time only: a runtime dependency of jig-client, jig-pipeline,
+    # jig-server, jig-nameserver, jig-cli, jig-bridge-email and
+    # integration-tests, linked into every shipped binary. No release fixes
+    # it and no drop-in replaces it; jiff and time both do the job with code
+    # changes. Drop this entry once that migration lands (#445).
+    "RUSTSEC-2026-0543",
+
+    # RUSTSEC-2026-0542: humantime is unmaintained (no known vulnerability).
+    # Reached only through humantime-serde 1.1 in jig-server, which reads
+    # config durations written as text. It does not depend on chrono here
+    # (`cargo tree -i humantime`), whatever the advisory says. jiff parses and
+    # prints durations, so it can replace both; drop this entry with chrono's
+    # (#445).
+    "RUSTSEC-2026-0542",
+
     # RUSTSEC-2026-0173: proc-macro-error2 is unmaintained (no vulnerability).
     # Build-time only — a proc-macro dependency of hax-lib-macros, reached via
     # jig-mls -> openmls_rust_crypto 0.6 -> hpke-rs 0.7 -> libcrux-sha3 ->
