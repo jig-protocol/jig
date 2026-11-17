@@ -101,6 +101,11 @@ pub enum Seen {
     Text { sender: String, text: String },
     /// Encrypted text this member cannot read, and why.
     Sealed { reason: String },
+    /// Encrypted text sent in an epoch of this member's group before it
+    /// joined, or while it was out of the group: MLS gives it no keys for
+    /// that epoch, by design (#431). Only ever said of a message this
+    /// device could not read, from what it recorded when it joined.
+    BeforeJoin,
     /// This member is now in the channel's group.
     Joined,
     /// Someone was added; the local group has followed.
@@ -169,6 +174,83 @@ struct Groups {
     /// one: what a page of history after the head must continue.
     #[serde(default)]
     head_records: HashMap<String, crate::chain::ChainHead>,
+    /// Hex group id → the epochs this device has been in that group, oldest
+    /// first, as it joined and was removed. Groups joined by a build before
+    /// #431 have none: nothing in the MLS state says when they were joined.
+    #[serde(default)]
+    spans: HashMap<String, Vec<Span>>,
+}
+
+/// Epochs `from..until` of one group this device was in; `until` is unset
+/// while it is still in, or when it left without this device seeing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct Span {
+    from: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    until: Option<u64>,
+}
+
+impl Groups {
+    /// This device is in `gid` from `epoch` on.
+    fn joined(&mut self, gid: &[u8], epoch: u64) {
+        let spans = self.spans.entry(hex::encode(gid)).or_default();
+        match spans.last() {
+            // The same join, seen again.
+            Some(last) if last.until.is_none() && last.from == epoch => {}
+            // Joined again without the end of the last span: its end stays
+            // unknown, so no epoch before this join is said to be outside.
+            _ => spans.push(Span {
+                from: epoch,
+                until: None,
+            }),
+        }
+    }
+
+    /// This device is out of `gid` from `epoch` on.
+    fn left(&mut self, gid: &[u8], epoch: u64) {
+        let spans = self.spans.entry(hex::encode(gid)).or_default();
+        match spans.last_mut() {
+            Some(last) if last.until.is_none() && epoch >= last.from => last.until = Some(epoch),
+            Some(_) => {}
+            // In a group joined before spans were recorded: since when is
+            // unknown, so the span starts at the first epoch, and no epoch
+            // before a later join is said to be outside but those after this.
+            None => spans.push(Span {
+                from: 0,
+                until: Some(epoch),
+            }),
+        }
+    }
+
+    /// A join of `gid` the server refused: the span it opened never was.
+    fn refused(&mut self, gid: &[u8]) {
+        let key = hex::encode(gid);
+        if let Some(spans) = self.spans.get_mut(&key)
+            && spans.last().is_some_and(|last| last.until.is_none())
+        {
+            spans.pop();
+            if spans.is_empty() {
+                self.spans.remove(&key);
+            }
+        }
+    }
+
+    /// Whether `epoch` of `gid` is one this device was never in: before its
+    /// first join, or between a removal it saw and the next join. Unknown
+    /// is no.
+    fn outside(&self, gid: &[u8], epoch: u64) -> bool {
+        let Some(spans) = self.spans.get(&hex::encode(gid)) else {
+            return false;
+        };
+        let Some(first) = spans.first() else {
+            return false;
+        };
+        epoch < first.from
+            || spans.windows(2).any(|w| {
+                w[0].until
+                    .is_some_and(|until| until <= epoch && epoch < w[1].from)
+            })
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -458,6 +540,7 @@ impl Session {
         let key = group_key(server, slug);
         self.with_member(|m, g| {
             let created = m.create_group()?;
+            g.joined(&created.group_id, m.epoch(&created.group_id)?);
             g.groups.insert(key, hex::encode(&created.group_id));
             Ok(created)
         })
@@ -469,6 +552,9 @@ impl Session {
         let key = group_key(server, slug);
         self.with_member(|m, g| {
             if let Some(gid) = group_of(g, &key) {
+                if m.has_group(&gid) {
+                    g.left(&gid, m.epoch(&gid)? + 1);
+                }
                 m.forget(&gid)?;
             }
             g.groups.remove(&key);
@@ -490,11 +576,28 @@ impl Session {
         self.with_group(server, slug, |m, gid| Ok(m.remove(gid, did)?))
     }
 
+    /// Drop the group of a join by external commit the server refused, or
+    /// that did not land: as [`Self::discard_group`], and the membership the
+    /// join recorded with it.
+    pub fn discard_join(&self, server: &str, slug: &str) -> Result<()> {
+        let key = group_key(server, slug);
+        self.with_member(|m, g| {
+            if let Some(gid) = group_of(g, &key) {
+                g.refused(&gid);
+                m.forget(&gid)?;
+            }
+            g.groups.remove(&key);
+            Ok(())
+        })
+    }
+
     /// Join by external commit from the channel's published group info.
     pub fn prepare_join(&self, server: &str, slug: &str, group_info: &[u8]) -> Result<Commit> {
         let key = group_key(server, slug);
         self.with_member(|m, g| {
             let (gid, commit) = m.join_external(group_info)?;
+            // In from the epoch the join commit starts.
+            g.joined(&gid, commit.epoch + 1);
             g.groups.insert(key, hex::encode(gid));
             Ok(commit)
         })
@@ -611,7 +714,7 @@ impl Session {
         channel: Option<&ReadIn<'_>>,
         block: &OpenedBlock,
     ) -> Seen {
-        match self.try_observe(server, channel, block) {
+        let seen = match self.try_observe(server, channel, block) {
             Ok(seen) => seen,
             Err(e) => match block.manifest.kind {
                 Some(BlockKind::MemberAdd | BlockKind::MemberRemove) => Seen::Broken {
@@ -621,7 +724,66 @@ impl Session {
                     reason: e.to_string(),
                 },
             },
+        };
+        self.before_join(server, channel, block, seen)
+    }
+
+    /// `seen` for `block`, or [`Seen::BeforeJoin`] when it is a message this
+    /// member could not read ([`Seen::Sealed`]) from an epoch of this
+    /// channel's group it was never in, as it recorded its joins. Anything
+    /// this cannot tell stays as it was. A replay in epoch order meets the
+    /// messages before a welcome before the welcome itself, so those read as
+    /// sealed until the next replay; `jig read` syncs before it shows.
+    fn before_join(
+        &self,
+        server: &str,
+        channel: Option<&ReadIn<'_>>,
+        block: &OpenedBlock,
+        seen: Seen,
+    ) -> Seen {
+        if !matches!(seen, Seen::Sealed { .. }) || !self.outside(server, channel, block) {
+            return seen;
         }
+        Seen::BeforeJoin
+    }
+
+    fn outside(&self, server: &str, channel: Option<&ReadIn<'_>>, block: &OpenedBlock) -> bool {
+        let Some(kind) = block.manifest.kind else {
+            return false;
+        };
+        // An application message of this channel, signed by its author, in
+        // the one suite this client reads.
+        if matches!(kind, BlockKind::MemberAdd | BlockKind::MemberRemove)
+            || block.authenticity != Authenticity::Verified
+            || block.manifest.content_suite() != EncryptionSuite::Mls
+            || channel.is_some_and(|c| !c.names(kind, block))
+        {
+            return false;
+        }
+        // Filed as [`Self::try_observe`] files it.
+        let key = match channel {
+            Some(c) => group_key(server, c.key),
+            None => group_key(
+                server,
+                block
+                    .meta_str(jig_pipeline::ingest::CHANNEL_ID_KEY)
+                    .or(jig_pipeline::ingest::channel_slug_of(kind, &block.manifest))
+                    .unwrap_or_default(),
+            ),
+        };
+        let Some((gid, epoch)) = block
+            .meta_str("mls_message")
+            .and_then(|m| STANDARD.decode(m).ok())
+            .and_then(|m| jig_mls::member::message_group_epoch(&m))
+        else {
+            return false;
+        };
+        let Ok(groups) = self.read_groups() else {
+            return false;
+        };
+        // The group this channel is filed under, and no other: epochs of
+        // another group say nothing about this one.
+        group_of(&groups, &key).is_some_and(|ours| ours == gid) && groups.outside(&gid, epoch)
     }
 
     fn try_observe(
@@ -697,6 +859,7 @@ impl Session {
                             .meta_str("mls_welcome")
                             .ok_or(SecureError::Field("mls_welcome"))?;
                         let gid = m.join_welcome(&b64(welcome, "mls_welcome")?)?;
+                        g.joined(&gid, m.epoch(&gid)?);
                         g.groups.insert(key.clone(), hex::encode(gid));
                         return Ok(Seen::Joined);
                     }
@@ -726,6 +889,7 @@ impl Session {
                             });
                         };
                         if member == me {
+                            g.left(&gid, m.epoch(&gid)? + 1);
                             m.forget(&gid)?;
                             g.groups.remove(&key);
                             return Ok(Seen::Gone);
@@ -950,8 +1114,33 @@ impl Session {
                 });
             }
         };
+        let mut groups = self.read_groups()?;
+        let out = f(&member, &mut groups);
+        // Save even when `f` failed: openmls may have written state (a staged
+        // commit, a consumed key package) before the failure.
+        // Both files, then one directory sync: a sync that failed after the
+        // first rename must not leave the second file unwritten.
+        replace(&state_path, &self.seal(STATE, &member.snapshot()))?;
+        replace(
+            &groups_path,
+            &self.seal(
+                GROUPS,
+                &serde_json::to_vec_pretty(&groups).expect("groups serialize"),
+            ),
+        )?;
+        crate::identity::sync_parent_dir(&state_path).map_err(|source| SecureError::Io {
+            path: self.dir.clone(),
+            source,
+        })?;
+        out
+    }
+
+    /// The group mapping on disk, without taking the lock: it is only ever
+    /// replaced whole.
+    fn read_groups(&self) -> Result<Groups> {
+        let groups_path = self.dir.join(GROUPS);
         // Only a missing file means "no groups yet". Anything else would be
-        // saved back over the real mapping below, orphaning every group.
+        // saved back over the real mapping, orphaning every group.
         let mut groups: Groups = match std::fs::read(&groups_path) {
             Ok(bytes) => serde_json::from_slice(&self.unseal(GROUPS, &groups_path, bytes)?)
                 .map_err(|e| SecureError::Io {
@@ -971,24 +1160,7 @@ impl Session {
             .into_iter()
             .map(|(key, gid)| (rekey(&key), gid))
             .collect();
-        let out = f(&member, &mut groups);
-        // Save even when `f` failed: openmls may have written state (a staged
-        // commit, a consumed key package) before the failure.
-        // Both files, then one directory sync: a sync that failed after the
-        // first rename must not leave the second file unwritten.
-        replace(&state_path, &self.seal(STATE, &member.snapshot()))?;
-        replace(
-            &groups_path,
-            &self.seal(
-                GROUPS,
-                &serde_json::to_vec_pretty(&groups).expect("groups serialize"),
-            ),
-        )?;
-        crate::identity::sync_parent_dir(&state_path).map_err(|source| SecureError::Io {
-            path: self.dir.clone(),
-            source,
-        })?;
-        out
+        Ok(groups)
     }
 
     /// Hold the channel's commit lock until the returned guard drops.
@@ -1077,6 +1249,10 @@ fn follow(
     match m.apply_commit(gid, commit)? {
         CommitOutcome::Applied { .. } | CommitOutcome::AlreadyApplied => Ok(done),
         CommitOutcome::Removed => {
+            // Out from the epoch the removing commit starts.
+            if let Some(epoch) = jig_mls::member::message_epoch(commit) {
+                g.left(gid, epoch + 1);
+            }
             g.groups.remove(key);
             Ok(Seen::Gone)
         }
@@ -1467,6 +1643,219 @@ mod tests {
                 text: "by id".to_string(),
             }
         );
+    }
+
+    fn remove_block(owner: &Session, slug: &str, who: &Session) -> BuiltBlock {
+        let c = owner.prepare_remove(SERVER, slug, who.did()).unwrap();
+        owner.confirm(SERVER, slug).unwrap();
+        build_with_metadata(
+            identity_of(owner),
+            BlockKind::MemberRemove,
+            hlc(owner),
+            json!({"channel": slug, "member_did": who.did(),
+                "mls_commit": STANDARD.encode(&c.commit)}),
+        )
+    }
+
+    fn sealed() -> Seen {
+        Seen::Sealed {
+            reason: String::new(),
+        }
+    }
+
+    /// #431: a member added by welcome reads what was sent before it joined
+    /// as that, not as a failure, and what is sent after as text. On a first
+    /// read of history the earlier messages come before the welcome, so they
+    /// are asked about again once it is in.
+    #[test]
+    fn a_late_joiner_sees_earlier_messages_as_sent_before_it_joined() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let bob = session(root.path());
+        alice.create_group(SERVER, "#sealed").unwrap();
+        let early = deliver(&say(&alice, "#sealed", "before bob"));
+        let first = bob.observe(SERVER, &early);
+        assert!(matches!(first, Seen::Sealed { .. }), "{first:?}");
+
+        let add = add_block(&alice, "#sealed", &bob);
+        assert_eq!(bob.observe(SERVER, &deliver(&add)), Seen::Joined);
+        assert_eq!(
+            bob.before_join(SERVER, None, &early, first),
+            Seen::BeforeJoin
+        );
+        assert_eq!(bob.observe(SERVER, &early), Seen::BeforeJoin);
+
+        let later = deliver(&say(&alice, "#sealed", "hi bob"));
+        assert!(matches!(bob.observe(SERVER, &later), Seen::Text { .. }));
+        // The creator was in from the start: nothing is before its join.
+        let sent = Seen::Text {
+            sender: alice.did().to_string(),
+            text: "before bob".to_string(),
+        };
+        assert_eq!(alice.observe(SERVER, &early), sent);
+    }
+
+    /// The same for a member that joins by external commit.
+    #[test]
+    fn a_self_joiner_sees_earlier_messages_as_sent_before_it_joined() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let bob = session(root.path());
+        let carol = session(root.path());
+        let created = alice.create_group(SERVER, "#open").unwrap();
+        let early = deliver(&say(&alice, "#open", "before bob"));
+        // Move the group on an epoch, so the join is not at the start.
+        let kp = carol.key_packages(1, false).unwrap().remove(0);
+        let c = alice
+            .prepare_add(SERVER, "#open", &kp, carol.did())
+            .unwrap();
+        alice.confirm(SERVER, "#open").unwrap();
+        let info = c.group_info.unwrap_or(created.group_info);
+        let c = bob.prepare_join(SERVER, "#open", &info).unwrap();
+        bob.confirm(SERVER, "#open").unwrap();
+        let join = build_with_metadata(
+            identity_of(&bob),
+            BlockKind::MemberAdd,
+            hlc(&bob),
+            json!({"channel": "#open", "member_did": bob.did(),
+                "mls_commit": STANDARD.encode(&c.commit)}),
+        );
+        alice.observe(SERVER, &deliver(&join));
+        assert_eq!(bob.observe(SERVER, &early), Seen::BeforeJoin);
+        let later = deliver(&say(&alice, "#open", "hi bob"));
+        assert!(matches!(bob.observe(SERVER, &later), Seen::Text { .. }));
+    }
+
+    /// A group joined by a build that recorded no spans, then left and
+    /// joined again: what came before the removal stays a failure, since when
+    /// this device first joined is unknown; what came after is labelled.
+    #[test]
+    fn a_group_joined_before_spans_were_recorded_labels_only_after_its_removal() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let bob = session(root.path());
+        alice.create_group(SERVER, "#sealed").unwrap();
+        bob.observe(SERVER, &deliver(&add_block(&alice, "#sealed", &bob)));
+        // State from before #431: the group, no spans.
+        bob.with_member(|_, g| {
+            g.spans.clear();
+            Ok(())
+        })
+        .unwrap();
+        let unread = deliver(&say(&alice, "#sealed", "never fetched"));
+        let kick = remove_block(&alice, "#sealed", &bob);
+        assert_eq!(bob.observe(SERVER, &deliver(&kick)), Seen::Gone);
+        let gap = deliver(&say(&alice, "#sealed", "while bob was out"));
+        let back = add_block(&alice, "#sealed", &bob);
+        assert_eq!(bob.observe(SERVER, &deliver(&back)), Seen::Joined);
+
+        let lost = bob.observe(SERVER, &unread);
+        assert!(matches!(lost, Seen::Sealed { .. }), "{lost:?}");
+        assert_eq!(bob.observe(SERVER, &gap), Seen::BeforeJoin);
+    }
+
+    /// A refused external join leaves no membership behind: after the join
+    /// that lands, what came before it is labelled, the epoch of the refused
+    /// attempt included.
+    #[test]
+    fn a_refused_external_join_records_no_membership() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let bob = session(root.path());
+        let carol = session(root.path());
+        let created = alice.create_group(SERVER, "#open").unwrap();
+        // Bob's first join, refused: Alice committed first.
+        bob.prepare_join(SERVER, "#open", &created.group_info)
+            .unwrap();
+        let kp = carol.key_packages(1, false).unwrap().remove(0);
+        let c = alice
+            .prepare_add(SERVER, "#open", &kp, carol.did())
+            .unwrap();
+        alice.confirm(SERVER, "#open").unwrap();
+        bob.discard_join(SERVER, "#open").unwrap();
+        let mid = deliver(&say(&alice, "#open", "between the two joins"));
+
+        let info = c.group_info.unwrap();
+        let c = bob.prepare_join(SERVER, "#open", &info).unwrap();
+        let join = build_with_metadata(
+            identity_of(&bob),
+            BlockKind::MemberAdd,
+            hlc(&bob),
+            json!({"channel": "#open", "member_did": bob.did(),
+                "mls_commit": STANDARD.encode(&c.commit)}),
+        );
+        alice.observe(SERVER, &deliver(&join));
+        assert_eq!(bob.observe(SERVER, &mid), Seen::BeforeJoin);
+        let later = deliver(&say(&alice, "#open", "hi bob"));
+        assert!(matches!(bob.observe(SERVER, &later), Seen::Text { .. }));
+    }
+
+    /// What this device cannot tell stays a failure, with its reason: a
+    /// message from another group under this channel's name, though its
+    /// epoch is older than the join, and any message in a group joined by
+    /// a build that recorded no join.
+    #[test]
+    fn a_failure_the_join_does_not_explain_stays_sealed() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let bob = session(root.path());
+        alice.create_group(SERVER, "#sealed").unwrap();
+        alice.create_group(SERVER, "#other").unwrap();
+        let early = deliver(&say(&alice, "#sealed", "before bob"));
+        bob.observe(SERVER, &deliver(&add_block(&alice, "#sealed", &bob)));
+
+        // Ciphertext of #other at its epoch 0, in a block that names #sealed.
+        let (msg, epoch) = alice.encrypt(SERVER, "#other", "elsewhere").unwrap();
+        let moved = deliver(&build_sealed_text(
+            identity_of(&alice),
+            "#sealed",
+            &msg,
+            epoch,
+            hlc(&alice),
+        ));
+        assert!(matches!(bob.observe(SERVER, &moved), Seen::Sealed { .. }));
+        // Unsigned: nothing vouches for it.
+        let forged = unsigned(&say(&alice, "#sealed", "unsigned"));
+        assert!(matches!(bob.observe(SERVER, &forged), Seen::Sealed { .. }));
+
+        // State from before #431: the group, but no record of the join.
+        bob.with_member(|_, g| {
+            g.spans.clear();
+            Ok(())
+        })
+        .unwrap();
+        assert!(matches!(bob.observe(SERVER, &early), Seen::Sealed { .. }));
+    }
+
+    /// Removed and added again: the messages sent while out read as sent
+    /// before the join; the ones read while in come from the cache; and one
+    /// sent while in that this device never read stays a failure, since it
+    /// was in the group then.
+    #[test]
+    fn a_rejoined_member_sees_the_gap_as_before_it_joined() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let bob = session(root.path());
+        alice.create_group(SERVER, "#sealed").unwrap();
+        let before = deliver(&say(&alice, "#sealed", "before"));
+        bob.observe(SERVER, &deliver(&add_block(&alice, "#sealed", &bob)));
+        let read = deliver(&say(&alice, "#sealed", "read"));
+        assert!(matches!(bob.observe(SERVER, &read), Seen::Text { .. }));
+        let unread = deliver(&say(&alice, "#sealed", "never fetched"));
+        let kick = remove_block(&alice, "#sealed", &bob);
+        assert_eq!(bob.observe(SERVER, &deliver(&kick)), Seen::Gone);
+        let gap = deliver(&say(&alice, "#sealed", "while bob was out"));
+
+        let back = add_block(&alice, "#sealed", &bob);
+        assert_eq!(bob.observe(SERVER, &deliver(&back)), Seen::Joined);
+        let after = deliver(&say(&alice, "#sealed", "welcome back"));
+        assert!(matches!(bob.observe(SERVER, &after), Seen::Text { .. }));
+        assert!(matches!(bob.observe(SERVER, &read), Seen::Text { .. }));
+        assert_eq!(bob.observe(SERVER, &gap), Seen::BeforeJoin);
+        assert_eq!(bob.observe(SERVER, &before), Seen::BeforeJoin);
+        let lost = bob.observe(SERVER, &unread);
+        assert!(matches!(lost, Seen::Sealed { .. }), "{lost:?}");
+        assert_eq!(bob.before_join(SERVER, None, &unread, sealed()), sealed());
     }
 
     #[test]

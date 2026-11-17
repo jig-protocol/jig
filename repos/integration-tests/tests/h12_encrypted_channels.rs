@@ -470,7 +470,12 @@ async fn an_open_encrypted_channel_is_joined_by_external_commit_and_tidied_on_le
         vec!["hi dave"],
         "nothing from before they joined"
     );
-    assert!(dave_view.iter().any(|s| matches!(s, Seen::Sealed { .. })));
+    // What came before the join is shown as that, not as a failure (#431).
+    assert!(dave_view.contains(&Seen::BeforeJoin), "{dave_view:?}");
+    assert!(
+        !dave_view.iter().any(|s| matches!(s, Seen::Sealed { .. })),
+        "{dave_view:?}"
+    );
 
     // Dave leaves: no commit from him, and Alice — online next — tidies his
     // leaf out of the tree.
