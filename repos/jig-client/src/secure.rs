@@ -2020,6 +2020,45 @@ mod tests {
         );
     }
 
+    /// Opened by an older build after the migration, then by this one again:
+    /// that build keeps the groups (it ignores the flag, and drops it when it
+    /// saves), so the migration runs a second time. It files nothing over
+    /// what is already filed by id: the group stays, and the head the older
+    /// build moved under the slug stays there, so the next read starts from
+    /// the id's older head and reads a little more.
+    #[test]
+    fn a_downgrade_and_upgrade_again_keeps_what_is_filed_by_id() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        alice.create_group(SERVER, "#team").unwrap();
+        alice.set_head(SERVER, "#team", "bafyold", None).unwrap();
+        let team = channel_id(b"team");
+        let pins = pins_naming(root.path(), &[("#team", &team)]);
+        alice.key_by_channel_id(&pins).unwrap();
+
+        // The older build: reads its group under the slug, moves its head,
+        // and saves without the flag it does not know.
+        assert!(alice.has_group(SERVER, "#team").unwrap());
+        alice.set_head(SERVER, "#team", "bafynewer", None).unwrap();
+        alice
+            .with_member(|_, g| {
+                g.keyed_by_id = false;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(alice.key_by_channel_id(&pins).unwrap().is_empty());
+        assert!(alice.has_group(SERVER, &team).unwrap());
+        assert_eq!(
+            alice.group_members(SERVER, &team).unwrap(),
+            alice.group_members(SERVER, "#team").unwrap()
+        );
+        assert_eq!(
+            alice.head(SERVER, &team).unwrap().as_deref(),
+            Some("bafyold")
+        );
+    }
+
     /// A server that gives a slug to a new channel: the new one's id finds no
     /// group, though the old one's group was filed under that slug, and the
     /// old group is not filed under the new id however the pins change.
