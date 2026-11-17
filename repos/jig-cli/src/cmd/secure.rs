@@ -483,9 +483,8 @@ impl Secure {
     /// same block, else fetched, verified and pinned.
     async fn proven(&self, info: &ChannelInfo) -> Result<ChannelPin> {
         let mut pins = Pins::load(&Pins::default_path())?;
-        if let Some(pin) = pins.channel(&self.server, &info.slug)
-            && pin.create_cid == info.id
-        {
+        // Pinned by id, and listed under the slug it was pinned as.
+        if let Some(pin) = pins.channel_listed_as(&self.server, &info.id, &info.slug)? {
             return Ok(pin.clone());
         }
         if info.id.is_empty() {
@@ -517,14 +516,37 @@ impl Secure {
             .server(&self.server)
             .map(|p| p.sequencers())
             .unwrap_or_default();
-        let orders = if names_another_server(&ours, &info.sequencer) {
+        let carried = names_another_server(&ours, &info.sequencer);
+        let orders = if carried {
             vec![info.sequencer.clone()]
         } else {
-            ours
+            ours.clone()
         };
-        let proven =
+        let mut proven =
             prove_channel_ordered_by(&info.slug, &info.id, &served.bundle_b64, &sig, &orders)?;
-        Ok(pins.check_channel(&self.server, &info.slug, proven)?)
+        // Which server orders it is part of what is pinned: a carried channel
+        // may share its slug with one of this server's own (#388), and only
+        // a channel of the same orderer can replace it. The owner is taken
+        // only as its signed offer proves ([`Self::anchor`] does the same).
+        if carried {
+            proven.sequencer = Some(prove_carried(
+                &self.server,
+                &info.slug,
+                &info.id,
+                &info.sequencer,
+                &ours,
+                info.share.as_deref(),
+            )?);
+        }
+        let pinned = pins.check_channel(&self.server, &info.slug, proven)?;
+        if let Some(owner) = &pinned.sequencer {
+            eprintln!(
+                "note: {} is now carried here for {owner}, which orders it; its history is \
+                 checked against that server's records from now on",
+                info.slug
+            );
+        }
+        Ok(pinned)
     }
 
     /// Whether what is sent to `slug` must be encrypted. This device's own
@@ -1291,16 +1313,22 @@ fn pick(
         if !channel.id.is_empty() && channel.id == reference {
             return Ok(Some(channel));
         }
-        if channel.slug == reference && by_slug.is_none() {
+        if channel.slug == reference {
             if names_another_server(ours, &channel.sequencer) {
                 carried.get_or_insert(channel);
             } else {
-                by_slug = Some(channel);
+                by_slug.get_or_insert(channel);
             }
         }
     }
     match (by_slug, carried) {
-        (Some(own), _) => Ok(Some(own)),
+        // Both: the slug names this server's own (JEP-0005 rule 1), but
+        // never silently (#388).
+        (Some(own), Some(c)) => {
+            eprintln!("note: {}", shadow_note(reference, &own, &c));
+            Ok(Some(own))
+        }
+        (Some(own), None) => Ok(Some(own)),
         (None, Some(c)) => anyhow::bail!(
             "{reference} here is a channel this server carries for {}; name it by its id, {}",
             c.sequencer,
@@ -1310,9 +1338,20 @@ fn pick(
     }
 }
 
+/// What `jig` says when `reference` names both this server's own channel
+/// `own` and a channel it carries for another server, `carried` (#388): the
+/// slug reads the server's own, and the other is named by its id.
+fn shadow_note(reference: &str, own: &ChannelInfo, carried: &ChannelInfo) -> String {
+    format!(
+        "{reference} here is this server's channel {}; {} is also {reference}, carried for {}. \
+         Name it by its id to read it.",
+        own.id, carried.id, carried.sequencer
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ChannelInfo, must_encrypt, pick, sequencers_for};
+    use super::{ChannelInfo, must_encrypt, pick, sequencers_for, shadow_note};
     use jig_client::pins::{ChannelPin, Pins};
 
     /// A carried channel's records are held to its owner; the server's own
@@ -1330,6 +1369,7 @@ mod tests {
                 slug,
                 ChannelPin {
                     create_cid: cid.to_string(),
+                    slug: String::new(),
                     suite: "mls".to_string(),
                     owner_did: "did:jig:zuser".to_string(),
                     chain_head: None,
@@ -1382,6 +1422,11 @@ mod tests {
             let got = pick(listing, "bafycarried", &ours).unwrap().unwrap();
             assert_eq!(got.id, "bafycarried");
         }
+        // Both: what `jig` says names the one read and the one shadowed.
+        let note = shadow_note("#shared", &own, &carried);
+        assert!(note.contains("bafyown"), "{note}");
+        assert!(note.contains("bafycarried"), "{note}");
+        assert!(note.contains("did:jig:zowner"), "{note}");
         // Only a carried channel under the slug: refused, naming its id.
         let error = pick(vec![carried], "#shared", &ours)
             .unwrap_err()

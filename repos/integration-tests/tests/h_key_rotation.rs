@@ -98,6 +98,7 @@ impl Device {
                 slug,
                 ChannelPin {
                     create_cid: records[0].channel_id.clone(),
+                    slug: String::new(),
                     suite: "none".into(),
                     owner_did: String::new(),
                     chain_head: None,
