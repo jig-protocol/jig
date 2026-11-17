@@ -1176,7 +1176,90 @@ mod tests {
             .into_iter()
             .map(|b| b.cid)
             .collect();
-        assert_eq!(history, [owner.channel.clone(), text, next]);
+        assert_eq!(history, [owner.channel.clone(), text.clone(), next.clone()]);
+
+        // Every read of the carried chain places the block by the carried
+        // record: a live frame or a timeline entry, and a cursor at it either
+        // way.
+        let record = follower
+            .store
+            .get_chain_record(&owner.channel, &text)
+            .unwrap()
+            .expect("the carried record");
+        assert_eq!(
+            record.encode(),
+            owner
+                .ctx
+                .store
+                .get_ingest_record(&text)
+                .unwrap()
+                .unwrap()
+                .encode()
+        );
+        assert!(
+            follower
+                .store
+                .get_chain_record("bafyours", &text)
+                .unwrap()
+                .is_none()
+        );
+        let cids = |blocks: Option<Vec<StoredBlock>>| -> Vec<String> {
+            blocks
+                .expect("a cursor in the chain")
+                .into_iter()
+                .map(|b| b.cid)
+                .collect()
+        };
+        assert_eq!(
+            cids(
+                follower
+                    .store
+                    .list_blocks_after_by_channel_id(&owner.channel, 10, &text)
+                    .unwrap()
+            ),
+            vec![next.clone()]
+        );
+        assert_eq!(
+            cids(
+                follower
+                    .store
+                    .list_blocks_before_by_channel_id(&owner.channel, 10, &text)
+                    .unwrap()
+            ),
+            vec![owner.channel.clone()]
+        );
+        assert!(
+            follower
+                .store
+                .list_blocks_after_by_channel_id("bafynone", 10, &text)
+                .unwrap()
+                .is_none(),
+            "a cursor tells nothing of a chain that does not hold it"
+        );
+        let sizes = |w: Option<Vec<(String, u64)>>| -> Vec<String> {
+            w.expect("a cursor in the chain")
+                .into_iter()
+                .map(|(cid, _)| cid)
+                .collect()
+        };
+        assert_eq!(
+            sizes(
+                follower
+                    .store
+                    .history_after_window_sizes(&owner.channel, 10, &text)
+                    .unwrap()
+            ),
+            vec![next.clone()]
+        );
+        assert_eq!(
+            sizes(
+                follower
+                    .store
+                    .history_window_sizes(&owner.channel, 10, Some(&text))
+                    .unwrap()
+            ),
+            [owner.channel.clone()]
+        );
     }
 
     #[tokio::test]

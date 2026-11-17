@@ -2587,6 +2587,34 @@ mod tests {
             .map(|b| b.cid)
             .collect();
         assert!(carried.contains(&text), "{carried:?}");
+        // Read through the carried channel, the block comes with the owner's
+        // record, not the one the follower's own chain holds it by.
+        let path = format!("/api/v1/channels/{channel}/blocks");
+        let reader = jig_client::identity::Identity::from_signing_key(SigningKey::from_bytes(
+            &rand::random(),
+        ));
+        let mut headers = axum::http::HeaderMap::new();
+        for (name, value) in jig_client::read_auth::ReadProof::sign(&reader, "GET", &path).headers()
+        {
+            headers.insert(name, value.parse().unwrap());
+        }
+        let uri: axum::http::Uri = path.parse().unwrap();
+        let page = crate::v0_0_2_blocks::get_channel_history(
+            axum::extract::State(p.follower.clone()),
+            axum::extract::Path(channel.clone()),
+            axum::extract::Query::try_from_uri(&uri).unwrap(),
+            uri,
+            headers,
+        )
+        .await
+        .map_err(|(status, body)| (status, body.0.code.clone()))
+        .unwrap();
+        let owners = p.owner.ingest_ctx.store.get_ingest_record(&text).unwrap();
+        assert!(owners.is_some());
+        assert!(
+            page.0.iter().any(|entry| entry.ingest == owners),
+            "the timeline places it by the owner's record"
+        );
 
         let mut live = Vec::new();
         while let Ok((block, _)) = carried_rx.try_recv() {

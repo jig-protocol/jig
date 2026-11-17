@@ -462,12 +462,17 @@ async fn handle_socket(
                     // Stored in the same transaction as the block, so it is
                     // there by the time fanout delivers it. A store error
                     // sends the block without one, which the client sees as
-                    // a block it cannot place, not as a forged record.
-                    ingest: state
-                        .ingest_ctx
-                        .store
-                        .get_ingest_record(&block.cid)
-                        .unwrap_or_else(|e| {
+                    // a block it cannot place, not as a forged record. The
+                    // record is the delivery channel's: a block a carried
+                    // channel shares with another holds one in each.
+                    ingest: match &block.channel_id {
+                        Some(channel_id) => state
+                            .ingest_ctx
+                            .store
+                            .get_chain_record(channel_id, &block.cid),
+                        None => state.ingest_ctx.store.get_ingest_record(&block.cid),
+                    }
+                    .unwrap_or_else(|e| {
                             tracing::warn!(cid = %block.cid, "ingest record lookup failed: {e}");
                             None
                         }),

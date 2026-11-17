@@ -1386,6 +1386,60 @@ impl SqliteStore {
             .transpose()
     }
 
+    /// The record that places `block_cid` in `channel_id`'s chain. That is
+    /// the home record ([`Self::get_ingest_record`]) for a block stored in the
+    /// channel, and the carried one for a block a carried channel shares with
+    /// another channel here (JEP-0005 rule 13). `None` when the chain does not
+    /// hold the block.
+    pub fn get_chain_record(
+        &self,
+        channel_id: &str,
+        block_cid: &str,
+    ) -> Result<Option<IngestRecord>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let bytes: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT record FROM chain_records WHERE channel_id = ?1 AND block_cid = ?2",
+                params![channel_id, block_cid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        bytes
+            .map(|b| {
+                IngestRecord::decode(&b)
+                    .map_err(|e| PersistError::Corrupt(format!("ingest record: {e}")))
+            })
+            .transpose()
+    }
+
+    /// Where a history cursor sits in `channel_id`: `None` when the channel
+    /// holds no such block, else the block with its `seq` in the channel's
+    /// chain, which is `None` in a channel nobody sequences. A block a
+    /// carried channel shares with another is a cursor in both.
+    fn history_cursor(
+        &self,
+        channel_id: &str,
+        cid: &str,
+    ) -> Result<Option<(StoredBlock, Option<u64>)>> {
+        let Some(cursor) = self.get_block(cid)? else {
+            return Ok(None);
+        };
+        let seq: Option<i64> = self
+            .conn
+            .lock()
+            .expect("poisoned")
+            .query_row(
+                "SELECT seq FROM chain_records WHERE channel_id = ?1 AND block_cid = ?2",
+                params![channel_id, cid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if seq.is_none() && cursor.channel_id.as_deref() != Some(channel_id) {
+            return Ok(None);
+        }
+        Ok(Some((cursor, seq.map(|s| s.max(0) as u64))))
+    }
+
     /// [`Self::list_ingest_records_by_id`] for the channel with this slug,
     /// archived or not. A slug that names no channel has no records.
     pub fn list_ingest_records(
@@ -1720,14 +1774,10 @@ impl SqliteStore {
         limit: usize,
         before: &str,
     ) -> Result<Option<Vec<StoredBlock>>> {
-        let Some(cursor) = self.get_block(before)? else {
+        let Some((cursor, cursor_seq)) = self.history_cursor(channel_id, before)? else {
             return Ok(None);
         };
-        if cursor.channel_id.as_deref() != Some(channel_id) {
-            return Ok(None);
-        }
         let limit = limit.min(MAX_HISTORY_LIMIT) as i64;
-        let cursor_seq = self.get_ingest_record(&cursor.cid)?.map(|r| r.seq);
         let conn = self.conn.lock().expect("SqliteStore mutex poisoned");
         if let Some(cursor_seq) = cursor_seq {
             let mut stmt = conn.prepare(&sequenced_history_sql(true))?;
@@ -1772,14 +1822,10 @@ impl SqliteStore {
         limit: usize,
         after: &str,
     ) -> Result<Option<Vec<StoredBlock>>> {
-        let Some(cursor) = self.get_block(after)? else {
+        let Some((cursor, cursor_seq)) = self.history_cursor(channel_id, after)? else {
             return Ok(None);
         };
-        if cursor.channel_id.as_deref() != Some(channel_id) {
-            return Ok(None);
-        }
         let limit = limit.min(MAX_HISTORY_LIMIT) as i64;
-        let cursor_seq = self.get_ingest_record(&cursor.cid)?.map(|r| r.seq);
         let conn = self.conn.lock().expect("SqliteStore mutex poisoned");
         if let Some(cursor_seq) = cursor_seq {
             let mut stmt = conn.prepare(&sequenced_history_after_sql())?;
@@ -1837,13 +1883,9 @@ impl SqliteStore {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             return Ok(Some(rows));
         };
-        let Some(cursor) = self.get_block(before)? else {
+        let Some((cursor, cursor_seq)) = self.history_cursor(channel_id, before)? else {
             return Ok(None);
         };
-        if cursor.channel_id.as_deref() != Some(channel_id) {
-            return Ok(None);
-        }
-        let cursor_seq = self.get_ingest_record(&cursor.cid)?.map(|r| r.seq);
         let conn = self.conn.lock().expect("SqliteStore mutex poisoned");
         let rows = if let Some(cursor_seq) = cursor_seq {
             conn.prepare(&sequenced_window_sql(true, Select::Sizes))?
@@ -1877,17 +1919,13 @@ impl SqliteStore {
         limit: usize,
         after: &str,
     ) -> Result<Option<Vec<(String, u64)>>> {
-        let Some(cursor) = self.get_block(after)? else {
+        let Some((cursor, cursor_seq)) = self.history_cursor(channel_id, after)? else {
             return Ok(None);
         };
-        if cursor.channel_id.as_deref() != Some(channel_id) {
-            return Ok(None);
-        }
         let limit = limit.min(MAX_HISTORY_LIMIT) as i64;
         let row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<(String, u64)> {
             Ok((r.get(0)?, r.get::<_, i64>(1)?.max(0) as u64))
         };
-        let cursor_seq = self.get_ingest_record(&cursor.cid)?.map(|r| r.seq);
         let conn = self.conn.lock().expect("SqliteStore mutex poisoned");
         let rows = if let Some(cursor_seq) = cursor_seq {
             conn.prepare(&sequenced_after_window_sql(Select::Sizes))?
