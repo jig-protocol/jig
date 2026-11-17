@@ -67,6 +67,8 @@ pub enum SecureError {
     Field(&'static str),
     #[error("the block names another channel than {0}")]
     OtherChannel(String),
+    #[error("this device already holds a group for {0}")]
+    GroupTaken(String),
     #[error("MLS state at {path:?} does not open: {reason}")]
     Sealed { path: PathBuf, reason: String },
     #[error(
@@ -179,6 +181,10 @@ struct Groups {
     /// #431 have none: nothing in the MLS state says when they were joined.
     #[serde(default)]
     spans: HashMap<String, Vec<Span>>,
+    /// Set once the entries above that named one of a server's own channels
+    /// by its slug have been filed under its channel id as well (#432).
+    #[serde(default)]
+    keyed_by_id: bool,
 }
 
 /// Epochs `from..until` of one group this device was in; `until` is unset
@@ -191,6 +197,15 @@ struct Span {
 }
 
 impl Groups {
+    /// Forget the channel filed under `key`, and every other name its group
+    /// is filed under: the slug an older build filed it under, kept so that
+    /// build still finds it ([`Session::key_by_channel_id`]).
+    fn drop_group(&mut self, key: &str) {
+        if let Some(gid) = self.groups.remove(key) {
+            self.groups.retain(|_, other| *other != gid);
+        }
+    }
+
     /// This device is in `gid` from `epoch` on.
     fn joined(&mut self, gid: &[u8], epoch: u64) {
         let spans = self.spans.entry(hex::encode(gid)).or_default();
@@ -557,7 +572,7 @@ impl Session {
                 }
                 m.forget(&gid)?;
             }
-            g.groups.remove(&key);
+            g.drop_group(&key);
             Ok(())
         })
     }
@@ -586,7 +601,7 @@ impl Session {
                 g.refused(&gid);
                 m.forget(&gid)?;
             }
-            g.groups.remove(&key);
+            g.drop_group(&key);
             Ok(())
         })
     }
@@ -690,6 +705,85 @@ impl Session {
     pub fn head_record(&self, server: &str, slug: &str) -> Result<Option<crate::chain::ChainHead>> {
         let key = group_key(server, slug);
         self.with_member(|_, g| Ok(g.head_records.get(&key).cloned()))
+    }
+
+    /// File the channel `from` names under `to`: its group, its head and the
+    /// head's record. For a group started before its channel's id is known,
+    /// filed under its id once it is (#432). Refused if `to` is taken.
+    pub fn rename_group(&self, server: &str, from: &str, to: &str) -> Result<()> {
+        let (from, to) = (group_key(server, from), group_key(server, to));
+        self.with_member(|_, g| {
+            if g.groups.contains_key(&to) {
+                return Err(SecureError::GroupTaken(to.clone()));
+            }
+            if let Some(gid) = g.groups.remove(&from) {
+                g.groups.insert(to.clone(), gid);
+            }
+            if let Some(head) = g.heads.remove(&from) {
+                g.heads.insert(to.clone(), head);
+            }
+            if let Some(record) = g.head_records.remove(&from) {
+                g.head_records.insert(to, record);
+            }
+            Ok(())
+        })
+    }
+
+    /// File every channel an older build filed by its slug under its channel
+    /// id as well, once (#432): a server can give a slug to a new channel, and
+    /// that channel must not find the old one's group. The id is the one the
+    /// channel is pinned to in `pins`. The entry under the slug stays, so an
+    /// older build opening these files still finds its groups; nothing here
+    /// reads it again. Returns, one per slug, what could not be filed: a
+    /// channel with no pin, or a pin with no creation block, is left where
+    /// it is.
+    pub fn key_by_channel_id(&self, pins: &crate::pins::Pins) -> Result<Vec<String>> {
+        self.with_member(|_, g| {
+            if g.keyed_by_id {
+                return Ok(Vec::new());
+            }
+            let mut left = Vec::new();
+            let mut names: Vec<String> = g
+                .groups
+                .keys()
+                .chain(g.heads.keys())
+                .chain(g.head_records.keys())
+                .cloned()
+                .collect();
+            names.sort();
+            names.dedup();
+            for key in names {
+                let Some((server, name)) = key.split_once('|') else {
+                    continue;
+                };
+                if jig_core::canonical_cid::is_canonical_text(name) {
+                    continue;
+                }
+                let Some(id) = pins
+                    .channel(server, name)
+                    .map(|pin| pin.create_cid.clone())
+                    .filter(|id| !id.is_empty())
+                else {
+                    left.push(format!(
+                        "{name} on {server}: no channel id pinned for it, so its MLS state \
+                         stays filed under the slug, where this build does not look"
+                    ));
+                    continue;
+                };
+                let to = group_key(server, &id);
+                if let Some(gid) = g.groups.get(&key).cloned() {
+                    g.groups.entry(to.clone()).or_insert(gid);
+                }
+                if let Some(head) = g.heads.get(&key).cloned() {
+                    g.heads.entry(to.clone()).or_insert(head);
+                }
+                if let Some(record) = g.head_records.get(&key).cloned() {
+                    g.head_records.entry(to).or_insert(record);
+                }
+            }
+            g.keyed_by_id = true;
+            Ok(left)
+        })
     }
 
     /// Apply a delivered block to this member's state and say what it meant.
@@ -891,7 +985,7 @@ impl Session {
                         if member == me {
                             g.left(&gid, m.epoch(&gid)? + 1);
                             m.forget(&gid)?;
-                            g.groups.remove(&key);
+                            g.drop_group(&key);
                             return Ok(Seen::Gone);
                         }
                         let tidy = m.members(&gid)?.contains(&member);
@@ -1253,7 +1347,7 @@ fn follow(
             if let Some(epoch) = jig_mls::member::message_epoch(commit) {
                 g.left(gid, epoch + 1);
             }
-            g.groups.remove(key);
+            g.drop_group(key);
             Ok(Seen::Gone)
         }
     }
@@ -1856,6 +1950,133 @@ mod tests {
         let lost = bob.observe(SERVER, &unread);
         assert!(matches!(lost, Seen::Sealed { .. }), "{lost:?}");
         assert_eq!(bob.before_join(SERVER, None, &unread, sealed()), sealed());
+    }
+
+    fn pins_naming(dir: &Path, channels: &[(&str, &str)]) -> crate::pins::Pins {
+        let mut pins = crate::pins::Pins::load(&dir.join("pins.json")).unwrap();
+        for (slug, id) in channels {
+            pins.check_channel(
+                SERVER,
+                slug,
+                crate::pins::ChannelPin {
+                    create_cid: id.to_string(),
+                    slug: String::new(),
+                    suite: "mls".into(),
+                    owner_did: "did:jig:zowner".into(),
+                    chain_head: None,
+                    sequencer: None,
+                },
+            )
+            .unwrap();
+        }
+        pins
+    }
+
+    fn channel_id(name: &[u8]) -> String {
+        jig_core::canonical_cid::of(name).to_string()
+    }
+
+    /// #432: state an older build filed under a server's own channel's slug
+    /// is filed under the channel id its pin names, once. The slug entry
+    /// stays for that build; a slug with no pin stays where it is, and says
+    /// so. Dropping the group drops both names.
+    #[test]
+    fn a_slug_keyed_group_map_is_filed_by_channel_id_once() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        alice.create_group(SERVER, "#team").unwrap();
+        alice.set_head(SERVER, "#team", "bafyhead", None).unwrap();
+        alice.create_group(SERVER, "#lost").unwrap();
+        let team = channel_id(b"team");
+        let pins = pins_naming(root.path(), &[("#team", &team)]);
+
+        let left = alice.key_by_channel_id(&pins).unwrap();
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert!(left[0].contains("#lost"), "{left:?}");
+        assert!(alice.has_group(SERVER, &team).unwrap());
+        assert_eq!(
+            alice.head(SERVER, &team).unwrap().as_deref(),
+            Some("bafyhead")
+        );
+        assert_eq!(
+            alice.group_members(SERVER, &team).unwrap(),
+            alice.group_members(SERVER, "#team").unwrap()
+        );
+        // Still there for an older build, and for the slug left unfiled.
+        assert!(alice.has_group(SERVER, "#team").unwrap());
+        assert!(alice.has_group(SERVER, "#lost").unwrap());
+
+        // Once: a later open files nothing, even with other pins.
+        assert!(alice.key_by_channel_id(&pins).unwrap().is_empty());
+        let again = Session::open(root.path(), alice.identity.duplicate()).unwrap();
+        assert!(again.has_group(SERVER, &team).unwrap());
+        assert!(again.key_by_channel_id(&pins).unwrap().is_empty());
+
+        again.discard_group(SERVER, &team).unwrap();
+        assert!(!again.has_group(SERVER, &team).unwrap());
+        assert!(
+            !again.has_group(SERVER, "#team").unwrap(),
+            "the slug entry goes with the group"
+        );
+    }
+
+    /// A server that gives a slug to a new channel: the new one's id finds no
+    /// group, though the old one's group was filed under that slug, and the
+    /// old group is not filed under the new id however the pins change.
+    #[test]
+    fn a_slug_given_to_a_new_channel_does_not_find_the_old_group() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        alice.create_group(SERVER, "#team").unwrap();
+        let (old, new) = (channel_id(b"team, first"), channel_id(b"team, again"));
+        alice
+            .key_by_channel_id(&pins_naming(root.path(), &[("#team", &old)]))
+            .unwrap();
+        assert!(alice.has_group(SERVER, &old).unwrap());
+
+        // `#team` re-created as another channel, and pinned to it afresh.
+        let other = tempfile::tempdir().unwrap();
+        let repinned = pins_naming(other.path(), &[("#team", &new)]);
+        assert!(alice.key_by_channel_id(&repinned).unwrap().is_empty());
+        assert!(!alice.has_group(SERVER, &new).unwrap());
+        assert!(matches!(
+            alice.encrypt(SERVER, &new, "for the new #team"),
+            Err(SecureError::NoGroup(_))
+        ));
+        let created = alice.create_group(SERVER, &new).unwrap();
+        assert!(alice.has_group(SERVER, &old).unwrap());
+        assert_ne!(
+            Some(hex::encode(&created.group_id)),
+            alice
+                .with_member(|_, g| Ok(g.groups.get(&group_key(SERVER, &old)).cloned()))
+                .unwrap()
+        );
+    }
+
+    /// A group started before its channel has an id is filed under the id
+    /// once it has one; never over a group already filed there.
+    #[test]
+    fn a_group_is_renamed_to_its_channel_id() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let id = channel_id(b"new");
+        alice.create_group(SERVER, "creating:#new").unwrap();
+        alice
+            .set_head(SERVER, "creating:#new", "bafyhead", None)
+            .unwrap();
+        alice.rename_group(SERVER, "creating:#new", &id).unwrap();
+        assert!(alice.has_group(SERVER, &id).unwrap());
+        assert!(!alice.has_group(SERVER, "creating:#new").unwrap());
+        assert_eq!(
+            alice.head(SERVER, &id).unwrap().as_deref(),
+            Some("bafyhead")
+        );
+
+        alice.create_group(SERVER, "creating:#new").unwrap();
+        assert!(matches!(
+            alice.rename_group(SERVER, "creating:#new", &id),
+            Err(SecureError::GroupTaken(_))
+        ));
     }
 
     #[test]
