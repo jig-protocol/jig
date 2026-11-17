@@ -893,7 +893,7 @@ async fn join_encrypted(ctx: &CliContext, secure: &Secure, slug: &str) -> Result
                 return Ok(());
             }
             Err(e) if refused(&e) => {
-                secure.session.discard_group(&server, slug)?;
+                secure.session.discard_join(&server, slug)?;
                 let stale = e
                     .downcast_ref::<Refused>()
                     .is_some_and(|r| r.code == "STALE_EPOCH");
@@ -910,7 +910,7 @@ async fn join_encrypted(ctx: &CliContext, secure: &Secure, slug: &str) -> Result
                         Ok(())
                     }
                     Ok(None) => {
-                        secure.session.discard_group(&server, slug)?;
+                        secure.session.discard_join(&server, slug)?;
                         Err(e)
                     }
                     Err(_) => Err(e.context(format!(

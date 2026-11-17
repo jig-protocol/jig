@@ -208,14 +208,30 @@ impl Groups {
 
     /// This device is out of `gid` from `epoch` on.
     fn left(&mut self, gid: &[u8], epoch: u64) {
-        if let Some(last) = self
-            .spans
-            .get_mut(&hex::encode(gid))
-            .and_then(|s| s.last_mut())
-            && last.until.is_none()
-            && epoch >= last.from
+        let spans = self.spans.entry(hex::encode(gid)).or_default();
+        match spans.last_mut() {
+            Some(last) if last.until.is_none() && epoch >= last.from => last.until = Some(epoch),
+            Some(_) => {}
+            // In a group joined before spans were recorded: since when is
+            // unknown, so the span starts at the first epoch, and no epoch
+            // before a later join is said to be outside but those after this.
+            None => spans.push(Span {
+                from: 0,
+                until: Some(epoch),
+            }),
+        }
+    }
+
+    /// A join of `gid` the server refused: the span it opened never was.
+    fn refused(&mut self, gid: &[u8]) {
+        let key = hex::encode(gid);
+        if let Some(spans) = self.spans.get_mut(&key)
+            && spans.last().is_some_and(|last| last.until.is_none())
         {
-            last.until = Some(epoch);
+            spans.pop();
+            if spans.is_empty() {
+                self.spans.remove(&key);
+            }
         }
     }
 
@@ -558,6 +574,21 @@ impl Session {
 
     pub fn prepare_remove(&self, server: &str, slug: &str, did: &str) -> Result<Commit> {
         self.with_group(server, slug, |m, gid| Ok(m.remove(gid, did)?))
+    }
+
+    /// Drop the group of a join by external commit the server refused, or
+    /// that did not land: as [`Self::discard_group`], and the membership the
+    /// join recorded with it.
+    pub fn discard_join(&self, server: &str, slug: &str) -> Result<()> {
+        let key = group_key(server, slug);
+        self.with_member(|m, g| {
+            if let Some(gid) = group_of(g, &key) {
+                g.refused(&gid);
+                m.forget(&gid)?;
+            }
+            g.groups.remove(&key);
+            Ok(())
+        })
     }
 
     /// Join by external commit from the channel's published group info.
@@ -1691,6 +1722,70 @@ mod tests {
         );
         alice.observe(SERVER, &deliver(&join));
         assert_eq!(bob.observe(SERVER, &early), Seen::BeforeJoin);
+        let later = deliver(&say(&alice, "#open", "hi bob"));
+        assert!(matches!(bob.observe(SERVER, &later), Seen::Text { .. }));
+    }
+
+    /// A group joined by a build that recorded no spans, then left and
+    /// joined again: what came before the removal stays a failure, since when
+    /// this device first joined is unknown; what came after is labelled.
+    #[test]
+    fn a_group_joined_before_spans_were_recorded_labels_only_after_its_removal() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let bob = session(root.path());
+        alice.create_group(SERVER, "#sealed").unwrap();
+        bob.observe(SERVER, &deliver(&add_block(&alice, "#sealed", &bob)));
+        // State from before #431: the group, no spans.
+        bob.with_member(|_, g| {
+            g.spans.clear();
+            Ok(())
+        })
+        .unwrap();
+        let unread = deliver(&say(&alice, "#sealed", "never fetched"));
+        let kick = remove_block(&alice, "#sealed", &bob);
+        assert_eq!(bob.observe(SERVER, &deliver(&kick)), Seen::Gone);
+        let gap = deliver(&say(&alice, "#sealed", "while bob was out"));
+        let back = add_block(&alice, "#sealed", &bob);
+        assert_eq!(bob.observe(SERVER, &deliver(&back)), Seen::Joined);
+
+        let lost = bob.observe(SERVER, &unread);
+        assert!(matches!(lost, Seen::Sealed { .. }), "{lost:?}");
+        assert_eq!(bob.observe(SERVER, &gap), Seen::BeforeJoin);
+    }
+
+    /// A refused external join leaves no membership behind: after the join
+    /// that lands, what came before it is labelled, the epoch of the refused
+    /// attempt included.
+    #[test]
+    fn a_refused_external_join_records_no_membership() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let bob = session(root.path());
+        let carol = session(root.path());
+        let created = alice.create_group(SERVER, "#open").unwrap();
+        // Bob's first join, refused: Alice committed first.
+        bob.prepare_join(SERVER, "#open", &created.group_info)
+            .unwrap();
+        let kp = carol.key_packages(1, false).unwrap().remove(0);
+        let c = alice
+            .prepare_add(SERVER, "#open", &kp, carol.did())
+            .unwrap();
+        alice.confirm(SERVER, "#open").unwrap();
+        bob.discard_join(SERVER, "#open").unwrap();
+        let mid = deliver(&say(&alice, "#open", "between the two joins"));
+
+        let info = c.group_info.unwrap();
+        let c = bob.prepare_join(SERVER, "#open", &info).unwrap();
+        let join = build_with_metadata(
+            identity_of(&bob),
+            BlockKind::MemberAdd,
+            hlc(&bob),
+            json!({"channel": "#open", "member_did": bob.did(),
+                "mls_commit": STANDARD.encode(&c.commit)}),
+        );
+        alice.observe(SERVER, &deliver(&join));
+        assert_eq!(bob.observe(SERVER, &mid), Seen::BeforeJoin);
         let later = deliver(&say(&alice, "#open", "hi bob"));
         assert!(matches!(bob.observe(SERVER, &later), Seen::Text { .. }));
     }
