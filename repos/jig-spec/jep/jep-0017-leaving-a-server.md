@@ -83,12 +83,13 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
    | --- | --- | --- | --- |
    | R1 | reachability record without `S` (JEP-0004 rule 21) | `jig-reach-v1` | `seq`: `S` keeps only a higher `seq` (JEP-0005 rule 21a) |
    | R2 | `{domain, did, server, allow: bool, seq}` | `jig-local-adds-v1` | `seq`: `S` keeps only a higher `seq`; `allow = true` undoes R2 |
-   | R3 | `{domain, did, server, nonce, issued_at}` | `jig-erase-v1` | `nonce` (16 fresh bytes), and `issued_at` within `S`'s request window (`[custody] request_window_secs`); `S` acts once and keeps the request's digest in the tombstone (rule 28) |
+   | R3 | `{domain, did, server, nonce, issued_at}` | `jig-erase-v1` | `nonce` (16 fresh bytes), and `issued_at` within `S`'s request window (`[custody] request_window_secs`); `S` keeps the request's digest, pending and then in the tombstone (rule 28), and acts on it at most once |
+   | Cancel R3 | `{domain, did, server, request_digest, issued_at}` | `jig-erase-cancel-v1` | names one pending R3 by its digest; `issued_at` within the request window; a cancelled digest stays cancelled, so the R3 cannot be resent to restart it |
 
 9. `S` MUST verify the signature, that `did` is `D`, and that `server` is its own DID. Otherwise
    it answers `400 BAD_REQUEST` or `400 WRONG_SERVER`.
 10. Each request passes `S`'s admission for `D` as any other request does. A DID `S` has banned
-    MAY still send R3.
+    MAY still send R3; the ban outlives it (rule 28).
 
 ## Routes
 
@@ -98,8 +99,9 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
     | --- | --- | --- |
     | R1 | `PUT /api/v1/reach/{did}` (existing) | `200 {stored, seq}` |
     | R2 | `PUT /api/v1/local-adds/{did}` | `200 {allow, seq}` |
-    | R3 | `POST /api/v1/erase/{did}` | `200` with a receipt signed by `S` (rule 30); `409 STILL_A_MEMBER`, `409 STILL_AN_OWNER` (rule 26); `410 ERASED` for a repeat |
-    | R3 receipt | `GET /api/v1/erase/{did}/receipt`, a signed read by `D` | `200` with the receipt, re-signed from the tombstone; `404` to anyone else |
+    | R3 | `POST /api/v1/erase/{did}` | `202 ERASE_PENDING {request_digest, acts_at}` (rule 21a); `409 STILL_A_MEMBER`, `409 STILL_AN_OWNER` (rule 26); `409 ERASE_PENDING` while another R3 is pending; `410 ERASED` once `S` has acted |
+    | Cancel R3 | `DELETE /api/v1/erase/{did}` with a `jig-erase-cancel-v1` | `200 {cancelled: request_digest}`; `404` if nothing is pending; `410 ERASED` once `S` has acted |
+    | R3 receipt | `GET /api/v1/erase/{did}/receipt`, a signed read by `D` | `200` with the receipt once `S` has acted, re-signed from the tombstone; `202` with the pending state before; `404` to anyone else |
 
 ## R1: end custody
 
@@ -154,6 +156,27 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
 
 21. R3 asks `S` to delete what it holds about `D`, keep only the tombstone of rule 28, and stop
     serving `D`. It binds `S` only (rule 34).
+21a. **Delay and cancel.** R3 is irreversible, and every one of `D`'s devices holds a key that
+     can sign it (Encryption chapter: a leaf's signature key is the DID's Ed25519 key). So `S`
+     does not act at once:
+     - `S` records the request as pending and answers `202 ERASE_PENDING` with `acts_at`, which
+       is the request's arrival plus `erase_delay_secs`. The reference default is 72 hours, to
+       be measured. An operator MAY set it longer, never shorter than 24 hours.
+     - While it is pending, every answer `S` gives to a request authenticated as `D`, signed
+       read or signed write, HTTP or the WebSocket welcome, carries
+       `erase_pending: {request_digest, acts_at}`. So each of `D`'s devices learns of it the
+       next time it talks to `S`.
+     - `D` cancels with a signed `jig-erase-cancel-v1` naming the request's digest, at any time
+       before `acts_at`. Nothing has changed at `S`, so nothing needs undoing.
+     - Until `S` acts, `D`'s data, stock, custody and local adds are as they were. A member that
+       wants packages to stop leaving at once sends R1 and R2 as well; they take effect
+       immediately and are separate requests.
+     - At `acts_at`, `S` checks rule 26's preconditions again. If `D` joined or came to own a
+       channel during the delay, `S` does not act: the request ends as
+       `aborted: STILL_A_MEMBER` or `aborted: STILL_AN_OWNER`, listing the channels, and `D`'s
+       next authenticated answer says so. `D` leaves and sends a new R3, which starts a new
+       delay. Otherwise `S` acts on it as this section describes, and issues the receipt
+       (rule 30).
 22. **What R3 does at this server.** "Deleted" means removed from `S`'s live store. Deletion
     from backups follows the operator's retention.
 
@@ -164,7 +187,7 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
     | `jig-local-adds-v1` marker | Deleted; its `seq` kept in the tombstone. |
     | Memberships | None remain: rule 26 requires `D` to have left first. |
     | Subscription and catch-up cursors, delivery state | Deleted. |
-    | Admission proofs, rate-limit and reputation inputs about `D` held only locally | Deleted. A later request from `D` starts as a stranger's. |
+    | Admission proofs, rate-limit and reputation inputs about `D` held only locally | Deleted, except `S`'s own moderation decisions, which the tombstone keeps (rule 28). |
     | TOFU keys, name evidence and attestations `S` holds for `D` | Deleted. |
     | Bridge state keyed by `D` | Deleted. |
     | Release log, rows where `D` is the DID released | Deleted. They exist for `D`'s audit only. |
@@ -178,7 +201,7 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
 
     | Party | Effect |
     | --- | --- |
-    | Member's devices | Before sending R3, the client leaves every affected channel (rule 26). After `S`'s receipt, it deletes, per device: its MLS state for channels on `S`; the private init keys of every key package it stocked at `S` (rule 31); its pins for `S`. It stops publishing to `S`. It keeps `S`'s signed receipt as evidence. A device that was offline during R3 and later gets `410 ERASED` from `S` fetches the receipt (rule 11), checks it, and then runs the same deletion. |
+    | Member's devices | Before sending R3, the client leaves every affected channel (rule 26). While R3 is pending, every device that talks to `S` shows the pending state and offers to cancel (rule 21a). After `S`'s receipt, it deletes, per device: its MLS state for channels on `S`; the private init keys of every key package it stocked at `S` (rule 31); its pins for `S`. It stops publishing to `S`. It keeps `S`'s signed receipt as evidence. A device that was offline during R3 and later gets `410 ERASED` from `S` fetches the receipt (rule 11), checks it, and then runs the same deletion. |
     | This server | Applies rule 22 and keeps the tombstone (rule 28). Refuses `D`'s own signed uploads, records and writes with `410 ERASED`. Answers anyone else as for a DID it never knew (rule 25). Serves nothing about `D` except what rules 27–29 keep. |
     | Other members of affected channels | They saw `D` leave: a `member-remove` naming `D`, then a commit removing `D`'s leaf (rule 26). They keep their history, including `D`'s messages. |
     | Other servers | `S` sends nothing. The client SHOULD publish a higher-`seq` reachability record without `S` to every other server and nameserver it uses (R1 everywhere), and MAY send R3 to them separately. Sequencers of federated channels saw `D`'s self-leave (rule 26). Copies other servers hold are theirs: rule 34. |
@@ -193,7 +216,8 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
 
     A `member-add` of `D` to a channel `S` sequences is refused with `403 MEMBER_DECLINED`, as
     under R2. `S` sends `410 ERASED` only in answer to a request `D` signed.
-26. **Leaving first.** `S` MUST refuse R3 with:
+26. **Leaving first.** These preconditions are checked when R3 arrives, and again when `S` is
+    about to act (rule 21a). `S` MUST refuse R3 with:
     - `409 STILL_A_MEMBER`, listing the channels, while `D` holds a membership in a channel `S`
       sequences or carries;
     - `409 STILL_AN_OWNER`, listing them, while `D` owns a channel `S` sequences that is not
@@ -213,8 +237,8 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
     affected channel of `S`: `D` leaves it at its sequencer directly.
 
     The MLS removal is committed by a remaining member, as for any self-leave (Encryption
-    chapter, Leaving): the next remaining member online commits `D`'s leaf out. On a federated channel that member commits through its own server to the channel's
-    sequencer. Remaining members see the self-leave, then that commit. Until the commit lands,
+    chapter, Leaving): the next remaining member online commits `D`'s leaf out. On a federated
+    channel that member commits through its own server to the channel's sequencer. Remaining members see the self-leave, then that commit. Until the commit lands,
     `D` holds keys for the current epoch only, and the sequencer delivers nothing to `D`.
 27. **Stored messages.** A block `D` wrote in a channel that still has other members is part of
     their history:
@@ -228,12 +252,15 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
 28. **Tombstone.** For each erased DID, `S` MUST keep exactly:
     - `did`;
     - the highest reachability `seq` and the highest `jig-local-adds-v1` `seq` it has seen;
-    - the digests of R3 requests it has acted on;
+    - the digests of R3 requests it has acted on, and of those cancelled;
     - the time of erasure;
-    - any revocation it holds for `D`.
+    - any revocation it holds for `D`;
+    - `S`'s own moderation decisions about `D`: a ban, if `D` was banned, and a standing floor,
+      which is `D`'s standing at `S` at the time of erasure under each ruleset `S` applies.
 
-    It keeps nothing else. A reachability record or marker at or below the tombstone's `seq` is
-    refused, so an older record cannot restore custody. A repeat of R3 answers `410 ERASED`.
+    It keeps nothing else. In particular, it keeps no evidence behind those decisions and no
+    data from other servers. A reachability record or marker at or below the tombstone's `seq`
+    is refused, so an older record cannot restore custody. A repeat of R3 answers `410 ERASED`.
 29. **Append-only logs.** A log whose entries are signed and chained cannot drop an entry
     without breaking its proofs:
     - **Ingest records and the manifest log** (JEP-0002 rule 12): kept. They hold block CIDs and
@@ -245,8 +272,10 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
       or to the group's members under the data contract cannot be recalled. `S` MAY ask the
       group's members to delete theirs.
     - **Release log:** rule 22.
-30. **Receipt.** `S` answers R3 with a `COSE_Sign1` by its server DID, domain
-    `jig-erase-receipt-v1`, over `{domain, server, did, request_digest, erased_at}`.
+30. **Receipt.** When `S` acts on R3, not when the request arrives, it issues a `COSE_Sign1` by
+    its server DID, domain `jig-erase-receipt-v1`, over
+    `{domain, server, did, request_digest, erased_at}`. `D` fetches it with the receipt route
+    (rule 11).
     - The receipt states only that `S` acted on the request.
     - It is evidence for `D`. It does not prove what other parties hold.
 
@@ -293,12 +322,16 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
     | R1 | no (`NO_CUSTODY`) | yes | kept | accepted | kept | newer record listing `S` |
     | R2 | yes, for channels other servers sequence | no (`LOCAL_ADDS_ENDED`, `MEMBER_DECLINED`) | kept | accepted | kept | marker `allow = true` |
     | R1 + R2 | no | no | deleted | refused (`NOT_STOCKED_HERE`) | kept | undo either; uploads resume when either is undone |
+    | R3 pending | as before R3 | as before R3 | as before R3 | as before R3 | kept | cancel (`jig-erase-cancel-v1`) before `acts_at` |
     | R3 (alone or with others) | no (`NO_CUSTODY` to others) | no (`NO_KEY_PACKAGE` to others; `MEMBER_DECLINED` on `member-add`) | deleted | refused (`ERASED`, to `D`) | deleted per rule 22 | none for the data; rule 36 to come back |
 
 36. **Coming back after R3.** The data is gone and is not restored. `D` may use `S` again by
     sending a `jig-local-adds-v1` with `allow = true` and a reachability record that lists `S`,
-    each at a `seq` above the tombstone's. `S` then treats `D` as a new DID: admission, stock
-    and memberships start empty. The tombstone stays.
+    each at a `seq` above the tombstone's.
+    - Stock, memberships and admission start empty.
+    - `S`'s moderation does not: a ban in the tombstone still applies, and `D`'s standing under
+      each ruleset starts from the lower of a stranger's standing and the tombstone's floor.
+    - The tombstone stays.
 37. Requests at different servers are independent. R1 at every server ends all custody, but
     the member's own server keeps adding it locally unless R2 is sent there too.
 
@@ -308,9 +341,18 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
   `D`'s custody or local adds.
 - **Replay and rollback.**
   - R1 and R2 are monotonic by `seq`, and the tombstone keeps the `seq` past R3.
-  - R3 is one-shot by `nonce`, `issued_at` and the kept digest.
+  - R3 is one-shot by `nonce`, `issued_at` and the kept digest. A cancel names one digest,
+    and a cancelled digest cannot be resent.
 - **Races.** A custody release re-checks the record inside its transaction (JEP-0005 rule 21a).
   R2's checks run in the same transaction as the release or the ingest of the `member-add`.
+- **A single signature.** Any one of `D`'s devices, or anyone holding its key, can sign R3.
+  The delay of rule 21a, the pending state on every answer to `D`, and the cancel bound the
+  damage of a lost device or a mistake to the delay. They do not help when every device is
+  lost, or the key is held by someone else for the whole delay.
+- **Moderation is not reset by erasure.** R3 followed by a return does not clear a ban or a
+  low standing at `S` (rules 28 and 36). Deleting the JEP-0009 salts (rule 29) still makes
+  `D`'s earlier leaves unlinkable, so the tombstone's ban and floor are `S`'s own record; no
+  one else can rebuild a proof from the log.
 - **Residual: released packages** stay usable until rule 31's bound. A hostile holder can add
   `D` to a group `D` cannot open once `D` has deleted the key. That is harmless to `D` but
   misleads the group about who is in it.
@@ -318,7 +360,8 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
   makes its answer provable, not its compliance.
 - **Residual: other members** keep their history, including `D`'s messages (rule 27).
 - **Metadata.** The tombstone, the logs of rule 29 and the release rows of rule 22 that are kept
-  still record that `D` existed at `S`.
+  still record that `D` existed at `S`. The tombstone also records whether `S` had banned `D`,
+  and `D`'s standing at erasure. To anyone but `D`, `S` answers as for an unknown DID (rule 25).
 
 # Backwards Compatibility
 
@@ -340,8 +383,13 @@ None yet. The work, by request:
   - the purge and upload refusal under R1 + R2;
   - client per-server state, the explicit command and the client's handling of the new codes.
 - **R3:**
-  - `jig-erase-v1` and `jig-erase-receipt-v1` with vectors, and the receipt route;
-  - the preconditions (`STILL_A_MEMBER`, `STILL_AN_OWNER`);
+  - `jig-erase-v1`, `jig-erase-cancel-v1` and `jig-erase-receipt-v1` with vectors, and the
+    receipt and cancel routes;
+  - the pending state: storage, `erase_delay_secs`, the `erase_pending` field on every answer
+    to `D`, and a task that acts at `acts_at`;
+  - the preconditions (`STILL_A_MEMBER`, `STILL_AN_OWNER`), checked on arrival and again before
+    acting;
+  - the tombstone's moderation entries, and rule 36's return applying them;
   - deletion across the store, the tombstone and its checks on every upload route, and rule
     25's answers to third parties;
   - the client's leave-archive-erase sequence, its local deletion, offline devices, and
@@ -353,37 +401,17 @@ None yet. The work, by request:
 
 # Test Vectors
 
-To be added with the implementation: one `jig-local-adds-v1` and one `jig-erase-v1` under
+To be added with the implementation: one each of `jig-local-adds-v1`, `jig-erase-v1`,
+`jig-erase-cancel-v1` and `jig-erase-receipt-v1` under
 fixed test keys, as deterministic payload and `COSE_Sign1`, in hex, in `vectors/0017/`.
-
-# Open Questions
-
-These change what R3 means. They are DJ's to decide before this JEP leaves Draft.
-
-1. **Moderation across R3 and a return.**
-   - **The problem.** Rule 10 lets a DID `S` has banned send R3, and rule 22 deletes `S`'s
-     admission, rate-limit and reputation inputs about `D`. Rules 28 and 36 then let `D` return
-     as a new DID. Together, R3 followed by a return clears a ban or a low standing at `S`.
-     Rule 29's salt deletion also stops any later proof about `D`'s earlier leaves.
-   - **Proposal.** The tombstone also keeps `S`'s own moderation decisions about `D`: a ban, and
-     a standing floor. A return under rule 36 starts from the lower of a stranger's standing and
-     `D`'s standing at erasure.
-2. **A delay before R3 acts.**
-   - **The problem.** R3 is irreversible and needs one signature. Every device holds `D`'s key
-     (Encryption chapter: a leaf's signature key is the DID's Ed25519 key), so a lost device or
-     a single mistake erases `D`'s data at `S`.
-   - **Proposal.** `S` records R3 as pending, and acts after `erase_delay_secs` (a reference
-     default, for example 72 hours).
-     - `D` can cancel during that window with a signed `jig-erase-cancel-v1`.
-     - Every authenticated answer to `D` during the window says the erasure is pending, so
-       `D`'s other devices see it.
-     - The receipt is issued when the erasure runs.
 
 # Rejected Alternatives
 
 - **One withdrawal that means everything.** It would turn a narrow request into a broad one the
   member did not make.
 - **Inferring R2 or R3 from a client going quiet.** It is not a request; devices go offline.
+- **Acting on R3 at once.** One signature, from any device, would erase with no way back.
+- **Resetting moderation on erasure.** R3 would become a way to clear a ban.
 - **Purging stock on R1.** The server's own channels still use it (#449).
 - **Server-authored `member-remove` under R3.** A block must be signed by its author. Requiring
   the self-leave first keeps every membership change signed by the member.
