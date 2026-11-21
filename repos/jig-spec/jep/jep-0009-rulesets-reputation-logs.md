@@ -21,6 +21,9 @@ Reputation is one number per subject per ruleset (D21). This JEP specifies:
 - **reputation reports**: servers report event codes with evidence, and the group's nameservers
   compute the numbers;
 - **reference maths** for the number, with a cap on what any one reporter can move;
+- **verifiable standing:** the number is a deterministic function of the ruleset, a log and an
+  epoch, so anyone holding the evidence recomputes it, and a wrong one is a portable fraud proof
+  (rules 35–52);
 - **standing that compute cannot buy:** accrual gated by time, and budgeted invites whose inviter
   can be identified only after a human-confirmed verdict;
 - **transparency logs** at servers and nameservers, witnessed within a ruleset group;
@@ -72,14 +75,19 @@ Non-goals:
 ## Rulesets
 
 3. A **ruleset document** is a signed object
-   `{v, id, version, authors: [did], maths, parameters, events, tribunal, invites, binding}`.
+   `{v, id, version, authors: [did], maths, epoch, parameters, events, consequences, tribunal,
+   useful_work, invites, binding}`.
    - `id` is a stable name.
    - `version` increases with every change. The document's CID is its **hash**.
    - `maths` names the reputation maths by id and version (rule 14).
    - `parameters` holds every value JEP-0008 and this JEP leave to a ruleset: effort bounds, pool
      shares, `established`, accrual caps, invite budgets and decay.
+   - `epoch` sets how epochs close (rule 36).
    - `events` maps event codes (rule 9) to weights.
-   - `tribunal` holds JEP-0010's parameters.
+   - `consequences` is the ruleset's recommended table from standing to local action (rule 50).
+   - `tribunal` holds JEP-0010's parameters, and `useful_work` JEP-0016's (JEP-0016 rule 35).
+     Either is `null` when the ruleset does not use it.
+   - Every parameter's unit is fixed by rule 52.
    - `invites` and `binding` declare which optional mechanisms the ruleset uses: invites,
      linked vouching (rule 27), person-binding (rule 28).
 4. **Declaration.** A server that applies a ruleset MUST name it in its signed welcome and
@@ -130,8 +138,10 @@ Non-goals:
 
 12. Each of the group's nameservers computes every subject's **net change** per period from the
     reports it holds:
-    - each reporter's contribution per (subject, period) is capped at `per_reporter_cap` evidence
-      units;
+    - each reporter's positive contribution per (subject, period) is capped at
+      `per_reporter_cap` evidence units, and its negative contribution at
+      `per_reporter_neg_cap`. A lying reporter's reach is bounded, and one evidence-backed
+      offence still outweighs a period of good standing;
     - each contribution is weighted by the reporter's own standing under the ruleset, with a
       reporter that has no standing weighted `unknown_reporter_weight` (reference: 0);
     - the subject's own reports about itself are ignored.
@@ -146,15 +156,17 @@ Non-goals:
     - Each period, `r` decays by `λ_pos` and `s` by `λ_neg`, both ruleset parameters. Verdict
       penalties (JEP-0010) do not decay until their term ends.
     - Conformance vectors pin the maths. Implementations MUST agree to the last bit given the same
-      report set, so the arithmetic is fixed-point at the precision the vectors set.
+      report set, so the arithmetic is fixed-point. Rule 40 fixes the arithmetic, and a period is
+      an epoch (rule 36).
 15. A ruleset MAY name other maths by id and version. Global trust propagation that pools scores
     across groups (EigenTrust and similar) MUST NOT be used (D21).
 
 ## Standing
 
 16. **Established.** A subject is established under a ruleset when its score is at or above
-    `established` and its age is at least `min_age`. Age is measured from the first report about
-    it, on the reporting server's clock, as cosigned in the group's log (rule 33; TM-01).
+    `established` and its age is at least `min_age_epochs`. Age is counted in epochs from the
+    epoch of the first leaf `f` applied about it (rules 36 and 41), never on any party's clock
+    (TM-01).
 17. **Accrual is gated by time.** A subject's positive evidence grows by at most
     `accrual_per_period` per period, whatever its activity and however many servers report it.
     Only reports by servers other than the subject count.
@@ -247,6 +259,268 @@ Non-goals:
     a client MUST check that the attestation is included in a witnessed checkpoint before it pins
     the name.
 
+## Verifiable standing
+
+This section makes standing checkable by anyone who holds the evidence. It is milestone R2.1. It
+binds R3 (rules 7–22) as well: R3's nameservers and R2.4's single server compute the same `f`.
+
+### Epochs
+
+35. **The epoch log.** Every computation under a ruleset reads one log, its **epoch log**:
+    - for a server in a ruleset group, the group log (rule 33);
+    - for a server outside any group, the server's own log (rule 30).
+36. **Epochs are ranges of log positions.** Epoch 0 starts at position 0. Epoch `N + 1` starts at
+    the position after epoch `N`'s **closing checkpoint**.
+    - The closing checkpoint of epoch `N` is the first checkpoint of the epoch log, counted at the
+      ruleset's `witness_threshold` of cosignatures, whose **epoch time** is at least `epoch_secs`
+      after that of epoch `N − 1`'s closing checkpoint. For epoch 0, it is measured from the log's
+      first checkpoint.
+    - A checkpoint's epoch time is the `witness_threshold`-th smallest timestamp among its valid
+      cosignatures. A minority of witnesses cannot move it earlier.
+    - An epoch never closes inside a window it opened. The closing checkpoint is also at or after
+      the end of every commit, reveal and beacon-reveal window that opened in the epoch
+      (JEP-0016 rules 16, 17 and 38). A quiet epoch runs long rather than cutting a window
+      short, so nobody misses a window because time ran out.
+    - `f` never reads a clock. Time enters only as cosignature timestamps already in the log, so
+      every recomputation finds the same boundaries.
+    - Every period in this JEP, JEP-0008 and JEP-0016 is an epoch.
+
+    Epochs do not close after a fixed number of positions. Anyone who can append leaves would
+    then shorten epochs and buy accrual (rule 17) with traffic.
+
+    On a log with no witnesses (`witness_threshold = 0`), the owner's own checkpoint time counts.
+    Standing computed there is the owner's own claim, and is local policy only (rule 20).
+
+### The function
+
+37. **Standing is a function.** Under the ruleset with hash `H`, the standing of every subject at
+    the end of epoch `N` is
+
+    ```
+    R_N = f(H, L_N, R_(N−1)),   R_(−1) = {}
+    ```
+
+    where `L_N` is the leaves of epoch `N` in the epoch log, in log order.
+    - `f` is the ruleset's `maths` (rule 14).
+    - `f` is deterministic. It reads only `H`'s document, `R_(N−1)` and `L_N`. It never reads a
+      clock, any state outside the log, or randomness other than the epoch's beacon (JEP-0016
+      rule 41).
+    - `f` is published as a block (JEP-0006). Its host functions are all on the deterministic
+      validator allowlist, so anyone can run the same component and check its receipt (#276). A
+      native implementation is allowed when it reproduces the vectors bit for bit.
+38. **What `f` reads.** `f` reads only these leaf kinds, and ignores every other kind without
+    refusing it:
+    - `ack` (rule 5). Until a subject's `ack` for `H` is in the epoch log, `f` ignores every leaf
+      about the subject, so no leaf can lower an unacknowledged subject's standing (GV-03);
+    - `event`: `{v, ruleset: H, reporter, subject_commit, code, count, covers?, ref?,
+      evidence: [CID]}`, one reporter's observation under a code of rule 9. `covers` names the
+      epoch a `good-standing-interval` is for (rule 45). In a group, events are the entries of
+      reports (rule 7). Outside a group, they are the server's own observations;
+    - `verdict` (JEP-0010 rules 21–22), applied as `verdict-applied` with the verdict's penalty;
+    - `uw-result` aggregates (JEP-0016 rules 20a and 29);
+    - `admit-proof`: `{v, subject_commit, proof: CID, effort}`, logged when a server accepts a
+      subject's admission proof of work (JEP-0008 rule 21; rule 49);
+    - `fraud-proof` (rule 44).
+39. **State.** For each subject, `R` holds
+    `{r, s, first_epoch, last_epoch, pinned: [{amount, until_epoch}], applied}`:
+    - `r` and `s` are the fixed-point evidence of rule 40;
+    - `first_epoch` is the first epoch in which `f` added evidence about the subject, and
+      `last_epoch` the latest. A report that weighs nothing, such as one from an unknown reporter
+      weighted 0, adds no evidence, creates no state and starts no clock;
+    - `pinned` holds verdict penalties that do not decay before their term ends (rule 14);
+    - `applied` is a hash chain over the positions of the leaves `f` applied to the subject,
+      continued from the previous epoch's `applied`.
+
+    A subject with no state in `R` is unknown (rule 21).
+40. **Arithmetic (`jig-beta-v1`).**
+    - Evidence and weights are integers in **micro-units**: one unit of evidence is 1 000 000.
+    - Fractions (`λ_pos`, `λ_neg`, reporter weights, `credit_cap_per_period`) are integers in
+      **parts per million**.
+    - All arithmetic is exact integer arithmetic in signed 128-bit. Division rounds towards
+      negative infinity. No floating point is used anywhere.
+    - For each subject in each epoch, in this order:
+      1. **Decay:** `r ← r − ⌊r · λ_pos / 10⁶⌋`, and `s ← s − ⌊s · λ_neg / 10⁶⌋`. Pinned amounts do
+         not decay, and leave `pinned` for `s` at `until_epoch`.
+      2. **Per reporter:** sum each reporter's `weight(code) × count` for the subject. Cap the
+         positive part at `per_reporter_cap` and the negative part at `per_reporter_neg_cap`
+         (rule 12). Multiply by
+         the reporter's weight, `w = 10⁶` if the reporter was established in `R_(N−1)`, else
+         `unknown_reporter_weight`, then divide by 10⁶. Reporter weight comes from the previous
+         epoch, so no epoch's result depends on itself. On an epoch log outside any group, the
+         log's owner is the only reporter and weighs 10⁶.
+      3. **Accrual cap:** `useful-work` credit counts only for a subject established at `N − 1`.
+         It keeps or regains standing and never builds it (JEP-0016 rules 8 and 31). Cap it at
+         `credit_cap_per_period × accrual_per_period / 10⁶`, then all positive evidence at
+         `accrual_per_period` (rule 17). Negative evidence is not capped by accrual.
+      4. **Add:** `r ← r + positive`, and `s ← s + negative`.
+    - **Score**, in parts per million:
+      `score = ⌊(r − s) · 10⁶ / (r + s + 2 · 10⁶)⌋`, so `−10⁶ ≤ score < 10⁶`. The floor reaches
+      −10⁶ once `s` exceeds about 2 · 10¹² micro-units, because negative evidence has no accrual
+      cap.
+41. **Age is counted in epochs:** `age = N − first_epoch + 1`. A subject is established at `N`
+    when all of these hold (rule 16):
+    - `score ≥ established`;
+    - `age ≥ min_age_epochs`;
+    - `N − last_epoch < max_idle_epochs`, unless the ruleset sets no `max_idle_epochs`.
+
+    The idle limit stops a key that earned standing once from keeping it while dormant, to be
+    used or sold later (AB-07).
+
+### Checkpoints and fraud proofs
+
+42. **Standing checkpoint.** After epoch `N` closes, every party that computes standing under `H`
+    (each group nameserver; for its own local standing, a server) logs in its own log a signed
+    `standing-checkpoint`:
+
+    ```
+    {v, ruleset: H, epoch: N, log: {origin, size, root}, standing_root, prev}
+    ```
+
+    - `log` is the epoch log's closing checkpoint for `N`.
+    - `standing_root` is the RFC 6962 Merkle root over one **state leaf** per subject,
+      `{standing_key, r, s, first_epoch, last_epoch, pinned, applied}`, sorted by
+      `standing_key` (rule 47).
+    - `prev` is the CID of the signer's checkpoint for `N − 1`.
+
+    Checkpoints are incremental. `R_N` is checkable from `R_(N−1)`'s root and epoch `N`'s leaves
+    alone, never from the log's whole history.
+43. **Recomputation.** One subject's state at `N` is recomputable from:
+    - its state leaf at `N − 1`, with its inclusion proof in the previous `standing_root`;
+    - the leaves of epoch `N` about it, each with its opening (rule 32's salt) and its inclusion
+      proof in the epoch log;
+    - each reporter's state leaf at `N − 1`, for the weights.
+
+    Who recomputes:
+    - the subject, which holds its own salts (rule 32) and its `standing_key` opening;
+    - auditors assigned by JEP-0016 `validate` tasks, who see bodies only for the task's duration
+      (JEP-0016 rules 24 and 34);
+    - spot checks by eligible clients past the retrievability gate, sampled by the epoch's beacon
+      (JEP-0016 rules 8 and 41). Nobody chooses whose standing to check.
+44. **Fraud proofs.** A fraud proof is a signed object
+    `{v, against: checkpoint CID, standing_key, kind, proof}` that a verifier checks with no trust
+    in its sender:
+    - `arithmetic`: the inputs of rule 43 for one subject, and the subject's state leaf in the
+      checkpoint, which differs from `f`'s output;
+    - `omission`: a leaf about the subject in epoch `N`, with its opening and inclusion proof,
+      that `applied` does not list; or an inclusion receipt (rule 45) whose deadline passed with
+      the leaf absent;
+    - `fabrication`: `applied` lists a position whose leaf is not about the subject, or is not a
+      kind `f` reads;
+    - `equivocation`: two standing checkpoints by one signer for the same `H` and `N` with
+      different roots.
+
+    A valid fraud proof is evidence about its signer's DID (rule 11). An observer logs it as a
+    `fraud-proof` leaf in its own epoch log, and `f` applies it as `standing-fraud` under the
+    observer's own ruleset. There is no global score: each observer applies the proof under its
+    own named ruleset, and no other.
+
+    Withheld data is not fraud. A party that cannot obtain an opening has a withheld-body report
+    (JEP-0016 rule 29), not a fraud proof.
+45. **Omission and inclusion receipts.** A log owner that accepts a leaf it did not write (a
+    report entry, a verdict, a peer's evidence, an `ack`) MUST return a signed inclusion receipt
+    `{v, log, leaf: CID, by}`: a promise to include the leaf at or before position `by`, at most
+    `receipt_positions` past the log's size when it signed.
+    - A receipt and a later checkpoint without the leaf is an `omission` fraud proof.
+    - **The owner's duty.** Under a ruleset that defines `good-standing-interval`, the epoch log's
+      owner MUST log one `event` with that code, `count = 1` and `covers = N` for each
+      acknowledged subject it ingested at least one block from in epoch `N` and logged no
+      negative leaf about in `N`.
+      - It logs these after `N` closes, during epoch `N + 1`, and never before. Only then does it
+        know which checkpoint closed `N` (rule 36) and whether a negative leaf arrived in `N`.
+        A whole epoch of grace closes on cosigned time, so appending leaves cannot cut it short.
+      - `f` applies a `good-standing-interval` in the epoch it is logged, only when its `covers`
+        is the previous epoch, and at most one per subject per covered epoch. Every epoch thus
+        receives exactly the previous epoch's intervals, and the accrual cap never clips one.
+      - The count is 1 however many blocks the subject wrote, because accrual is capped per
+        epoch (rule 17).
+    - For what the owner observes itself, the subject holds receipts too: the owner-signed
+      `ingest` record of each block it wrote (JEP-0002; JEP-0005 rule 12). An `ingest` record in
+      epoch `N`, no negative leaf about the subject in `N`, epoch `N + 1` closed, and no
+      `good-standing-interval` with `covers = N` in `N + 1` is an `omission` fraud proof against
+      that duty. An owner that could not yet have complied cannot be convicted.
+    - Witnessed and gossiped checkpoints (rule 33; JEP-0016 rules 22–23) make a split view
+      detectable. Something the owner never received and never signed for is outside what any
+      rule can prove.
+46. **Encrypted tiers.** Evidence from an encrypted channel enters `f` only as a **committed
+    verdict**: a tribunal's verdict on a franked report (JEP-0010), logged with its pseudonymous
+    case id, outcome and penalty.
+    - `f` reads the verdict. It never reads the report, the franking opening or any plaintext.
+    - A public verifier checks `R` from verdict leaves. Whether the verdict was right is the
+      tribunal's question (JEP-0010), checked there and not here.
+    - Execution inside encrypted tiers is checked by the channel's members, who re-run receipts
+      and are not credited for it (JEP-0014 rules 25 and 34; JEP-0016 rule 26). A dormant
+      encrypted channel gets no execution check.
+    - Zero-knowledge proofs that a verdict follows from its evidence are future work.
+
+### Scope, cost and local policy
+
+47. **Scope (OP-04).** A per-DID standing trail links that DID's activity across epochs. The
+    default scope is **per server, unpublished**:
+    - `standing_key = H(("domain", "jig-standing-key-v1"), ("log", origin), ("salt", key_salt),
+      ("did", did))`, with a 32-byte `key_salt` the computing party draws once per subject;
+    - `key_salt` goes to the subject and, for a task's duration, to its assigned auditors. Nobody
+      else can find a DID's state leaf;
+    - a subject MAY publish its `key_salt` (opt-in publication), and its standing becomes
+      readable by anyone who knows its DID;
+    - servers and nameservers have no `key_salt`: their `standing_key` is the same hash with an
+      empty salt, so anyone can find a reporter's state leaf (rule 43), as rule 32 names them in
+      leaves.
+
+    State leaves show the distribution of standing under `H`, never who holds which.
+48. **Sybil cost stays an input.** `f` MUST NOT let a subject gain standing from evidence it can
+    manufacture cheaply. Under `jig-beta-v1`:
+    - accrual is capped per epoch (rule 17);
+    - only reporters other than the subject count (rule 17);
+    - a reporter's weight comes from its own standing at `N − 1` (rule 40), so a farm of fresh
+      reporters weighs `unknown_reporter_weight` (reference: 0);
+    - membership by aged proof (rule 49) costs proof of work once, and then time.
+
+    A ruleset that uses linked vouching (rule 27) MUST weight it by the vouching graph:
+    - a vouch counts only after the voucher has been established for `vouch_min_epochs`;
+    - a voucher's weight is shared across its active vouchees, so vouching for many dilutes each
+      vouch;
+    - vouched evidence per vouchee is capped at `vouch_cap`;
+    - a vouchee's losses propagate to its vouchers (rule 27).
+49. **Membership by aged proof.** Under a ruleset that sets `admit_age_epochs`, a subject is a
+    member at `N` (JEP-0008 rule 21) when:
+    - its `admit-proof` leaf is in the epoch log at least `admit_age_epochs` epochs before `N`.
+      A proof logged before the subject's `ack` counts from the `ack`'s epoch (rule 38); and
+    - its score is not negative, or it has none.
+
+    This is the verifiable form of a server's proof-age membership today: the proof's position
+    and its age in epochs are in the log. An `admit-proof` adds no evidence. It never moves `r`,
+    `s`, the score or the age (rule 39), so proof of work never becomes standing (JEP-0016
+    rule 1).
+
+    Aged-proof membership can be farmed: one proof per DID, solved in parallel, and one wait
+    for all of them. The wait does not grow with the farm. Aged-proof members therefore draw
+    from their own sub-share of the member pool (JEP-0008 rule 23's `aged_share`). The bound
+    protects established members only. A farm can still fill `aged_share` and crowd out honest
+    newcomers who are members by aged proof. Operator `records` stay local policy, outside `R`. A
+    server MAY treat a recorded DID as a member. That membership is not part of `R` and is never a
+    protocol input (rule 20).
+50. **Consequences are local.** `f` outputs the score and whether the subject is established,
+    and nothing else. What a server does with them is local policy (JEP-0014 rule 9):
+    floors, the effort multiplier within JEP-0008 rule 28's bounds, join roles.
+    - The ruleset's `consequences` table is a declared recommendation, shown to the subject
+      before its `ack` (rule 5).
+    - A server that enforces something other than what it declared has evidence against itself
+      (rule 4; OP-02). That is not a fraud proof against `R`.
+    - Only "the score of this subject under ruleset `H` at epoch `N`" is verifiable.
+51. **Servers' standing.** A server's standing is `R` about the server's DID under each
+    observer's own ruleset, computed from the events and fraud proofs in that observer's epoch
+    log. No party holds a global score for a server.
+52. **Units.** Every parameter that `f` reads (the `standing`, `events` and `useful_work`
+    blocks) is an integer in one of these units, which the JEP that names the parameter fixes:
+    - evidence and weights: micro-units (rule 40);
+    - fractions and scores: parts per million;
+    - counts of epochs, of log positions or of items;
+    - `epoch_secs`, the only time `f` uses, measured on epoch time (rule 36).
+
+    No such parameter is a float or a wall-clock duration, and a ruleset document that has one
+    is invalid. Parameters `f` does not read (`pow`, `pools`, `tribunal`) keep the names and
+    units their own JEPs give them.
+
 # Security Considerations (Zero-Trust)
 
 **Threats addressed:**
@@ -263,7 +537,13 @@ Non-goals:
 - **NS-02, NS-03.** Witnessed logs refuse split views. Net changes count only at a threshold of
   nameservers (rule 13).
 - **GV-03.** A penalty is never applied under an unacknowledged ruleset (rule 5).
-- **TM-01.** Age and accrual run on cosigned group time (rule 33).
+- **TM-01.** Age and accrual run in epochs, which close on cosigned time already in the log
+  (rule 36). No computation reads a clock.
+- **A server that misstates standing.** Anyone holding the evidence recomputes one subject's
+  state, and a wrong state, an omitted or fabricated leaf, or two roots for one epoch is a
+  portable fraud proof against the signer (rules 42–45).
+- **Epoch stuffing.** Epochs close on cosigned time, not on a count of positions, so appending
+  leaves does not speed accrual (rule 36).
 
 **Residual risks:**
 
@@ -273,12 +553,23 @@ Non-goals:
   servers other than its own to report them.
 - **Before a tag scheme is registered** (rule 25), inviters cannot be identified, and the budget
   is the only bound.
+- **Omission of what a log never received.** A leaf nobody handed the owner, and that the owner
+  never signed for, cannot be proven missing (rule 45).
+- **An unwitnessed log** sets its own epoch time (rule 36). Standing computed there is the
+  owner's claim and stays local policy.
+- **A late witness.** When a checkpoint has exactly `witness_threshold` cosignatures, the latest
+  of them sets its epoch time, so one late witness can delay an epoch's close (rule 36). That only
+  slows accrual. It cannot speed it.
+- **Verdict correctness** is not checked by `f` (rule 46). It is the tribunal's, until verdicts
+  carry zero-knowledge proofs.
 
 **Privacy:**
 
 - The PV-03 carve-out is exactly one: the inviter tag, which opens only under rule 26.
 - Reports never link subjects.
 - Logs carry subject commitments, not user DIDs.
+- State leaves are keyed by a salted `standing_key`, so standing is per server and unpublished
+  unless the subject publishes its salt (rule 47).
 - `--anon` keys are never reported or logged against a DID.
 
 # Backwards Compatibility
@@ -291,7 +582,8 @@ Non-goals:
 
 # Reference Implementation
 
-None yet. Milestones R2 (rules 3–6), R3 (rules 7–22), R4 (rules 29–34) and R7 (rules 23–28).
+None yet. Milestones R2 (rules 3–6, and R2.1's rules 35–52), R3 (rules 7–22), R4 (rules 29–34)
+and R7 (rules 23–28).
 
 # Test Vectors
 
@@ -299,6 +591,10 @@ To be added with each milestone:
 
 - a ruleset document, an `ack` and a report, each as CBOR, COSE and the signer's key;
 - `jig-beta-v1`: a report set with its net changes, including one capped reporter;
+- the four reference rulesets (`jig-reference`, high-sec, community and null-sec), each with an
+  epoch-by-epoch trace of `f` over a fixed leaf sequence, its state leaves and its
+  `standing_root`;
+- one fraud proof of each kind in rule 44, each with the checkpoint it is against;
 - a checkpoint, a cosignature, and an inclusion and a consistency proof;
 - an invite token issuance and redemption.
 
@@ -314,6 +610,12 @@ To be added with each milestone:
 - **A nameserver that sees both inviter and invitee.** It would hold the group's invite graph. The
   threshold tag gives the same accountability with nobody holding the graph.
 - **The prototype's hourly Merkle roots over JSON.** They have no inclusion or consistency proofs.
+- **Epochs of a fixed number of log positions.** Appending leaves would shorten them and buy
+  accrual with traffic (rule 36).
+- **A standing key derived from the DID alone.** Anyone who knows a DID could read its standing
+  trail on every server (rule 47).
+- **Recomputing every subject from the log's start.** It grows without bound. Incremental
+  checkpoints keep a check to one epoch (rule 42).
 
 # Copyright
 

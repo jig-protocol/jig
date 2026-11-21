@@ -526,7 +526,7 @@ async fn check_chain_in(
         eprintln!("warning: {server} {slug}: {defect}.");
     }
     if let Some(head) = chain.head() {
-        pins.advance_chain(server, slug, head)?;
+        pins.advance_chain(server, &channel.create_cid, head)?;
     }
     Ok(outcome)
 }
@@ -693,6 +693,7 @@ async fn check_manifest_in(
         LOG_SLUG,
         jig_client::pins::ChannelPin {
             create_cid: record.channel_id.clone(),
+            slug: String::new(),
             suite: "none".into(),
             owner_did: welcome.server_did.clone(),
             chain_head: None,
@@ -970,6 +971,7 @@ mod tests {
             "#ops",
             ChannelPin {
                 create_cid: label_cid("bafyCreate"),
+                slug: String::new(),
                 suite: "none".into(),
                 owner_did: did,
                 chain_head: None,

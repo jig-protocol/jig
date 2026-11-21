@@ -237,7 +237,9 @@ transport, not a source of authority. Listing a peer is what trusts it: the serv
 it, pins its DID, and lets only listed DIDs read its federation stream. A channel reaches
 another server only by a share under the federation contract (JEP-0005, JEP-0014): a
 `shared` channel is carried as ciphertext, and `private` and `server` channels never leave
-the server that orders them. The legacy relay carries only open, unencrypted channels.
+the server that orders them. A server sends nothing over the legacy relay; it still judges
+what a peer on an earlier release relays to it, which is only ever open, unencrypted
+channels.
 
 **Status evidence.**
 
@@ -270,17 +272,17 @@ never plaintext (#373).
 
 *Links.* The dialer pins each peer's `expected_did` in the handshake, and a
 federation-scope subscribe must come from a listed peer's DID, authenticated even where
-reads are not. A `ws://` peer is a boot error, and is never dialed, unless
+reads are not; a listed peer's is answered `FEDERATION_STREAM_RETIRED`, and nothing is sent
+on it. A `ws://` peer is a boot error, and is never dialed, unless
 `dangerously_allow_plaintext_federation` is set (advertised in `unsafe_options_active`):
 the pin covers the handshake, not what follows it on an unprotected link. The
-`naively_trust_peer_authored_blocks` flag is gone. `DeliveryPolicy::federates` keeps
-restricted and encrypted channels' blocks off the legacy relay's outbound links. Peers
-actually receive a server's blocks through the federation-scope subscription they hold on
-their connection to it, not through the server's own dial (whose block frames the peer
-ignores); until the fix below that subscription was filtered by `permits` alone, so an open
-encrypted channel's commits, welcomes and ciphertext reached every peer. `federates` now
-gates both paths. It derives block CIDs the way `ingest` does (before v0.2 it used a
-different scheme, so one block had two identities).
+`naively_trust_peer_authored_blocks` flag is gone. The legacy relay's outbound links are
+gone too: a server sends no block over its own dial, over a peer's federation-scope
+subscription, or in answer to a peer's catch-up. Before that, an open encrypted channel's
+commits, welcomes and ciphertext reached every peer while the subscription was filtered by
+`permits` alone, until `DeliveryPolicy::federates` gated it. The relay derives block CIDs
+the way `ingest` does (before v0.2 it used a different scheme, so one block had two
+identities).
 
 ### OP-10: discovery and reputation gaming
 
