@@ -2798,6 +2798,32 @@ impl SqliteStore {
         Ok(inserted > 0)
     }
 
+    /// Store `did`'s new last-resort package and retire any it had: they are
+    /// no longer released, and their rows stay, marked `consumed_at`, so
+    /// nobody holding one can upload it again to bring it back (JEP-0017
+    /// rule 32). Returns whether the package was new.
+    pub fn replace_last_resort(
+        &self,
+        reference: &[u8],
+        did: &str,
+        package: &[u8],
+        now: i64,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO mls_key_packages
+                (reference, did, package, last_resort, published_at)
+             VALUES (?,?,?,1,?)",
+            params![reference, did, package, now],
+        )? > 0;
+        if inserted {
+            retire_last_resorts_on(&tx, did, reference, now)?;
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
     /// Keep `envelope`, `did`'s reachability record at `seq`, unless a record
     /// with this `seq` or a higher one is kept already. Returns whether it was
     /// stored. The caller verifies the record.
@@ -2937,12 +2963,7 @@ impl SqliteStore {
                 // The rows retired stay, marked consumed, so the package is
                 // never released or accepted again.
                 if has_last_resort {
-                    tx.execute(
-                        "UPDATE mls_key_packages SET consumed_at = ?
-                          WHERE did = ? AND last_resort = 1 AND consumed_at IS NULL
-                            AND reference != ?",
-                        params![now, did, reference],
-                    )?;
+                    retire_last_resorts_on(&tx, did, reference, now)?;
                 }
             } else {
                 available += 1;
@@ -3776,6 +3797,19 @@ fn custody_withdrawn_on(conn: &Connection, did: &str, server_did: &str) -> Resul
 /// its stock there has no use (JEP-0017 rule 19).
 fn stock_ended_on(conn: &Connection, did: &str, server_did: &str) -> Result<bool> {
     Ok(local_adds_ended_on(conn, did)? && custody_withdrawn_on(conn, did, server_did)?)
+}
+
+/// Retire every last-resort package of `did` in use but `reference`: never
+/// released or accepted again, its row kept, marked consumed (JEP-0017
+/// rule 32).
+fn retire_last_resorts_on(conn: &Connection, did: &str, reference: &[u8], now: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE mls_key_packages SET consumed_at = ?
+          WHERE did = ? AND last_resort = 1 AND consumed_at IS NULL
+            AND reference != ?",
+        params![now, did, reference],
+    )?;
+    Ok(())
 }
 
 /// Delete `did`'s stock: its unconsumed packages and its last-resort one.
@@ -5253,18 +5287,11 @@ mod tests {
                 last_resort: true
             }
         );
-        let stock = |r: &[u8], p: &[u8], now| {
+        assert!(
             store
-                .stock_key_packages(
-                    did,
-                    &[(r.to_vec(), p.to_vec(), true)],
-                    10,
-                    "did:jig:zS",
-                    now,
-                )
+                .replace_last_resort(b"new", did, b"kpNew", 200)
                 .unwrap()
-        };
-        assert_eq!(stock(b"new", b"kpNew", 200), Stocked::Accepted(1));
+        );
         assert_eq!(store.key_package_stock(did).unwrap(), (0, true));
         // A repeat of the earlier request gets the new package, not the dead one.
         assert_eq!(
@@ -5277,7 +5304,11 @@ mod tests {
             }
         );
         // The old one cannot be brought back, by either route.
-        assert_eq!(stock(b"old", b"kpOld", 400), Stocked::Accepted(0));
+        assert!(
+            !store
+                .replace_last_resort(b"old", did, b"kpOld", 400)
+                .unwrap()
+        );
         assert!(
             !store
                 .insert_key_package(b"old", did, b"kpOld", true, 400)
@@ -5293,6 +5324,54 @@ mod tests {
                 last_resort: true
             }
         );
+    }
+
+    /// The same through an upload batch (`stock_key_packages`), which is
+    /// what the key-package route runs: a repeat after a replacement never
+    /// gets the replaced package, and the replaced one is never taken back.
+    #[test]
+    fn an_uploaded_last_resort_package_retires_the_old_for_good() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let did = "did:jig:zD";
+        let stock = |r: &[u8], p: &[u8], now| {
+            store
+                .stock_key_packages(
+                    did,
+                    &[(r.to_vec(), p.to_vec(), true)],
+                    10,
+                    "did:jig:zS",
+                    now,
+                )
+                .unwrap()
+        };
+        assert_eq!(stock(b"old", b"kpOld", 1), Stocked::Accepted(1));
+        let released = |requester, hash: &[u8], now| {
+            store
+                .release_key_package(&ask(did, requester, hash, now))
+                .unwrap()
+        };
+        let got = |p: &[u8]| Release::Released {
+            package: p.to_vec(),
+            last_resort: true,
+        };
+        assert_eq!(released("did:jig:zA", b"h1", 100), got(b"kpOld"));
+        assert_eq!(stock(b"new", b"kpNew", 200), Stocked::Accepted(1));
+        assert_eq!(store.key_package_stock(did).unwrap(), (0, true));
+        assert_eq!(released("did:jig:zA", b"h1", 300), got(b"kpNew"));
+        assert_eq!(stock(b"old", b"kpOld", 400), Stocked::Accepted(0));
+        // Two in one batch: the first replaces, the second is ignored.
+        let batch = [
+            (b"n2".to_vec(), b"kpN2".to_vec(), true),
+            (b"n3".to_vec(), b"kpN3".to_vec(), true),
+        ];
+        assert_eq!(
+            store
+                .stock_key_packages(did, &batch, 10, "did:jig:zS", 500)
+                .unwrap(),
+            Stocked::Accepted(1)
+        );
+        assert_eq!(released("did:jig:zB", b"h2", 600), got(b"kpN2"));
+        assert_eq!(released("did:jig:zA", b"h1", 700), got(b"kpN2"));
     }
 
     #[test]

@@ -803,13 +803,19 @@ impl Secure {
         let did = self.session.did().to_string();
         let server_did = self.server_did().await?;
         // Custody withdrawn and local adds ended: the server keeps no stock
-        // for this identity and refuses uploads (JEP-0017 rule 19). Not
-        // publishing reachability either keeps R1's record as it is.
-        if self
-            .server_state(&server_did)?
-            .is_some_and(|s| s.stock_ended())
-        {
-            return Ok(false);
+        // for this identity and refuses uploads (JEP-0017 rule 19). The
+        // reachability check still runs: it is how this device learns that
+        // another restored custody (`ensure_reachable` keeps a withdrawal as
+        // it is).
+        let ended = |s: &Self| -> Result<bool> {
+            Ok(s.server_state(&server_did)?
+                .is_some_and(|s| s.stock_ended()))
+        };
+        if ended(self)? {
+            self.ensure_reachable().await?;
+            if ended(self)? {
+                return Ok(false);
+            }
         }
         let stock: Stock = self
             .get_json(&format!("/api/v1/mls/key-packages/{did}/stock"))
@@ -1070,9 +1076,9 @@ impl Secure {
         dead.extend(old.and_then(|h| hex::decode(h).ok()));
         let fresh = self.session.key_packages(1, true)?;
         let fresh_ref = jig_mls::delivery::validate_key_package(&fresh[0])?.reference;
-        // Refused only with local adds ended too: then `note_reach` deletes
-        // every key stocked here, this one included.
-        self.publish_packages(&fresh).await?;
+        // Refused only with local adds ended too: its key is deleted then,
+        // and `note_reach` deletes every other key stocked here.
+        let stocked = self.publish_packages(&fresh).await?;
         dead.retain(|r| *r != fresh_ref);
         let deleted = self.session.forget_key_packages(&dead)?;
         let base = self.base.clone();
@@ -1080,7 +1086,7 @@ impl Secure {
             let entry = s.entry(server_did, &base);
             let gone: std::collections::HashSet<String> = dead.iter().map(hex::encode).collect();
             entry.packages.retain(|p| !gone.contains(p));
-            entry.last_resort = Some(hex::encode(&fresh_ref));
+            entry.last_resort = stocked.then(|| hex::encode(&fresh_ref));
         })?;
         Ok(deleted)
     }

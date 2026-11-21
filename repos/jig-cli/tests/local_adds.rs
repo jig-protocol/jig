@@ -288,7 +288,17 @@ async fn custody_and_local_adds_both_ended_end_the_stock_on_every_device() {
     assert_eq!(reach_status(&a, &member).await, 404, "R1's record stands");
     assert_eq!(stocked(other.path()), (0, false));
 
-    // Either undone, uploads resume.
+    // Custody restored from the other device: this one, which recorded
+    // both ended, learns of it from A's record and stocks A again.
+    ok(other.path(), &["server", "custody", "on"]);
+    let out = ok(member_home.path(), &["server", "set", &a.http_url()]);
+    assert!(out.contains("published MLS key packages"), "{out}");
+    assert!(available(&a, &member).await > 0);
+    assert!(stocked(member_home.path()).0 > 0);
+
+    // Undoing local adds alone does it too.
+    ok(member_home.path(), &["server", "custody", "off"]);
+    assert_eq!(available(&a, &member).await, 0);
     ok(member_home.path(), &["server", "local-adds", "on"]);
     let out = ok(member_home.path(), &["server", "set", &a.http_url()]);
     assert!(out.contains("published MLS key packages"), "{out}");
