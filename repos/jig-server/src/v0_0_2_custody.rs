@@ -754,8 +754,51 @@ mod tests {
             code(&refused),
             (StatusCode::FORBIDDEN, "NOT_STOCKED_HERE".into())
         );
+        assert!(
+            !stocked(&state, 4).await,
+            "the stock route says it is ended"
+        );
         let _ = mark(&state, 4, &ours(&state), true, 2).await.unwrap();
+        assert!(stocked(&state, 4).await);
         publish(&state, 4).await.unwrap();
+    }
+
+    /// The stock route's `stocked` is the server's own rule-19 state, not
+    /// an empty stock: a stock emptied by takes, or under one of R1 and R2
+    /// alone, is still in use (a released package is handed again to a
+    /// repeated request), so its owner must keep the keys.
+    #[tokio::test]
+    async fn the_stock_route_says_stocked_until_both_are_ended() {
+        let state = state();
+        let here = (ours(&state), "https://here.example".to_string());
+        let elsewhere = (did_of(90), "https://elsewhere.example".to_string());
+        assert!(stocked(&state, 4).await, "nothing stocked yet");
+        let _ = keep(&state, 4, vec![here.clone()], 1).await.unwrap();
+        let _ = keep(&state, 4, vec![elsewhere], 2).await.unwrap();
+        assert!(stocked(&state, 4).await, "R1 alone");
+        let _ = keep(&state, 4, vec![here], 3).await.unwrap();
+        let _ = mark(&state, 4, &ours(&state), false, 1).await.unwrap();
+        assert!(stocked(&state, 4).await, "R2 alone");
+    }
+
+    async fn stocked(state: &Arc<AppState>, seed: u8) -> bool {
+        let did = did_of(seed);
+        let path = format!("/api/v1/mls/key-packages/{did}/stock");
+        let reader = jig_client::identity::Identity::from_signing_key(key(seed));
+        let mut headers = axum::http::HeaderMap::new();
+        for (name, value) in jig_client::read_auth::ReadProof::sign(&reader, "GET", &path).headers()
+        {
+            headers.insert(name, value.parse().unwrap());
+        }
+        let Json(body) = crate::v0_0_2_mls::key_package_stock(
+            State(state.clone()),
+            Path(did.clone()),
+            path.parse().unwrap(),
+            headers,
+        )
+        .await
+        .unwrap();
+        body.stocked
     }
 
     #[tokio::test]

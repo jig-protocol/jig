@@ -1233,16 +1233,22 @@ impl Secure {
     }
 
     /// JEP-0017 rules 19 and 32: where this device's state says custody and
-    /// local adds are both ended at `server_did`, and the server confirms it
-    /// keeps no stock for us, delete this device's keys for that stock.
+    /// local adds are both ended at `server_did`, and the server confirms its
+    /// stock for us is ended, delete this device's keys for that stock.
     /// The state alone is not enough: another device may have undone either
     /// since, and the server then still hands out packages whose keys this
-    /// would delete. Repeatable, so a deletion cut short runs again.
+    /// would delete. Nor is an empty stock: a released package is handed
+    /// again to a repeated request. A server that does not say (`stocked`
+    /// absent) predates R2 and never ends a stock. Repeatable, so a
+    /// deletion cut short runs again.
     async fn end_stock_if_purged(&self, server_did: &str) -> Result<()> {
         #[derive(Deserialize)]
         struct Stock {
-            available: u64,
-            last_resort: bool,
+            #[serde(default = "stocked_by_default")]
+            stocked: bool,
+        }
+        fn stocked_by_default() -> bool {
+            true
         }
         if !self
             .server_state(server_did)?
@@ -1254,7 +1260,7 @@ impl Secure {
         let stock: Stock = self
             .get_json(&format!("/api/v1/mls/key-packages/{did}/stock"))
             .await?;
-        if stock.available == 0 && !stock.last_resort {
+        if !stock.stocked {
             self.delete_stock_keys(server_did)?;
         }
         Ok(())

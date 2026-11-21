@@ -2947,6 +2947,13 @@ impl SqliteStore {
         local_adds_ended_on(&self.conn.lock().expect("poisoned"), did)
     }
 
+    /// Whether `did` has ended both custody and local adds at `server_did`
+    /// (JEP-0017 rule 19): its stock is ended here, and nothing of it is
+    /// handed out any more.
+    pub fn stock_ended(&self, did: &str, server_did: &str) -> Result<bool> {
+        stock_ended_on(&self.conn.lock().expect("poisoned"), did, server_did)
+    }
+
     /// Store `did`'s validated packages, `(reference, bytes, last_resort)`,
     /// in one transaction: at most one last-resort package, and ordinary ones
     /// up to `max_stock` unconsumed. Nothing is stored while `did` has ended

@@ -56,6 +56,11 @@ pub struct KeyPackageBody {
 pub struct StockBody {
     pub available: u64,
     pub last_resort: bool,
+    /// `false` once the DID ended both custody and local adds here (JEP-0017
+    /// rule 19): the stock is ended and none of it is handed out again, so
+    /// its owner may delete the keys. An empty stock alone does not say so:
+    /// a released package is handed again to a repeated request.
+    pub stocked: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -237,14 +242,15 @@ pub async fn key_package_stock(
     let started = std::time::Instant::now();
     admit_caller(&state, &headers, "GET", uri.path(), started)?;
     let did = jig_pipeline::effect::canonical_did_string(&did);
-    let (available, last_resort) = state
-        .ingest_ctx
-        .store
-        .key_package_stock(&did)
+    let store = &state.ingest_ctx.store;
+    let (available, last_resort) = store.key_package_stock(&did).map_err(persist_err)?;
+    let stocked = !store
+        .stock_ended(&did, &state.server_did.to_did_jig_string())
         .map_err(persist_err)?;
     Ok(Json(StockBody {
         available,
         last_resort,
+        stocked,
     }))
 }
 
