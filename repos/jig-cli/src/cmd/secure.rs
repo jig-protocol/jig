@@ -83,6 +83,15 @@ pub fn local_adds_ended(e: &anyhow::Error) -> bool {
     })
 }
 
+/// Drop the references in `refs` from `state`, keeping any recorded since.
+fn forget_stock_refs(state: &mut ServerState, refs: &std::collections::BTreeSet<String>) {
+    state.packages.retain(|r| !refs.contains(r));
+    state.retiring.retain(|r| !refs.contains(r));
+    if state.last_resort.as_ref().is_some_and(|r| refs.contains(r)) {
+        state.last_resort = None;
+    }
+}
+
 /// How [`first_release`] ended without a package.
 enum Asked {
     /// A refusal no other custodian can get around (JEP-0017 rule 18).
@@ -998,6 +1007,7 @@ impl Secure {
             self.ensure_reachable().await?;
             return Ok(true);
         }
+        let stocked_before = self.stock_refs(&server_did)?;
         if !self.publish_packages(&packages).await? {
             // Another of this identity's devices ended both custody and local
             // adds here, and the server deleted the stock (rule 19): this
@@ -1007,7 +1017,7 @@ impl Secure {
                  were both ended, from another device); deleting this device's keys for them",
                 self.server
             );
-            self.delete_stock_keys(&server_did)?;
+            self.delete_stock_keys(&server_did, &stocked_before)?;
             return Ok(false);
         }
         self.ensure_reachable().await?;
@@ -1256,12 +1266,16 @@ impl Secure {
         {
             return Ok(());
         }
+        // Taken before the server is asked: what it says is ended is the
+        // stock as of then, not packages stocked after (see
+        // `delete_stock_keys`).
+        let refs = self.stock_refs(server_did)?;
         let did = self.session.did().to_string();
         let stock: Stock = self
             .get_json(&format!("/api/v1/mls/key-packages/{did}/stock"))
             .await?;
         if !stock.stocked {
-            self.delete_stock_keys(server_did)?;
+            self.delete_stock_keys(server_did, &refs)?;
         }
         Ok(())
     }
@@ -1421,30 +1435,39 @@ impl Secure {
         Ok(deleted)
     }
 
-    /// JEP-0017 rule 32, under R1 and R2 together and on R3: delete the
-    /// private init keys of every package this device stocked at
-    /// `server_did`, the last-resort one included, and forget their
-    /// references. Local only, and repeatable. Returns how many keys were
-    /// deleted.
-    pub fn delete_stock_keys(&self, server_did: &str) -> Result<usize> {
-        let path = self.server_states_path();
-        let refs: Vec<Vec<u8>> = ServerStates::load(&path)?
+    /// The references this device has recorded as stocked at `server_did`
+    /// (packages, last resort, retiring), as lowercase hex.
+    fn stock_refs(&self, server_did: &str) -> Result<std::collections::BTreeSet<String>> {
+        Ok(ServerStates::load(&self.server_states_path())?
             .get(server_did)
             .map(|s| {
                 s.packages
                     .iter()
                     .chain(&s.last_resort)
                     .chain(&s.retiring)
-                    .filter_map(|h| hex::decode(h).ok())
+                    .cloned()
                     .collect()
             })
-            .unwrap_or_default();
-        let deleted = self.session.forget_key_packages(&refs)?;
-        ServerStates::update(&path, |s| {
+            .unwrap_or_default())
+    }
+
+    /// JEP-0017 rule 32, under R1 and R2 together and on R3: delete the
+    /// private init keys of the packages `refs` names, the stock this device
+    /// had at `server_did` when the server said it was ended
+    /// ([`Self::stock_refs`], taken before asking), and forget those
+    /// references. Packages another `jig` process on this device stocked
+    /// since (after undoing R1 or R2) are not in `refs`, and keep their keys.
+    /// Local only, and repeatable. Returns how many keys were deleted.
+    fn delete_stock_keys(
+        &self,
+        server_did: &str,
+        refs: &std::collections::BTreeSet<String>,
+    ) -> Result<usize> {
+        let bytes: Vec<Vec<u8>> = refs.iter().filter_map(|h| hex::decode(h).ok()).collect();
+        let deleted = self.session.forget_key_packages(&bytes)?;
+        ServerStates::update(&self.server_states_path(), |s| {
             if let Some(state) = s.servers.get_mut(server_did) {
-                state.packages.clear();
-                state.last_resort = None;
-                state.retiring.clear();
+                forget_stock_refs(state, refs);
             }
         })?;
         Ok(deleted)
@@ -2461,9 +2484,9 @@ fn shadow_note(reference: &str, own: &ChannelInfo, carried: &ChannelInfo) -> Str
 mod tests {
     use super::{
         Asked, ChannelInfo, KeptAnswer, LocalAdds, LogWalk, RELEASE_PAGE, RecordBody, Refused,
-        ReleaseEntry, first_release, group_name, judge_kept_answer, kept_leaves_out, must_encrypt,
-        ordered_here, own_group_name, pick, sequencers_for, settle_local_adds, shadow_note,
-        split_unchecked, walk_release_log,
+        ReleaseEntry, ServerState, first_release, forget_stock_refs, group_name, judge_kept_answer,
+        kept_leaves_out, must_encrypt, ordered_here, own_group_name, pick, sequencers_for,
+        settle_local_adds, shadow_note, split_unchecked, walk_release_log,
     };
     use std::cell::RefCell;
 
@@ -2777,6 +2800,35 @@ mod tests {
 
     fn ids(xs: &[&str]) -> Option<Vec<String>> {
         Some(xs.iter().map(|x| x.to_string()).collect())
+    }
+
+    /// The stock references taken when the server said the stock was ended
+    /// are the ones forgotten; references another process recorded since,
+    /// a fresh last-resort package included, stay with their keys.
+    #[test]
+    fn only_the_stock_seen_ended_is_forgotten() {
+        let mut state = ServerState {
+            packages: vec!["a".into(), "b".into()],
+            last_resort: Some("l0".into()),
+            retiring: vec!["old".into()],
+            ..ServerState::default()
+        };
+        let seen: std::collections::BTreeSet<String> =
+            ["a", "b", "l0", "old"].map(String::from).into();
+        // Another process undid R2 and stocked anew in between.
+        state.packages.push("c".into());
+        state.last_resort = Some("l1".into());
+        forget_stock_refs(&mut state, &seen);
+        assert_eq!(state.packages, ["c"]);
+        assert_eq!(state.last_resort.as_deref(), Some("l1"));
+        assert!(state.retiring.is_empty());
+
+        let mut same = ServerState {
+            last_resort: Some("l0".into()),
+            ..ServerState::default()
+        };
+        forget_stock_refs(&mut same, &seen);
+        assert_eq!(same.last_resort, None);
     }
 
     #[test]
