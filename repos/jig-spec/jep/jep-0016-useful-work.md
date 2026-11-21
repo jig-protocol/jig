@@ -176,18 +176,23 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
     - The worker cannot grind: its VRF key was fixed before the beacon (rule 9), and the
       beacon comes from contributions committed before the epoch began (rule 37).
     - The number assigned varies around `n`. Rule 19 says what happens when too few submit.
+    - **Arithmetic, here and in rule 13:**
+      - `int(x)` reads the bytes `x` as an unsigned big-endian integer.
+      - `⌊a / b⌋` is exact integer division rounded down.
+      - Every threshold is computed in integers wide enough to hold `(2^64 − 1)` times its
+        multiplier, so every implementation draws the same set.
 13. **Tasks are derived, not handed out.** Every party computes the epoch's tasks from public
     data, so no one picks a task for a particular worker. Labelled BLAKE3 throughout, with
     domain `jig-uw-task-v1`:
     - **`witness`:** one task per log that the group witnesses (JEP-0009 rule 33), per epoch.
       `task_id` = H(domain, `witness`, log origin, epoch).
     - **`validate`:** the sample is the leaves of each server's and nameserver's log whose
-      index `i` satisfies `int(H(domain, beacon, log origin, i)[0..8]) < (2^64 − 1) ×
-      sample_rate`. `task_id` = H(domain, `validate`, log origin, i). Only leaves included
+      index `i` satisfies `int(H(domain, beacon, log origin, i)[0..8]) < ⌊(2^64 − 1) ×
+      sample_rate / 10^6⌋`. `task_id` = H(domain, `validate`, log origin, i). Only leaves included
       before the beacon are sampled.
     - **`reexecute`:** the sample is the positions `s` of each `public` channel (system
       channels included, JEP-0014 rule 6) whose owner is in the group, where
-      `int(H(domain, beacon, channel_id, s)[0..8]) < (2^64 − 1) × reexecute_rate` and the block
+      `int(H(domain, beacon, channel_id, s)[0..8]) < ⌊(2^64 − 1) × reexecute_rate / 10^6⌋` and the block
       at `s` has a receipt. `task_id` = H(domain, `reexecute`, channel_id, s). Only blocks
       sequenced before the beacon are sampled.
     - **`retrieve`:** one task per stored object per epoch (section 8). `task_id` =
@@ -362,7 +367,11 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
     depend on the result, the subject or the time spent.
 31. **Accrual stays gated by time.** Credits count towards positive evidence `r` (JEP-0009
     rule 14), inside `accrual_per_period` (JEP-0009 rule 17), and within that inside
-    `credit_cap_per_period`, a fraction of `accrual_per_period` (R2.1 reference: at most half).
+    `credit_cap_per_period`, a fraction of `accrual_per_period` in ppm.
+    - The cap is `⌊credit_cap_per_period × accrual_per_period / 10^6⌋`, rounded down as in
+      rule 12. `accrual_per_period` is in micro-units (JEP-0009 rule 40; one unit is
+      1 000 000), so the cap is in micro-units too.
+    - R2.1 reference: at most half, i.e. 500 000.
     - Useful work lets an established subject keep or regain standing. It cannot buy standing
       faster than time allows.
     - Standing cannot come from useful work alone: witnessing is cheap for a farm of DIDs that
@@ -391,8 +400,8 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
     | `kinds` | the kinds the ruleset uses |
     | `n[kind]`, `k[kind]` | expected workers per task, and agreeing reveals needed |
     | `n_escalate`, `k_escalate` | the same, for escalation |
-    | `sample_rate` | the fraction of log leaves sampled per epoch for `validate` |
-    | `reexecute_rate` | the fraction of `public` channel positions with receipts sampled per epoch for `reexecute` |
+    | `sample_rate` | the fraction of log leaves sampled per epoch for `validate`, in ppm |
+    | `reexecute_rate` | the fraction of `public` channel positions with receipts sampled per epoch for `reexecute`, in ppm |
     | `retrieve_samples` | chunks per retrievability challenge |
     | `beacon_reveal_positions` | the beacon's reveal window, from the epoch's start (rule 38) |
     | `beacon_min_reveals` | valid reveals an epoch needs to have a beacon (rule 39) |
@@ -404,10 +413,11 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
     | `retrievability_epochs` | how recent a passed challenge must be for eligibility |
     | `dispute_retention_epochs` | how long a nameserver keeps `π` and `nonce_a` |
     | `credit[kind]` | the flat weight of `useful-work` |
-    | `credit_cap_per_period` | the most `useful-work` weight counted per period, as a fraction of `accrual_per_period` |
+    | `credit_cap_per_period` | the most `useful-work` weight counted per period, as a fraction of `accrual_per_period`, in ppm |
     | `fraud_weight` | the weight of `useful-work-fraud`, more than one period's capped credit |
 
-    No parameter is in seconds. R2.1 sets the reference values. Its starting points are `n` = 5,
+    No parameter is in seconds. Every fraction is an integer in parts per million (ppm), from
+    0 to 1 000 000. R2.1 sets the reference values. Its starting points are `n` = 5,
     `k` = 3, `n_escalate` = 11 and `k_escalate` = 7.
 
 ## 12. The witness beacon

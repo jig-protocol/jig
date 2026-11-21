@@ -63,9 +63,10 @@ pub struct KnownBuild {
 /// by its block-ABI vectors' outcome hashes (`jig-spec/vectors/block-abi`).
 #[cfg(not(target_arch = "wasm32"))]
 pub const OTHER_BUILDS: &[KnownBuild] = &[KnownBuild {
-    // unicode-normalization 0.1.26 (Unicode 18), wit-bindgen 0.57.
-    blake3: "blake3:99593614ee82449902364ae342cc9d4d671e39c9da0c2d236394908e3c351fb8",
-    bytes: include_bytes!("../artifacts/text_block.next.component.wasm"),
+    // The canonical build through v0.2.0-alpha.6: unicode-normalization 0.1.25 (Unicode 17),
+    // wit-bindgen 0.57. Kept so this client verifies servers that have not switched yet.
+    blake3: "blake3:8ab0a9ebe0261c63973cccabdbb5c5f04ac703486e8de890518bb2c91175b179",
+    bytes: include_bytes!("../artifacts/text_block.prev.component.wasm"),
 }];
 
 /// Media type of the component's output body: the postcard-encoded [`crate::Output`].
