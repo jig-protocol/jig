@@ -337,6 +337,14 @@ impl Secure {
         group_name(pins.as_ref(), &self.server, reference)
     }
 
+    /// [`Self::key`] for the channel this server itself orders under `slug`:
+    /// `None` when none is pinned, though a channel it carries for another
+    /// server may go by the same slug.
+    pub fn own_key(&self, slug: &str) -> Option<String> {
+        let pins = Pins::load(&Pins::default_path()).ok();
+        own_group_name(pins.as_ref(), &self.server, slug)
+    }
+
     /// [`Self::key`], once the channel `reference` names is pinned: proven
     /// from the server's listing if it is not yet. Before a channel's MLS
     /// state is first written, so it is filed under its id from the start.
@@ -1330,6 +1338,15 @@ fn group_name(pins: Option<&Pins>, server: &str, reference: &str) -> String {
         .unwrap_or_else(|| reference.to_string())
 }
 
+/// [`Secure::own_key`] against `pins`: the id of the channel `server` itself
+/// orders under `slug`, never one it carries.
+fn own_group_name(pins: Option<&Pins>, server: &str, slug: &str) -> Option<String> {
+    pins.and_then(|p| p.channel(server, slug))
+        .filter(|pin| pin.sequencer.is_none())
+        .map(|pin| pin.create_cid.clone())
+        .filter(|id| !id.is_empty())
+}
+
 /// The blocks that open; the rest are dropped (and reported) by `replay`.
 fn opened(delivered: &[DeliveredBlock]) -> Vec<jig_client::open::OpenedBlock> {
     delivered.iter().filter_map(|d| open(d).ok()).collect()
@@ -1404,7 +1421,9 @@ fn shadow_note(reference: &str, own: &ChannelInfo, carried: &ChannelInfo) -> Str
 
 #[cfg(test)]
 mod tests {
-    use super::{ChannelInfo, group_name, must_encrypt, pick, sequencers_for, shadow_note};
+    use super::{
+        ChannelInfo, group_name, must_encrypt, own_group_name, pick, sequencers_for, shadow_note,
+    };
     use jig_client::pins::{ChannelPin, Pins};
 
     /// A carried channel's records are held to its owner; the server's own
@@ -1524,6 +1543,36 @@ mod tests {
         assert_eq!(group_name(None, server, "#team"), "#team");
         // Another server's `#team` is not this one's.
         assert_eq!(group_name(Some(&pins), "wss://elsewhere", "#team"), "#team");
+    }
+
+    /// `channel create` asks whether this server's own channel is already
+    /// here: a channel the server carries for another under the same slug is
+    /// not it, though [`group_name`] resolves the slug to the carried one
+    /// while the server orders none by that slug.
+    #[test]
+    fn a_carried_channel_is_not_the_servers_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pins = Pins::load(&dir.path().join("pins.json")).unwrap();
+        let server = "wss://host";
+        let pin = |id: &str, sequencer: Option<&str>| ChannelPin {
+            create_cid: id.to_string(),
+            slug: String::new(),
+            suite: "mls".to_string(),
+            owner_did: "did:jig:zuser".to_string(),
+            chain_head: None,
+            sequencer: sequencer.map(str::to_string),
+        };
+        let carried = jig_core::canonical_cid::of(b"shared, carried").to_string();
+        pins.check_channel(server, "#shared", pin(&carried, Some("did:jig:zother")))
+            .unwrap();
+        assert_eq!(group_name(Some(&pins), server, "#shared"), carried);
+        assert_eq!(own_group_name(Some(&pins), server, "#shared"), None);
+
+        let own = jig_core::canonical_cid::of(b"shared, own").to_string();
+        pins.check_channel(server, "#shared", pin(&own, None))
+            .unwrap();
+        assert_eq!(own_group_name(Some(&pins), server, "#shared"), Some(own));
+        assert_eq!(own_group_name(None, server, "#shared"), None);
     }
 
     /// A server can say anything about a channel's suite. A device that

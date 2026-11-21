@@ -433,8 +433,11 @@ pub(crate) async fn create_with(
             }
             anyhow::bail!("this device already holds the group for {slug}")
         };
-        let listed = secure.key(slug);
-        if listed != slug && secure.session.has_group(secure.server(), &listed)? {
+        // The channel this server orders under the slug, not one it carries
+        // for another server under the same slug.
+        if let Some(own) = secure.own_key(slug)
+            && secure.session.has_group(secure.server(), &own)?
+        {
             return already();
         }
         if secure.session.has_group(secure.server(), &pending)? {

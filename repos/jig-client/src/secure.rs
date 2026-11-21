@@ -771,6 +771,25 @@ impl Session {
                     continue;
                 };
                 let to = group_key(server, &id);
+                // An alias an earlier run left (an older build drops the flag
+                // when it saves): its group or head is already filed under
+                // another channel's id, and the slug has since been pinned to
+                // a new channel. Copying it would hand the old channel's
+                // state to the new one.
+                let filed_elsewhere = |entries: &HashMap<String, String>| {
+                    entries.get(&key).is_some_and(|v| {
+                        entries.iter().any(|(k, w)| {
+                            *k != to
+                                && w == v
+                                && k.split_once('|').is_some_and(|(s, n)| {
+                                    s == server && jig_core::canonical_cid::is_canonical_text(n)
+                                })
+                        })
+                    })
+                };
+                if filed_elsewhere(&g.groups) || filed_elsewhere(&g.heads) {
+                    continue;
+                }
                 if let Some(gid) = g.groups.get(&key).cloned() {
                     g.groups.entry(to.clone()).or_insert(gid);
                 }
@@ -2057,6 +2076,42 @@ mod tests {
             alice.head(SERVER, &team).unwrap().as_deref(),
             Some("bafyold")
         );
+    }
+
+    /// A slug re-pinned to a new channel after a migration, then an older
+    /// build saving without the flag: the next migration finds the slug's
+    /// entry already filed under the old channel's id, and does not copy it
+    /// to the new one.
+    #[test]
+    fn an_alias_is_not_migrated_to_the_channel_its_slug_was_repinned_to() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        alice.create_group(SERVER, "#team").unwrap();
+        alice.set_head(SERVER, "#team", "bafyold", None).unwrap();
+        let (old, new) = (channel_id(b"team, first"), channel_id(b"team, again"));
+        alice
+            .key_by_channel_id(&pins_naming(root.path(), &[("#team", &old)]))
+            .unwrap();
+        assert!(alice.has_group(SERVER, &old).unwrap());
+
+        // The older build saves without the flag it does not know.
+        alice
+            .with_member(|_, g| {
+                g.keyed_by_id = false;
+                Ok(())
+            })
+            .unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let repinned = pins_naming(other.path(), &[("#team", &new)]);
+        assert!(alice.key_by_channel_id(&repinned).unwrap().is_empty());
+
+        assert!(!alice.has_group(SERVER, &new).unwrap());
+        assert_eq!(alice.head(SERVER, &new).unwrap(), None);
+        assert!(matches!(
+            alice.encrypt(SERVER, &new, "for the new #team"),
+            Err(SecureError::NoGroup(_))
+        ));
+        assert!(alice.has_group(SERVER, &old).unwrap());
     }
 
     /// A server that gives a slug to a new channel: the new one's id finds no
