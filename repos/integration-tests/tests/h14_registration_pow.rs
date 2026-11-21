@@ -241,12 +241,57 @@ async fn short_names_cost_more_and_squatting_is_refused_before_work() {
     let a = jig_core::crypto::ed25519::generate_signing_key();
     let b = jig_core::crypto::ed25519::generate_signing_key();
     let paid = ns.prepare_registration("paidfor", &a).await.expect("a");
-    let mut forged = ns.prepare_registration("freeride", &b).await.expect("b");
+    let borrowed: jig_core::pow::Proof =
+        serde_json::from_value(paid["pow"].clone()).expect("a's work");
+    assert!(
+        borrowed_work_solves(&ns, &paid, &borrowed),
+        "the check models the nameserver's: a's work solves a's own registration"
+    );
+    // At effort FLOOR, work for one puzzle also meets another about once in
+    // FLOOR tries, and the nameserver then rightly accepts it. Take a
+    // challenge the borrowed work does not happen to solve.
+    let mut forged = None;
+    for _ in 0..8 {
+        let body = ns.prepare_registration("freeride", &b).await.expect("b");
+        if !borrowed_work_solves(&ns, &body, &borrowed) {
+            forged = Some(body);
+            break;
+        }
+    }
+    let mut forged = forged.expect("a challenge a's work does not solve");
     forged["pow"] = paid["pow"].clone();
     let attempt = ns.submit_registration(&forged).await.expect("submit");
     assert_eq!(attempt.status, StatusCode::BAD_REQUEST, "{attempt:?}");
     assert_eq!(attempt.body["code"], "POW_INVALID", "{attempt:?}");
     assert_eq!(effort_for(&ns, "abcdef").await, 2 * FLOOR);
+}
+
+/// Whether `work` also meets the puzzle of the registration `body` was
+/// prepared for, at the effort it bids: the check the nameserver makes.
+fn borrowed_work_solves(
+    ns: &TestNameserver,
+    body: &serde_json::Value,
+    work: &jig_core::pow::Proof,
+) -> bool {
+    let ns_did = ns.state.ns_did_string();
+    let did = body["did"].as_str().expect("did");
+    let alias = format!(
+        "{}@{}",
+        body["requested_alias"].as_str().expect("alias"),
+        ns.alias_suffix
+    )
+    .to_ascii_lowercase();
+    let challenge = body["challenge"].as_str().expect("challenge");
+    let binding = jig_core::naming::proof_hash(
+        jig_core::naming::Action::Register,
+        &ns_did,
+        &alias,
+        challenge,
+    );
+    jig_core::pow::Puzzle::new(&ns_did, did, jig_core::pow::Action::NsRegister, &binding)
+        .expect("a challenge puzzle")
+        .check(work, work.effort)
+        .is_ok()
 }
 
 /// 4. A client that predates proof-of-work gets a clear `428 POW_REQUIRED`,

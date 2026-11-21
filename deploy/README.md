@@ -242,7 +242,30 @@ the root keys and every section in one file.
 > front of it.** The signed welcome carries the connection's TLS exporter (#234),
 > so a server behind a proxy that terminates TLS signs an empty exporter, and
 > every remote client refuses it. If something must sit in front of jig-server,
-> it passes TLS through (TCP or SNI passthrough). `[tls] enabled = false` serves
+> it passes TLS through (TCP or SNI passthrough).
+>
+> **Behind a passthrough proxy, enable PROXY protocol on both sides**, or every
+> client has the proxy's address and shares one per-address rate bucket and one
+> set of REST relay slots. Have the proxy send PROXY protocol **v2**
+> (HAProxy: `send-proxy-v2`; nginx 1.31.4+ `stream`: `proxy_protocol v2`. nginx's
+> `proxy_protocol on` sends v1, which jig-server refuses), and list it in
+> jig-server's config:
+>
+> ```toml
+> [server.proxy_protocol]
+> trusted = ["10.0.0.5"]        # the proxy's address, or a CIDR
+> header_timeout_ms = 5000
+> ```
+>
+> This fails closed. A connection from a listed proxy that does not open with a
+> valid v2 header within `header_timeout_ms` is closed, never served as the
+> proxy. That includes no header, v1 text, and a header over 536 bytes: a load
+> balancer that adds many TLVs can exceed that. A connection from any other
+> address is served as before, and a PROXY header from it is never read.
+> jig-server never trusts `X-Forwarded-For` or any other forwarded header. The
+> nameserver does not read PROXY protocol yet (#419).
+>
+> `[tls] enabled = false` serves
 > plaintext for loopback or local testing only: the server lists
 > `tls.enabled=false` in `/.well-known/jig`'s `unsafe_options_active` and logs a
 > startup warning, and a `jig` CLI refuses a plaintext `http://` server that is
@@ -842,50 +865,33 @@ passthrough) without terminating it.
 
 ## A stalled carried channel
 
-A channel this server follows for another server (an accepted share) can
-stall. That happens when the owner's chain names a block this server already
-holds in one of **its own** channels. One block belongs to one channel, so the
-owner's record for it cannot land. Nothing is moved and nothing is deleted:
-this server's channel keeps the block and its history, and the carried channel
-takes nothing past that record.
+Before v0.2.0-alpha.7, a channel this server follows for another server (an
+accepted share) could stall, when the owner's chain named a block this server
+already held in one of **its own** channels.
 
-**When it happens.** Both servers have a channel with the same name, say
-`#general`, and they were peered before the share. Clients post by channel
-name, so the federation relay lands each server's posts in the other's
-same-name channel. Share one of them, and the carried channel stalls at the
-first post the relay brought across. Any two servers that each have a
-`#general` and were peered before the share will hit this on its first share,
-until relayed posts into a channel the receiving server orders are refused
-(#357).
+**When it happened.** Both servers had a channel with the same name, say
+`#general`, and were peered before the share, on a release before
+v0.2.0-alpha.6. Clients post by channel name, so the legacy relay landed each
+server's posts in the other's same-name channel. Once one followed the other's
+`#general` by a share, the carried channel stalled at the first post the relay
+had brought across. v0.2.0-alpha.6 stopped new relayed posts from landing
+there (#357), and v0.2.0-alpha.7 stopped the relay altogether.
 
-From v0.2.0-alpha.6, a server refuses a post a peer relays into a channel the
-server orders itself (#357), so new relayed posts no longer cause this. A
-channel that stalled before you upgraded stays stalled: upgrading does not
-repair it.
+**After upgrading to v0.2.0-alpha.7 it heals by itself (#427).** The block stays
+in your own channel, whose chain is unchanged. The carried channel takes the
+owner's record for it as well, kept beside your own record of it, and goes on
+from there. Nothing is moved or deleted. A follower asks its owners for what it
+is missing every few seconds, so the stalled channel catches up within that,
+with no step on your part. `jig-server contracts list` stops showing a
+`stalled: channel …` line for it once it has. If you ended the share to get
+around the stall, share the channel again (the owner runs `jig channel share`)
+for it to catch up.
 
-**How to confirm it.**
-
-- `jig-server contracts list` ends with one line per stalled channel:
-  `stalled: channel <id> stalled at seq <n>: block <cid> is held in channel <id>`.
-- The log has a WARN, `a carried channel is stalled`, with `channel_id`, `seq`,
-  `block_cid`, `holder` and the owner's DID as `sequencer`. It repeats each time
-  the owner sends that record again.
-
-**What to do.** There is no safe way to fix it in place yet. Moving the block
-into the carried channel breaks your own channel's chain, which still names
-it. Deleting it does the same. Your options:
-
-- **Leave it.** The carried channel shows everything up to the stall. Your own
-  channel is untouched.
-- **End the share** with `jig-server contracts end <offer>` (the offer id is in
-  `contracts list`). This server stops following the channel. What it already
-  carried stays readable.
-- **Avoid it.** Before sharing a channel, ask the peer's operator whether their
-  server has a channel of its own with the same name. If it has, don't share
-  that channel yet.
-
-Repairing a stalled channel in place, so a carried channel can hold a block
-this server also holds elsewhere, is planned for a later release.
+**Downgrading.** A release before v0.2.0-alpha.7 does not read the records
+kept beside your own, and shows the carried channel with a hole at each
+formerly stalled position. A client that holds caught-up history to the
+channel's chain (#414) warns that the history is not whole there. Nothing is
+lost: upgrading again reads them.
 
 ## Gotchas worth knowing before they cost you an evening
 
