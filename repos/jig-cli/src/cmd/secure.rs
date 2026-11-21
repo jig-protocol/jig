@@ -83,6 +83,54 @@ pub fn local_adds_ended(e: &anyhow::Error) -> bool {
     })
 }
 
+/// How [`first_release`] ended without a package.
+enum Asked {
+    /// A refusal no other custodian can get around (JEP-0017 rule 18).
+    Final(anyhow::Error),
+    /// Each custodian asked, and why it gave nothing.
+    Tried(Vec<String>),
+}
+
+/// Ask each of `servers` in turn with `ask` until one releases a package.
+/// A custodian that sequences the channel, where the member ended local
+/// adds, would refuse the member-add too: the next is not asked.
+async fn first_release<'a, F, Fut>(
+    servers: &'a [(String, String)],
+    mut ask: F,
+) -> std::result::Result<Vec<u8>, Asked>
+where
+    F: FnMut(&'a str, &'a str) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+{
+    let mut tried = Vec::new();
+    for (server_did, url) in servers {
+        match ask(server_did, url).await {
+            Ok(package) => return Ok(package),
+            Err(e) if local_adds_ended(&e) => {
+                return Err(Asked::Final(e.context(format!("{url} ({server_did})"))));
+            }
+            Err(e) => tried.push(format!("  {url} ({server_did}): {e:#}")),
+        }
+    }
+    Err(Asked::Tried(tried))
+}
+
+/// Send a local-adds marker at `seq` with `put`, which answers the marker
+/// the server keeps. If that is a later one from another device saying the
+/// opposite, say ours once more, above it, and take what is kept then: one
+/// retry, so two devices disagreeing do not race without end.
+async fn settle_local_adds<F, Fut>(allow: bool, seq: u64, mut put: F) -> Result<LocalAdds>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = Result<LocalAdds>>,
+{
+    let kept = put(seq).await?;
+    if kept.allow == allow {
+        return Ok(kept);
+    }
+    put(kept.seq.saturating_add(1)).await
+}
+
 /// Whether `e` is the server definitely turning a request down.
 pub fn refused(e: &anyhow::Error) -> bool {
     e.downcast_ref::<Refused>()
@@ -1189,16 +1237,10 @@ impl Secure {
         // Like reachability records, the clock keeps each marker above any
         // another device of this identity sent.
         let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
-        let mut kept = self
-            .put_local_adds(&did, &server_did, allow, sent.saturating_add(1).max(now))
-            .await?;
-        // The server kept a later marker than ours, from another device:
-        // say this one once more, above it.
-        if kept.allow != allow {
-            kept = self
-                .put_local_adds(&did, &server_did, allow, kept.seq.saturating_add(1))
-                .await?;
-        }
+        let kept = settle_local_adds(allow, sent.saturating_add(1).max(now), |seq| {
+            self.put_local_adds(&did, &server_did, allow, seq)
+        })
+        .await?;
         let stock_ended = ServerStates::update(&path, |s| {
             let state = s.entry(&server_did, &self.base);
             state.local_adds = Some(kept);
@@ -1278,19 +1320,15 @@ impl Secure {
             .ok()
             .filter(|_| jig_core::canonical_cid::is_canonical_text(channel_id))
             .with_context(|| format!("the channel's id `{channel_id}` is not a canonical CID"))?;
-        let mut tried = Vec::new();
-        for (server_did, url) in &record.servers {
-            match self.ask_custodian(did, channel_id, server_did, url).await {
-                Ok(package) => return Ok(package),
-                // The custodian sequences the channel and `did` ended local
-                // adds there: it would refuse the member-add too, so no other
-                // custodian is asked (JEP-0017 rule 18).
-                Err(e) if local_adds_ended(&e) => {
-                    return Err(e.context(format!("{url} ({server_did})")));
-                }
-                Err(e) => tried.push(format!("  {url} ({server_did}): {e:#}")),
-            }
-        }
+        let tried = match first_release(&record.servers, |server_did, url| {
+            self.ask_custodian(did, channel_id, server_did, url)
+        })
+        .await
+        {
+            Ok(package) => return Ok(package),
+            Err(Asked::Final(e)) => return Err(e),
+            Err(Asked::Tried(tried)) => tried,
+        };
         if tried.is_empty() {
             anyhow::bail!("{did}'s reachability record lists no servers");
         }
@@ -2122,9 +2160,164 @@ fn shadow_note(reference: &str, own: &ChannelInfo, carried: &ChannelInfo) -> Str
 #[cfg(test)]
 mod tests {
     use super::{
-        ChannelInfo, group_name, must_encrypt, ordered_here, own_group_name, pick, sequencers_for,
-        shadow_note,
+        Asked, ChannelInfo, LocalAdds, Refused, first_release, group_name, must_encrypt,
+        ordered_here, own_group_name, pick, sequencers_for, settle_local_adds, shadow_note,
     };
+    use std::cell::RefCell;
+
+    fn refusal(status: u16, code: &str) -> anyhow::Error {
+        Refused {
+            status,
+            code: code.into(),
+            message: String::new(),
+        }
+        .into()
+    }
+
+    fn custodians() -> Vec<(String, String)> {
+        ["one", "two", "three"]
+            .iter()
+            .map(|n| (format!("did:jig:z{n}"), format!("https://{n}")))
+            .collect()
+    }
+
+    /// JEP-0017 rule 18: the custodian sequences the channel and refuses
+    /// it; a second custodian's package would be refused at the member-add
+    /// anyway, so none is asked.
+    #[tokio::test]
+    async fn ended_local_adds_at_a_custodian_stop_the_search() {
+        for code in ["LOCAL_ADDS_ENDED", "MEMBER_DECLINED"] {
+            let servers = custodians();
+            let asked = RefCell::new(Vec::new());
+            let got = first_release(&servers, |_, url| {
+                asked.borrow_mut().push(url.to_string());
+                let e = refusal(403, code).context("asking");
+                async move { Err(e) }
+            })
+            .await;
+            match got {
+                Err(Asked::Final(e)) => {
+                    assert!(format!("{e:#}").contains(code), "{e:#}");
+                    assert!(format!("{e:#}").contains("https://one"), "{e:#}");
+                }
+                _ => panic!("{code}: not final"),
+            }
+            assert_eq!(*asked.borrow(), ["https://one"], "{code}");
+        }
+    }
+
+    /// Any other refusal moves on to the next custodian.
+    #[tokio::test]
+    async fn other_refusals_ask_the_next_custodian() {
+        let servers = custodians();
+        let asked = RefCell::new(0);
+        let got = first_release(&servers, |_, url| {
+            *asked.borrow_mut() += 1;
+            let answer = match url {
+                "https://one" => Err(refusal(404, "NO_CUSTODY")),
+                "https://two" => Err(refusal(429, "RATE_LIMITED")),
+                _ => Ok(b"kp".to_vec()),
+            };
+            async move { answer }
+        })
+        .await;
+        assert!(matches!(got, Ok(ref p) if p == b"kp"));
+        assert_eq!(*asked.borrow(), 3);
+        let got = first_release(&servers, |_, _| async { Err(refusal(404, "NO_CUSTODY")) }).await;
+        assert!(matches!(got, Err(Asked::Tried(ref t)) if t.len() == 3));
+    }
+
+    /// A marker the server keeps is answered back. Ours kept: no retry. A
+    /// later, opposite one from another device: exactly one retry, above
+    /// its seq, and what is kept then is the answer even if it still
+    /// disagrees.
+    #[tokio::test]
+    async fn a_stale_local_adds_marker_is_sent_once_more_above_the_kept_one() {
+        let sent = RefCell::new(Vec::new());
+        let kept = settle_local_adds(false, 10, |seq| {
+            sent.borrow_mut().push(seq);
+            async move { Ok(LocalAdds { seq, allow: false }) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            kept,
+            LocalAdds {
+                seq: 10,
+                allow: false
+            }
+        );
+        assert_eq!(*sent.borrow(), [10]);
+
+        // A kept marker that agrees, at a higher seq, is taken as it is.
+        sent.borrow_mut().clear();
+        let kept = settle_local_adds(false, 10, |seq| {
+            sent.borrow_mut().push(seq);
+            async move {
+                Ok(LocalAdds {
+                    seq: 50,
+                    allow: false,
+                })
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            kept,
+            LocalAdds {
+                seq: 50,
+                allow: false
+            }
+        );
+        assert_eq!(*sent.borrow(), [10]);
+
+        sent.borrow_mut().clear();
+        let kept = settle_local_adds(false, 10, |seq| {
+            sent.borrow_mut().push(seq);
+            async move {
+                Ok(if seq == 51 {
+                    LocalAdds { seq, allow: false }
+                } else {
+                    LocalAdds {
+                        seq: 50,
+                        allow: true,
+                    }
+                })
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            kept,
+            LocalAdds {
+                seq: 51,
+                allow: false
+            }
+        );
+        assert_eq!(*sent.borrow(), [10, 51]);
+
+        // Still outrun: one retry only, and the kept marker is the answer.
+        sent.borrow_mut().clear();
+        let kept = settle_local_adds(false, 10, |seq| {
+            sent.borrow_mut().push(seq);
+            async move {
+                Ok(LocalAdds {
+                    seq: seq + 100,
+                    allow: true,
+                })
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            kept,
+            LocalAdds {
+                seq: 211,
+                allow: true
+            }
+        );
+        assert_eq!(*sent.borrow(), [10, 111]);
+    }
     use jig_client::pins::{ChannelPin, Pins};
 
     /// A carried channel's records are held to its owner; the server's own

@@ -78,13 +78,24 @@ async fn available(server: &TestJigServer, did: &str) -> u64 {
     body["available"].as_u64().unwrap()
 }
 
+/// The status of a stranger's read of `did`'s reachability record at `server`.
+async fn reach_status(server: &TestJigServer, did: &str) -> u16 {
+    let url = format!("{}/api/v1/reach/{did}", server.http_url());
+    let proof = ReadProof::sign(&test_identity(), "GET", signable_path(&url));
+    let mut req = reqwest::Client::new().get(&url);
+    for (name, value) in proof.headers() {
+        req = req.header(name, value);
+    }
+    req.send().await.unwrap().status().as_u16()
+}
+
 /// What the member's device recorded for its servers.
 fn server_states(home: &Path, did: &str) -> Value {
     let path = home
         .join(".jig")
         .join("servers")
         .join(format!("{}.json", did.replace(':', "_")));
-    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    std::fs::read_to_string(path).map_or(Value::Null, |s| serde_json::from_str(&s).unwrap())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -228,11 +239,8 @@ async fn custody_and_local_adds_both_ended_end_the_stock_on_every_device() {
         let states = server_states(home, &member);
         let state = states["servers"]
             .as_object()
-            .unwrap()
-            .values()
-            .next()
-            .unwrap()
-            .clone();
+            .and_then(|s| s.values().next().cloned())
+            .unwrap_or_default();
         (
             state["packages"].as_array().map_or(0, Vec::len),
             state["last_resort"].is_string(),
@@ -275,6 +283,10 @@ async fn custody_and_local_adds_both_ended_end_the_stock_on_every_device() {
     );
     assert!(said.contains("keeps no key packages for you"), "{said}");
     assert_eq!(available(&a, &member).await, 0);
+    // It stopped there: no reachability record listing A again (others
+    // still see none), and it keeps no references to a stock at A.
+    assert_eq!(reach_status(&a, &member).await, 404, "R1's record stands");
+    assert_eq!(stocked(other.path()), (0, false));
 
     // Either undone, uploads resume.
     ok(member_home.path(), &["server", "local-adds", "on"]);
