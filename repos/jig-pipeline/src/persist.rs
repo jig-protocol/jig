@@ -60,6 +60,11 @@ pub struct ReleaseAsk<'a> {
     pub per_did: u64,
     /// Most releases to one requester per hour.
     pub per_requester: u64,
+    /// For a custodian release: the reachability record envelope the caller
+    /// verified as listing this server. The release happens only if it is
+    /// still the record kept, checked in the same transaction, so a
+    /// withdrawal stored meanwhile wins. `None` for a server's own take.
+    pub listing: Option<&'a [u8]>,
 }
 
 /// Which hourly limit a release hit.
@@ -81,6 +86,9 @@ pub enum Release {
     Limited(LimitHit),
     /// The DID has no package here at all.
     Empty,
+    /// The record `listing` named is no longer the one kept: custody was
+    /// withdrawn or replaced since it was checked. Nothing was released.
+    NotListed,
 }
 
 /// One entry of a custodian's release log.
@@ -2636,37 +2644,6 @@ impl SqliteStore {
         Ok(inserted > 0)
     }
 
-    /// Hand out one of `did`'s key packages: the oldest ordinary one, which is
-    /// consumed, or failing that the newest last-resort one, which is not.
-    pub fn take_key_package(&self, did: &str, now: i64) -> Result<Option<Vec<u8>>> {
-        let conn = self.conn.lock().expect("poisoned");
-        let ordinary: Option<(Vec<u8>, Vec<u8>)> = conn
-            .query_row(
-                "SELECT reference, package FROM mls_key_packages
-                  WHERE did = ? AND consumed_at IS NULL AND last_resort = 0
-                  ORDER BY published_at ASC, reference ASC LIMIT 1",
-                [did],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        if let Some((reference, package)) = ordinary {
-            conn.execute(
-                "UPDATE mls_key_packages SET consumed_at = ? WHERE reference = ?",
-                params![now, reference],
-            )?;
-            return Ok(Some(package));
-        }
-        conn.query_row(
-            "SELECT package FROM mls_key_packages
-              WHERE did = ? AND last_resort = 1
-              ORDER BY published_at DESC, reference DESC LIMIT 1",
-            [did],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(Into::into)
-    }
-
     /// Keep `envelope`, `did`'s reachability record at `seq`, unless a record
     /// with this `seq` or a higher one is kept already. Returns whether it was
     /// stored. The caller verifies the record.
@@ -2714,6 +2691,18 @@ impl SqliteStore {
     pub fn release_key_package(&self, ask: &ReleaseAsk<'_>) -> Result<Release> {
         let mut conn = self.conn.lock().expect("poisoned");
         let tx = conn.transaction()?;
+        if let Some(listing) = ask.listing {
+            let kept: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT envelope FROM reachability_records WHERE did = ?",
+                    [ask.did],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if kept.as_deref() != Some(listing) {
+                return Ok(Release::NotListed);
+            }
+        }
         let earlier: Option<(Vec<u8>, Vec<u8>, bool)> = if ask.repeat {
             tx.query_row(
                 // The exact request first: its own answer, even when a later
@@ -2762,6 +2751,36 @@ impl SqliteStore {
                 last_resort,
             });
         }
+        // Which package, before the limits: a DID with none here is told so
+        // (`Empty`), never `Limited`, so an adder falls back to its
+        // custodians instead of waiting out a limit for nothing.
+        let ordinary: Option<(Vec<u8>, Vec<u8>)> = tx
+            .query_row(
+                "SELECT reference, package FROM mls_key_packages
+                  WHERE did = ? AND consumed_at IS NULL AND last_resort = 0
+                  ORDER BY published_at ASC, reference ASC LIMIT 1",
+                [ask.did],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (reference, package, last_resort) = match ordinary {
+            Some((reference, package)) => (reference, package, false),
+            None => {
+                let resort: Option<(Vec<u8>, Vec<u8>)> = tx
+                    .query_row(
+                        "SELECT reference, package FROM mls_key_packages
+                          WHERE did = ? AND last_resort = 1
+                          ORDER BY published_at DESC, reference DESC LIMIT 1",
+                        [ask.did],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                match resort {
+                    Some((reference, package)) => (reference, package, true),
+                    None => return Ok(Release::Empty),
+                }
+            }
+        };
         let hour_ago = ask.now - 3600;
         let by_did: i64 = tx.query_row(
             "SELECT COUNT(*) FROM kp_releases
@@ -2781,39 +2800,12 @@ impl SqliteStore {
         if by_requester as u64 >= ask.per_requester {
             return Ok(Release::Limited(LimitHit::Requester));
         }
-        let ordinary: Option<(Vec<u8>, Vec<u8>)> = tx
-            .query_row(
-                "SELECT reference, package FROM mls_key_packages
-                  WHERE did = ? AND consumed_at IS NULL AND last_resort = 0
-                  ORDER BY published_at ASC, reference ASC LIMIT 1",
-                [ask.did],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let (reference, package, last_resort) = match ordinary {
-            Some((reference, package)) => {
-                tx.execute(
-                    "UPDATE mls_key_packages SET consumed_at = ? WHERE reference = ?",
-                    params![ask.now, reference],
-                )?;
-                (reference, package, false)
-            }
-            None => {
-                let resort: Option<(Vec<u8>, Vec<u8>)> = tx
-                    .query_row(
-                        "SELECT reference, package FROM mls_key_packages
-                          WHERE did = ? AND last_resort = 1
-                          ORDER BY published_at DESC, reference DESC LIMIT 1",
-                        [ask.did],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
-                    .optional()?;
-                match resort {
-                    Some((reference, package)) => (reference, package, true),
-                    None => return Ok(Release::Empty),
-                }
-            }
-        };
+        if !last_resort {
+            tx.execute(
+                "UPDATE mls_key_packages SET consumed_at = ? WHERE reference = ?",
+                params![ask.now, reference],
+            )?;
+        }
         tx.execute(
             "INSERT INTO kp_releases
                 (request_hash, did, requester, channel_id, reference, last_resort,
@@ -4760,6 +4752,7 @@ mod tests {
             repeat: true,
             per_did: 3,
             per_requester: 2,
+            listing: None,
         }
     }
 
@@ -4992,6 +4985,62 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_stock_is_reported_as_empty_even_past_a_limit() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let full = "did:jig:zFull";
+        for i in 0..3u8 {
+            store
+                .insert_key_package(&[b'r', i], full, &[b'k', i], false, i64::from(i))
+                .unwrap();
+        }
+        // Spend the requester's limit (2) on another DID.
+        for (i, c) in ["c1", "c2"].into_iter().enumerate() {
+            let hash = [b'h', i as u8];
+            let mut a = ask(full, "did:jig:zA", &hash, 100);
+            a.channel_id = c;
+            assert!(matches!(
+                store.release_key_package(&a).unwrap(),
+                Release::Released { .. }
+            ));
+        }
+        let mut over = ask(full, "did:jig:zA", b"h9", 100);
+        over.channel_id = "c3";
+        assert_eq!(
+            store.release_key_package(&over).unwrap(),
+            Release::Limited(LimitHit::Requester)
+        );
+        // A DID with nothing here is Empty for the same requester, not Limited.
+        let empty = ask("did:jig:zNone", "did:jig:zA", b"h10", 100);
+        assert_eq!(store.release_key_package(&empty).unwrap(), Release::Empty);
+    }
+
+    #[test]
+    fn a_custodian_release_needs_the_listing_it_was_checked_under() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let did = "did:jig:zD";
+        store
+            .insert_key_package(b"r1", did, b"kp1", false, 1)
+            .unwrap();
+        store.put_reachability(did, 1, b"listing", 1).unwrap();
+        // A withdrawal lands between the handler's check and the release.
+        store.put_reachability(did, 2, b"withdrawal", 2).unwrap();
+        let mut a = ask(did, "did:jig:zA", b"h1", 100);
+        a.listing = Some(b"listing");
+        assert_eq!(store.release_key_package(&a).unwrap(), Release::NotListed);
+        assert_eq!(
+            store.key_package_stock(did).unwrap(),
+            (1, false),
+            "nothing consumed"
+        );
+        assert!(store.key_package_releases(did, 10).unwrap().is_empty());
+        a.listing = Some(b"withdrawal");
+        assert!(matches!(
+            store.release_key_package(&a).unwrap(),
+            Release::Released { .. }
+        ));
+    }
+
+    #[test]
     fn a_reachability_record_is_replaced_only_by_a_higher_seq() {
         let store = SqliteStore::open_in_memory().unwrap();
         let did = "did:jig:zD";
@@ -5030,10 +5079,23 @@ mod tests {
             "a package is stored once"
         );
         assert_eq!(store.key_package_stock(did).unwrap(), (2, true));
-        assert_eq!(store.take_key_package(did, 10).unwrap().unwrap(), b"kp1");
-        assert_eq!(store.take_key_package(did, 11).unwrap().unwrap(), b"kp2");
-        assert_eq!(store.take_key_package(did, 12).unwrap().unwrap(), b"kpL");
-        assert_eq!(store.take_key_package(did, 13).unwrap().unwrap(), b"kpL");
+        // Every take goes through the release path; these are a server's own.
+        let take = |hash: &[u8], now: i64| {
+            let mut a = ask(did, "did:jig:zAsker", hash, now);
+            a.repeat = false;
+            a.channel_id = "";
+            a.per_did = 100;
+            a.per_requester = 100;
+            match store.release_key_package(&a).unwrap() {
+                Release::Released { package, .. } => Some(package),
+                Release::Empty => None,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(take(b"t1", 10).unwrap(), b"kp1");
+        assert_eq!(take(b"t2", 11).unwrap(), b"kp2");
+        assert_eq!(take(b"t3", 12).unwrap(), b"kpL");
+        assert_eq!(take(b"t4", 13).unwrap(), b"kpL");
         assert_eq!(store.key_package_stock(did).unwrap(), (0, true));
         assert!(
             !store
@@ -5041,12 +5103,9 @@ mod tests {
                 .unwrap(),
             "a consumed package cannot be uploaded again"
         );
-        assert!(
-            store
-                .take_key_package("did:jig:zNobody", 15)
-                .unwrap()
-                .is_none()
-        );
+        let mut a = ask("did:jig:zNobody", "did:jig:zAsker", b"t5", 15);
+        a.repeat = false;
+        assert_eq!(store.release_key_package(&a).unwrap(), Release::Empty);
     }
 
     #[test]

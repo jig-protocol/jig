@@ -251,9 +251,9 @@ pub async fn request_key_package(
         .auth
         .admit_and_charge(&request.requester)
         .map_err(|outcome| refuse(&state, &outcome, started))?;
-    if listing_record(&state, &did)?.is_none() {
+    let Some(listing) = listing_record(&state, &did)? else {
         return Err(no_custody(&did));
-    }
+    };
     if custody.release == ReleasePolicy::Closed {
         return Err(err(
             StatusCode::FORBIDDEN,
@@ -274,6 +274,9 @@ pub async fn request_key_package(
         repeat: true,
         per_did: custody.per_member_per_hour,
         per_requester: custody.per_requester_per_hour,
+        // Re-checked inside the release's transaction: a withdrawal stored
+        // since `listing_record` read it stops this release.
+        listing: Some(&listing.envelope),
     };
     match state
         .ingest_ctx
@@ -318,7 +321,7 @@ pub async fn request_key_package(
                 ),
             },
         )),
-        Release::Empty => Err(no_custody(&did)),
+        Release::Empty | Release::NotListed => Err(no_custody(&did)),
     }
 }
 

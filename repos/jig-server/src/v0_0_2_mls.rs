@@ -178,6 +178,7 @@ pub async fn take_key_package(
         repeat: false,
         per_did: custody.per_member_per_hour,
         per_requester: custody.per_requester_per_hour,
+        listing: None,
     };
     match state
         .ingest_ctx
@@ -194,13 +195,15 @@ pub async fn take_key_package(
             "RATE_LIMITED",
             format!("{did}'s key packages were taken too often in the last hour; try again later"),
         )),
-        jig_pipeline::persist::Release::Empty => Err(err(
-            StatusCode::NOT_FOUND,
-            "NO_KEY_PACKAGE",
-            format!(
-                "{did} has published no MLS key packages here; they need to run a jig client against this server once"
-            ),
-        )),
+        jig_pipeline::persist::Release::Empty | jig_pipeline::persist::Release::NotListed => {
+            Err(err(
+                StatusCode::NOT_FOUND,
+                "NO_KEY_PACKAGE",
+                format!(
+                    "{did} has published no MLS key packages here; they need to run a jig client against this server once"
+                ),
+            ))
+        }
     }
 }
 
