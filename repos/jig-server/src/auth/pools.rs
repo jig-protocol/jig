@@ -1,9 +1,9 @@
 //! Capacity pools: members, invited and strangers (JEP-0008 rules 21–23).
 //!
 //! The server's accepted local writes per second are split three ways, and
-//! the member share is split again: aged-proof members (JEP-0009 rule 49)
-//! draw only from its `aged_share_pct`, and established members from all of
-//! it. Each part is a token bucket holding its share of the burst and refilling at its
+//! aged-proof members (JEP-0009 rule 49) may draw at most `aged_share_pct`
+//! of the member share; established members draw from all of it. Each pool
+//! is a token bucket holding its share of the burst and refilling at its
 //! share of the rate. A write takes a token from its own pool first. When that
 //! pool is empty it may borrow from another pool that is **idle**: one that
 //! has had no demand of its own for [`IDLE_AFTER`], and then only what that
@@ -15,8 +15,9 @@
 //!   borrows from them, and what they lent while idle never takes their
 //!   bucket below half.
 //! - Aged-proof members are bounded by capacity, not by count: a farm of
-//!   proofs that ages in together shares the aged part, and cannot crowd out
-//!   established members (rule 23).
+//!   proofs that ages in together shares one allowance, and cannot crowd
+//!   out established members (rule 23). The allowance is a cap, not a
+//!   reservation: established members may use the whole member pool.
 //! - A server with no members at all (no records, nobody aged in) lends the
 //!   whole member share to strangers, so the pools cost it nothing.
 //!
@@ -37,40 +38,40 @@ pub enum Pool {
     /// An established member: today, a DID in the operator's records.
     Member,
     /// A member by aged admission proof (JEP-0009 rule 49): the member pool,
-    /// but only its `aged_share_pct`.
+    /// but at most its `aged_share_pct`.
     AgedMember,
     Invited,
     Stranger,
 }
 
-/// Bucket indices. The member pool is two buckets: the part only
-/// established members draw from, and the aged part both draw from.
-const ESTABLISHED: usize = 0;
-const AGED: usize = 1;
+/// Bucket indices. The member pool is one bucket that both kinds of member
+/// draw from. [`ALLOWANCE`] holds no capacity of its own: it only caps what
+/// aged-proof members may draw from the member bucket (rule 23 is a bound,
+/// not a reservation).
+const MEMBER: usize = 0;
+const ALLOWANCE: usize = 1;
 const INVITED: usize = 2;
 const STRANGER: usize = 3;
 
 impl Pool {
-    /// The buckets this pool draws on as its own, in order: no idleness
-    /// needed, and its requests are demand on each. Established members own
-    /// the whole member pool.
-    fn owned(self) -> &'static [usize] {
+    /// The bucket this pool's requests are served from, and whose demand
+    /// they are.
+    fn own(self) -> usize {
         match self {
-            Pool::Member => &[ESTABLISHED, AGED],
-            Pool::AgedMember => &[AGED],
-            Pool::Invited => &[INVITED],
-            Pool::Stranger => &[STRANGER],
+            Pool::Member | Pool::AgedMember => MEMBER,
+            Pool::Invited => INVITED,
+            Pool::Stranger => STRANGER,
         }
     }
 
     /// The buckets this pool may borrow from while they are idle, cheapest
-    /// to lend first.
+    /// to lend first. Aged-proof members borrow nothing from the member
+    /// pool beyond their allowance: that pool is already theirs to draw on.
     fn lenders(self) -> &'static [usize] {
         match self {
-            Pool::Member => &[STRANGER, INVITED],
-            Pool::AgedMember => &[STRANGER, INVITED, ESTABLISHED],
-            Pool::Invited => &[STRANGER, AGED, ESTABLISHED],
-            Pool::Stranger => &[INVITED, AGED, ESTABLISHED],
+            Pool::Member | Pool::AgedMember => &[STRANGER, INVITED],
+            Pool::Invited => &[STRANGER, MEMBER],
+            Pool::Stranger => &[INVITED, MEMBER],
         }
     }
 }
@@ -86,6 +87,16 @@ struct Bucket {
 }
 
 impl Bucket {
+    fn new(burst: f64, per_second: f64, now: Instant) -> Self {
+        Self {
+            tokens: burst,
+            burst,
+            per_second,
+            at: now,
+            demand: None,
+        }
+    }
+
     fn refill(&mut self, now: Instant) {
         let elapsed = now.saturating_duration_since(self.at).as_secs_f64();
         self.tokens = (self.tokens + elapsed * self.per_second).min(self.burst);
@@ -101,7 +112,8 @@ impl Bucket {
     }
 }
 
-/// The write capacity, split into the three pools, the member pool in two.
+/// The write capacity, split into the three pools, with aged-proof members
+/// capped within the member pool.
 pub struct WritePools {
     buckets: Mutex<[Bucket; 4]>,
     warnings: Vec<String>,
@@ -111,7 +123,8 @@ impl WritePools {
     /// `None` when `writes_per_second` is 0: the pools are off. Fails on
     /// shares that leave members nothing, an aged share above 100, and a
     /// nonzero member, invited or stranger share whose burst is under one
-    /// write. An aged part under one write is raised to one, with a warning.
+    /// write. An aged allowance under one write is raised to one, with a
+    /// warning.
     pub fn new(section: &PoolsSection, now: Instant) -> anyhow::Result<Option<Self>> {
         let (stranger, invited) = (section.stranger_share_pct, section.invited_share_pct);
         if u16::from(stranger) + u16::from(invited) >= 100 {
@@ -132,17 +145,9 @@ impl WritePools {
         }
         let rate = f64::from(section.writes_per_second);
         let burst = f64::from(section.writes_burst.max(section.writes_per_second));
-        let bucket = |pct: f64| Bucket {
-            tokens: burst * pct / 100.0,
-            burst: burst * pct / 100.0,
-            per_second: rate * pct / 100.0,
-            at: now,
-            demand: None,
-        };
         let member = 100.0 - f64::from(stranger) - f64::from(invited);
         // A share whose burst is under one token could never serve a write
-        // from its own bucket. These shares were checked before the member
-        // split, so a config that booted before still boots.
+        // from its own bucket.
         for (name, pct) in [
             ("member", member),
             ("invited", f64::from(invited)),
@@ -155,36 +160,29 @@ impl WritePools {
                 );
             }
         }
-        // The member pool's split. Established members own both parts, so
-        // their part may hold under one write. The aged part may not, and
-        // refusing to boot over it would turn an upgrade into an outage: it
-        // is raised to one write, taken from the established part, and the
-        // operator is told.
-        let member_burst = burst * member / 100.0;
-        let mut aged_burst = member_burst * f64::from(aged_pct) / 100.0;
+        let share = |pct: f64| Bucket::new(burst * pct / 100.0, rate * pct / 100.0, now);
+        // The aged allowance caps aged-proof members' draw on the member
+        // bucket. It takes nothing from established members, so raising a
+        // tiny one to a single write costs them nothing; refusing to boot
+        // over it would turn an upgrade into an outage.
+        let aged = member * f64::from(aged_pct) / 100.0;
+        let mut allowance = share(aged);
         let mut warnings = Vec::new();
-        if aged_pct > 0 && aged_burst < 1.0 {
+        if aged_pct > 0 && allowance.burst < 1.0 {
             warnings.push(format!(
                 "[auth.pools] aged_share_pct {aged_pct} of the member share of writes_burst \
-                 {burst} is under one write; members by aged proof get one write of burst \
+                 {burst} is under one write; members by aged proof may burst one write \
                  instead. Raise writes_burst, or set aged_share_pct to 0 or 100"
             ));
-            aged_burst = 1.0;
+            allowance.burst = 1.0;
+            allowance.tokens = 1.0;
         }
-        let aged_rate = rate * member / 100.0 * f64::from(aged_pct) / 100.0;
-        let part = |burst: f64, per_second: f64| Bucket {
-            tokens: burst,
-            burst,
-            per_second,
-            at: now,
-            demand: None,
-        };
         Ok(Some(Self {
             buckets: Mutex::new([
-                part(member_burst - aged_burst, rate * member / 100.0 - aged_rate),
-                part(aged_burst, aged_rate),
-                bucket(f64::from(invited)),
-                bucket(f64::from(stranger)),
+                share(member),
+                allowance,
+                share(f64::from(invited)),
+                share(f64::from(stranger)),
             ]),
             warnings,
         }))
@@ -196,36 +194,33 @@ impl WritePools {
         &self.warnings
     }
 
-    /// One token's refill in the buckets `pool` owns. `None` when its share
-    /// is 0: it never refills, and writes from it only borrow.
+    /// One token's refill for `pool`: its own bucket's, or for aged-proof
+    /// members the slower of the member bucket and their allowance. `None`
+    /// when that rate is 0: writes from it only borrow.
     pub fn refill_interval(&self, pool: Pool) -> Option<Duration> {
         let buckets = self.buckets.lock().expect("write pools lock poisoned");
-        let rate: f64 = pool.owned().iter().map(|&i| buckets[i].per_second).sum();
+        let mut rate = buckets[pool.own()].per_second;
+        if pool == Pool::AgedMember {
+            rate = rate.min(buckets[ALLOWANCE].per_second);
+        }
         (rate > 0.0).then(|| Duration::from_secs_f64(1.0 / rate))
     }
 
-    /// Take one write's worth for `pool` at `now`: from a bucket it owns, or
-    /// else from an idle one. False when none has it.
+    /// Take one write's worth for `pool` at `now`: from its own bucket (for
+    /// aged-proof members, within their allowance), or else from an idle
+    /// pool. False when neither has it.
     pub fn try_take(&self, pool: Pool, now: Instant) -> bool {
         let mut buckets = self.buckets.lock().expect("write pools lock poisoned");
         for bucket in buckets.iter_mut() {
             bucket.refill(now);
         }
-        // Demand on every bucket the pool owns: while established members
-        // write, the aged part does not lend to strangers either.
-        for &i in pool.owned() {
-            let own = &mut buckets[i];
-            own.demand = Some(now.max(own.demand.unwrap_or(now)));
-        }
-        // The buckets a pool owns count together: splitting the member pool
-        // must not strand a write's worth in fractions on either side.
-        let owned: f64 = pool.owned().iter().map(|&i| buckets[i].tokens).sum();
-        if owned >= 1.0 {
-            let mut due = 1.0;
-            for &i in pool.owned() {
-                let take = buckets[i].tokens.min(due);
-                buckets[i].tokens -= take;
-                due -= take;
+        let own = &mut buckets[pool.own()];
+        own.demand = Some(now.max(own.demand.unwrap_or(now)));
+        let allowed = pool != Pool::AgedMember || buckets[ALLOWANCE].tokens >= 1.0;
+        if allowed && buckets[pool.own()].tokens >= 1.0 {
+            buckets[pool.own()].tokens -= 1.0;
+            if pool == Pool::AgedMember {
+                buckets[ALLOWANCE].tokens -= 1.0;
             }
             return true;
         }
@@ -244,8 +239,8 @@ mod tests {
     use super::*;
 
     /// 100 writes a second, burst 100: members 70, invited 10, strangers 20.
-    /// The aged part of the members' 70 is 14 (20 %), so every bucket holds
-    /// whole writes.
+    /// The aged allowance within the members' 70 is 14 (20 %), so every
+    /// bucket holds whole writes.
     fn pools(now: Instant) -> WritePools {
         WritePools::new(
             &PoolsSection {
@@ -462,8 +457,8 @@ mod tests {
     }
 
     /// Rule 23's bound on aged-proof members: while everyone is writing, a
-    /// farm of aged proofs gets the aged part of the member pool and no
-    /// more, and established members keep the rest.
+    /// farm of aged proofs draws at most its allowance of the member pool,
+    /// and established members keep the rest.
     #[test]
     fn aged_members_draw_only_their_share_while_members_write() {
         let t0 = Instant::now();
@@ -476,7 +471,7 @@ mod tests {
         assert!(pools.try_take(Pool::Member, t0), "members are active");
         let mut aged = take_all(&pools, Pool::AgedMember, t0);
         let mut members = 1 + take_all(&pools, Pool::Member, t0);
-        assert_eq!((aged, members), (14, 56), "each its own burst");
+        assert_eq!((aged, members), (14, 56), "the allowance, and the rest");
         for tick in 1..=20 {
             let at = t0 + ms(500 * tick);
             busy(at);
@@ -487,8 +482,9 @@ mod tests {
         assert_eq!(members, 56 + 560, "established members' 56/s");
     }
 
-    /// Established members draw from the whole member pool, aged part
-    /// included; an aged member arriving then waits like any other pool.
+    /// Established members may draw the whole member pool, allowance and
+    /// all; an aged member arriving then waits like any other pool. The
+    /// allowance caps aged members; it reserves nothing for them.
     #[test]
     fn established_members_draw_from_the_whole_member_pool() {
         let t0 = Instant::now();
@@ -507,22 +503,71 @@ mod tests {
         );
     }
 
-    /// While established members are quiet, aged members borrow their idle
-    /// capacity above half, as any pool may; the members' first write stops
-    /// it.
+    /// The allowance is a cap even on a quiet server: aged-proof members
+    /// never draw more than their share of the member pool. They borrow
+    /// idle stranger and invited capacity like anyone else.
     #[test]
-    fn aged_members_borrow_idle_established_capacity() {
+    fn aged_members_stay_within_their_allowance_on_a_quiet_server() {
         let t0 = Instant::now();
         let pools = aged_pools(20, t0);
         assert!(pools.try_take(Pool::Invited, t0));
         assert!(pools.try_take(Pool::Stranger, t0));
-        assert_eq!(take_all(&pools, Pool::AgedMember, t0), 14 + 28);
+        assert_eq!(take_all(&pools, Pool::AgedMember, t0), 14);
+        // A second later invited and strangers are idle and lend above half:
+        // 5 and 10, besides the allowance's own 14.
         let t1 = t0 + ms(1_000);
-        assert!(pools.try_take(Pool::Invited, t1));
-        assert!(pools.try_take(Pool::Stranger, t1));
-        assert!(pools.try_take(Pool::Member, t1), "the reserve is there");
-        // A second's refill: aged 14 of its own, established now busy.
-        assert_eq!(take_all(&pools, Pool::AgedMember, t1), 14);
+        assert_eq!(take_all(&pools, Pool::AgedMember, t1), 14 + 5 + 10);
+        // Established members have the rest of the refilled member pool.
+        assert_eq!(take_all(&pools, Pool::Member, t1), 70 - 14);
+    }
+
+    /// CodeRabbit on #451: with a burst of one, the member pool must keep
+    /// its whole refill. A cap takes nothing from established members.
+    #[test]
+    fn a_burst_of_one_keeps_the_members_whole_rate() {
+        let t0 = Instant::now();
+        let pools = WritePools::new(
+            &PoolsSection {
+                writes_per_second: 1,
+                writes_burst: 1,
+                stranger_share_pct: 0,
+                invited_share_pct: 0,
+                aged_share_pct: 25,
+                ..PoolsSection::default()
+            },
+            t0,
+        )
+        .unwrap()
+        .unwrap();
+        let mut members = take_all(&pools, Pool::Member, t0);
+        for tick in 1..=10 {
+            members += take_all(&pools, Pool::Member, t0 + ms(1_000 * tick));
+        }
+        assert_eq!(members, 1 + 10, "one a second, the whole member rate");
+        assert_eq!(pools.refill_interval(Pool::Member), Some(ms(1_000)));
+    }
+
+    /// CodeRabbit on #451: a burst of 3 with no stranger or invited share
+    /// lent strangers nothing once the member pool was split in two. One
+    /// member bucket lends above half again, as before the split.
+    #[test]
+    fn a_small_member_pool_still_lends_to_strangers() {
+        let t0 = Instant::now();
+        let pools = WritePools::new(
+            &PoolsSection {
+                writes_per_second: 3,
+                writes_burst: 3,
+                stranger_share_pct: 0,
+                invited_share_pct: 0,
+                aged_share_pct: 50,
+                ..PoolsSection::default()
+            },
+            t0,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(pools.try_take(Pool::Stranger, t0), "the idle members lend");
+        assert!(!pools.try_take(Pool::Stranger, t0), "but only above half");
     }
 
     /// An aged share of 100 is the split turned off: aged-proof members draw
@@ -538,10 +583,10 @@ mod tests {
         assert_eq!(pools.refill_interval(Pool::Member), Some(ms(1_000) / 70));
     }
 
-    /// A burst small enough for every pool before the split leaves the aged
-    /// part under one write. The config booted before the split, so it still
-    /// boots: the aged part gets one write of burst, taken from established
-    /// members, and boot is told to warn.
+    /// A burst small enough for every pool on alpha.6 leaves the aged
+    /// allowance under one write. That config booted before, so it still
+    /// boots: the allowance is raised to one write, which takes nothing from
+    /// established members, and boot is told to warn.
     #[test]
     fn a_tiny_aged_part_boots_with_one_write_and_a_warning() {
         let t0 = Instant::now();
@@ -561,8 +606,8 @@ mod tests {
             warning.contains("set aged_share_pct to 0 or 100"),
             "{warning}"
         );
-        // While members write, the aged part holds one write, and the member
-        // pool still holds three in all.
+        // Aged members may draw one write; the member pool still holds three
+        // in all.
         assert!(pools.try_take(Pool::Member, t0), "members are active");
         assert!(pools.try_take(Pool::AgedMember, t0));
         assert!(!pools.try_take(Pool::AgedMember, t0), "only one");

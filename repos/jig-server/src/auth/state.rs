@@ -672,7 +672,8 @@ mod tests {
     }
 
     /// A tiny-burst config that booted before the member split still boots:
-    /// the pools raise the aged part to one write and boot logs a warning.
+    /// the pools raise the aged allowance to one write and boot logs a
+    /// warning.
     #[test]
     fn a_tiny_burst_config_still_boots() {
         let mut section = AuthSection::default();
