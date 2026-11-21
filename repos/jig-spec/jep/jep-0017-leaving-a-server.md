@@ -154,8 +154,8 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
       additive: a client that does not know it ignores it, and a server without it is read as
       `stocked: true`. A client MUST delete the private keys of its stock at `S` only on
       `stocked: false`, never on an empty stock (`available = 0`): `S` answers a repeat of a
-      request it already served with the same released package, so that package's key is
-      still needed.
+      request it already served with the same released package (JEP-0005 rule 21a), so that
+      package's key is still needed.
 20. **Undo:** a `jig-local-adds-v1` with `allow = true` at a higher `seq`. Uploads are accepted
     again.
 
