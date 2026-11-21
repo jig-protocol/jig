@@ -417,23 +417,43 @@ pub(crate) async fn create_with(
 
     // An encrypted channel is one MLS group, started here with the creator
     // alone in it; its epoch-0 public state rides the creation block.
+    // The group is filed under its channel's id (#432), which is the CID of
+    // the creation block that carries the group's public state: until that
+    // block is taken, under a name no channel has.
+    let pending = format!("creating:{slug}");
     let (secure, _held) = if encrypted {
         let secure = Secure::open(ctx)?;
         // Held until the create is settled, so a second `create` racing this
         // one cannot discard the group this one is about to publish.
         let held = secure.hold(slug).await?;
-        if secure.session.has_group(secure.server(), slug)? {
-            if secure.channel(slug).await?.is_some() {
-                if exist_ok {
-                    println!("channel already exists: {slug}");
-                    return Ok(false);
-                }
-                anyhow::bail!("this device already holds the group for {slug}");
+        let already = || -> Result<bool> {
+            if exist_ok {
+                println!("channel already exists: {slug}");
+                return Ok(false);
+            }
+            anyhow::bail!("this device already holds the group for {slug}")
+        };
+        // The channel this server orders under the slug, not one it carries
+        // for another server under the same slug.
+        if let Some(own) = secure.own_key(slug)
+            && secure.session.has_group(secure.server(), &own)?
+        {
+            return already();
+        }
+        if secure.session.has_group(secure.server(), &pending)? {
+            // This server's own channel under the slug: one it carries for
+            // another server is not the create this device left pending.
+            if let Some(info) = secure.own_channel(slug).await? {
+                // A create the server never answered, and took.
+                secure
+                    .session
+                    .rename_group(secure.server(), &pending, &info.id)?;
+                return already();
             }
             // Left over from a create the server never answered and never took.
-            secure.session.discard_group(secure.server(), slug)?;
+            secure.session.discard_group(secure.server(), &pending)?;
         }
-        let created = secure.session.create_group(secure.server(), slug)?;
+        let created = secure.session.create_group(secure.server(), &pending)?;
         merge(
             &mut meta,
             json!({
@@ -457,7 +477,7 @@ pub(crate) async fn create_with(
         if e.downcast_ref::<ChannelOpError>()
             .is_some_and(|c| c.status.is_client_error())
         {
-            secure.session.discard_group(secure.server(), slug)?;
+            secure.session.discard_group(secure.server(), &pending)?;
         } else {
             // No answer, or none to trust: the server may have created it
             // anyway, and then the group is the only copy of the channel's
@@ -469,7 +489,7 @@ pub(crate) async fn create_with(
                         block_cid: block.cid(),
                     })
                 }
-                Ok(_) => secure.session.discard_group(secure.server(), slug)?,
+                Ok(_) => secure.session.discard_group(secure.server(), &pending)?,
                 Err(_) => {}
             }
         }
@@ -477,6 +497,11 @@ pub(crate) async fn create_with(
     let label = tier_label(choice.tier.as_str());
     match outcome {
         Ok(result) => {
+            if let Some(secure) = &secure {
+                secure
+                    .session
+                    .rename_group(secure.server(), &pending, &result.block_cid)?;
+            }
             println!("channel created: {slug} ({label})");
             println!("  block_cid: {}", result.block_cid);
             Ok(true)
@@ -604,7 +629,7 @@ pub async fn add(ctx: &CliContext, slug: String, who: String) -> Result<()> {
         secure
             .commit(
                 &slug,
-                |s| Ok(s.prepare_add(&server, &slug, &kp, &did)?),
+                |s, key| Ok(s.prepare_add(&server, key, &kp, &did)?),
                 |c| {
                     let mut meta = json!({"channel": slug, "member_did": did});
                     merge(&mut meta, mls_fields(c));
@@ -632,7 +657,7 @@ pub async fn kick(ctx: &CliContext, slug: String, who: String) -> Result<()> {
         secure
             .commit(
                 &slug,
-                |s| Ok(s.prepare_remove(&server, &slug, &did)?),
+                |s, key| Ok(s.prepare_remove(&server, key, &did)?),
                 |c| build_member_remove(id, &slug, &did, mls_fields(c), now(id)),
             )
             .await?
@@ -653,12 +678,13 @@ pub async fn kick(ctx: &CliContext, slug: String, who: String) -> Result<()> {
 /// leaf out of the tree (a member cannot commit its own removal in MLS).
 pub async fn leave(ctx: &CliContext, slug: String) -> Result<()> {
     let secure = Secure::open(ctx)?;
+    let key = secure.pin(&slug).await?;
     let id = secure.identity();
     let me = id.did_string();
     let cid = secure
         .submit(&build_member_remove(id, &slug, &me, json!({}), now(id)))
         .await?;
-    secure.session.discard_group(secure.server(), &slug)?;
+    secure.session.discard_group(secure.server(), &key)?;
     println!("left {slug}");
     println!("  block_cid: {cid}");
     Ok(())
@@ -868,9 +894,10 @@ async fn join_encrypted(ctx: &CliContext, secure: &Secure, slug: &str) -> Result
     let me = id.did_string();
     let server = secure.server().to_string();
     let _held = secure.hold(slug).await?;
+    let key = secure.key(slug);
     // A join whose answer never came may have landed: then the group held
     // here is the one that works, and joining again would replace it.
-    if secure.session.has_group(&server, slug)? && member_role(secure, slug, &me).await?.is_some() {
+    if secure.session.has_group(&server, &key)? && member_role(secure, slug, &me).await?.is_some() {
         println!("already in {slug}");
         return Ok(());
     }
@@ -883,7 +910,7 @@ async fn join_encrypted(ctx: &CliContext, secure: &Secure, slug: &str) -> Result
     };
     for attempt in 0..2 {
         let info = secure.group_info(slug).await?;
-        let commit = secure.session.prepare_join(&server, slug, &info)?;
+        let commit = secure.session.prepare_join(&server, &key, &info)?;
         let mut meta = json!({"channel": slug, "member_did": me});
         merge(&mut meta, mls_fields(&commit));
         let block = build_with_metadata(id, BlockKind::MemberAdd, now(id), meta);
@@ -893,7 +920,7 @@ async fn join_encrypted(ctx: &CliContext, secure: &Secure, slug: &str) -> Result
                 return Ok(());
             }
             Err(e) if refused(&e) => {
-                secure.session.discard_join(&server, slug)?;
+                secure.session.discard_join(&server, &key)?;
                 let stale = e
                     .downcast_ref::<Refused>()
                     .is_some_and(|r| r.code == "STALE_EPOCH");
@@ -910,7 +937,7 @@ async fn join_encrypted(ctx: &CliContext, secure: &Secure, slug: &str) -> Result
                         Ok(())
                     }
                     Ok(None) => {
-                        secure.session.discard_join(&server, slug)?;
+                        secure.session.discard_join(&server, &key)?;
                         Err(e)
                     }
                     Err(_) => Err(e.context(format!(
