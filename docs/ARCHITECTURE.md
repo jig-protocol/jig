@@ -162,8 +162,10 @@ the DID's ed25519 key ([`credential.rs`](../repos/jig-mls/src/credential.rs) bin
   client writing to a channel its server carries for the owner has the write relayed to the owner,
   if the share's grant covers it. The owner runs it through `ingest` as a relayed write, and the
   block comes back on the follower stream with the owner's record.
-- **Not built yet:** MLS channels across servers. The follower
-  stream refuses MLS channels. The build plan is
+- **MLS channels across servers** ([`follow.rs`](../repos/jig-pipeline/src/follow.rs), JEP-0005
+  rule 19): a `shared` MLS channel is followed too. Each block the owner sequenced is checked
+  against the follower's mirror of the group's public state, and a commit or sealed message the
+  mirror refuses stops the channel. A block of any other suite is refused. The build plan is
   [`2026-10-19-f2-channel-contract.md`](superpowers/plans/2026-10-19-f2-channel-contract.md).
 
 ## Blocks and the runtime
