@@ -299,6 +299,11 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
       - it deletes the private init keys of the ordinary packages the release log
         (`GET /api/v1/custody/{did}/releases`) shows went to other servers' requesters. If one was
         used, `D` already joined with it and its key is gone; if not, it can no longer be used.
+      - Each release-log entry carries `kind`: `custody` for a release to a signed custody
+        request, `local` for a take by `S`'s own key-package route. The client deletes keys for
+        `custody` entries only. An entry without `kind`, from a server before this rule, is
+        `local` when its `channel_id` is empty and it carries no signed request (as #440 logs a
+        local take), and `custody` otherwise.
 
       The rest of the stock stays for local adds.
     - On R2 together with R1, and on R3, the client MUST delete the private init keys of every
