@@ -1095,7 +1095,10 @@ impl SignedRuleset {
         key: &ed25519_dalek::SigningKey,
     ) -> Result<Self, RulesetError> {
         let payload = document.to_payload();
-        RulesetDocument::from_payload(&payload)?;
+        // Keep what `open` will read back, not the caller's copy: they differ when the caller's
+        // document holds fields the payload skips (an `x-` event code), and the hash covers the
+        // payload.
+        let document = RulesetDocument::from_payload(&payload)?;
         let signer = crate::did::Did::from_ed25519_pubkey(&key.verifying_key().to_bytes())
             .to_did_jig_string();
         if !document.authors.contains(&signer) {
@@ -1514,6 +1517,21 @@ mod tests {
             next.version += 1;
             let b = SignedRuleset::sign(next, &alice).unwrap();
             assert_ne!(a.hash(), b.hash());
+        }
+
+        /// A signed ruleset's document is the one `open` reads back, even when the caller's copy
+        /// held a field the payload skips.
+        #[test]
+        fn a_signed_document_is_what_open_reads_back() {
+            let (alice, alice_did) = key(1);
+            let mut doc = authored(vec![alice_did]);
+            doc.events.insert("x-local".into(), 7);
+            let signed = SignedRuleset::sign(doc, &alice).unwrap();
+            assert!(!signed.document().events.contains_key("x-local"));
+            assert_eq!(
+                SignedRuleset::open(signed.envelope()).unwrap().document(),
+                signed.document()
+            );
         }
 
         /// `sign` refuses what `open` would refuse, so it never returns an envelope nobody can
