@@ -81,6 +81,8 @@ pub struct LogEntryBody {
     pub kind: String,
     /// The released package's hash reference, lowercase hex.
     pub reference_hex: String,
+    /// The entry's own identity, unique in the log, lowercase hex.
+    pub id_hex: String,
     pub requester: String,
     pub channel_id: String,
     pub last_resort: bool,
@@ -389,6 +391,7 @@ pub async fn release_log(
         .map(|e| LogEntryBody {
             kind: e.kind.as_str().to_string(),
             reference_hex: hex::encode(&e.reference),
+            id_hex: hex::encode(&e.id),
             requester: e.requester,
             channel_id: e.channel_id,
             last_resort: e.last_resort,
@@ -618,15 +621,19 @@ mod tests {
             jig_core::request_auth::headers::SIGNATURE,
             "not base64!".parse().unwrap(),
         );
-        assert!(
-            get_reachability(
-                State(state.clone()),
-                Path(did_of(4)),
-                path.parse().unwrap(),
-                malformed
-            )
-            .await
-            .is_err()
+        let refused = get_reachability(
+            State(state.clone()),
+            Path(did_of(4)),
+            path.parse().unwrap(),
+            malformed,
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(
+            code(&refused),
+            (StatusCode::UNAUTHORIZED, "INVALID_SIG".into()),
+            "refused, not answered as anonymous with NO_RECORD"
         );
         // A proof that does not verify is refused, not read as anonymous.
         let mut forged = axum::http::HeaderMap::new();
@@ -636,15 +643,18 @@ mod tests {
         {
             forged.insert(name, value.parse().unwrap());
         }
-        assert!(
-            get_reachability(
-                State(state.clone()),
-                Path(did_of(4)),
-                path.parse().unwrap(),
-                forged
-            )
-            .await
-            .is_err()
+        let refused = get_reachability(
+            State(state.clone()),
+            Path(did_of(4)),
+            path.parse().unwrap(),
+            forged,
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(
+            code(&refused),
+            (StatusCode::UNAUTHORIZED, "INVALID_SIG".into())
         );
     }
 

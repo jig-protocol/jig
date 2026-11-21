@@ -350,6 +350,15 @@ enum Kept {
     Record(ReachabilityRecord),
 }
 
+/// Whether the record a server keeps for `did`, as it answered, leaves
+/// `server_did` out (a withdrawal there). `None` when the answer is not a
+/// record `did` signed: nothing can be concluded from it.
+fn kept_leaves_out(body: &RecordBody, did: &str, server_did: &str) -> Option<bool> {
+    let envelope = STANDARD.decode(&body.record_b64).ok()?;
+    let record = ReachabilityRecord::from_envelope(&envelope).ok()?;
+    (record.did == did).then(|| !record.servers.iter().any(|(s, _)| s == server_did))
+}
+
 /// Guards a walk of the release log's pages against a server that ignores
 /// `offset`: a page the same as the one before, or more pages than any log
 /// can hold, ends the walk with an error that names the server.
@@ -982,13 +991,17 @@ impl Secure {
             }
             let withdrawn = match req.send().await {
                 Ok(resp) if resp.status().is_success() => {
-                    limits::json_capped::<RecordBody>(resp, limits::MAX_DOCUMENT_BYTES)
+                    let body = limits::json_capped::<RecordBody>(resp, limits::MAX_DOCUMENT_BYTES)
                         .await
-                        .ok()
-                        .and_then(|b| STANDARD.decode(b.record_b64).ok())
-                        .and_then(|e| ReachabilityRecord::from_envelope(&e).ok())
-                        .filter(|r| r.did == did)
-                        .is_some_and(|r| !r.servers.iter().any(|(s, _)| *s == server_did))
+                        .ok();
+                    match body.and_then(|b| kept_leaves_out(&b, &did, &server_did)) {
+                        Some(withdrawn) => withdrawn,
+                        // An answer that is not our record: not checked.
+                        None => {
+                            unchecked.insert(server_did.clone());
+                            false
+                        }
+                    }
                 }
                 // No record there: nothing to restore, so sending is safe.
                 Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => false,
@@ -1214,7 +1227,7 @@ impl Secure {
             #[serde(default)]
             request_b64: String,
             #[serde(default)]
-            released_at: i64,
+            id_hex: Option<String>,
         }
         #[derive(Deserialize)]
         struct Log {
@@ -1237,17 +1250,9 @@ impl Secure {
                 },
             };
             let n = log.releases.len();
-            // Each entry is told apart by its package and time; a server that
-            // sends no references leaves only the page cap.
-            let ids: Option<Vec<String>> = log
-                .releases
-                .iter()
-                .map(|e| {
-                    e.reference_hex
-                        .as_ref()
-                        .map(|r| format!("{r}@{}", e.released_at))
-                })
-                .collect();
+            // Each entry is told apart by its own id; a server that sends
+            // none leaves only the page cap.
+            let ids: Option<Vec<String>> = log.releases.iter().map(|e| e.id_hex.clone()).collect();
             walk.page(&self.server, ids)?;
             for e in log.releases {
                 let custody = match e.kind.as_deref() {
@@ -2174,9 +2179,39 @@ fn shadow_note(reference: &str, own: &ChannelInfo, carried: &ChannelInfo) -> Str
 #[cfg(test)]
 mod tests {
     use super::{
-        ChannelInfo, LogWalk, group_name, must_encrypt, ordered_here, own_group_name, pick,
-        sequencers_for, shadow_note,
+        ChannelInfo, LogWalk, RecordBody, group_name, kept_leaves_out, must_encrypt, ordered_here,
+        own_group_name, pick, sequencers_for, shadow_note,
     };
+
+    #[test]
+    fn an_answer_that_is_not_our_record_concludes_nothing() {
+        use base64::Engine as _;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[4; 32]);
+        let did =
+            jig_core::Did::from_ed25519_pubkey(&key.verifying_key().to_bytes()).to_did_jig_string();
+        let other = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
+        let b64 = |e: &[u8]| base64::engine::general_purpose::STANDARD.encode(e);
+        let rec = |k: &ed25519_dalek::SigningKey, servers: Vec<(String, String)>| {
+            jig_core::naming::ReachabilityRecord::sign(k, servers, 3).envelope
+        };
+        let did_from = |seed: u8| {
+            let k = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+            jig_core::Did::from_ed25519_pubkey(&k.verifying_key().to_bytes()).to_did_jig_string()
+        };
+        let s = did_from(10);
+        let t = did_from(11);
+        let body = |record_b64: String| RecordBody { record_b64 };
+        // Ours, leaving S out: a withdrawal. Ours, listing S: not.
+        let out = rec(&key, vec![(t.clone(), "u".into())]);
+        assert_eq!(kept_leaves_out(&body(b64(&out)), &did, &s), Some(true));
+        let listed = rec(&key, vec![(s.clone(), "u".into())]);
+        assert_eq!(kept_leaves_out(&body(b64(&listed)), &did, &s), Some(false));
+        // Not base64, not a record, or someone else's: nothing concluded.
+        assert_eq!(kept_leaves_out(&body("not base64!".into()), &did, &s), None);
+        assert_eq!(kept_leaves_out(&body(b64(b"garbage")), &did, &s), None);
+        let theirs = rec(&other, vec![(t.clone(), "u".into())]);
+        assert_eq!(kept_leaves_out(&body(b64(&theirs)), &did, &s), None);
+    }
 
     fn ids(xs: &[&str]) -> Option<Vec<String>> {
         Some(xs.iter().map(|x| x.to_string()).collect())
@@ -2196,7 +2231,7 @@ mod tests {
 
     #[test]
     fn distinct_pages_of_local_takes_are_not_a_repeat() {
-        // Local takes carry no request; their packages and times differ.
+        // Local takes of one package in one second differ only by their ids.
         let mut walk = LogWalk::default();
         walk.page("S", ids(&["a@1", "b@1"])).unwrap();
         walk.page("S", ids(&["c@1", "d@1"])).unwrap();
