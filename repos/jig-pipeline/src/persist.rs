@@ -54,11 +54,14 @@ impl ReleaseKind {
         }
     }
 
-    fn parse(s: &str) -> Self {
-        if s == "custody" {
-            ReleaseKind::Custody
-        } else {
-            ReleaseKind::Local
+    /// Strict: an unknown value is an error, never a default. A misread
+    /// `custody` row taken as `local` would keep a released package's init key
+    /// alive through R1's rotation (JEP-0017 rule 32).
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "custody" => Some(ReleaseKind::Custody),
+            "local" => Some(ReleaseKind::Local),
+            _ => None,
         }
     }
 }
@@ -2880,7 +2883,16 @@ impl SqliteStore {
                     last_resort: r.get(2)?,
                     request: r.get(3)?,
                     released_at: r.get(4)?,
-                    kind: ReleaseKind::parse(&r.get::<_, String>(5)?),
+                    kind: {
+                        let raw: String = r.get(5)?;
+                        ReleaseKind::parse(&raw).ok_or_else(|| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                5,
+                                rusqlite::types::Type::Text,
+                                format!("unknown release kind `{raw}`").into(),
+                            )
+                        })?
+                    },
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -5075,6 +5087,34 @@ mod tests {
             store.release_key_package(&a).unwrap(),
             Release::Released { .. }
         ));
+    }
+
+    #[test]
+    fn a_release_kind_parses_strictly() {
+        assert_eq!(ReleaseKind::parse("custody"), Some(ReleaseKind::Custody));
+        assert_eq!(ReleaseKind::parse("local"), Some(ReleaseKind::Local));
+        for bad in ["", "Custody", "remote", "local "] {
+            assert_eq!(ReleaseKind::parse(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_release_row_of_unknown_kind_is_an_error_not_a_default() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let did = "did:jig:zD";
+        store
+            .insert_key_package(b"r1", did, b"kp1", false, 1)
+            .unwrap();
+        store
+            .release_key_package(&ask(did, "did:jig:zA", b"h1", 100))
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE kp_releases SET kind = 'remote'", [])
+            .unwrap();
+        assert!(store.key_package_releases(did, 10).is_err());
     }
 
     #[test]
