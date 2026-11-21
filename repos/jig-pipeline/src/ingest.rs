@@ -181,9 +181,6 @@ pub struct IngestContext {
     /// anyway. Wired from `[identity] naively_allow_unknown_handles_fallback`.
     /// Surfaces in `unsafe_options_active`.
     pub naively_allow_unknown_handles_fallback: bool,
-    /// `[federation] naively_accept_peer_relayed_creates`. Read by nothing
-    /// since this server stopped taking relayed blocks; the key goes next.
-    pub naively_accept_peer_relayed_creates: bool,
     /// Executes canonical Wasm block modules, holding them pre-compiled.
     ///
     /// `None` is a statement that this server does not execute Wasm-backed kinds
@@ -2682,7 +2679,6 @@ mod tests {
             fanout: Arc::new(Fanout::new()),
             server_url: "ws://127.0.0.1:7117".to_string(),
             naively_allow_unknown_handles_fallback: false,
-            naively_accept_peer_relayed_creates: false,
             // Shared, so the ~16ms module compile is paid once for the whole
             // test binary rather than per test.
             executor: Some(crate::executor::BlockExecutor::shared()),

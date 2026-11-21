@@ -194,12 +194,6 @@ list_handles = false
 # DID is still checked at the handshake, but nothing after it is protected;
 # the flag is advertised in /.well-known/jig. Prefer wss://.
 # dangerously_allow_plaintext_federation = false
-# A channel reaches a peer only once it is shared. This flag has no effect:
-# this server takes no relayed blocks, so there is no relayed create for it
-# to copy. Servers that trust each other set offers = "accept" in the peer
-# entry and use `jig channel share`. Set, it is still advertised in
-# /.well-known/jig as an unsafe option.
-# naively_accept_peer_relayed_creates = false
 # Listing a peer is what trusts it: this server dials `url` (it appends
 # /api/v1/ws), refuses a welcome signed by any DID but `expected_did`, and
 # offers a share only to a listed server. Both servers list each other.

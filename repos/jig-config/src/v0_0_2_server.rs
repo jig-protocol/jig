@@ -507,15 +507,6 @@ pub struct FederationSection {
     /// still checked by the signed welcome, but nothing after the welcome is
     /// protected on a plaintext link. Surfaces in `unsafe_options_active`.
     pub dangerously_allow_plaintext_federation: bool,
-    /// For tests only: a `channel-create` a configured peer relays, which
-    /// names another server as its sequencer (or none), is stored as a copy
-    /// this server sequences, as the legacy relay did before creates named
-    /// their sequencer. Clients refuse to read such a copy, because its
-    /// creation block names another server. Off, such a create is refused,
-    /// and a channel reaches a peer only once it is shared (JEP-0005):
-    /// servers that trust each other set `offers = "accept"` and use
-    /// `jig channel share`. Surfaces in `unsafe_options_active`.
-    pub naively_accept_peer_relayed_creates: bool,
     /// The quota for every peer without its own `quota`, published in the
     /// server manifest (JEP-0005 rule 16). Defaults to
     /// [`DEFAULT_PEER_BLOCKS_PER_MIN`] blocks and [`DEFAULT_PEER_BYTES_PER_MIN`]
@@ -561,7 +552,6 @@ impl Default for FederationSection {
             peers: Vec::new(),
             dangerously_disable_federation_tls: false,
             dangerously_allow_plaintext_federation: false,
-            naively_accept_peer_relayed_creates: false,
             default_peer_quota: PeerQuotaConfig {
                 blocks_per_min: DEFAULT_PEER_BLOCKS_PER_MIN,
                 bytes_per_min: DEFAULT_PEER_BYTES_PER_MIN,
@@ -1157,9 +1147,6 @@ impl JigServerConfig {
         if self.federation.dangerously_allow_plaintext_federation {
             active.push("federation.dangerously_allow_plaintext_federation".to_string());
         }
-        if self.federation.naively_accept_peer_relayed_creates {
-            active.push("federation.naively_accept_peer_relayed_creates".to_string());
-        }
         if self.identity.naively_allow_unknown_handles_fallback {
             active.push("identity.naively_allow_unknown_handles_fallback".to_string());
         }
@@ -1401,7 +1388,6 @@ mod tests {
         let cfg = JigServerConfig::default();
         assert!(!cfg.federation.dangerously_disable_federation_tls);
         assert!(!cfg.federation.dangerously_allow_plaintext_federation);
-        assert!(!cfg.federation.naively_accept_peer_relayed_creates);
         assert!(!cfg.identity.naively_allow_unknown_handles_fallback);
         assert!(!cfg.debug.list_handles);
     }
@@ -1448,7 +1434,6 @@ mod tests {
         let mut cfg = JigServerConfig::default();
         cfg.federation.dangerously_disable_federation_tls = true;
         cfg.federation.dangerously_allow_plaintext_federation = true;
-        cfg.federation.naively_accept_peer_relayed_creates = true;
         cfg.identity.naively_allow_unknown_handles_fallback = true;
         cfg.identity.dangerously_allow_plaintext_nameservers = true;
         cfg.debug.list_handles = true;
@@ -1461,7 +1446,6 @@ mod tests {
         assert!(active.contains(&"auth.require_authenticated_reads=false".to_string()));
         assert!(active.contains(&"federation.dangerously_disable_federation_tls".to_string()));
         assert!(active.contains(&"federation.dangerously_allow_plaintext_federation".to_string()));
-        assert!(active.contains(&"federation.naively_accept_peer_relayed_creates".to_string()));
         assert!(active.contains(&"identity.naively_allow_unknown_handles_fallback".to_string()));
         assert!(active.contains(&"identity.dangerously_allow_plaintext_nameservers".to_string()));
         assert!(active.contains(&"debug.list_handles".to_string()));
@@ -1790,6 +1774,24 @@ mod tests {
             .expect_err("a misspelled per-bridge key must be rejected");
         assert!(err.to_string().contains("enabeld"), "got: {err}");
         assert!(toml::from_str::<JigServerConfig>("[sever]\n").is_err());
+    }
+
+    /// `naively_accept_peer_relayed_creates` went with the legacy relay it
+    /// configured. A config that still sets it does not boot, and the error
+    /// names the key, so the operator knows which line to delete.
+    #[test]
+    fn the_removed_relayed_creates_flag_is_refused_by_name() {
+        for value in ["true", "false"] {
+            let err = toml::from_str::<JigServerConfig>(&format!(
+                "[federation]\nnaively_accept_peer_relayed_creates = {value}\n"
+            ))
+            .expect_err("the removed key must not parse");
+            assert!(
+                err.to_string()
+                    .contains("naively_accept_peer_relayed_creates"),
+                "{err}"
+            );
+        }
     }
 
     #[test]
