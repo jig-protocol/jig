@@ -64,7 +64,9 @@ Non-goals:
 2. The **subject** is the DID asking, or the session key of an `--anon` identity.
 3. An **action** is a registered label (rule 11). The action's **binding** is the bytes the work
    commits to for that action.
-4. **Effort** `E` is an integer, at least 1: the expected number of digests a solver computes.
+4. **Effort** `E` is an integer, at least 1: the expected number of **attempts** a solver makes
+   under its algorithm. An attempt is one digest under `alg = 1`, and one tested solution under
+   `alg = 2` (rule 8c).
 5. **Members**, **invited** and **strangers** are the capacity pools (rules 20–25).
 
 ## The puzzle
@@ -83,22 +85,82 @@ Non-goals:
 7. Work is **valid** for effort `E` when the first 8 bytes of the output of algorithm `alg`,
    read as a big-endian unsigned integer `d`, satisfy `d ≤ ⌊(2^64 − 1) / E⌋`.
    - For `E = 2^b`, this is the same test as "at least `b` leading zero bits".
-8. **Algorithms.** `alg = 1` is the digest of rule 6 itself. Further algorithms are registered by
-   JEP amendment; Equi-X is the candidate if R1's measurements justify it.
-   - A verifier MUST state the `alg` it requires with the effort (rule 16).
-   - A verifier MUST refuse work under an algorithm it did not ask for.
+8. **Algorithms.** `alg = 1` is the digest of rule 6 itself. `alg = 2` is Equi-X (rules 8a–8d).
+   Further algorithms are registered by JEP amendment.
+   - A verifier MUST state each `alg` it accepts, with that algorithm's effort, in a signed offer
+     (rules 8e and 16).
+   - A verifier MUST refuse work under an algorithm its offer did not name.
+8a. **`alg = 2`, Equi-X.** It is tevador's Equi-X, the asymmetric, memory-bound puzzle that Tor
+    uses for onion-service denial-of-service defence (Tor proposal 327, `hs pow v1`), over HashX.
+    - Its **challenge** `C` is the 32-byte digest of rule 6, computed with `alg` = 2. The nonce
+      is inside `C`, so a solver tries a new nonce to get a new challenge.
+    - Solving `C` yields zero or more **solutions**. Each solution is eight 16-bit indices,
+      encoded as 16 bytes, each index little-endian, as Equi-X encodes them.
+    - Each solution `S` gives an **output**: the labelled BLAKE3 hash, as in rule 6, of
+      (`domain`, `jig-pow-equix-v1`), (`challenge`, `C`) and (`solution`, `S`).
+8b. **Validity under `alg = 2`.** Work is valid for effort `E` when both hold:
+    1. the output passes rule 7's test for `E`; and
+    2. `S` is a valid Equi-X solution for `C`.
+8c. **One attempt is one tested solution.** A solver tests every solution of every challenge it
+    solves against rule 7, so `E` is the expected number of solutions it tests. Equi-X yields
+    about two solutions per challenge, so the expected number of solves is about `E / 2`.
+8d. **The proof under `alg = 2`** is `{alg, effort, nonce, salt_id, solution}`. In JSON,
+    `solution` is unpadded base64url of its 16 bytes. A proof under `alg = 1` carries no
+    `solution`, and a verifier MUST refuse one that does.
+8e. **Offering more than one algorithm.** An offer names a **primary** algorithm and its effort
+    in the fields it has today (`alg`, `effort`), and MAY add `alts: [{alg, effort}]` inside the
+    same signed object.
+    - A client that understands an alternative MAY solve it instead of the primary. A client
+      that understands none of them solves the primary.
+    - A verifier accepts a proof under any algorithm its offer named, at that algorithm's effort.
+    - Old clients read only `alg` and `effort`, so `alts` changes nothing for them.
+8f. **Efforts across algorithms.** The controller (rule 17), length scaling and penalties
+    (rules 18 and 26) work in `alg = 1` digests. The verifier converts the result for
+    `alg = 2`:
+
+    ```
+    effort(alg 2) = max(1, ⌈effort(alg 1) / digests_per_solution⌉)
+    ```
+
+    - `digests_per_solution` is the number of `alg = 1` digests that cost the slowest client the
+      verifier means to serve as much as one tested Equi-X solution (rule 19). It is measured,
+      not derived (#337).
+    - Both efforts in one offer therefore ask a phone for about the same time, and no other
+      state is kept per algorithm.
 9. **No secret.** Nothing in the puzzle is keyed. A solver MUST be able to compute it from the
    verifier's DID, its own key, the action's binding and the published salt alone. A verifier
    MUST NOT key the digest with any secret.
 10. **The proof** is `{alg, effort, nonce, salt_id}` where `salt_id` names the salt (rule 13). A
     verifier checks it with one evaluation of the algorithm. It MUST check the work before any
     signature verification, database read or other costly step for the same request.
+    - Under `alg = 2`, the verifier checks in this order, and stops at the first failure:
+      1. the proof's shape and bounds, which cost nothing;
+      2. rule 7's test on the output, which costs two BLAKE3 hashes (`C`, then the output);
+      3. Equi-X verification of `S` for `C`, within the budget of rule 10a;
+      4. only then any signature or store read.
     - `effort` is the solver's bid, at least the effort asked (rule 20). The verifier checks the
       work against the bid.
     - In JSON, `alg`, `effort` and `salt_id` are integers and `nonce` is unpadded base64url.
 
 ## Actions and bindings
 
+10a. **Verification budget (`alg = 2`).** Step 3 costs far more than a digest, and at the small
+     efforts `alg = 2` uses, step 2 is cheap to pass with a made-up solution. A verifier
+     therefore bounds how often it runs step 3:
+     - **Per address.** At most `equix_verifies_per_window` proofs from one address (IPv6 per
+       /64) reach step 3 per `controller_window_secs`. Over that, the verifier refuses without
+       running step 3, as `RATE_LIMITED`. This costs the sender nothing beyond the refusal, and
+       charges no penalty.
+     - **Per challenge.** In challenge mode, a challenge whose `alg = 2` proofs have failed step 3
+       `max_failed_verifies` times is consumed, and the sender asks for a new one under the
+       challenge rate limits.
+     - A proof that fails step 3 charges the sender's address (rule 26), as any work that does not
+       verify does.
+
+     A botnet spreads across addresses and walks past the per-address bound. It is bounded by
+     how fast it obtains challenges, and for `admit` and stamps by the server's capacity to spend
+     on step 3. A verifier sets `equix_verifies_per_window` so that this capacity is a small
+     share of one core.
 11. Actions, their modes and their bindings:
 
     | Action | Verifier | Mode | Binding |
@@ -135,7 +197,8 @@ Non-goals:
 15. The epoch salt and its epoch number are published in the verifier's signed welcome and
     `server-manifest` (JEP-0002, JEP-0005 rule 16) and in every refusal (rule 16).
     `/.well-known/jig` MAY repeat them as a hint, never as the authority.
-    - The welcome's `admit` states admission's ask as `{alg, effort, salt_id, expires_at}`:
+    - The welcome's `admit` states admission's ask as `{alg, effort, salt_id, expires_at}`,
+      with `alts` as in rule 8e:
       `salt_id` is 0, and `expires_at` (Unix seconds) is when the verifier stops promising to
       accept a proof at that `effort`. The field is absent when admission asks no work. A
       `salt_id` other than 0 contradicts the welcome.
@@ -143,7 +206,8 @@ Non-goals:
 ## Effort: the controller and the refusal
 
 16. A verifier that requires work for a request refuses it with `PROOF_OF_WORK_REQUIRED`, carrying
-    `{action, alg, effort, salt_id, salt, expires_at}`, signed by the verifier's DID.
+    `{action, alg, effort, alts?, salt_id, salt, expires_at}`, signed by the verifier's DID. A
+    nameserver's challenge offer carries `alts` in the same way.
     - `effort` is the effort the request needs now (rule 18).
     - A client MUST verify the signature against the DID it pinned for the verifier, and MUST
       ignore an unsigned or wrongly signed effort.
@@ -174,12 +238,23 @@ Non-goals:
     parameters (JEP-0009). Without a ruleset they are server configuration.
     - A verifier MUST set `max_effort(action)` so that the slowest client it means to serve finishes
       within `max_solve_secs`.
-    - A verifier MUST NOT ask for more than `2^28` for `admit`, or `2^28` for any challenge action.
+    - A verifier MUST NOT ask for more than `2^28` for `admit`, or `2^28` for any challenge action,
+      under `alg = 1`. Under `alg = 2`, the cap is `⌈2^28 / digests_per_solution⌉`.
     - A client SHOULD refuse an effort above those caps.
     - A verifier cannot measure its clients, so a client SHOULD also derive its own cap from its
       measured solve rate × `max_solve_secs`, by a short calibration run on the cores it will
       solve with, and refuse an effort above that cap as it would one above `2^28`.
     - A ruleset MAY set `min_effort ≥ 1` (a floor). The reference ruleset sets none.
+19a. **Units.** Every parameter of this JEP is an integer, and none is a float:
+     - efforts (`min_effort`, `max_effort`, the controller's start) are counts of `alg = 1`
+       digests (rule 8f);
+     - `digests_per_solution` is a count of `alg = 1` digests;
+     - budgets (`equix_verifies_per_window`, `max_failed_verifies`, `queue_len`) are counts;
+     - shares are percentages, as rule 23 states them;
+     - times are seconds on the verifier's own clock, in keys ending `_secs` (TM-01).
+
+     PoW stays on the verifier's clock: it is local admission policy, not a computation others
+     check. JEP-0009 rule 52's units bind only what `f` reads.
 20. **Client behaviour.** A client:
     - bids at least the signed `effort`;
     - on another refusal for the same request, doubles its bid, up to `max_effort`;
@@ -284,16 +359,31 @@ Non-goals:
 - **Forged load signals.** The effort is signed and checked against the pinned DID (rule 16).
 - **Precomputation.** Stamps are bounded to one epoch. An admission can be precomputed, but that
   only moves the same cost earlier.
-- **Verifier exhaustion.** Checking work costs one digest and comes before every costly step
-  (rule 10).
+- **Verifier exhaustion.** Under `alg = 1`, checking work costs one digest and comes before every
+  costly step (rule 10). Under `alg = 2`, the target test costs two digests. The Equi-X check
+  costs much more, so it is bounded per address and per challenge (rule 10a).
 - **TM-01.** Epochs and decay run on the verifier's clock.
 
 **Residual risks:**
 
 - Honest newcomers are slowed while the stranger pool is under attack. JEP-0009's invites let a
   newcomer use the invited pool instead.
-- A GPU-equipped attacker gets far more stranger-pool priority per unit of cost than a phone.
-  Algorithm agility (rule 8) is the answer if R1's measurements show it matters.
+- A GPU-equipped attacker gets far more stranger-pool priority per unit of cost than a phone
+  under `alg = 1`. Equi-X narrows that gap, but only where the verifier stops offering `alg = 1`.
+  While both are offered, the attacker picks the one that suits its hardware (rule 8e).
+- **Equi-X is memory-bound, not strongly memory-hard.** It uses about 2 MB per solve, so it fits
+  in a CPU cache. Its GPU resistance comes mostly from HashX's random programs, one per challenge.
+  An FPGA or ASIC for HashX is possible in principle. None is known, and no break of Equi-X has
+  been published to date. A break would be met by registering a new `alg`, as rule 8 allows.
+- **A shared address shares the Equi-X budget.** Everyone behind one carrier-grade NAT or one
+  /64 draws on the same `equix_verifies_per_window` (rule 10a), so one flooder there can spend it
+  for all of them. They are refused `RATE_LIMITED` with no penalty. While `alg = 1` is offered,
+  they can fall back to it. On a verifier that has dropped `alg = 1` (migration step 3), they wait
+  for the next window.
+- **Clients without the HashX compiler** solve with an interpreter, which is several times slower:
+  browsers and Wasm hosts, and platforms that forbid JIT code, such as iOS. They pay more under
+  `alg = 2` than under `alg = 1`. Verification is cheap with or without the compiler, so small and
+  Wasm-hosted verifiers are not affected.
 - Before JEP-0009, membership is local policy, so a new server has few members and its stranger
   pool carries most of its traffic.
 
@@ -309,11 +399,27 @@ a nonce. No message links two DIDs.
 - The nameserver's legacy keyed PoW (`/v1/challenge` POST, `/v1/claim`, `/v1/alias`) is removed
   with those routes (lane L6), not migrated.
 - `admission_pow_bits` in `/.well-known/jig` is replaced by the signed effort and salt of rule 15.
+- **Migration to `alg = 2`**, in three releases. Each step is a verifier default, not a protocol
+  change, because rule 8e lets old and new clients share one offer:
+  1. **Alternative.** Clients learn `alg = 2`. Verifiers MAY add it as an `alts` entry. The
+     primary stays `alg = 1`, so every client still works.
+  2. **Primary.** The reference verifiers offer `alg = 2` as primary and `alg = 1` as an
+     alternative. A client solves `alg = 2` whenever it is offered, unless it has no HashX
+     compiler and the `alg = 1` alternative is cheaper for it.
+  3. **Sole.** The reference verifiers stop offering `alg = 1` by default. An operator MAY keep
+     it, and accepts that a GPU then picks it. Without it, clients behind a shared address lose
+     their fallback when a flooder there spends the Equi-X budget (rule 10a).
+
+  Each step needs `digests_per_solution` measured on #337's set-up first.
 
 # Reference Implementation
 
 `jig_core::pow` (milestone R1): the digest, the effort test, the solver and the proof. The
 verifiers that ask for work are built on it in R1's later tasks.
+
+`alg = 2`: not yet implemented. The reference implementation would use the `equix` and `hashx`
+crates from the Tor Project's Arti, which are pure Rust and dual MIT/Apache-2.0. The licence
+needs `cargo deny` to pass when the dependency is added.
 
 # Test Vectors
 
@@ -325,6 +431,11 @@ verifiers that ask for work are built on it in R1's later tasks.
 `vectors/0008/ns-pow.json`: a nameserver's signed offer (`jig-ns-pow-offer-v1`), which it
 returns with a challenge and restates in its `428` refusal, and the interim `ns-rotate` binding.
 
+To add with `alg = 2`:
+- one proof per action, with `C`, `S`, the output and the effort;
+- a proof whose output passes rule 7 but whose solution is invalid;
+- an offer with `alts`, and the conversion of rule 8f for one `digests_per_solution`.
+
 # Rejected Alternatives
 
 - **PoW as the price of an identity.** Any effort a phone tolerates is cheap for a GPU and free for
@@ -334,9 +445,17 @@ returns with a challenge and restates in its `428` refusal, and the interim `ns-
   (D26).
 - **Argon2 and other puzzles that are as slow to verify as to solve.** The verifier becomes the
   target.
-- **Equi-X as the only algorithm, now.** It narrows the GPU gap but does nothing against botnets,
-  and its HashX JIT is a poor fit for potato-class and Wasm-hosted servers. It stays a candidate
-  under rule 8.
+- **RandomX.** Verifying it costs as much as hashing, and needs a 256 MB cache.
+- **Equihash at its common parameters**, (200,9) and (144,5). ASICs exist for both. Its verification
+  is cheap, but the hardware gap it was meant to close is already gone.
+- **Cuckoo Cycle and Cuckatoo.** Verification is cheap (42 edges), but the larger graph sizes are
+  tuned for ASICs, and the memory they need is too much for a phone. The Cuckaroo variants favour
+  GPUs.
+- **Argon2 with Merkle proofs (MTP).** It makes a memory-hard function verifiable, but published
+  time-memory trade-offs weaken it (Dinur and Nadler, 2017), and its proofs are large.
+- **Equi-X as the only algorithm, now.** It narrows the GPU gap but does nothing against botnets.
+  Clients without the HashX compiler solve it slowly. It is registered as `alg = 2` beside
+  `alg = 1`, and migration retires `alg = 1` only by default (Backwards Compatibility).
 - **Refusing unknown subjects under load.** That makes unknown mean low, which punishes the key
   discarding that the anonymity model depends on.
 
