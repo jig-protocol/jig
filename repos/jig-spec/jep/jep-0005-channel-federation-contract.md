@@ -239,6 +239,9 @@ Non-goals for v0.2:
     `{channel_id, seq, ingest_hlc, block_cid, prev}`, signed by the owner.
     - Followers MUST relay the record unchanged and MUST NOT re-sign it.
 13. Followers MUST keep the chain and MUST deliver blocks to their users in `seq` order.
+    - A block the follower already holds in another channel of its own, whose chain names it
+      too, is kept in both chains, each under its own record. The follower MUST NOT move it or
+      re-sign either record (#427).
 14. A follower MUST stop delivering the channel when it sees any of these, and SHOULD
     surface the conflicting records as evidence:
     - a gap in `seq`;
