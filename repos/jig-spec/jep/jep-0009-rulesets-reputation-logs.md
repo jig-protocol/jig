@@ -312,8 +312,9 @@ binds R3 (rules 7–22) as well: R3's nameservers and R2.4's single server compu
     refusing it:
     - `ack` (rule 5). Until a subject's `ack` for `H` is in the epoch log, `f` ignores every leaf
       about the subject, so no leaf can lower an unacknowledged subject's standing (GV-03);
-    - `event`: `{v, ruleset: H, reporter, subject_commit, code, count, ref?, evidence: [CID]}`,
-      one reporter's observation under a code of rule 9. In a group, events are the entries of
+    - `event`: `{v, ruleset: H, reporter, subject_commit, code, count, covers?, ref?,
+      evidence: [CID]}`, one reporter's observation under a code of rule 9. `covers` names the
+      epoch a `good-standing-interval` is for (rule 45). In a group, events are the entries of
       reports (rule 7). Outside a group, they are the server's own observations;
     - `verdict` (JEP-0010 rules 21–22), applied as `verdict-applied` with the verdict's penalty;
     - `uw-result` aggregates (JEP-0016 rules 20a and 29);
@@ -421,14 +422,22 @@ binds R3 (rules 7–22) as well: R3's nameservers and R2.4's single server compu
     `receipt_positions` past the log's size when it signed.
     - A receipt and a later checkpoint without the leaf is an `omission` fraud proof.
     - **The owner's duty.** Under a ruleset that defines `good-standing-interval`, the epoch log's
-      owner MUST log one `event` with that code and `count = 1` for each acknowledged subject it
-      ingested at least one block from in epoch `N` and logged no negative leaf about in `N`.
-      The count is 1 however many blocks the subject wrote, because accrual is capped per epoch
-      (rule 17).
+      owner MUST log one `event` with that code, `count = 1` and `covers = N` for each
+      acknowledged subject it ingested at least one block from in epoch `N` and logged no
+      negative leaf about in `N`.
+      - It logs these after `N` closes, during epoch `N + 1`, and never before. Only then does it
+        know which checkpoint closed `N` (rule 36) and whether a negative leaf arrived in `N`.
+        A whole epoch of grace closes on cosigned time, so appending leaves cannot cut it short.
+      - `f` applies a `good-standing-interval` in the epoch it is logged, only when its `covers`
+        is the previous epoch, and at most one per subject per covered epoch. Every epoch thus
+        receives exactly the previous epoch's intervals, and the accrual cap never clips one.
+      - The count is 1 however many blocks the subject wrote, because accrual is capped per
+        epoch (rule 17).
     - For what the owner observes itself, the subject holds receipts too: the owner-signed
       `ingest` record of each block it wrote (JEP-0002; JEP-0005 rule 12). An `ingest` record in
-      epoch `N`, no negative leaf about the subject in `N`, and no `good-standing-interval`
-      applied is an `omission` fraud proof against that duty.
+      epoch `N`, no negative leaf about the subject in `N`, epoch `N + 1` closed, and no
+      `good-standing-interval` with `covers = N` in `N + 1` is an `omission` fraud proof against
+      that duty. An owner that could not yet have complied cannot be convicted.
     - Witnessed and gossiped checkpoints (rule 33; JEP-0016 rules 22–23) make a split view
       detectable. Something the owner never received and never signed for is outside what any
       rule can prove.
