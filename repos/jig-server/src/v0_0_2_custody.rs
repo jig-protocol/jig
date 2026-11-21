@@ -199,15 +199,13 @@ pub async fn put_reachability(
         .admit_and_charge(&did)
         .map_err(|outcome| refuse(&state, &outcome, started))?;
     let store = &state.ingest_ctx.store;
+    // A withdrawal also retires what this server released through custody
+    // before it, in the same transaction: those are never answered again as
+    // repeats, since their owner deletes the keys (JEP-0017 rule 32), even if
+    // custody is restored inside the window.
     let stored = store
-        .put_reachability(&did, record.seq, &envelope, &ours, now())
+        .put_reachability_retiring(&did, record.seq, &envelope, &ours, now(), !listed)
         .map_err(persist_err)?;
-    // A withdrawal: what this server released through custody before it is
-    // never answered again as a repeat, since its owner deletes those keys
-    // (JEP-0017 rule 32), even if custody is restored inside the window.
-    if stored && !listed {
-        store.retire_custody_releases(&did).map_err(persist_err)?;
-    }
     let seq = kept_record(&state, &did)?.map_or(record.seq, |kept| kept.seq);
     Ok(Json(StoredBody { stored, seq }))
 }
@@ -533,9 +531,11 @@ mod tests {
             State(state.clone()),
             "/api/v1/mls/key-packages".parse().unwrap(),
             axum::http::HeaderMap::new(),
-            Json(crate::v0_0_2_mls::PublishBody {
+            serde_json::to_vec(&crate::v0_0_2_mls::PublishBody {
                 key_packages_b64: kps.iter().map(|p| STANDARD.encode(p)).collect(),
-            }),
+            })
+            .unwrap()
+            .into(),
         )
         .await
         .unwrap();
@@ -609,14 +609,16 @@ mod tests {
             State(state.clone()),
             "/api/v1/mls/key-packages".parse().unwrap(),
             axum::http::HeaderMap::new(),
-            Json(crate::v0_0_2_mls::PublishBody {
+            serde_json::to_vec(&crate::v0_0_2_mls::PublishBody {
                 key_packages_b64: m
                     .key_packages(2, false)
                     .unwrap()
                     .iter()
                     .map(|p| STANDARD.encode(p))
                     .collect(),
-            }),
+            })
+            .unwrap()
+            .into(),
         )
         .await
         .map(drop)
@@ -862,6 +864,22 @@ mod tests {
         .map(|_| ())
         .unwrap_err();
         assert_eq!(code(&anon), (StatusCode::NOT_FOUND, "NO_RECORD".into()));
+        // A proof header that does not parse is refused too.
+        let mut malformed = axum::http::HeaderMap::new();
+        malformed.insert(
+            jig_core::request_auth::headers::SIGNATURE,
+            "not base64!".parse().unwrap(),
+        );
+        assert!(
+            get_reachability(
+                State(state.clone()),
+                Path(did_of(4)),
+                path.parse().unwrap(),
+                malformed
+            )
+            .await
+            .is_err()
+        );
         // A proof that does not verify is refused, not read as anonymous.
         let mut forged = axum::http::HeaderMap::new();
         let identity = jig_client::identity::Identity::from_signing_key(key(4));

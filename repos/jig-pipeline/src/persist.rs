@@ -2855,6 +2855,22 @@ impl SqliteStore {
         server_did: &str,
         now: i64,
     ) -> Result<bool> {
+        self.put_reachability_retiring(did, seq, envelope, server_did, now, false)
+    }
+
+    /// [`Self::put_reachability`]; with `withdrawal`, a stored record also
+    /// retires `did`'s custody releases ([`Self::retire_custody_releases`])
+    /// in the same transaction, so a crash cannot keep the record and leave
+    /// the releases repeatable.
+    pub fn put_reachability_retiring(
+        &self,
+        did: &str,
+        seq: u64,
+        envelope: &[u8],
+        server_did: &str,
+        now: i64,
+        withdrawal: bool,
+    ) -> Result<bool> {
         // Big-endian bytes compare as the numbers do, across all of u64.
         let seq = seq.to_be_bytes().to_vec();
         let mut conn = self.conn.lock().expect("poisoned");
@@ -2868,6 +2884,13 @@ impl SqliteStore {
               WHERE excluded.seq > reachability_records.seq",
             params![did, seq, envelope, now],
         )?;
+        if changed > 0 && withdrawal {
+            tx.execute(
+                "UPDATE kp_releases SET retired = 1
+                  WHERE did = ?1 AND kind = 'custody' AND retired = 0",
+                [did],
+            )?;
+        }
         if stock_ended_on(&tx, did, server_did)? {
             purge_stock_on(&tx, did)?;
         }
@@ -5459,7 +5482,12 @@ mod tests {
             .release_key_package(&ask(did, "did:jig:zA", b"h1", 100))
             .unwrap();
         assert!(matches!(first, Release::Released { ref package, .. } if package == b"kp1"));
-        assert_eq!(store.retire_custody_releases(did).unwrap(), 1);
+        // Stored with the withdrawal, in one transaction.
+        assert!(
+            store
+                .put_reachability_retiring(did, 2, b"w", "did:jig:zserver", 120, true)
+                .unwrap()
+        );
         // Within the repeat window, a new request and the same request
         // resent both get a fresh package, never the retired one.
         let again = store

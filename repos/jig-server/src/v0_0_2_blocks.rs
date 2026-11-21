@@ -635,7 +635,46 @@ pub(crate) fn optional_caller(
     if state.config.auth.require_authenticated_reads {
         return admit_caller(state, headers, method, path, started);
     }
+    let did = verify_proof(state, headers, method, path, b"", started)?;
+    if let Some(did) = &did {
+        state
+            .auth
+            .admit_and_charge(did.as_str())
+            .map_err(|outcome| refuse(state, &outcome, started))?;
+    }
+    Ok(did)
+}
+
+/// The DID a request proof in `headers` verifies as over `body`, or `None`
+/// with no proof. Verification only: the caller admits and charges, once.
+pub(crate) fn verify_proof(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    started: std::time::Instant,
+) -> Result<Option<jig_core::did::Did>, (StatusCode, Json<ErrorBody>)> {
     let Some(proof) = crate::auth::authenticate::proof_from_headers(headers) else {
+        // No proof headers at all: anonymous. Some but not a whole, readable
+        // proof: refused, never read as anonymous.
+        use jig_core::request_auth::headers as h;
+        let offered = [
+            h::DID,
+            h::HLC_WALL_MS,
+            h::HLC_LOGICAL,
+            h::NONCE,
+            h::SIGNATURE,
+        ]
+        .iter()
+        .any(|name| headers.contains_key(*name));
+        if offered {
+            return Err(refuse(
+                state,
+                &crate::auth::GateOutcome::AuthSignatureInvalid,
+                started,
+            ));
+        }
         return Ok(None);
     };
     let now_ms = std::time::SystemTime::now()
@@ -647,12 +686,7 @@ pub(crate) fn optional_caller(
         .replay_guard
         .lock()
         .expect("replay guard mutex poisoned");
-    let did = crate::auth::authenticate(&proof, method, path, b"", now_ms, &mut guard)
-        .map_err(|outcome| refuse(state, &outcome, started))?;
-    drop(guard);
-    state
-        .auth
-        .admit_and_charge(did.as_str())
+    let did = crate::auth::authenticate(&proof, method, path, body, now_ms, &mut guard)
         .map_err(|outcome| refuse(state, &outcome, started))?;
     Ok(Some(did))
 }
