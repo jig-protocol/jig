@@ -164,13 +164,24 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
        be measured. An operator MAY set it longer, never shorter than 24 hours.
      - While it is pending, every answer `S` gives to a request authenticated as `D`, signed
        read or signed write, HTTP or the WebSocket welcome, carries
-       `erase_pending: {request_digest, acts_at}`. So each of `D`'s devices learns of it the
-       next time it talks to `S`.
+       `erase_pending: {request_digest, acts_at, joined}`, where `joined` lists the channels
+       `D` has joined since the request. So each of `D`'s devices learns of it the next time it
+       talks to `S`.
      - `D` cancels with a signed `jig-erase-cancel-v1` naming the request's digest, at any time
        before `acts_at`. Nothing has changed at `S`, so nothing needs undoing.
      - Until `S` acts, `D`'s data, stock, custody and local adds are as they were. A member that
        wants packages to stop leaving at once sends R1 and R2 as well; they take effect
        immediately and are separate requests.
+     - While R3 is pending, `S` MUST refuse a `member-add` of `D` by anyone else with
+       `403 MEMBER_DECLINED`: in channels it sequences, and in membership blocks it relays for
+       channels it carries. Otherwise another member could re-add `D` before every `acts_at`
+       and block the erasure for good. A cancel lifts the refusal. `D`'s own blocks, its
+       self-leaves above all, pass as before.
+     - A sequencer elsewhere can still take an add of `D` directly, for a channel `S` carries.
+       `S` lists every channel `D` has joined since the request in the `erase_pending` field.
+       `D`'s client self-leaves each before `acts_at`, through `S`. The re-check counts
+       memberships at `acts_at` only, so a membership that was added and left during the delay
+       does not abort the erasure. `D` may also send R2 to that sequencer.
      - At `acts_at`, `S` checks rule 26's preconditions again. If `D` joined or came to own a
        channel during the delay, `S` does not act: the request ends as
        `aborted: STILL_A_MEMBER` or `aborted: STILL_AN_OWNER`, listing the channels, and `D`'s
@@ -238,8 +249,9 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
 
     The MLS removal is committed by a remaining member, as for any self-leave (Encryption
     chapter, Leaving): the next remaining member online commits `D`'s leaf out. On a federated
-    channel that member commits through its own server to the channel's sequencer. Remaining members see the self-leave, then that commit. Until the commit lands,
-    `D` holds keys for the current epoch only, and the sequencer delivers nothing to `D`.
+    channel that member commits through its own server to the channel's sequencer. Remaining
+    members see the self-leave, then that commit. Until the commit lands, `D` holds keys for the
+    current epoch only, and the sequencer delivers nothing to `D`.
 27. **Stored messages.** A block `D` wrote in a channel that still has other members is part of
     their history:
     - its CID is in the sequencer's signed chain;
@@ -353,7 +365,10 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
 - **A single signature.** Any one of `D`'s devices, or anyone holding its key, can sign R3.
   The delay of rule 21a, the pending state on every answer to `D`, and the cancel bound the
   damage of a lost device or a mistake to the delay. They do not help when every device is
-  lost, or the key is held by someone else for the whole delay.
+  lost, or the key is held by someone else for the whole delay. The delay protects `S`'s data
+  only. The steps rule 26 requires first, the self-leaves and the archives, take effect as
+  soon as they land. Any holder of `D`'s key can take those steps without this JEP, so this
+  adds no exposure.
 - **Moderation is not reset by erasure.** R3 followed by a return does not clear a ban or a
   low standing at `S` (rules 28 and 36). Deleting the JEP-0009 salts (rule 29) still makes
   `D`'s earlier leaves unlinkable, so the tombstone's ban and floor are `S`'s own record; no
