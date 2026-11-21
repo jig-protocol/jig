@@ -976,6 +976,8 @@ impl Secure {
         if ended(self)? {
             self.ensure_reachable().await?;
             if ended(self)? {
+                // Finishes a deletion an earlier run left undone.
+                self.end_stock_if_purged(&server_did).await?;
                 return Ok(false);
             }
         }
@@ -1085,6 +1087,7 @@ impl Secure {
                     );
                     self.rotate_after_withdrawal(&server_did).await?;
                     self.note_reach(&server_did, k.seq, true)?;
+                    self.end_stock_if_purged(&server_did).await?;
                 }
                 return Ok(());
             }
@@ -1223,14 +1226,35 @@ impl Secure {
 
     fn note_reach(&self, server_did: &str, seq: u64, withdrawn: bool) -> Result<()> {
         let base = self.base.clone();
-        let stock_ended = ServerStates::update(&self.server_states_path(), |s| {
-            let state = s.entry(server_did, &base);
-            state.reach = Some(Reach { seq, withdrawn });
-            state.stock_ended()
+        ServerStates::update(&self.server_states_path(), |s| {
+            s.entry(server_did, &base).reach = Some(Reach { seq, withdrawn });
         })?;
-        if stock_ended {
-            // Local adds were ended here already: with custody gone too, the
-            // server deleted the stock (rules 19 and 32).
+        Ok(())
+    }
+
+    /// JEP-0017 rules 19 and 32: where this device's state says custody and
+    /// local adds are both ended at `server_did`, and the server confirms it
+    /// keeps no stock for us, delete this device's keys for that stock.
+    /// The state alone is not enough: another device may have undone either
+    /// since, and the server then still hands out packages whose keys this
+    /// would delete. Repeatable, so a deletion cut short runs again.
+    async fn end_stock_if_purged(&self, server_did: &str) -> Result<()> {
+        #[derive(Deserialize)]
+        struct Stock {
+            available: u64,
+            last_resort: bool,
+        }
+        if !self
+            .server_state(server_did)?
+            .is_some_and(|s| s.stock_ended())
+        {
+            return Ok(());
+        }
+        let did = self.session.did().to_string();
+        let stock: Stock = self
+            .get_json(&format!("/api/v1/mls/key-packages/{did}/stock"))
+            .await?;
+        if stock.available == 0 && !stock.last_resort {
             self.delete_stock_keys(server_did)?;
         }
         Ok(())
@@ -1311,6 +1335,7 @@ impl Secure {
             self.rotate_after_withdrawal(&server_did).await?
         };
         self.note_reach(&server_did, record.seq, true)?;
+        self.end_stock_if_purged(&server_did).await?;
         Ok(change)
     }
 
@@ -1516,16 +1541,10 @@ impl Secure {
             self.put_local_adds(&did, &server_did, allow, seq)
         })
         .await?;
-        let stock_ended = ServerStates::update(&path, |s| {
-            let state = s.entry(&server_did, &self.base);
-            state.local_adds = Some(kept);
-            state.stock_ended()
+        ServerStates::update(&path, |s| {
+            s.entry(&server_did, &self.base).local_adds = Some(kept);
         })?;
-        if stock_ended {
-            // Custody was withdrawn here already: with local adds ended too,
-            // the server deleted the stock (rules 19 and 32).
-            self.delete_stock_keys(&server_did)?;
-        }
+        self.end_stock_if_purged(&server_did).await?;
         Ok(kept)
     }
 

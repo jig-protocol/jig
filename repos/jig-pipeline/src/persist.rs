@@ -2895,7 +2895,7 @@ impl SqliteStore {
             )?;
         }
         if stock_ended_on(&tx, did, server_did)? {
-            purge_stock_on(&tx, did)?;
+            purge_stock_on(&tx, did, now)?;
         }
         tx.commit()?;
         Ok(changed > 0)
@@ -2930,7 +2930,7 @@ impl SqliteStore {
         )?;
         let kept = local_adds_on(&tx, did)?.expect("a marker was just kept");
         if stock_ended_on(&tx, did, server_did)? {
-            purge_stock_on(&tx, did)?;
+            purge_stock_on(&tx, did, now)?;
         }
         tx.commit()?;
         Ok(kept)
@@ -3864,14 +3864,24 @@ fn retire_last_resorts_on(conn: &Connection, did: &str, reference: &[u8], now: i
     Ok(())
 }
 
-/// Delete `did`'s stock: its unconsumed packages and its last-resort one.
-/// Consumed packages stay, so their references cannot be stored again.
-fn purge_stock_on(conn: &Connection, did: &str) -> Result<usize> {
-    Ok(conn.execute(
+/// End `did`'s stock (JEP-0017 rule 19): delete its ordinary packages never
+/// released, which nobody else holds, and retire its last-resort one in use.
+/// Rows of released or retired packages stay, marked consumed, so their
+/// references cannot be stored again: whoever was released one could
+/// otherwise upload it once uploads resume, and the server would hand out a
+/// package whose key its owner deleted.
+fn purge_stock_on(conn: &Connection, did: &str, now: i64) -> Result<usize> {
+    let deleted = conn.execute(
         "DELETE FROM mls_key_packages
-          WHERE did = ? AND (consumed_at IS NULL OR last_resort = 1)",
+          WHERE did = ? AND consumed_at IS NULL AND last_resort = 0",
         [did],
-    )?)
+    )?;
+    let retired = conn.execute(
+        "UPDATE mls_key_packages SET consumed_at = ?
+          WHERE did = ? AND consumed_at IS NULL AND last_resort = 1",
+        params![now, did],
+    )?;
+    Ok(deleted + retired)
 }
 
 /// Whether the channel `channel_id` names is one this server sequences: a
@@ -5982,13 +5992,49 @@ mod tests {
             } else {
                 r2.local_adds(&store, 2, true);
             }
-            // References of deleted stock are fresh ones again.
+            // Nothing was stocked before both were ended: both references
+            // are fresh.
             assert_eq!(
                 r2.stock(&store),
                 Stocked::Accepted(2),
                 "undo_r1 = {undo_r1}"
             );
         }
+    }
+
+    /// Ending the stock keeps the rows of last-resort packages, the retired
+    /// and the one in use, as consumed: both went out to requesters, whose
+    /// copies must not be uploadable once uploads resume, since their owner
+    /// deleted the keys (rule 32). A fresh one is taken.
+    #[test]
+    fn last_resort_packages_stay_retired_through_an_ended_stock() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let r2 = R2::new();
+        let upload = |r: &[u8], p: &[u8], signed| {
+            store
+                .stock_key_packages(
+                    &r2.did,
+                    &[(r.to_vec(), p.to_vec(), true)],
+                    200,
+                    &r2.server,
+                    signed,
+                    1,
+                )
+                .unwrap()
+        };
+        assert_eq!(upload(b"L0", b"kpL0", false), Stocked::Accepted(1));
+        assert_eq!(upload(b"L1", b"kpL1", true), Stocked::Accepted(1));
+        r2.reach(&store, 1, false);
+        r2.local_adds(&store, 1, false);
+        assert_eq!(store.key_package_stock(&r2.did).unwrap(), (0, false));
+        r2.local_adds(&store, 2, true);
+        for (r, p) in [(b"L0", b"kpL0"), (b"L1", b"kpL1")] {
+            assert_eq!(upload(r, p, false), Stocked::Accepted(0));
+            assert_eq!(upload(r, p, true), Stocked::Accepted(0));
+        }
+        assert_eq!(store.key_package_stock(&r2.did).unwrap(), (0, false));
+        assert_eq!(upload(b"L2", b"kpL2", false), Stocked::Accepted(1));
+        assert_eq!(store.key_package_stock(&r2.did).unwrap(), (0, true));
     }
 
     #[test]

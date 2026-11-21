@@ -320,3 +320,44 @@ fn copy_except(from: &Path, to: &Path, skip: &[&str]) {
         }
     }
 }
+
+/// This device's state alone is not enough to delete its stock keys: here it
+/// recorded custody withdrawn, another device restored custody, and then
+/// this device ends local adds. The server still holds the stock and hands it
+/// out for custody, so the keys stay.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_withdrawal_does_not_delete_keys_the_server_still_uses() {
+    let a = TestJigServer::start().await.unwrap();
+    let member_home = tempfile::tempdir().unwrap();
+    let member = person(member_home.path(), &a);
+    let refs = |home: &Path| {
+        server_states(home, &member)["servers"]
+            .as_object()
+            .and_then(|s| s.values().next().cloned())
+            .unwrap_or_default()["packages"]
+            .as_array()
+            .map_or(0, Vec::len)
+    };
+    ok(member_home.path(), &["server", "custody", "off"]);
+    let other = tempfile::tempdir().unwrap();
+    copy_except(
+        &member_home.path().join(".jig"),
+        &other.path().join(".jig"),
+        &["mls", "servers"],
+    );
+    ok(other.path(), &["server", "set", &a.http_url()]);
+    ok(other.path(), &["server", "custody", "on"]);
+    let stocked = refs(member_home.path());
+    assert!(stocked > 0);
+
+    ok(member_home.path(), &["server", "local-adds", "off"]);
+    assert!(
+        available(&a, &member).await > 0,
+        "the server kept the stock"
+    );
+    assert_eq!(
+        refs(member_home.path()),
+        stocked,
+        "and this device its keys"
+    );
+}
