@@ -512,6 +512,14 @@ impl Session {
         self.with_member(|m, _| Ok(m.key_packages(count, last_resort)?))
     }
 
+    /// Delete the private init keys of this device's key packages named by
+    /// `references` (hash references, as
+    /// `jig_mls::delivery::validate_key_package` gives them). Repeatable:
+    /// references already gone are skipped. Returns how many were deleted.
+    pub fn forget_key_packages(&self, references: &[Vec<u8>]) -> Result<usize> {
+        self.with_member(|m, _| Ok(m.forget_key_packages(references)?))
+    }
+
     /// Whether this device holds the group for `server`/`slug`.
     pub fn has_group(&self, server: &str, slug: &str) -> Result<bool> {
         let key = group_key(server, slug);
