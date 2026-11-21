@@ -359,6 +359,55 @@ fn kept_leaves_out(body: &RecordBody, did: &str, server_did: &str) -> Option<boo
     (record.did == did).then(|| !record.servers.iter().any(|(s, _)| s == server_did))
 }
 
+/// What one server's answer to our signed read of its kept record says.
+#[derive(Debug, PartialEq, Eq)]
+enum KeptAnswer {
+    /// Its record leaves it out: withdrawn there, so it is dropped.
+    Withdrawn,
+    /// It still lists itself, or keeps no record: the new one may go there.
+    Listed,
+    /// Nothing can be concluded: it stays listed, but is not sent the record.
+    Unchecked,
+}
+
+/// Judge an answer: `None` when the request failed; otherwise its status and
+/// its body, `None` when the body could not be read in full.
+fn judge_kept_answer(
+    answer: Option<(reqwest::StatusCode, Option<&[u8]>)>,
+    did: &str,
+    server_did: &str,
+) -> KeptAnswer {
+    match answer {
+        Some((status, body)) if status.is_success() => {
+            let record = body.and_then(|b| serde_json::from_slice::<RecordBody>(b).ok());
+            match record.and_then(|r| kept_leaves_out(&r, did, server_did)) {
+                Some(true) => KeptAnswer::Withdrawn,
+                Some(false) => KeptAnswer::Listed,
+                // An answer that is not our record: not checked.
+                None => KeptAnswer::Unchecked,
+            }
+        }
+        // No record there: nothing to restore, so sending is safe.
+        Some((reqwest::StatusCode::NOT_FOUND, _)) => KeptAnswer::Listed,
+        _ => KeptAnswer::Unchecked,
+    }
+}
+
+/// Servers as (DID, URL) pairs.
+type ServerList = Vec<(String, String)>;
+
+/// Split the servers a new record lists into those it is sent to and those
+/// it is not, because their own record could not be read.
+fn split_unchecked(
+    servers: &[(String, String)],
+    unchecked: &std::collections::HashSet<String>,
+) -> (ServerList, ServerList) {
+    servers
+        .iter()
+        .cloned()
+        .partition(|(s, _)| !unchecked.contains(s))
+}
+
 /// Guards a walk of the release log's pages against a server that ignores
 /// `offset`: a page the same as the one before, or more pages than any log
 /// can hold, ends the walk with an error that names the server.
@@ -989,29 +1038,27 @@ impl Secure {
             for (name, value) in proof.headers() {
                 req = req.header(name, value);
             }
-            let withdrawn = match req.send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    let body = limits::json_capped::<RecordBody>(resp, limits::MAX_DOCUMENT_BYTES)
-                        .await
-                        .ok();
-                    match body.and_then(|b| kept_leaves_out(&b, &did, &server_did)) {
-                        Some(withdrawn) => withdrawn,
-                        // An answer that is not our record: not checked.
-                        None => {
-                            unchecked.insert(server_did.clone());
-                            false
-                        }
-                    }
+            let answer = match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = if status.is_success() {
+                        limits::read_capped(resp, limits::MAX_DOCUMENT_BYTES)
+                            .await
+                            .ok()
+                    } else {
+                        None
+                    };
+                    judge_kept_answer(Some((status, body.as_deref())), &did, &server_did)
                 }
-                // No record there: nothing to restore, so sending is safe.
-                Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => false,
-                _ => {
-                    unchecked.insert(server_did.clone());
-                    false
-                }
+                Err(_) => judge_kept_answer(None, &did, &server_did),
             };
-            if !withdrawn {
-                out.push((server_did, url));
+            match answer {
+                KeptAnswer::Withdrawn => {}
+                KeptAnswer::Listed => out.push((server_did, url)),
+                KeptAnswer::Unchecked => {
+                    unchecked.insert(server_did.clone());
+                    out.push((server_did, url));
+                }
             }
         }
         (out, unchecked)
@@ -1055,18 +1102,13 @@ impl Secure {
             .collect();
         let (others, unchecked) = self.still_custodians(others).await;
         // Sent only to servers whose own state was read.
-        let send_to: Vec<_> = others
-            .iter()
-            .filter(|(s, _)| !unchecked.contains(s))
-            .cloned()
-            .collect();
+        let (send_to, skipped) = split_unchecked(&others, &unchecked);
         let mut change = CustodyChange {
-            elsewhere: others
-                .iter()
-                .filter(|(s, _)| unchecked.contains(s))
+            elsewhere: skipped
+                .into_iter()
                 .map(|(_, url)| {
                     (
-                        url.clone(),
+                        url,
                         Err("its record could not be read, so the new one was not sent".into()),
                     )
                 })
@@ -2179,8 +2221,9 @@ fn shadow_note(reference: &str, own: &ChannelInfo, carried: &ChannelInfo) -> Str
 #[cfg(test)]
 mod tests {
     use super::{
-        ChannelInfo, LogWalk, RecordBody, group_name, kept_leaves_out, must_encrypt, ordered_here,
-        own_group_name, pick, sequencers_for, shadow_note,
+        ChannelInfo, KeptAnswer, LogWalk, RecordBody, group_name, judge_kept_answer,
+        kept_leaves_out, must_encrypt, ordered_here, own_group_name, pick, sequencers_for,
+        shadow_note, split_unchecked,
     };
 
     #[test]
@@ -2211,6 +2254,63 @@ mod tests {
         assert_eq!(kept_leaves_out(&body(b64(b"garbage")), &did, &s), None);
         let theirs = rec(&other, vec![(t.clone(), "u".into())]);
         assert_eq!(kept_leaves_out(&body(b64(&theirs)), &did, &s), None);
+    }
+
+    #[test]
+    fn an_unreadable_or_malformed_answer_is_unchecked() {
+        use base64::Engine as _;
+        use reqwest::StatusCode;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[4; 32]);
+        let did =
+            jig_core::Did::from_ed25519_pubkey(&key.verifying_key().to_bytes()).to_did_jig_string();
+        let s = {
+            let k = ed25519_dalek::SigningKey::from_bytes(&[10; 32]);
+            jig_core::Did::from_ed25519_pubkey(&k.verifying_key().to_bytes()).to_did_jig_string()
+        };
+        let kept = |servers: Vec<(String, String)>| {
+            let env = jig_core::naming::ReachabilityRecord::sign(&key, servers, 3).envelope;
+            serde_json::json!({
+                "record_b64": base64::engine::general_purpose::STANDARD.encode(env)
+            })
+            .to_string()
+            .into_bytes()
+        };
+        let judge = |a: Option<(StatusCode, Option<&[u8]>)>| judge_kept_answer(a, &did, &s);
+        let ok = StatusCode::OK;
+        // Our record, listing S or leaving it out; or no record at all.
+        let listed = kept(vec![(s.clone(), "u".into())]);
+        assert_eq!(judge(Some((ok, Some(&listed)))), KeptAnswer::Listed);
+        assert_eq!(
+            judge(Some((ok, Some(&kept(vec![]))))),
+            KeptAnswer::Withdrawn
+        );
+        assert_eq!(
+            judge(Some((StatusCode::NOT_FOUND, None))),
+            KeptAnswer::Listed
+        );
+        // A 200 whose body is malformed JSON, the wrong shape, or unread.
+        for body in [&b"{ not json"[..], b"[]", b"{\"other\": 1}"] {
+            assert_eq!(judge(Some((ok, Some(body)))), KeptAnswer::Unchecked);
+        }
+        assert_eq!(judge(Some((ok, None))), KeptAnswer::Unchecked);
+        // Any other status, or no answer.
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::INTERNAL_SERVER_ERROR] {
+            assert_eq!(judge(Some((status, Some(&listed)))), KeptAnswer::Unchecked);
+        }
+        assert_eq!(judge(None), KeptAnswer::Unchecked);
+    }
+
+    #[test]
+    fn the_new_record_is_not_sent_to_an_unchecked_server() {
+        let servers = vec![
+            ("did:a".to_string(), "https://a".to_string()),
+            ("did:b".to_string(), "https://b".to_string()),
+            ("did:c".to_string(), "https://c".to_string()),
+        ];
+        let unchecked = std::collections::HashSet::from(["did:b".to_string()]);
+        let (send_to, skipped) = split_unchecked(&servers, &unchecked);
+        assert_eq!(send_to, [servers[0].clone(), servers[2].clone()]);
+        assert_eq!(skipped, [servers[1].clone()]);
     }
 
     fn ids(xs: &[&str]) -> Option<Vec<String>> {
