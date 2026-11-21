@@ -912,3 +912,28 @@ async fn a_create_retry_does_not_adopt_another_devices_channel() {
     let (_, said) = fails(alice.path(), &["send", "--channel", "#x", "lost"]);
     assert!(said.contains("no MLS group"), "{said}");
 }
+
+/// The same, where the other device created the slug unencrypted: its
+/// creation block names no group, so the pending one is discarded rather
+/// than failing every retry.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_retry_does_not_adopt_another_devices_public_channel() {
+    let server = TestJigServer::start().await.expect("start");
+    let (url, losing) = losing_proxy(&server).await;
+    let (alice, _) = device(&url, "alice");
+    let laptop = same_identity(alice.path(), &server.http_url());
+
+    *losing.next.lock().unwrap() = Some(Lose::Create);
+    fails(alice.path(), &["channel", "create", "#x"]);
+    ok(
+        laptop.path(),
+        &["channel", "create", "#x", "--tier", "public", "--yes"],
+    );
+    losing.gone.store(false, Ordering::SeqCst);
+
+    let (_, said) = fails(alice.path(), &["channel", "create", "#x"]);
+    assert!(said.contains("#x already exists"), "{said}");
+    assert!(!said.contains("MLS"), "{said}");
+    let out = ok(alice.path(), &["channel", "create", "#x", "--exist-ok"]);
+    assert!(out.contains("channel already exists: #x"), "{out}");
+}

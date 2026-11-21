@@ -607,7 +607,7 @@ impl Secure {
 
     /// The id of the MLS group `info`'s creation block starts (#455): the
     /// block is fetched and held to the channel's id, which it must hash to.
-    pub async fn created_group_id(&self, info: &ChannelInfo) -> Result<Vec<u8>> {
+    pub async fn created_group_id(&self, info: &ChannelInfo) -> Result<Option<Vec<u8>>> {
         #[derive(Deserialize)]
         struct Served {
             bundle_b64: String,
@@ -1445,7 +1445,7 @@ fn pick(
 /// The MLS group the channel-create in `bundle_b64` starts, once the bundle
 /// is shown to be the block `channel_id` names: the server serving it is not
 /// taken at its word.
-fn creation_group_id(channel_id: &str, bundle_b64: &str) -> Result<Vec<u8>> {
+fn creation_group_id(channel_id: &str, bundle_b64: &str) -> Result<Option<Vec<u8>>> {
     let bytes = STANDARD
         .decode(bundle_b64)
         .context("the bundle is not base64")?;
@@ -1463,12 +1463,15 @@ fn creation_group_id(channel_id: &str, bundle_b64: &str) -> Result<Vec<u8>> {
     );
     let manifest: jig_core::BlockManifest =
         serde_json::from_slice(&manifest_bytes).context("the manifest is malformed")?;
-    let info = manifest
-        .metadata
-        .get("mls_group_info")
-        .and_then(|v| v.as_str())
-        .context("it starts no MLS group")?;
-    Ok(jig_client::secure::created_group_id(info)?)
+    // The block is the channel's own, by its hash: without a group info it
+    // was created unencrypted, and no group is anyone's to adopt.
+    let Some(info) = manifest.metadata.get("mls_group_info") else {
+        return Ok(None);
+    };
+    let info = info
+        .as_str()
+        .context("its `mls_group_info` is not a string")?;
+    Ok(Some(jig_client::secure::created_group_id(info)?))
 }
 
 /// The channels in a listing that this server orders itself, leaving out
@@ -1616,16 +1619,19 @@ mod tests {
         let bundle = STANDARD.encode(block.canonical_bytes());
         assert_eq!(
             creation_group_id(&block.cid(), &bundle).unwrap(),
-            created.group_id
+            Some(created.group_id)
         );
 
         // Served under another channel's id: not taken.
         let other = create(serde_json::json!({ "slug": "#y" }));
         assert!(creation_group_id(&other.cid(), &bundle).is_err());
-        // A channel created with no group.
+        // A channel created with no group: none to adopt.
         let plain = STANDARD.encode(other.canonical_bytes());
-        let error = creation_group_id(&other.cid(), &plain).unwrap_err();
-        assert!(format!("{error:#}").contains("no MLS group"), "{error:#}");
+        assert_eq!(creation_group_id(&other.cid(), &plain).unwrap(), None);
+        // A group info that is no string is an error, not "no group".
+        let odd = create(serde_json::json!({ "slug": "#z", "mls_group_info": 7 }));
+        let odd_bundle = STANDARD.encode(odd.canonical_bytes());
+        assert!(creation_group_id(&odd.cid(), &odd_bundle).is_err());
     }
 
     /// A `channel create` retry asks whether this server took the create it

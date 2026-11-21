@@ -447,8 +447,10 @@ pub(crate) async fn create_with(
                 // A create the server never answered, and took: only if the
                 // channel was created with this group (#455). Another device
                 // under this identity may have created the slug with its own.
+                // A channel created unencrypted names no group: not this one.
                 let listed = secure.created_group_id(&info).await?;
-                if secure.session.group_id(secure.server(), &pending)?.as_ref() == Some(&listed) {
+                let held = secure.session.group_id(secure.server(), &pending)?;
+                if listed.is_some() && held == listed {
                     secure
                         .session
                         .rename_group(secure.server(), &pending, &info.id)?;
