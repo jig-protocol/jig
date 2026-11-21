@@ -855,7 +855,13 @@ pub async fn get_channel_history(
             // that dedupes on delivery_cid sees replay and live delivery of
             // the same block as one identity.
             delivery_cid: format!("delivery:{}", block.cid),
-            ingest: store.get_ingest_record(&block.cid).map_err(persist_err)?,
+            // The record that places it in this channel's chain: a block a
+            // carried channel shares with another holds one in each.
+            ingest: match &channel {
+                Some(channel) => store.get_chain_record(&channel.id, &block.cid),
+                None => store.get_ingest_record(&block.cid),
+            }
+            .map_err(persist_err)?,
         });
     }
     Ok(Json(timeline))

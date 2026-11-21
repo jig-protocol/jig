@@ -1,15 +1,9 @@
 //! Fanout: multi-subscriber block delivery.
 //!
-//! Two kinds of subscribers:
-//!
-//! - **Local** — CLI clients on this server subscribed to a channel or
-//!   to federation-level streams. Identified by a numeric `sub_id`.
-//! - **Peer** — federated jig-servers (each with its own outbound stream).
-//!   Identified by `peer_server_url`.
-//!
-//! `broadcast` delivers to BOTH; `broadcast_local_only` delivers ONLY
-//! to local subs (used when the block came from a federated peer, to
-//! prevent relay loops).
+//! Subscribers are clients on this server, each subscribed to one channel
+//! and identified by a numeric `sub_id`; bridge sinks, by managed DID; and the
+//! server's own watchers. Nothing here sends to another server: a channel
+//! reaches one only by a share, through the owner's stream.
 
 use std::collections::HashMap;
 use std::sync::RwLock as StdRwLock;
@@ -29,9 +23,6 @@ pub enum SubscriptionScope {
     /// which matches no block until [`Fanout::bind_pending_channel`] rewrites
     /// it to the channel's id when the channel is created.
     Channel(String),
-    /// Federation-level subscription, filtered to specific block kinds.
-    /// Empty `block_kinds` means "all kinds".
-    Federation { block_kinds: Vec<String> },
 }
 
 /// Who a local subscription belongs to, as far as delivery is concerned.
@@ -63,10 +54,9 @@ pub struct DeliveryPolicy {
     pub open: bool,
     pub owner_did: String,
     pub member_dids: Vec<String>,
-    /// Whether federation peers may receive the channel's blocks. In v0.2
-    /// only open, unencrypted channels federate: membership does not
-    /// replicate, so a peer cannot gate a restricted channel's readers, and an
-    /// encrypted channel's commits are validated only by its home server.
+    /// Whether the channel is one the legacy relay carried: open,
+    /// unencrypted, not `#jig/`. The relay no longer sends; this server still
+    /// judges by it what an older peer relays to it.
     pub federates: bool,
 }
 
@@ -114,7 +104,6 @@ struct LocalSubscription {
 pub struct Fanout {
     next_id: AtomicU64,
     local: RwLock<HashMap<u64, LocalSubscription>>,
-    peers: RwLock<HashMap<String, DeliverySender>>,
     bridge_dids: StdRwLock<HashMap<String, DeliverySender>>,
     /// The server's own watchers, by block kind ([`Fanout::watch_kinds`]), or
     /// of every block (`None`, [`Fanout::watch_all`]).
@@ -170,17 +159,6 @@ impl Fanout {
         self.local.read().await.len()
     }
 
-    /// Register an outbound federation peer. The caller is responsible for
-    /// taking deliveries off `rx` and writing them onto the peer's WSS
-    /// connection. Re-registering the same URL replaces the previous sender.
-    pub async fn register_peer(&self, peer_server_url: String, tx: DeliverySender) {
-        self.peers.write().await.insert(peer_server_url, tx);
-    }
-
-    pub async fn unregister_peer(&self, peer_server_url: &str) {
-        self.peers.write().await.remove(peer_server_url);
-    }
-
     /// Register a sink for a bridge-managed DID. Synchronous: the insert
     /// completes before this returns, so a caller that registers a DID and then
     /// returns can be sure a subsequently-delivered block finds the sink (no
@@ -230,9 +208,6 @@ impl Fanout {
         policy: Option<&DeliveryPolicy>,
     ) -> anyhow::Result<()> {
         self.broadcast_to_locals(block, receipt, policy).await;
-        if policy.is_some_and(|p| p.federates) {
-            self.broadcast_to_peers(block, receipt).await;
-        }
         self.dispatch_to_bridges(block, receipt, policy);
         Ok(())
     }
@@ -274,9 +249,9 @@ impl Fanout {
         }
     }
 
-    /// Broadcast to BOTH local subscribers (filtered by scope match and by
-    /// `policy`) and every registered federation peer. Called when the source
-    /// is a local CLI or admin endpoint.
+    /// Broadcast to local subscribers, filtered by scope match and by
+    /// `policy`. Blocks reach other servers only by a share, through the
+    /// owner's stream ([`Self::watch_all`]), never from here.
     pub async fn broadcast(
         &self,
         block: &StoredBlock,
@@ -284,14 +259,10 @@ impl Fanout {
         policy: Option<&DeliveryPolicy>,
     ) -> anyhow::Result<()> {
         self.broadcast_to_locals(block, receipt, policy).await;
-        if policy.is_some_and(|p| p.federates) {
-            self.broadcast_to_peers(block, receipt).await;
-        }
         Ok(())
     }
 
-    /// Broadcast to LOCAL subscribers ONLY. Used when the source is a
-    /// federated peer (re-broadcasting to peers would cause a relay loop).
+    /// [`Self::broadcast`], for a block that came from another server.
     pub async fn broadcast_local_only(
         &self,
         block: &StoredBlock,
@@ -303,11 +274,7 @@ impl Fanout {
     }
 
     /// Deliver to every local subscriber whose scope matches AND whom
-    /// `policy` permits. Both filters apply whatever the scope: a
-    /// federation-scope subscription is a kind filter, not a licence to read
-    /// every channel. A federation-scope subscriber is a peer server — the
-    /// stream it subscribes to is how peers actually receive our blocks — so
-    /// it also gets only channels that federate.
+    /// `policy` permits.
     ///
     /// `None` policy means the block is not scoped to a channel this server
     /// knows (control-plane blocks, or a federated block for a channel with no
@@ -335,28 +302,14 @@ impl Fanout {
         }
         let subs = self.local.read().await;
         for sub in subs.values() {
-            let matches = match &sub.scope {
-                SubscriptionScope::Channel(channel_id) => {
-                    block.channel_id.as_deref() == Some(channel_id.as_str())
-                }
-                SubscriptionScope::Federation { block_kinds } => {
-                    (block_kinds.is_empty() || block_kinds.iter().any(|k| k == &block.block_kind))
-                        && policy.is_some_and(|p| p.federates)
-                }
-            };
+            let SubscriptionScope::Channel(channel_id) = &sub.scope;
+            let matches = block.channel_id.as_deref() == Some(channel_id.as_str());
             let permitted = policy.is_none_or(|p| p.permits(&sub.who));
             if matches && permitted {
                 // Ignore send errors — receiver disconnected; cleanup happens
                 // when the consumer calls unsubscribe_local.
                 let _ = sub.tx.send((block.clone(), receipt.clone()));
             }
-        }
-    }
-
-    async fn broadcast_to_peers(&self, block: &StoredBlock, receipt: &StoredReceipt) {
-        let peers = self.peers.read().await;
-        for tx in peers.values() {
-            let _ = tx.send((block.clone(), receipt.clone()));
         }
     }
 }
@@ -534,40 +487,6 @@ mod tests {
         );
     }
 
-    /// A federation-scope subscription is a kind filter, not a licence: it
-    /// must not see restricted channels its DID may not read.
-    #[tokio::test]
-    async fn a_federation_scope_subscriber_is_still_bound_by_the_policy() {
-        let f = Fanout::new();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        f.subscribe_local(
-            SubscriptionScope::Federation {
-                block_kinds: vec![],
-            },
-            did("did:jig:zStranger"),
-            tx,
-        )
-        .await;
-
-        f.broadcast(
-            &sample_block(Some("#private"), "text-render"),
-            &sample_receipt(),
-            Some(&restricted("did:jig:zOwner", &[])),
-        )
-        .await
-        .unwrap();
-        assert!(!received(&mut rx).await);
-
-        f.broadcast(
-            &sample_block(Some("#public"), "text-render"),
-            &sample_receipt(),
-            Some(&open_with_members(&[])),
-        )
-        .await
-        .unwrap();
-        assert!(received(&mut rx).await, "open channels still flow");
-    }
-
     /// No resolved channel, nothing to authorize against: scope alone decides,
     /// exactly as before policies existed. Control-plane blocks and federated
     /// blocks for channels with no local row take this path.
@@ -583,85 +502,6 @@ mod tests {
         .await
         .unwrap();
         assert!(received(&mut rx).await);
-    }
-
-    /// Peers are servers, not readers, and membership does not replicate to
-    /// them — so a peer handed a restricted channel's block could not gate who
-    /// reads it. Until it can, only open, unencrypted channels federate. (Up
-    /// to v0.1 restricted content went to every peer.)
-    #[tokio::test]
-    async fn only_open_unencrypted_channels_reach_peers() {
-        let f = Fanout::new();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        f.register_peer("wss://peer-a".to_string(), tx).await;
-        f.broadcast(
-            &sample_block(Some("#private"), "text-render"),
-            &sample_receipt(),
-            Some(&restricted("did:jig:zOwner", &[])),
-        )
-        .await
-        .unwrap();
-        assert!(!received(&mut rx).await, "restricted content stays home");
-
-        let mut sealed = open_with_members(&[]);
-        sealed.federates = false;
-        f.broadcast_with_members(
-            &sample_block(Some("#sealed"), "text-render"),
-            &sample_receipt(),
-            Some(&sealed),
-        )
-        .await
-        .unwrap();
-        assert!(!received(&mut rx).await, "encrypted channels stay home");
-
-        f.broadcast(
-            &sample_block(Some("#public"), "text-render"),
-            &sample_receipt(),
-            Some(&open_with_members(&[])),
-        )
-        .await
-        .unwrap();
-        assert!(received(&mut rx).await, "open plaintext channels federate");
-    }
-
-    /// Peers receive our blocks through a federation-scope subscription on
-    /// their connection to us, not through `register_peer` (the receiving
-    /// side ignores block frames pushed down its own dial). The `federates`
-    /// gate has to hold on that path too, or an open encrypted channel's
-    /// commits, welcomes and ciphertext reach every peer.
-    #[tokio::test]
-    async fn a_peer_subscription_gets_only_channels_that_federate() {
-        let f = Fanout::new();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let _ = f
-            .subscribe_local(
-                SubscriptionScope::Federation {
-                    block_kinds: vec![],
-                },
-                SubscriberIdentity::Did("did:jig:zPeer".to_string()),
-                tx,
-            )
-            .await;
-
-        let mut sealed = open_with_members(&[]);
-        sealed.federates = false;
-        f.broadcast_with_members(
-            &sample_block(Some("#sealed"), "member-add"),
-            &sample_receipt(),
-            Some(&sealed),
-        )
-        .await
-        .unwrap();
-        assert!(!received(&mut rx).await, "encrypted channels stay home");
-
-        f.broadcast(
-            &sample_block(Some("#public"), "text-render"),
-            &sample_receipt(),
-            Some(&open_with_members(&[])),
-        )
-        .await
-        .unwrap();
-        assert!(received(&mut rx).await, "open plaintext channels federate");
     }
 
     #[test]
@@ -737,156 +577,6 @@ mod tests {
         .unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
         assert!(result.is_err(), "should not have received any delivery");
-    }
-
-    #[tokio::test]
-    async fn federation_subscriber_with_empty_block_kinds_gets_everything() {
-        let f = Fanout::new();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let _ = f
-            .subscribe_local(
-                SubscriptionScope::Federation {
-                    block_kinds: vec![],
-                },
-                SubscriberIdentity::Unchecked,
-                tx,
-            )
-            .await;
-        f.broadcast(
-            &sample_block(Some("#public"), "text-render"),
-            &sample_receipt(),
-            Some(&open_with_members(&[])),
-        )
-        .await
-        .unwrap();
-        let delivered = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(delivered.0.block_kind, "text-render");
-    }
-
-    #[tokio::test]
-    async fn federation_subscriber_filters_by_block_kinds() {
-        let f = Fanout::new();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let _ = f
-            .subscribe_local(
-                SubscriptionScope::Federation {
-                    block_kinds: vec!["text-render".to_string()],
-                },
-                SubscriberIdentity::Unchecked,
-                tx,
-            )
-            .await;
-        // Matching kind — delivered
-        f.broadcast(
-            &sample_block(Some("#public"), "text-render"),
-            &sample_receipt(),
-            Some(&open_with_members(&[])),
-        )
-        .await
-        .unwrap();
-        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
-        assert!(result.is_ok());
-        // Non-matching kind — NOT delivered
-        f.broadcast(
-            &sample_block(Some("#public"), "channel-create"),
-            &sample_receipt(),
-            Some(&open_with_members(&[])),
-        )
-        .await
-        .unwrap();
-        let result2 = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
-        assert!(result2.is_err());
-    }
-
-    #[tokio::test]
-    async fn registered_peer_receives_broadcast() {
-        let f = Fanout::new();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        f.register_peer("wss://peer-a".to_string(), tx).await;
-        f.broadcast(
-            &sample_block(Some("#x"), "text-render"),
-            &sample_receipt(),
-            Some(&open_with_members(&[])),
-        )
-        .await
-        .unwrap();
-        let delivered = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(delivered.0.cid, "bafy_test");
-    }
-
-    /// Fail closed: a block with no channel policy has no channel that could
-    /// have agreed to federate, so it reaches no peer, on either path.
-    #[tokio::test]
-    async fn a_block_with_no_policy_never_federates() {
-        let f = Fanout::new();
-        let (peer_tx, mut peer_rx) = mpsc::unbounded_channel();
-        f.register_peer("wss://peer-a".to_string(), peer_tx).await;
-        let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
-        let _ = f
-            .subscribe_local(
-                SubscriptionScope::Federation {
-                    block_kinds: vec![],
-                },
-                SubscriberIdentity::Unchecked,
-                sub_tx,
-            )
-            .await;
-        f.broadcast_with_members(
-            &sample_block(Some("#remote-only"), "text-render"),
-            &sample_receipt(),
-            None,
-        )
-        .await
-        .unwrap();
-        assert!(
-            !received(&mut peer_rx).await,
-            "no policy: not pushed to peers"
-        );
-        assert!(
-            !received(&mut sub_rx).await,
-            "no policy: not streamed to federation subscribers"
-        );
-    }
-
-    #[tokio::test]
-    async fn broadcast_local_only_skips_peers() {
-        let f = Fanout::new();
-        let (peer_tx, mut peer_rx) = mpsc::unbounded_channel();
-        let (local_tx, mut local_rx) = mpsc::unbounded_channel();
-        f.register_peer("wss://peer-a".to_string(), peer_tx).await;
-        let _ = f
-            .subscribe_local(
-                SubscriptionScope::Channel("#x".to_string()),
-                SubscriberIdentity::Unchecked,
-                local_tx,
-            )
-            .await;
-
-        f.broadcast_local_only(
-            &sample_block(Some("#x"), "text-render"),
-            &sample_receipt(),
-            None,
-        )
-        .await
-        .unwrap();
-
-        // Local DID receive
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(100), local_rx.recv())
-                .await
-                .unwrap()
-                .is_some()
-        );
-        // Peer did NOT
-        let peer_result =
-            tokio::time::timeout(std::time::Duration::from_millis(50), peer_rx.recv()).await;
-        assert!(peer_result.is_err());
     }
 
     #[tokio::test]

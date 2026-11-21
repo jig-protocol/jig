@@ -768,6 +768,12 @@ counted in `jig_federation_relayed_refused_total`. **Share any channel that
 reaches peers only through the relay**; until it is shared, peers' posts to it
 are refused and logged, and their users post on this server.
 
+This server relays nothing to its peers either. Its posts reach another server
+only through a channel it shares, so a peer on an earlier release no longer sees
+them in its own channel of the same name. A peer's federation subscription is
+answered with `FEDERATION_STREAM_RETIRED` and sends nothing; the connection,
+which also carries shares, stays up.
+
 ---
 
 ## The nameserver
@@ -875,50 +881,33 @@ passthrough) without terminating it.
 
 ## A stalled carried channel
 
-A channel this server follows for another server (an accepted share) can
-stall. That happens when the owner's chain names a block this server already
-holds in one of **its own** channels. One block belongs to one channel, so the
-owner's record for it cannot land. Nothing is moved and nothing is deleted:
-this server's channel keeps the block and its history, and the carried channel
-takes nothing past that record.
+Before v0.2.0-alpha.7, a channel this server follows for another server (an
+accepted share) could stall, when the owner's chain named a block this server
+already held in one of **its own** channels.
 
-**When it happens.** Both servers have a channel with the same name, say
-`#general`, and they were peered before the share. Clients post by channel
-name, so the federation relay lands each server's posts in the other's
-same-name channel. Share one of them, and the carried channel stalls at the
-first post the relay brought across. Any two servers that each have a
-`#general` and were peered before the share will hit this on its first share,
-until relayed posts into a channel the receiving server orders are refused
-(#357).
+**When it happened.** Both servers had a channel with the same name, say
+`#general`, and were peered before the share, on a release before
+v0.2.0-alpha.6. Clients post by channel name, so the legacy relay landed each
+server's posts in the other's same-name channel. Once one followed the other's
+`#general` by a share, the carried channel stalled at the first post the relay
+had brought across. v0.2.0-alpha.6 stopped new relayed posts from landing
+there (#357), and v0.2.0-alpha.7 stopped the relay altogether.
 
-From v0.2.0-alpha.6, a server refuses a post a peer relays into a channel the
-server orders itself (#357), so new relayed posts no longer cause this. A
-channel that stalled before you upgraded stays stalled: upgrading does not
-repair it.
+**After upgrading to v0.2.0-alpha.7 it heals by itself (#427).** The block stays
+in your own channel, whose chain is unchanged. The carried channel takes the
+owner's record for it as well, kept beside your own record of it, and goes on
+from there. Nothing is moved or deleted. A follower asks its owners for what it
+is missing every few seconds, so the stalled channel catches up within that,
+with no step on your part. `jig-server contracts list` stops showing a
+`stalled: channel …` line for it once it has. If you ended the share to get
+around the stall, share the channel again (the owner runs `jig channel share`)
+for it to catch up.
 
-**How to confirm it.**
-
-- `jig-server contracts list` ends with one line per stalled channel:
-  `stalled: channel <id> stalled at seq <n>: block <cid> is held in channel <id>`.
-- The log has a WARN, `a carried channel is stalled`, with `channel_id`, `seq`,
-  `block_cid`, `holder` and the owner's DID as `sequencer`. It repeats each time
-  the owner sends that record again.
-
-**What to do.** There is no safe way to fix it in place yet. Moving the block
-into the carried channel breaks your own channel's chain, which still names
-it. Deleting it does the same. Your options:
-
-- **Leave it.** The carried channel shows everything up to the stall. Your own
-  channel is untouched.
-- **End the share** with `jig-server contracts end <offer>` (the offer id is in
-  `contracts list`). This server stops following the channel. What it already
-  carried stays readable.
-- **Avoid it.** Before sharing a channel, ask the peer's operator whether their
-  server has a channel of its own with the same name. If it has, don't share
-  that channel yet.
-
-Repairing a stalled channel in place, so a carried channel can hold a block
-this server also holds elsewhere, is planned for a later release.
+**Downgrading.** A release before v0.2.0-alpha.7 does not read the records
+kept beside your own, and shows the carried channel with a hole at each
+formerly stalled position. A client that holds caught-up history to the
+channel's chain (#414) warns that the history is not whole there. Nothing is
+lost: upgrading again reads them.
 
 ## Gotchas worth knowing before they cost you an evening
 

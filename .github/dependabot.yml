@@ -8,6 +8,30 @@ updates:
       cargo:
         patterns:
           - "*"
+    # The wasm toolchain moves in lockstep with wasmtime (50 today), and a
+    # wit-bindgen bump rebuilds the text-block component, which ships through
+    # the two-step rollout (#402): clients learn the new build first, servers
+    # switch a release later. Neither belongs in a weekly batch. Raise these
+    # floors in the PR that moves wasmtime, or that starts a text-block step.
+    # wast and wat ship in the same wasm-tools release train and pull its newer
+    # wasm-encoder, so they move with the rest.
+    ignore:
+      - dependency-name: wasmparser
+        versions: [">= 0.262"]
+      - dependency-name: wasm-encoder
+        versions: [">= 0.262"]
+      - dependency-name: wasm-metadata
+        versions: [">= 0.262"]
+      - dependency-name: wit-component
+        versions: [">= 0.262"]
+      - dependency-name: wit-parser
+        versions: [">= 0.262"]
+      - dependency-name: wit-bindgen
+        versions: [">= 0.58"]
+      - dependency-name: wast
+        versions: [">= 263"]
+      - dependency-name: wat
+        versions: [">= 1.263"]
 
   - package-ecosystem: github-actions
     directory: /

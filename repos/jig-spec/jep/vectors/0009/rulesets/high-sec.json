@@ -1,0 +1,174 @@
+{
+  "authors": [],
+  "binding": [],
+  "consequences": [
+    {
+      "band": "severe",
+      "effort": "m_standing = max_penalty_multiplier",
+      "join": "none",
+      "note": "recommend refusing new channel joins",
+      "pool": "stranger",
+      "score_ppm": [
+        -999999,
+        -500000
+      ]
+    },
+    {
+      "band": "negative",
+      "effort": "m_standing above 1, up to max_penalty_multiplier",
+      "join": "guest",
+      "pool": "stranger",
+      "score_ppm": [
+        -499999,
+        -1
+      ]
+    },
+    {
+      "band": "unknown",
+      "effort": "m_standing = 1",
+      "join": "guest",
+      "note": "stranger",
+      "pool": "stranger",
+      "score_ppm": null
+    },
+    {
+      "band": "below-established",
+      "effort": "m_standing = 1",
+      "join": "guest",
+      "note": "stranger",
+      "pool": "stranger",
+      "score_ppm": [
+        0,
+        499999
+      ]
+    },
+    {
+      "band": "established",
+      "effort": "m_standing falls linearly to 1 / max_standing_discount",
+      "join": "member",
+      "pool": "member",
+      "score_ppm": [
+        500000,
+        999999
+      ]
+    }
+  ],
+  "epoch": {
+    "epoch_secs": 86400,
+    "witness_threshold": 3
+  },
+  "events": {
+    "beacon-withheld": -10000000,
+    "good-standing-interval": 1000000,
+    "invalid-proof": -2000000,
+    "invite-redeemed": 0,
+    "quota-breach": -2000000,
+    "signed-contradiction": -50000000,
+    "spam-confirmed": -20000000,
+    "standing-fraud": -50000000,
+    "useful-work-fraud": -5000000,
+    "verdict-applied": 0
+  },
+  "id": "high-sec",
+  "invites": true,
+  "maths": {
+    "id": "jig-beta-v1",
+    "version": 1
+  },
+  "parameters": {
+    "invites": {
+      "invite_start": 1000000,
+      "invite_window_epochs": 30,
+      "invites_per_window": 1
+    },
+    "pools": {
+      "aged_share": 0,
+      "invited_share": 10,
+      "stranger_share": 10
+    },
+    "pow": {
+      "admit": {
+        "max_effort": 16777216,
+        "max_solve_secs": 13,
+        "min_effort": 4194304
+      },
+      "max_penalty_multiplier": 16,
+      "max_standing_discount": 4
+    },
+    "standing": {
+      "accrual_per_period": 1000000,
+      "established": 500000,
+      "lambda_neg": 7672,
+      "lambda_pos": 3843,
+      "max_idle_epochs": 7,
+      "min_age_epochs": 60,
+      "minor": 1000000,
+      "per_reporter_cap": 2000000,
+      "per_reporter_neg_cap": 50000000,
+      "receipt_positions": 1024,
+      "unknown_reporter_weight": 0
+    }
+  },
+  "tribunal": {
+    "appeal_window": 1209600,
+    "evidence_threshold": 3,
+    "panel_size": 5,
+    "panel_sustain": 4,
+    "provisional_threshold": 2,
+    "provisional_ttl": 259200,
+    "response_window": 604800,
+    "seat_admission_threshold": 4,
+    "seats": 5
+  },
+  "useful_work": {
+    "beacon_exclusion_epochs": 7,
+    "beacon_min_reveals": 3,
+    "beacon_reveal_min": 10000,
+    "beacon_reveal_positions": 1024,
+    "beacon_withheld_weight": -10000000,
+    "commit_min": 20000,
+    "commit_positions": 2048,
+    "credit": {
+      "reexecute": 200000,
+      "retrieve": 100000,
+      "validate": 200000,
+      "witness": 100000
+    },
+    "credit_cap_per_period": 500000,
+    "dispute_retention_epochs": 90,
+    "fraud_weight": -5000000,
+    "k": {
+      "reexecute": 3,
+      "retrieve": 3,
+      "validate": 3,
+      "witness": 3
+    },
+    "k_escalate": 7,
+    "kinds": [
+      "witness",
+      "validate",
+      "reexecute",
+      "retrieve"
+    ],
+    "max_carry": 3,
+    "max_missed": 3,
+    "miss_pause_epochs": 7,
+    "miss_window_epochs": 7,
+    "n": {
+      "reexecute": 5,
+      "retrieve": 5,
+      "validate": 5,
+      "witness": 5
+    },
+    "n_escalate": 11,
+    "reexecute_rate": 1000,
+    "retrievability_epochs": 7,
+    "retrieve_samples": 16,
+    "reveal_min": 20000,
+    "reveal_positions": 2048,
+    "same_subject_cooldown_epochs": 30,
+    "sample_rate": 1000
+  },
+  "v": 1,
+  "version": 1
+}

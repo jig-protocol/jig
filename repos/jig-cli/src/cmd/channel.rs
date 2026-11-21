@@ -893,7 +893,7 @@ async fn join_encrypted(ctx: &CliContext, secure: &Secure, slug: &str) -> Result
                 return Ok(());
             }
             Err(e) if refused(&e) => {
-                secure.session.discard_group(&server, slug)?;
+                secure.session.discard_join(&server, slug)?;
                 let stale = e
                     .downcast_ref::<Refused>()
                     .is_some_and(|r| r.code == "STALE_EPOCH");
@@ -910,7 +910,7 @@ async fn join_encrypted(ctx: &CliContext, secure: &Secure, slug: &str) -> Result
                         Ok(())
                     }
                     Ok(None) => {
-                        secure.session.discard_group(&server, slug)?;
+                        secure.session.discard_join(&server, slug)?;
                         Err(e)
                     }
                     Err(_) => Err(e.context(format!(
@@ -1048,6 +1048,12 @@ struct ChannelView {
     /// before tiers, which show `visibility` instead.
     #[serde(default)]
     tier: Option<String>,
+    /// The CID of its creation block. Absent from servers before ids.
+    #[serde(default)]
+    id: String,
+    /// The server that orders it. Absent from servers before JEP-0005.
+    #[serde(default)]
+    sequencer: String,
 }
 
 impl ChannelView {
@@ -1131,9 +1137,17 @@ fn channel_lines(channels: &[ChannelView]) -> Vec<String> {
         .max()
         .unwrap_or(0)
         .max(10);
+    // A slug two listed channels share: this server's own and one it carries
+    // for another server (#388). Each such line says which it is.
+    let shared = |slug: &str| channels.iter().filter(|c| c.slug == slug).count() > 1;
     channels
         .iter()
         .map(|c| {
+            let collision = if shared(&c.slug) && !c.id.is_empty() {
+                format!("  (slug shared: id {}, ordered by {})", c.id, c.sequencer)
+            } else {
+                String::new()
+            };
             let sealed = if !matches!(c.suite.as_str(), "" | "none") {
                 "🔒"
             } else {
@@ -1146,7 +1160,7 @@ fn channel_lines(channels: &[ChannelView]) -> Vec<String> {
                 _ => "",
             };
             format!(
-                "{:<slug_w$}  {:<vis_w$}  {sealed}  {}{note}",
+                "{:<slug_w$}  {:<vis_w$}  {sealed}  {}{note}{collision}",
                 c.slug,
                 c.kind(),
                 c.owner_did,
@@ -1244,6 +1258,37 @@ mod tests {
         }
     }
 
+    /// #388: when this server's own channel and one it carries share a slug,
+    /// the list marks both with their ids and who orders each; a slug only
+    /// one channel has is listed as before.
+    #[test]
+    fn the_list_marks_a_slug_two_channels_share() {
+        let view = |slug: &str, id: &str, sequencer: &str| ChannelView {
+            slug: slug.to_string(),
+            visibility: "open".to_string(),
+            owner_did: String::new(),
+            created_at: 0,
+            suite: String::new(),
+            tier: None,
+            id: id.to_string(),
+            sequencer: sequencer.to_string(),
+        };
+        let lines = channel_lines(&[
+            view("#team", "bafyown", "did:jig:zfollower"),
+            view("#team", "bafycarried", "did:jig:zowner"),
+            view("#solo", "bafysolo", "did:jig:zfollower"),
+        ]);
+        assert!(
+            lines[0].contains("slug shared: id bafyown, ordered by did:jig:zfollower"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].contains("slug shared: id bafycarried, ordered by did:jig:zowner"),
+            "{lines:?}"
+        );
+        assert!(!lines[2].contains("slug shared"), "{lines:?}");
+    }
+
     #[test]
     fn a_public_channel_is_confirmed_or_refused_off_a_terminal() {
         assert!(public_confirmed("#news", true, false).unwrap());
@@ -1268,6 +1313,8 @@ mod tests {
             created_at: 0,
             suite: String::new(),
             tier: tier.map(str::to_string),
+            id: String::new(),
+            sequencer: String::new(),
         };
         assert_eq!(view(Some("public")).kind(), "public");
         let lines = channel_lines(&[view(Some("public")), view(Some("frozen")), view(None)]);
@@ -1474,6 +1521,8 @@ mod tests {
                 created_at: 0,
                 suite: "none".into(),
                 tier: None,
+                id: String::new(),
+                sequencer: String::new(),
             },
             ChannelView {
                 slug: "#devops".into(),
@@ -1482,6 +1531,8 @@ mod tests {
                 created_at: 0,
                 suite: "mls".into(),
                 tier: None,
+                id: String::new(),
+                sequencer: String::new(),
             },
         ]);
     }
