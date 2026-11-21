@@ -125,6 +125,9 @@ pub enum Release {
 /// One entry of a custodian's release log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseLogEntry {
+    /// The released package's hash reference, so its owner can delete that
+    /// package's private init key (JEP-0017 rule 32).
+    pub reference: Vec<u8>,
     pub requester: String,
     pub channel_id: String,
     pub last_resort: bool,
@@ -2907,15 +2910,28 @@ impl SqliteStore {
 
     /// The custodian's log of `did`'s releases, newest first, at most `limit`.
     pub fn key_package_releases(&self, did: &str, limit: u32) -> Result<Vec<ReleaseLogEntry>> {
+        self.key_package_releases_page(did, limit, 0)
+    }
+
+    /// [`Self::key_package_releases`], skipping the `offset` newest entries.
+    /// A release logged between two pages shifts the next page by one, so a
+    /// reader paging through sees an entry twice, never misses one.
+    pub fn key_package_releases_page(
+        &self,
+        did: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<ReleaseLogEntry>> {
         let conn = self.conn.lock().expect("poisoned");
         let mut stmt = conn.prepare(
-            "SELECT requester, channel_id, last_resort, request, released_at, kind
+            "SELECT requester, channel_id, last_resort, request, released_at, kind, reference
                FROM kp_releases WHERE did = ?1 AND counted = 1
-              ORDER BY released_at DESC, request_hash ASC LIMIT ?2",
+              ORDER BY released_at DESC, request_hash ASC LIMIT ?2 OFFSET ?3",
         )?;
         let rows = stmt
-            .query_map(params![did, limit], |r| {
+            .query_map(params![did, limit, offset], |r| {
                 Ok(ReleaseLogEntry {
+                    reference: r.get(6)?,
                     requester: r.get(0)?,
                     channel_id: r.get(1)?,
                     last_resort: r.get(2)?,
@@ -4891,6 +4907,39 @@ mod tests {
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].requester, "did:jig:zA");
         assert_eq!(log[0].request, b"signed request");
+    }
+
+    #[test]
+    fn the_release_log_names_each_package_and_pages_newest_first() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let did = "did:jig:zD";
+        for (n, r) in [b"r1", b"r2", b"r3"].iter().enumerate() {
+            store
+                .insert_key_package(*r, did, b"kp", false, n as i64)
+                .unwrap();
+        }
+        for (n, h) in [b"h1", b"h2", b"h3"].iter().enumerate() {
+            let requester = format!("did:jig:zA{n}");
+            let released = store
+                .release_key_package(&ask(did, &requester, *h, 100 + n as i64 * 10_000))
+                .unwrap();
+            assert!(matches!(released, Release::Released { .. }));
+        }
+        let first = store.key_package_releases_page(did, 2, 0).unwrap();
+        let rest = store.key_package_releases_page(did, 2, 2).unwrap();
+        let refs: Vec<_> = first
+            .iter()
+            .chain(&rest)
+            .map(|e| e.reference.clone())
+            .collect();
+        // Oldest package released first, so the newest entry names r3.
+        assert_eq!(refs, [b"r3".to_vec(), b"r2".to_vec(), b"r1".to_vec()]);
+        assert!(
+            store
+                .key_package_releases_page(did, 2, 3)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

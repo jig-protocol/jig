@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::{get, post},
 };
@@ -79,12 +79,22 @@ pub struct ReleasedBody {
 pub struct LogEntryBody {
     /// `custody` or `local` (JEP-0017 rule 32).
     pub kind: String,
+    /// The released package's hash reference, lowercase hex.
+    pub reference_hex: String,
     pub requester: String,
     pub channel_id: String,
     pub last_resort: bool,
     pub released_at: i64,
     /// The signed request the release answered, base64.
     pub request_b64: String,
+}
+
+/// `?offset=N`: skip the `N` newest entries. A page holds at most
+/// [`MAX_LOG_ENTRIES`]; a shorter one is the last.
+#[derive(Debug, Default, Deserialize)]
+pub struct LogPage {
+    #[serde(default)]
+    pub offset: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -341,6 +351,7 @@ fn no_custody(did: &str) -> Refusal {
 pub async fn release_log(
     State(state): State<Arc<AppState>>,
     Path(did): Path<String>,
+    Query(page): Query<LogPage>,
     uri: axum::http::Uri,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<LogBody>, Refusal> {
@@ -357,11 +368,12 @@ pub async fn release_log(
     let releases = state
         .ingest_ctx
         .store
-        .key_package_releases(&did, MAX_LOG_ENTRIES)
+        .key_package_releases_page(&did, MAX_LOG_ENTRIES, page.offset)
         .map_err(persist_err)?
         .into_iter()
         .map(|e| LogEntryBody {
             kind: e.kind.as_str().to_string(),
+            reference_hex: hex::encode(&e.reference),
             requester: e.requester,
             channel_id: e.channel_id,
             last_resort: e.last_resort,
