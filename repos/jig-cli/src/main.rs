@@ -464,6 +464,17 @@ enum ServerAction {
         #[arg(long)]
         url: Option<String>,
     },
+
+    /// End (`off`) or restore (`on`) the configured server's custody of
+    /// your key packages: whether it releases them to members of other
+    /// servers who add you (JEP-0017 R1). Members of this server can still
+    /// add you. `off` publishes a record without this server here and to
+    /// each other server it lists, and deletes this device's keys for the
+    /// packages it already released elsewhere.
+    Custody {
+        #[arg(value_enum)]
+        state: cmd::server::Switch,
+    },
 }
 
 // Parsed once per process; boxing `Run`'s fields would buy nothing.
@@ -876,6 +887,9 @@ async fn run() -> Result<()> {
             }
             ServerAction::Forget { url } => {
                 cmd::server::forget(&ctx, url.as_deref())?;
+            }
+            ServerAction::Custody { state } => {
+                cmd::server::custody(&ctx, state).await?;
             }
         }
         return Ok(());

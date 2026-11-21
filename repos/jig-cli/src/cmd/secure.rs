@@ -20,6 +20,7 @@ use jig_client::pins::{
 };
 use jig_client::read_auth::{ReadProof, signable_path};
 use jig_client::secure::{CommitLock, ReadIn, Seen, Session, history_reaches, replay_order};
+use jig_client::servers::{Reach, ServerStates};
 use jig_client::{Client, ClientError, DeliveredBlock, Identity};
 use jig_core::naming::ReachabilityRecord;
 use jig_mls::member::Commit;
@@ -339,6 +340,25 @@ fn sequencers_for(
 fn position_of(page: &[DeliveredBlock], cid: &str) -> Option<usize> {
     page.iter()
         .position(|d| open(d).is_ok_and(|o| o.cid == cid))
+}
+
+/// The reachability record a server keeps for us ([`Secure::kept_record`]).
+enum Kept {
+    /// The server has no route for records.
+    Unsupported,
+    None,
+    Record(ReachabilityRecord),
+}
+
+/// What [`Secure::set_custody`] did.
+#[derive(Debug, Default)]
+pub struct CustodyChange {
+    /// The new record's seq.
+    pub seq: u64,
+    /// Each other server the record went to, and how it answered.
+    pub elsewhere: Vec<(String, Result<(), String>)>,
+    /// Private init keys this device deleted (rule 32).
+    pub deleted: usize,
 }
 
 /// One identity's encrypted-channel state, bound to one server.
@@ -736,6 +756,333 @@ impl Secure {
         if packages.is_empty() {
             return self.ensure_reachable().await;
         }
+        self.publish_packages(&packages).await?;
+        self.ensure_reachable().await
+    }
+
+    /// The DID this device pinned for its server.
+    async fn server_did(&self) -> Result<String> {
+        self.ensure_pinned().await?;
+        Pins::load(&Pins::default_path())?
+            .offer(&self.server)
+            .pinned_server_did
+            .with_context(|| format!("no DID is pinned for {}", self.server))
+    }
+
+    /// This device's per-server state file ([`ServerStates`]).
+    fn server_states_path(&self) -> std::path::PathBuf {
+        ServerStates::default_path(self.session.did())
+    }
+
+    /// The reachability record this server keeps for us, as we see it: a
+    /// withdrawal included, which the server serves to its DID alone.
+    async fn kept_record(&self) -> Result<Kept> {
+        let did = self.session.did().to_string();
+        match self
+            .get_json::<RecordBody>(&format!("/api/v1/reach/{did}"))
+            .await
+        {
+            Ok(body) => Ok(STANDARD
+                .decode(body.record_b64)
+                .ok()
+                .and_then(|e| ReachabilityRecord::from_envelope(&e).ok())
+                .filter(|r| r.did == did)
+                .map_or(Kept::None, Kept::Record)),
+            Err(e) => match e.downcast_ref::<Refused>() {
+                Some(r) if r.code == "NO_RECORD" => Ok(Kept::None),
+                // A server from before reachability records has no route for
+                // them: nothing kept there, and nothing wrong.
+                Some(r) if r.status == 404 || r.status == 405 => Ok(Kept::Unsupported),
+                _ => Err(e),
+            },
+        }
+    }
+
+    /// Keep a reachability record on this server that lists it (JEP-0004
+    /// rule 21), so members of other servers can ask it for our key packages
+    /// ([`Self::key_package_from_custodians`]). Servers the record kept here
+    /// already listed stay listed; this server is put first.
+    ///
+    /// Never after custody here was withdrawn (JEP-0017 R1): only
+    /// [`Self::set_custody`] lists this server again. A withdrawal made on
+    /// another device is learned here, from the record the server keeps, and
+    /// this device then rotates its own keys (rule 32), since only it holds
+    /// them. Nothing, with `[server] publish_reachability = false`.
+    pub async fn ensure_reachable(&self) -> Result<()> {
+        if !self.publish_reachability {
+            return Ok(());
+        }
+        let server_did = self.server_did().await?;
+        let here = (server_did.clone(), self.base.clone());
+        let kept = match self.kept_record().await? {
+            Kept::Unsupported => return Ok(()),
+            Kept::None => None,
+            Kept::Record(r) => Some(r),
+        };
+        let path = self.server_states_path();
+        let mine = ServerStates::load(&path)?
+            .get(&server_did)
+            .and_then(|s| s.reach);
+        match (&kept, mine) {
+            // The server keeps a record without itself only as a withdrawal.
+            (Some(k), _) if !k.servers.iter().any(|(s, _)| *s == server_did) => {
+                if !mine.is_some_and(|m| m.withdrawn && m.seq >= k.seq) {
+                    eprintln!(
+                        "note: custody of your key packages at {} was withdrawn, from another device; deleting this device's keys for packages it released",
+                        self.server
+                    );
+                    self.rotate_after_withdrawal(&server_did).await?;
+                    self.note_reach(&server_did, k.seq, true)?;
+                }
+                return Ok(());
+            }
+            (Some(k), _) if k.servers.contains(&here) => {
+                // Listed here; a higher seq than ours is another device's
+                // record, an undo included.
+                if mine.is_none_or(|m| m.seq < k.seq || m.withdrawn) {
+                    self.note_reach(&server_did, k.seq, false)?;
+                }
+                return Ok(());
+            }
+            // Withdrawn by this device, and the server keeps no record:
+            // still withdrawn.
+            (None, Some(m)) if m.withdrawn => return Ok(()),
+            _ => {}
+        }
+        let mut servers = vec![here];
+        let mut floor = mine.map_or(0, |m| m.seq);
+        if let Some(kept) = kept {
+            floor = floor.max(kept.seq);
+            servers.extend(kept.servers.into_iter().filter(|(s, _)| *s != server_did));
+        }
+        let record = self.sign_record(servers, floor);
+        self.put_record(&self.base, &record).await?;
+        self.note_reach(&server_did, record.seq, false)
+    }
+
+    /// A record of `servers` above `floor` and above any this device signed
+    /// before: a record kept on another server may have reached a higher
+    /// seq, and the clock keeps each new one above it.
+    fn sign_record(&self, servers: Vec<(String, String)>, floor: u64) -> ReachabilityRecord {
+        let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
+        self.identity
+            .sign_reachability(servers, floor.saturating_add(1).max(now))
+    }
+
+    /// Put `record` on the server at `base`. The record is signed by us; the
+    /// route needs no request signature.
+    async fn put_record(&self, base: &str, record: &ReachabilityRecord) -> Result<()> {
+        let url = format!("{base}/api/v1/reach/{}", record.did);
+        let resp = crate::cmd::trust::http(base, std::time::Duration::from_secs(15))
+            .await?
+            .put(&url)
+            .json(&serde_json::json!({"record_b64": STANDARD.encode(&record.envelope)}))
+            .send()
+            .await
+            .with_context(|| format!("PUT {url}"))?;
+        if !resp.status().is_success() {
+            return Err(Self::refusal(resp).await.into());
+        }
+        Ok(())
+    }
+
+    fn note_reach(&self, server_did: &str, seq: u64, withdrawn: bool) -> Result<()> {
+        let base = self.base.clone();
+        ServerStates::update(&self.server_states_path(), |s| {
+            s.entry(server_did, &base).reach = Some(Reach { seq, withdrawn });
+        })?;
+        Ok(())
+    }
+
+    /// End (`on = false`) or restore custody of our key packages at this
+    /// server: JEP-0017 R1 and its undo (rules 12–15). The new record goes
+    /// here, then, best effort, to every other server it lists, which should
+    /// drop or list this one too. Ending custody also rotates this device's
+    /// keys (rule 32).
+    pub async fn set_custody(&self, on: bool) -> Result<CustodyChange> {
+        let server_did = self.server_did().await?;
+        let here = (server_did.clone(), self.base.clone());
+        let kept = match self.kept_record().await? {
+            Kept::Unsupported => anyhow::bail!(
+                "{} keeps no reachability records, so it is no custodian of your key packages",
+                self.server
+            ),
+            Kept::None => None,
+            Kept::Record(r) => Some(r),
+        };
+        let mine = ServerStates::load(&self.server_states_path())?
+            .get(&server_did)
+            .and_then(|s| s.reach);
+        let floor = mine
+            .map_or(0, |m| m.seq)
+            .max(kept.as_ref().map_or(0, |k| k.seq));
+        let others: Vec<_> = kept
+            .map(|k| k.servers)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(s, _)| *s != server_did)
+            .collect();
+        let mut change = CustodyChange::default();
+        if on {
+            let mut servers = vec![here];
+            servers.extend(others.iter().cloned());
+            let record = self.sign_record(servers, floor);
+            self.put_record(&self.base, &record).await?;
+            self.note_reach(&server_did, record.seq, false)?;
+            change.seq = record.seq;
+            change.elsewhere = self.put_elsewhere(&others, &record).await;
+            return Ok(change);
+        }
+        let record = self.sign_record(others.clone(), floor);
+        if floor > 0 {
+            self.put_record(&self.base, &record).await?;
+        }
+        // With no record here ever, custody was never in force: noting the
+        // withdrawal keeps this device from listing the server later.
+        change.seq = record.seq;
+        change.elsewhere = self.put_elsewhere(&others, &record).await;
+        change.deleted = self.rotate_after_withdrawal(&server_did).await?;
+        self.note_reach(&server_did, record.seq, true)?;
+        Ok(change)
+    }
+
+    /// Put `record` on each of `servers`, best effort: what each answered.
+    async fn put_elsewhere(
+        &self,
+        servers: &[(String, String)],
+        record: &ReachabilityRecord,
+    ) -> Vec<(String, Result<(), String>)> {
+        let mut out = Vec::new();
+        for (_, url) in servers {
+            let base = base_http_url(url);
+            let result = self
+                .put_record(&base, record)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            out.push((url.clone(), result));
+        }
+        out
+    }
+
+    /// JEP-0017 rule 32, on R1: publish a fresh last-resort package here,
+    /// then delete the private init keys of the old one and of each ordinary
+    /// package the release log shows went to another server's requester.
+    /// Packages taken by this server's own route stay, for local adds.
+    /// Returns how many keys this device deleted.
+    async fn rotate_after_withdrawal(&self, server_did: &str) -> Result<usize> {
+        let mut dead = self.custody_releases().await?;
+        // Read before publishing, which records the fresh one in its place.
+        let path = self.server_states_path();
+        let old = ServerStates::load(&path)?
+            .get(server_did)
+            .and_then(|s| s.last_resort.clone());
+        dead.extend(old.and_then(|h| hex::decode(h).ok()));
+        let fresh = self.session.key_packages(1, true)?;
+        let fresh_ref = jig_mls::delivery::validate_key_package(&fresh[0])?.reference;
+        self.publish_packages(&fresh).await?;
+        dead.retain(|r| *r != fresh_ref);
+        let deleted = self.session.forget_key_packages(&dead)?;
+        let base = self.base.clone();
+        ServerStates::update(&path, |s| {
+            let entry = s.entry(server_did, &base);
+            let gone: std::collections::HashSet<String> = dead.iter().map(hex::encode).collect();
+            entry.packages.retain(|p| !gone.contains(p));
+            entry.last_resort = Some(hex::encode(&fresh_ref));
+        })?;
+        Ok(deleted)
+    }
+
+    /// JEP-0017 rule 32, under R1 and R2 together and on R3: delete the
+    /// private init keys of every package this device stocked at
+    /// `server_did`, the last-resort one included, and forget their
+    /// references. Local only, and repeatable. Returns how many keys were
+    /// deleted.
+    #[expect(dead_code, reason = "R2's client (JEP-0017 rules 19 and 32) calls it")]
+    pub fn delete_stock_keys(&self, server_did: &str) -> Result<usize> {
+        let path = self.server_states_path();
+        let refs: Vec<Vec<u8>> = ServerStates::load(&path)?
+            .get(server_did)
+            .map(|s| {
+                s.packages
+                    .iter()
+                    .chain(&s.last_resort)
+                    .filter_map(|h| hex::decode(h).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let deleted = self.session.forget_key_packages(&refs)?;
+        ServerStates::update(&path, |s| {
+            if let Some(state) = s.servers.get_mut(server_did) {
+                state.packages.clear();
+                state.last_resort = None;
+            }
+        })?;
+        Ok(deleted)
+    }
+
+    /// The references of every package this server released to a custody
+    /// request, from our release log, every page. An entry from a server
+    /// before rule 32 carries no `kind`: it is `local` when it names no
+    /// channel and no request, as #440 logged a local take.
+    async fn custody_releases(&self) -> Result<Vec<Vec<u8>>> {
+        #[derive(Deserialize)]
+        struct Entry {
+            #[serde(default)]
+            kind: Option<String>,
+            #[serde(default)]
+            reference_hex: Option<String>,
+            #[serde(default)]
+            channel_id: String,
+            #[serde(default)]
+            request_b64: String,
+        }
+        #[derive(Deserialize)]
+        struct Log {
+            releases: Vec<Entry>,
+        }
+        const PAGE: usize = 200;
+        let did = self.session.did().to_string();
+        let mut refs = Vec::new();
+        let mut offset = 0;
+        loop {
+            let log: Log = match self
+                .get_json(&format!("/api/v1/custody/{did}/releases?offset={offset}"))
+                .await
+            {
+                Ok(log) => log,
+                Err(e) => match e.downcast_ref::<Refused>() {
+                    Some(r) if r.status == 404 || r.status == 405 => return Ok(refs),
+                    _ => return Err(e),
+                },
+            };
+            let n = log.releases.len();
+            for e in log.releases {
+                let custody = match e.kind.as_deref() {
+                    Some(kind) => kind == "custody",
+                    None => !e.channel_id.is_empty() || !e.request_b64.is_empty(),
+                };
+                if !custody {
+                    continue;
+                }
+                match e.reference_hex.as_deref().map(hex::decode) {
+                    Some(Ok(r)) => refs.push(r),
+                    _ => anyhow::bail!(
+                        "{} logs releases without the package they released; it cannot \
+                         tell this device which keys to delete",
+                        self.server
+                    ),
+                }
+            }
+            if n < PAGE {
+                return Ok(refs);
+            }
+            offset += n;
+        }
+    }
+
+    /// Upload `packages` here, and remember their references
+    /// ([`ServerStates`]), so their keys can be deleted later (rule 32).
+    async fn publish_packages(&self, packages: &[Vec<u8>]) -> Result<()> {
         self.ensure_pinned().await?;
         let url = format!("{}/api/v1/mls/key-packages", self.base);
         let body = serde_json::json!({
@@ -752,72 +1099,23 @@ impl Secure {
         if !resp.status().is_success() {
             return Err(Self::refusal(resp).await.into());
         }
-        self.ensure_reachable().await
-    }
-
-    /// The DID this device pinned for its server.
-    async fn server_did(&self) -> Result<String> {
-        self.ensure_pinned().await?;
-        Pins::load(&Pins::default_path())?
-            .offer(&self.server)
-            .pinned_server_did
-            .with_context(|| format!("no DID is pinned for {}", self.server))
-    }
-
-    /// Keep a reachability record on this server that lists it (JEP-0004
-    /// rule 21), so members of other servers can ask it for our key packages
-    /// ([`Self::key_package_from_custodians`]). Servers the record kept here
-    /// already listed stay listed; this server is put first.
-    /// Nothing, with `[server] publish_reachability = false`.
-    pub async fn ensure_reachable(&self) -> Result<()> {
-        if !self.publish_reachability {
-            return Ok(());
-        }
-        let did = self.session.did().to_string();
         let server_did = self.server_did().await?;
-        let here = (server_did.clone(), self.base.clone());
-        let kept = match self
-            .get_json::<RecordBody>(&format!("/api/v1/reach/{did}"))
-            .await
-        {
-            Ok(body) => STANDARD
-                .decode(body.record_b64)
-                .ok()
-                .and_then(|e| ReachabilityRecord::from_envelope(&e).ok())
-                .filter(|r| r.did == did),
-            Err(e) => match e.downcast_ref::<Refused>() {
-                Some(r) if r.code == "NO_RECORD" => None,
-                // A server from before reachability records has no route for
-                // them: nothing to keep there, and nothing wrong.
-                Some(r) if r.status == 404 || r.status == 405 => return Ok(()),
-                _ => return Err(e),
-            },
-        };
-        if kept.as_ref().is_some_and(|r| r.servers.contains(&here)) {
-            return Ok(());
-        }
-        let mut servers = vec![here];
-        let mut seq = 1;
-        if let Some(kept) = kept {
-            seq = kept.seq.saturating_add(1);
-            servers.extend(kept.servers.into_iter().filter(|(s, _)| *s != server_did));
-        }
-        // A record kept on another server may have reached a higher seq: the
-        // clock keeps each new record above any this device signed before.
-        let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
-        let record = self.identity.sign_reachability(servers, seq.max(now));
-        let url = format!("{}/api/v1/reach/{did}", self.base);
-        let resp = self
-            .http()
-            .await?
-            .put(&url)
-            .json(&serde_json::json!({"record_b64": STANDARD.encode(&record.envelope)}))
-            .send()
-            .await
-            .with_context(|| format!("PUT {url}"))?;
-        if !resp.status().is_success() {
-            return Err(Self::refusal(resp).await.into());
-        }
+        let base = self.base.clone();
+        let infos = packages
+            .iter()
+            .map(|p| jig_mls::delivery::validate_key_package(p))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        ServerStates::update(&self.server_states_path(), |s| {
+            let entry = s.entry(&server_did, &base);
+            for info in infos {
+                let reference = hex::encode(&info.reference);
+                if info.last_resort {
+                    entry.last_resort = Some(reference);
+                } else if !entry.packages.contains(&reference) {
+                    entry.packages.push(reference);
+                }
+            }
+        })?;
         Ok(())
     }
 
