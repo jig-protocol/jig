@@ -172,8 +172,11 @@ the peer's, and the receiving server judges it by its own rules.
 - A server **MUST** accept relayed blocks only from a peer it is configured to federate
   with, over a connection whose handshake the peer signed with the DID the server pinned for
   it.
-- A server **SHOULD** let only its configured peers subscribe to its federation stream,
-  authenticated whether or not it authenticates other reads.
+- A server **MUST NOT** send a block to a peer outside a share: a channel reaches another
+  server only by a share, through its owner's stream (JEP-0005). A peer on a release that
+  still relayed subscribes to the federation stream; a server **MAY** answer that with an
+  error and send nothing. It **SHOULD** answer a server it does not list as a peer with the
+  refusal it gave before (`NOT_A_PEER`), so that server reconnects once it is listed.
 
 ### Replay Protection
 
@@ -368,6 +371,7 @@ If a federation message includes a field you don't recognize and it's not in an 
 - Sign all federation payloads with server keypair (E2E signatures).
 - Process relayed blocks through the same checks as local submissions, and accept them only
   from configured, pinned peers.
+- Send a peer no block outside a share.
 - Perform replay detection (nonces + strict timestamp windows).
 - Negotiate protocol versions explicitly (no silent downgrades).
 - Enforce rate limiting at ingress.

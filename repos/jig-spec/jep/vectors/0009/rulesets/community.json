@@ -1,0 +1,108 @@
+{
+  "authors": [],
+  "binding": [
+    "linked-vouching"
+  ],
+  "consequences": [
+    {
+      "band": "negative",
+      "effort": "m_standing above 1, up to max_penalty_multiplier",
+      "join": "guest",
+      "pool": "stranger",
+      "score_ppm": [
+        -999999,
+        -1
+      ]
+    },
+    {
+      "band": "unknown",
+      "effort": "m_standing = 1",
+      "join": "guest",
+      "note": "member only by aged proof (rule 49)",
+      "pool": "member",
+      "score_ppm": null
+    },
+    {
+      "band": "below-established",
+      "effort": "m_standing = 1",
+      "join": "guest",
+      "note": "member only by aged proof (rule 49)",
+      "pool": "member",
+      "score_ppm": [
+        0,
+        199999
+      ]
+    },
+    {
+      "band": "established",
+      "effort": "m_standing falls linearly to 1 / max_standing_discount",
+      "join": "member",
+      "pool": "member",
+      "score_ppm": [
+        200000,
+        999999
+      ]
+    }
+  ],
+  "epoch": {
+    "epoch_secs": 86400,
+    "witness_threshold": 1
+  },
+  "events": {
+    "good-standing-interval": 1000000,
+    "invalid-proof": -1000000,
+    "invite-redeemed": 0,
+    "quota-breach": -500000,
+    "signed-contradiction": -15000000,
+    "spam-confirmed": -5000000,
+    "standing-fraud": -15000000,
+    "verdict-applied": 0
+  },
+  "id": "community",
+  "invites": true,
+  "maths": {
+    "id": "jig-beta-v1",
+    "version": 1
+  },
+  "parameters": {
+    "invites": {
+      "invite_start": 1000000,
+      "invite_window_epochs": 30,
+      "invites_per_window": 3
+    },
+    "pools": {
+      "aged_share": 25,
+      "invited_share": 15,
+      "stranger_share": 30
+    },
+    "pow": {
+      "admit": {
+        "max_effort": 16777216,
+        "max_solve_secs": 13,
+        "min_effort": 1048576
+      },
+      "max_penalty_multiplier": 16,
+      "max_standing_discount": 4
+    },
+    "standing": {
+      "accrual_per_period": 1000000,
+      "admit_age_epochs": 3,
+      "established": 200000,
+      "lambda_neg": 48305,
+      "lambda_pos": 11486,
+      "max_idle_epochs": 7,
+      "min_age_epochs": 14,
+      "minor": 2000000,
+      "per_reporter_cap": 4000000,
+      "per_reporter_neg_cap": 15000000,
+      "receipt_positions": 4096,
+      "unknown_reporter_weight": 250000,
+      "vouch_cap": 2000000,
+      "vouch_min_epochs": 30
+    }
+  },
+  "tribunal": null,
+  "useful_work": null,
+  "v": 1,
+  "version": 1
+}

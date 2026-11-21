@@ -78,10 +78,16 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
 
 ## 1. Proof-of-work is a toll
 
-1. **Proof-of-work never converts into standing.** No ruleset event, score, pool membership or
+1. **Proof-of-work never converts into standing.** No ruleset event, score, standing or
    eligibility under this JEP MAY depend on proof-of-work a subject solved, its effort, or how
    often it solved. JEP-0008 rules 21 and 28 already take standing as an input to effort. This
    rule closes the reverse direction.
+   - **The one bridge is membership by an aged admission proof** (JEP-0008 rule 21, JEP-0009
+     rule 49).
+     - It sets capacity-pool membership only.
+     - It needs the subject's `ack`, and never feeds `R`.
+     - Aged-proof members draw from at most `aged_share` of the member pool (JEP-0008
+       rule 23), so a farm that ages many proofs at once cannot crowd out established members.
 2. **The puzzle is asymmetric and memory-hard.** The algorithm that replaces `alg = 1` under
    JEP-0008 rule 8 MUST:
    - be memory-hard to solve, so that a GPU or ASIC gains less over a phone than it does on
@@ -101,11 +107,29 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
 5. A **task** is one unit of useful work: one log checkpoint to witness, one evidence sample to
    validate, one `public` receipt to re-execute, or one retrievability challenge to answer. It
    has a `task_id` (rule 13).
-6. An **epoch** is the ruleset's epoch, as R2.1 defines it for `f`: a range of positions in the
-   group log, never a span of wall-clock time. Every window in this JEP is counted in group-log
-   positions or epochs (TM-01, TM-02).
+6. An **epoch** is the ruleset's epoch, as JEP-0009 rules 35 and 36 define it.
+   - It is a range of positions in the epoch log, which for a ruleset group is the group log.
+   - It closes at the first checkpoint, counted at `witness_threshold` cosignatures, whose
+     **epoch time** is at least `epoch_secs` after the previous close. Epoch time is the
+     `witness_threshold`-th smallest cosignature timestamp, so a minority of witnesses cannot
+     move it earlier.
+   - An epoch never closes inside a window it opened (JEP-0009 rule 36).
+   - Nothing in this JEP reads a local clock. Time enters only as epoch time already in the
+     log (TM-01, TM-02).
 6a. The **beacon** of an epoch is the witness beacon of section 12: randomness the group's
    witnesses commit to in the epoch before and reveal in the epoch itself (rules 36–41).
+6b. A **window** closes on group-log positions and on epoch time, whichever comes later. Each
+   window of rules 16, 17 and 38 has:
+   - a length in group-log positions;
+   - a floor, given as a fraction of `epoch_secs` in ppm.
+
+   It closes at the first checkpoint counted at `witness_threshold` that is both:
+   - at least the window's length in positions after the checkpoint it opens at; and
+   - at least `⌊floor × epoch_secs / 10^6⌋` seconds of epoch time after that checkpoint.
+
+   The floor is what stops a flood. Appending leaves alone cannot close a window early, so a
+   flood cannot make an honest worker miss a commit or reveal (rule 17a). Nor can it make a
+   contributor miss a beacon reveal (rule 40).
 7. **Content** is anything a channel's members encrypted, and anything inside a franking opening
    (JEP-0010 rule 8). A block's CID, its signed outer fields, `ingest` records, counters, proofs
    and log records are not content.
@@ -214,7 +238,7 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
 
 ## 5. Commit and reveal
 
-16. **Commit.** Within `commit_positions` of the beacon's checkpoint, an assigned worker sends
+16. **Commit.** Within the commit window, an assigned worker sends
     its group's nameservers an `uw-commit`:
 
     ```
@@ -225,13 +249,15 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
                     ("task", task_id), ("result", result), ("nonce", nonce_r)
     ```
 
-    `nonce_a` and `nonce_r` are fresh 32-byte random values.
+    The commit window opens at the beacon's checkpoint, with `commit_positions` and
+    `commit_min` (rule 6b). `nonce_a` and `nonce_r` are fresh 32-byte random values.
     - The worker sends the `uw-commit`, with `π`, its enrolment's CID and `nonce_a`, over a
       connection authenticated as its DID. The nameserver checks the proof as in rule 15.
     - The nameserver logs the `uw-commit` signed by itself, not by the worker. Nothing in the
       logged record identifies the worker, or links two commits to the same worker.
-17. **Reveal.** After the commit window closes, and within a further `reveal_positions`, the
-    worker sends `uw-reveal {v, task_id, result, nonce_r}`.
+17. **Reveal.** Within the reveal window, the worker sends
+    `uw-reveal {v, task_id, result, nonce_r}`. The reveal window opens when the commit window
+    closes, with `reveal_positions` and `reveal_min` (rule 6b).
     - A reveal without a matching commit, or after the reveal window, is ignored.
     - A worker that does not reveal earns no credit for the task (rule 10).
     - No worker's result is visible to any other worker before every commit for the task has
@@ -403,10 +429,11 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
     | `sample_rate` | the fraction of log leaves sampled per epoch for `validate`, in ppm |
     | `reexecute_rate` | the fraction of `public` channel positions with receipts sampled per epoch for `reexecute`, in ppm |
     | `retrieve_samples` | chunks per retrievability challenge |
-    | `beacon_reveal_positions` | the beacon's reveal window, from the epoch's start (rule 38) |
+    | `beacon_reveal_positions`, `beacon_reveal_min` | the beacon's reveal window from the epoch's start, in group-log positions and as a floor in ppm of `epoch_secs` (rules 6b and 38) |
     | `beacon_min_reveals` | valid reveals an epoch needs to have a beacon (rule 39) |
     | `beacon_exclusion_epochs`, `beacon_withheld_weight` | the penalties for a withheld reveal (rule 40) |
     | `commit_positions`, `reveal_positions` | the commit and reveal windows, in group-log positions |
+    | `commit_min`, `reveal_min` | the commit and reveal windows' floors, in ppm of `epoch_secs` (rule 6b) |
     | `max_carry` | epochs a task may carry before it is `unresolved` |
     | `same_subject_cooldown_epochs` | epochs before an auditor may validate the same subject again |
     | `max_missed`, `miss_window_epochs`, `miss_pause_epochs` | the missed-reveal pause (rule 17a) |
@@ -416,7 +443,8 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
     | `credit_cap_per_period` | the most `useful-work` weight counted per period, as a fraction of `accrual_per_period`, in ppm |
     | `fraud_weight` | the weight of `useful-work-fraud`, more than one period's capped credit |
 
-    No parameter is in seconds. Every fraction is an integer in parts per million (ppm), from
+    No parameter is in seconds. The window floors are fractions of JEP-0009's `epoch_secs`.
+    Every fraction is an integer in parts per million (ppm), from
     0 to 1 000 000. R2.1 sets the reference values. Its starting points are `n` = 5,
     `k` = 3, `n_escalate` = 11 and `k_escalate` = 7.
 
@@ -430,8 +458,10 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
     hash of (`domain`, `jig-beacon-commit-v1`), (`epoch`, `N` as decimal ASCII) and (`r`).
     - A commit counts only if it is included in the group log before epoch `N` starts.
     - A contributor MUST NOT commit twice for one epoch. A second commit voids both.
-38. **Reveal, in the epoch itself.** Within `beacon_reveal_positions` of epoch `N`'s start,
-    each contributor that committed logs `beacon-reveal {v, witness, epoch: N, r}`.
+38. **Reveal, in the epoch itself.** Within the beacon-reveal window, each contributor that
+    committed logs `beacon-reveal {v, witness, epoch: N, r}`.
+    - The window opens at epoch `N`'s start, which is epoch `N − 1`'s closing checkpoint.
+    - Its length is `beacon_reveal_positions`, with a floor of `beacon_reveal_min` (rule 6b).
     - A reveal that does not hash to its commit is void.
     - A reveal included after the window is late, and counts as missing.
 39. **The beacon** of epoch `N` is the labelled BLAKE3 hash of:
@@ -483,6 +513,10 @@ JEP-0009 defines them; after D29 they are a role of `jig-server`.
   and 12), and the sample from the beacon (rule 13). The same subject cannot be drawn twice by
   one auditor within the cooldown (rule 14a).
 - **Withholding reveals to stall quorums.** Repeated misses pause the worker (rule 17a).
+- **Flooding to close windows.** Windows close on epoch time as well as positions (rule 6b).
+  So appending leaves cannot cut honest workers out of a commit or reveal, and cannot get them
+  paused. Epochs close on cosigned time (rule 6), so a flood cannot shorten them to buy accrual
+  either.
 - **NS-02, equivocation.** Workers witness logs from more than one path, and a split view is
   evidence (rule 22).
 - **OP-07, forged receipts.** Assigned workers re-execute sampled receipts in `public`
@@ -579,8 +613,8 @@ JEP-0009, JEP-0010 and JEP-0014 on `main`, and reviewed by the author.
 
 # Open Questions
 
-1. **The epoch.** This JEP takes R2.1's epoch for `f`. If R2.1's epoch is long, `witness`
-   tasks may want a shorter cadence of their own.
+1. **The epoch.** This JEP takes JEP-0009's epoch (rules 35 and 36). If `epoch_secs` is long,
+   `witness` tasks may want a shorter cadence of their own.
 2. **Encrypted evidence copies.** Which scheme lets a `retrieve` worker hold an evidence body
    that only the DID it concerns and an assigned auditor can decrypt, without the holder
    learning who is assigned?

@@ -5,9 +5,6 @@
 //! Arc so tests can read directly from the store when needed.
 //!
 //! Notes on design:
-//! - `add_peer` writes directly into the v0_0_2 federation config so the
-//!   `spawn_federation_peers` loop can pick it up. This is the additive
-//!   way — keeps tests in step with the production handshake path.
 //! - `create_channel` and `send_text_render` go through real HTTP /
 //!   WSS so we exercise the same path the CLI uses.
 
@@ -18,8 +15,7 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 use jig_client::{Identity, blocks::BuiltBlock};
 use jig_config::v0_0_2_server::{
-    FederationPeer, FederationSection, IdentityMode, IdentitySection, JigServerConfig,
-    ServerSection,
+    FederationSection, IdentityMode, IdentitySection, JigServerConfig, ServerSection,
 };
 use jig_pipeline::persist::{StoredBlock, StoredReceipt};
 use tempfile::TempDir;
@@ -234,34 +230,6 @@ impl TestJigServer {
 
     pub fn http_url(&self) -> String {
         format!("http://{}", self.bound_addr)
-    }
-
-    /// Register `other` as a federation peer of this server. Direct mutation
-    /// of the peers list via Fanout — we can't restart with a new config in
-    /// place, so we spawn a new federation loop pointing at the new peer.
-    pub async fn add_peer(&self, other: &TestJigServer) -> Result<()> {
-        let peer = FederationPeer {
-            url: other.ws_url(),
-            expected_did: other.server_did_string.clone(),
-            alias: None,
-            publish: false,
-            quota: None,
-            offers: Default::default(),
-        };
-
-        // Listing a peer is what trusts it: `other` may now subscribe to our
-        // federation stream, as a `[federation] peers` entry would allow.
-        self.state.auth.trust_federation_peer(&peer.expected_did)?;
-
-        // We can't mutate `state.config` after boot (it's behind an Arc),
-        // so instead we drive the run_peer_loop entry point manually.
-        // Inline the spawn_federation_peers logic with just our one peer.
-        let state_clone = self.state.clone();
-        let peer_clone = peer.clone();
-        tokio::spawn(async move {
-            spawn_one_peer_loop(state_clone, peer_clone).await;
-        });
-        Ok(())
     }
 
     /// Seed a channel STRAIGHT INTO THE STORE, bypassing ingest.
@@ -1085,148 +1053,4 @@ fn build_legacy_routes(
         }
     };
     Ok(Router::new().route("/.well-known/jig", get(handler)))
-}
-
-/// Spawn a single peer-loop on an ad-hoc basis (used by `add_peer`).
-/// Mirrors `jig_server::v0_0_2_federation::run_peer_loop` but takes a
-/// peer struct directly instead of iterating `config.federation.peers`.
-async fn spawn_one_peer_loop(state: Arc<jig_server::v0_0_2::AppState>, peer: FederationPeer) {
-    use futures_util::{SinkExt, StreamExt};
-    use jig_pipeline::{Envelope, Frame, Scope, envelope::ReceiptRef};
-    use tokio_tungstenite::tungstenite::Message;
-
-    // Inline copy of the connect-and-relay logic — keeps the test harness
-    // self-contained instead of requiring us to expose pub `run_peer_loop`
-    // on jig-server (which would change the production surface).
-    loop {
-        let ws_url = format!("{}/api/v1/ws", peer.url.trim_end_matches('/'));
-        let connect_result = tokio_tungstenite::connect_async(&ws_url).await;
-        let Ok((mut ws, _resp)) = connect_result else {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            continue;
-        };
-        // The production dialer does this too. A peer that has not welcomed
-        // us will refuse the subscribe below.
-        if jig_server::v0_0_2_federation::complete_client_handshake(
-            &mut ws,
-            Some(&peer.expected_did),
-        )
-        .await
-        .is_err()
-        {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            continue;
-        }
-        let (mut sink, mut stream) = ws.split();
-
-        // Subscribe federation scope so we receive their block stream.
-        // Signed like any other caller: the peer requires a proof.
-        // Uses the SAME helper production federation uses, so this harness
-        // cannot drift into signing something the real path does not.
-        let sub_scope = Scope::Federation {
-            block_kinds: vec![],
-        };
-        let sub_env = Envelope::new(Frame::Subscribe {
-            auth: Some(jig_server::v0_0_2_federation::sign_federation_subscribe(
-                &state, &sub_scope,
-            )),
-            scope: sub_scope,
-        });
-        if sink
-            .send(Message::Text(
-                serde_json::to_string(&sub_env).unwrap().into(),
-            ))
-            .await
-            .is_err()
-        {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            continue;
-        }
-
-        // Register a peer subscriber on our Fanout so OUR locally-ingested
-        // blocks get pushed to this peer.
-        let (peer_tx, mut peer_rx) =
-            tokio::sync::mpsc::unbounded_channel::<(StoredBlock, StoredReceipt)>();
-        state
-            .ingest_ctx
-            .fanout
-            .register_peer(peer.url.clone(), peer_tx)
-            .await;
-
-        loop {
-            tokio::select! {
-                msg = stream.next() => {
-                    let Some(Ok(m)) = msg else { break };
-                    if let Message::Text(text) = m {
-                        // The peer has not listed us (yet): reconnect and
-                        // ask again, as the production loop does.
-                        if jig_server::v0_0_2_federation::subscription_refusal(&text).is_some() {
-                            break;
-                        }
-                        let _ = handle_inbound_test_frame(&state, &peer, &text).await;
-                    }
-                }
-                delivery = peer_rx.recv() => {
-                    let Some((block, receipt)) = delivery else { break };
-                    let frame = Envelope::new(Frame::Block {
-                        bundle_b64: base64::engine::general_purpose::STANDARD
-                            .encode(&block.bundle_bytes),
-                        sig_b64: if block.sender_sig.is_empty() {
-                            None
-                        } else {
-                            Some(
-                                base64::engine::general_purpose::STANDARD
-                                    .encode(&block.sender_sig),
-                            )
-                        },
-                        receipts: vec![ReceiptRef {
-                            server_did: receipt.server_id.clone(),
-                            render_hash: receipt.render_hash.clone(),
-                            receipt_bytes_b64: base64::engine::general_purpose::STANDARD
-                                .encode(&receipt.receipt_bytes),
-                        }],
-                        delivery_cid: format!("delivery:{}", block.cid),
-                        ingest: None,
-                    });
-                    let json = serde_json::to_string(&frame).unwrap();
-                    if sink.send(Message::Text(json.into())).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-        state.ingest_ctx.fanout.unregister_peer(&peer.url).await;
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-}
-
-/// Inbound `Block` frames from a peer go through the server's own relay
-/// path, `jig_server::v0_0_2_federation::ingest_peer_block`. This used to be a
-/// line-by-line copy, and the copy drifted (it kept an old CID scheme after
-/// the server's changed), so the federation tests were testing the copy.
-async fn handle_inbound_test_frame(
-    state: &Arc<jig_server::v0_0_2::AppState>,
-    peer: &FederationPeer,
-    text: &str,
-) -> anyhow::Result<()> {
-    use jig_pipeline::{Envelope, Frame};
-
-    let env: Envelope = serde_json::from_str(text)?;
-    let Frame::Block {
-        bundle_b64,
-        sig_b64,
-        delivery_cid,
-        ..
-    } = env.frame
-    else {
-        return Ok(());
-    };
-    jig_server::v0_0_2_federation::ingest_peer_block(
-        state,
-        peer,
-        &bundle_b64,
-        sig_b64.as_deref(),
-        &delivery_cid,
-    )
-    .await
 }

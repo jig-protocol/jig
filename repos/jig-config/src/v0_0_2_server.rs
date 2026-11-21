@@ -155,10 +155,43 @@ pub struct ServerSection {
     /// to 30 000–900 000 (`jig_pipeline::handshake`); the server refuses to
     /// boot outside that range.
     pub max_future_skew_ms: u64,
+    /// `[server.proxy_protocol]`: TLS-passthrough proxies whose connections
+    /// carry the client's address in a PROXY protocol v2 header. Off unless
+    /// `trusted` names one.
+    pub proxy_protocol: ProxyProtocolSection,
 }
 
 /// The default `[server] max_future_skew_ms`: five minutes.
 pub const DEFAULT_MAX_FUTURE_SKEW_MS: u64 = 300_000;
+
+/// `[server.proxy_protocol]` (#399). A TLS-passthrough proxy cannot add an
+/// HTTP header, so without this every client behind it has the proxy's
+/// address: one per-address rate bucket and one set of relay slots for all.
+///
+/// A connection from an address in `trusted` must open with a PROXY protocol
+/// v2 header, which names the client. One that does not (no header, a
+/// malformed or oversized one, v1 text, a UDP or Unix-socket address, or none
+/// within `header_timeout_ms`) is closed, never served under the proxy's own
+/// address. A connection from any other address is served as before, and a
+/// PROXY header from it is not read. No forwarded HTTP header is ever trusted.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProxyProtocolSection {
+    /// Proxy addresses or CIDRs, e.g. `"10.0.0.5"`, `"10.0.1.0/24"` or
+    /// `"2001:db8::/48"`. Empty: PROXY protocol is off.
+    pub trusted: Vec<String>,
+    /// How long a trusted proxy has to send the whole header.
+    pub header_timeout_ms: u64,
+}
+
+impl Default for ProxyProtocolSection {
+    fn default() -> Self {
+        Self {
+            trusted: Vec::new(),
+            header_timeout_ms: 5_000,
+        }
+    }
+}
 
 impl Default for ServerSection {
     fn default() -> Self {
@@ -194,6 +227,7 @@ impl Default for ServerSection {
                 "contract-end".to_string(),
             ],
             max_future_skew_ms: DEFAULT_MAX_FUTURE_SKEW_MS,
+            proxy_protocol: ProxyProtocolSection::default(),
         }
     }
 }
@@ -368,10 +402,11 @@ pub struct RateLimitSection {
     pub per_did_per_second: u32,
     /// Per remote address: every HTTP request and every WebSocket frame,
     /// signed or not. Behind a reverse proxy every request comes from the
-    /// proxy's address, so raise this or turn it off there. The same address
+    /// proxy's address, so raise this or turn it off there, or behind a
+    /// TLS-passthrough proxy set `[server.proxy_protocol]`. The same address
     /// keys a REST write's relay slots (`MAX_IN_FLIGHT` per address), so
-    /// clients behind one proxy share those too; no forwarded header is
-    /// trusted yet (#399).
+    /// clients behind one proxy without PROXY protocol share those too. No
+    /// forwarded HTTP header is trusted.
     pub per_ip_burst: u32,
     pub per_ip_per_second: u32,
     /// Nonces one DID may hold in the replay guard at once. Keeps one
