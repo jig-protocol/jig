@@ -441,7 +441,9 @@ pub(crate) async fn create_with(
             return already();
         }
         if secure.session.has_group(secure.server(), &pending)? {
-            if let Some(info) = secure.channel(slug).await? {
+            // This server's own channel under the slug: one it carries for
+            // another server is not the create this device left pending.
+            if let Some(info) = secure.own_channel(slug).await? {
                 // A create the server never answered, and took.
                 secure
                     .session

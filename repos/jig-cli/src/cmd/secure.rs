@@ -450,6 +450,17 @@ impl Secure {
     /// creation block is pinned on first sight, so a channel re-created
     /// under the same name is refused rather than silently trusted.
     pub async fn channel(&self, slug: &str) -> Result<Option<ChannelInfo>> {
+        self.listed(slug, false).await
+    }
+
+    /// [`Self::channel`], for the channel this server itself orders under
+    /// `slug`: `None` when it orders none, though it may carry a channel for
+    /// another server under the same slug.
+    pub async fn own_channel(&self, slug: &str) -> Result<Option<ChannelInfo>> {
+        self.listed(slug, true).await
+    }
+
+    async fn listed(&self, slug: &str, own_only: bool) -> Result<Option<ChannelInfo>> {
         #[derive(Deserialize)]
         struct Listing {
             channels: Vec<ChannelInfo>,
@@ -459,7 +470,12 @@ impl Secure {
             .server(&self.server)
             .map(|p| p.sequencers())
             .unwrap_or_default();
-        let Some(mut info) = pick(listing.channels, slug, &ours)? else {
+        let channels = if own_only {
+            ordered_here(listing.channels, &ours)
+        } else {
+            listing.channels
+        };
+        let Some(mut info) = pick(channels, slug, &ours)? else {
             return Ok(None);
         };
         let pin = self.proven(&info).await?;
@@ -1408,6 +1424,15 @@ fn pick(
     }
 }
 
+/// The channels in a listing that this server orders itself, leaving out
+/// those it carries for another server.
+fn ordered_here(channels: Vec<ChannelInfo>, ours: &[String]) -> Vec<ChannelInfo> {
+    channels
+        .into_iter()
+        .filter(|c| !names_another_server(ours, &c.sequencer))
+        .collect()
+}
+
 /// What `jig` says when `reference` names both this server's own channel
 /// `own` and a channel it carries for another server, `carried` (#388): the
 /// slug reads the server's own, and the other is named by its id.
@@ -1422,7 +1447,8 @@ fn shadow_note(reference: &str, own: &ChannelInfo, carried: &ChannelInfo) -> Str
 #[cfg(test)]
 mod tests {
     use super::{
-        ChannelInfo, group_name, must_encrypt, own_group_name, pick, sequencers_for, shadow_note,
+        ChannelInfo, group_name, must_encrypt, ordered_here, own_group_name, pick, sequencers_for,
+        shadow_note,
     };
     use jig_client::pins::{ChannelPin, Pins};
 
@@ -1511,6 +1537,25 @@ mod tests {
             "bafylegacy"
         );
         assert!(pick(vec![], "#none", &ours).unwrap().is_none());
+    }
+
+    /// A `channel create` retry asks whether this server took the create it
+    /// left pending: a channel the server carries for another under the slug
+    /// is not that create, and is no error.
+    #[test]
+    fn a_retry_reads_past_a_carried_channel_with_the_slug() {
+        let ours = vec!["did:jig:zfollower".to_string()];
+        let carried = listed("bafycarried", "#shared", "did:jig:zowner");
+        let own = listed("bafyown", "#shared", "did:jig:zfollower");
+        assert!(
+            pick(ordered_here(vec![carried.clone()], &ours), "#shared", &ours)
+                .unwrap()
+                .is_none()
+        );
+        let got = pick(ordered_here(vec![carried, own], &ours), "#shared", &ours)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.id, "bafyown");
     }
 
     /// #432: a server's own channel's MLS state is filed under the id its
