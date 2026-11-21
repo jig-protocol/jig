@@ -253,6 +253,9 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
         }
         // 409: the block is well formed; a 1:1 adds nobody (rule 18).
         IngestError::DmIsAPair { .. } => (StatusCode::CONFLICT, "DM_IS_A_PAIR", e.to_string()),
+        IngestError::MemberDeclined { .. } => {
+            (StatusCode::FORBIDDEN, "MEMBER_DECLINED", e.to_string())
+        }
         // 409: someone else committed first. The client catches up and
         // rebuilds; nothing about the request itself was wrong.
         IngestError::StaleEpoch { .. } => (StatusCode::CONFLICT, "STALE_EPOCH", e.to_string()),
@@ -397,6 +400,10 @@ mod tests {
                 slug: "#dm/0123456789abcdef".to_string(),
                 member: "did:jig:zThird".to_string(),
             },
+            IngestError::MemberDeclined {
+                slug: "#team".to_string(),
+                member: "did:jig:zBob".to_string(),
+            },
             IngestError::StaleEpoch {
                 slug: "#sealed".to_string(),
                 current: 2,
@@ -515,6 +522,16 @@ mod tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(code, "RENDER_FAILED");
         assert!(message.contains("may be transient"), "{message}");
+    }
+
+    #[test]
+    fn a_declined_member_add_is_forbidden() {
+        let (status, code, _) = classify_ingest_error(&IngestError::MemberDeclined {
+            slug: "#team".to_string(),
+            member: "did:jig:zBob".to_string(),
+        });
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(code, "MEMBER_DECLINED");
     }
 
     #[test]

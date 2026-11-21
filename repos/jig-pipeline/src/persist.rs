@@ -1008,6 +1008,39 @@ pub enum Landing {
     /// The guarded right no longer held at the block's seq; nothing was
     /// written.
     Unauthorized,
+    /// A `member-add` of a DID that has ended local adds here (JEP-0017
+    /// R2), read in the landing's transaction; nothing was written.
+    Declined,
+}
+
+/// A `member-add` refused because its member has ended local adds here
+/// (JEP-0017 rule 16). The error the plain landing path returns, so ingest
+/// can tell it from any other.
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+#[error("{member} has asked this server not to be added to the channels it sequences")]
+pub struct MemberDeclined {
+    pub member: String,
+}
+
+/// Whether `block` adds a DID other than its signer that has ended local
+/// adds here (JEP-0017 rule 16). A DID's own join is its act, not an add by
+/// others, so it is never declined. Read on the landing's transaction.
+fn declined_on(
+    conn: &Connection,
+    block: &StoredBlock,
+    membership: &MembershipChange,
+) -> Result<bool> {
+    let MembershipChange::Upsert(m) = membership else {
+        return Ok(false);
+    };
+    if block.block_kind != "member-add" {
+        return Ok(false);
+    }
+    let member = crate::effect::canonical_did_string(&m.member_did);
+    if member == crate::effect::canonical_did_string(&block.sender_did) {
+        return Ok(false);
+    }
+    local_adds_ended_on(conn, &member)
 }
 
 fn role_blocks_before_on(
@@ -1701,6 +1734,9 @@ impl SqliteStore {
         }
         let mut conn = self.conn.lock().expect("poisoned");
         let tx = conn.transaction()?;
+        if declined_on(&tx, b, membership)? {
+            return Ok(Landing::Declined);
+        }
         insert_block_on(&tx, b)?;
         let record = sequence_on(&tx, &b.cid, signer)?;
         if let Some(guard) = guard
@@ -2635,7 +2671,7 @@ impl SqliteStore {
                 signer, None,
             )? {
                 Landing::Landed(record) => Some(record),
-                Landing::LostRace | Landing::Unauthorized => None,
+                Landing::LostRace | Landing::Unauthorized | Landing::Declined => None,
             },
         )
     }
@@ -2661,6 +2697,9 @@ impl SqliteStore {
     ) -> Result<Landing> {
         let mut conn = self.conn.lock().expect("poisoned");
         let tx = conn.transaction()?;
+        if declined_on(&tx, block, membership)? {
+            return Ok(Landing::Declined);
+        }
         // `group_info` replaces the stored one even when `None`: a group info
         // describes one epoch, and serving the previous epoch's under the new
         // one would send every external joiner into a stale commit.
@@ -3613,7 +3652,7 @@ fn local_adds_on(conn: &Connection, did: &str) -> Result<Option<LocalAddsMarker>
 }
 
 /// Whether `did`'s kept marker ends local adds here (JEP-0017 R2).
-fn local_adds_ended_on(conn: &Connection, did: &str) -> Result<bool> {
+pub(crate) fn local_adds_ended_on(conn: &Connection, did: &str) -> Result<bool> {
     Ok(local_adds_on(conn, did)?.is_some_and(|m| !m.allow))
 }
 

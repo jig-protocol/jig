@@ -231,12 +231,23 @@ fn apply_member_add(
     let (named, channel) = channel_of(store, BlockKind::MemberAdd, m, block_cid, false)?;
     let channel = channel
         .ok_or_else(|| anyhow::anyhow!("member-add references unknown channel `{named}`"))?;
-    member_add_on(
-        &store.conn.lock().expect("poisoned"),
-        m,
-        block_cid,
-        &channel,
-    )
+    let conn = store.conn.lock().expect("poisoned");
+    // JEP-0017 rule 16, read under the lock that writes the membership: a
+    // member who has ended local adds is not added by others. On this path
+    // the block itself is stored after, in its own transaction (see
+    // `ingest`): a refusal here returns before it, and a marker stored after
+    // the membership write orders the add before the marker.
+    if let Some(member) = meta_str(m, "member_did").map(canonical_did_string) {
+        let signer = m
+            .authors
+            .first()
+            .map(|a| canonical_did_string(&a.did))
+            .unwrap_or_default();
+        if member != signer && crate::persist::local_adds_ended_on(&conn, &member)? {
+            return Err(crate::persist::MemberDeclined { member }.into());
+        }
+    }
+    member_add_on(&conn, m, block_cid, &channel)
 }
 
 fn member_add_on(
