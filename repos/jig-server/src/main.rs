@@ -322,8 +322,14 @@ fn warn_on_ignored_legacy_config_files() {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Not `#[tokio::main]`: its runtime waits, without a bound, for blocking
+    // work still running at exit, which would outlast the shutdown drain
+    // (#424).
+    jig_server::shutdown::run(serve())?
+}
+
+async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     // Default to `info` when RUST_LOG is unset: `from_default_env()` alone
     // yields an empty filter, which silences every startup diagnostic below
     // (including the fatal-config and decorative-`listen` warnings).

@@ -62,9 +62,11 @@ impl Shutdown {
         self.tracker.spawn(task)
     }
 
-    /// Have [`Shutdown::drain`] wait for `future` too.
-    pub fn track<F: Future>(&self, future: F) -> tokio_util::task::task_tracker::TrackedFuture<F> {
-        self.tracker.track_future(future)
+    /// Have [`Shutdown::drain`] wait until the returned token is dropped.
+    /// Taken synchronously, it covers work that starts later, such as a
+    /// WebSocket session whose upgrade has not completed yet.
+    pub fn hold(&self) -> tokio_util::task::task_tracker::TaskTrackerToken {
+        self.tracker.token()
     }
 
     /// How many tracked connections and sessions are still running.
@@ -81,6 +83,25 @@ impl Shutdown {
             .await
             .is_ok()
     }
+}
+
+/// How long the runtime waits, once the server has returned, for blocking
+/// work still running (a text render, a SQLite call) before the process
+/// exits anyway. The drain bounds connections; this bounds what they left on
+/// the blocking pool.
+pub const TEARDOWN_GRACE: Duration = Duration::from_secs(1);
+
+/// Run `main` on a multi-threaded runtime, then shut the runtime down within
+/// [`TEARDOWN_GRACE`]. `#[tokio::main]` instead waits, without a bound, for
+/// every blocking task already started, so a render queued for an execution
+/// slot could hold a stopping server past its drain.
+pub fn run<F: Future>(main: F) -> std::io::Result<F::Output> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let out = runtime.block_on(main);
+    runtime.shutdown_timeout(TEARDOWN_GRACE);
+    Ok(out)
 }
 
 /// A future that resolves on the next SIGTERM or SIGINT. The handlers are
@@ -143,6 +164,38 @@ mod tests {
         done_tx.send(()).unwrap();
         assert!(shutdown.drain(Duration::from_secs(5)).await);
         assert_eq!(shutdown.in_flight(), 0);
+    }
+
+    /// Blocking work still running when the server returns does not hold
+    /// the process: the runtime gives it [`TEARDOWN_GRACE`], then goes.
+    #[test]
+    fn run_does_not_wait_for_blocking_work_past_the_grace() {
+        let started = std::time::Instant::now();
+        let out = run(async {
+            let (running_tx, running_rx) = tokio::sync::oneshot::channel();
+            tokio::task::spawn_blocking(move || {
+                let _ = running_tx.send(());
+                std::thread::sleep(Duration::from_secs(30));
+            });
+            running_rx.await.unwrap();
+            7
+        })
+        .unwrap();
+        assert_eq!(out, 7);
+        assert!(
+            started.elapsed() < TEARDOWN_GRACE + Duration::from_secs(3),
+            "returned after {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn hold_keeps_the_drain_waiting_until_dropped() {
+        let shutdown = Shutdown::new();
+        let held = shutdown.hold();
+        assert!(!shutdown.drain(Duration::from_millis(50)).await);
+        drop(held);
+        assert!(shutdown.drain(Duration::from_secs(5)).await);
     }
 
     #[tokio::test]

@@ -238,6 +238,11 @@ where
         }
     };
 
+    // The listener lives no longer than this future: dropped early (a caller
+    // aborting it), or returning once the drain has run out or been cut, it
+    // stops accepting and frees the port rather than serving on detached.
+    let _listener_lifetime = AbortOnDrop(listening.abort_handle());
+
     // Serve until the signal, or until the listener fails.
     tokio::pin!(stop);
     tokio::select! {
@@ -275,6 +280,15 @@ where
         }
     }
     Ok(())
+}
+
+/// Aborts a task when dropped.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// [`jig_config::tls::load_rustls_config`], with its error as a config error.
@@ -1066,6 +1080,30 @@ mod tests {
                 .unwrap_or_else(|_| panic!("{mode:?}: the drain finished"))
                 .unwrap()
                 .unwrap();
+        }
+    }
+
+    /// A server future dropped before its signal (a caller aborting it) takes
+    /// its listener with it: the port stops accepting at once.
+    #[tokio::test]
+    async fn dropping_the_server_stops_its_listener() {
+        for mode in [Listening::Axum, Listening::Proxied, Listening::Tls] {
+            let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+            let (harness, served) = Harness::start(
+                mode,
+                Router::new(),
+                Duration::from_secs(5),
+                stop_rx,
+                std::future::pending,
+            )
+            .await;
+            assert!(harness.accepts().await, "{mode:?}: serving");
+            served.abort();
+            let _ = served.await;
+            assert!(
+                !harness.accepts().await,
+                "{mode:?}: still accepting once dropped"
+            );
         }
     }
 
