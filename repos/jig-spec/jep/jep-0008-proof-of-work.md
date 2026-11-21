@@ -370,6 +370,11 @@ Non-goals:
   in a CPU cache. Its GPU resistance comes mostly from HashX's random programs, one per challenge.
   An FPGA or ASIC for HashX is possible in principle. None is known, and no break of Equi-X has
   been published to date. A break would be met by registering a new `alg`, as rule 8 allows.
+- **A shared address shares the Equi-X budget.** Everyone behind one carrier-grade NAT or one
+  /64 draws on the same `equix_verifies_per_window` (rule 10a), so one flooder there can spend it
+  for all of them. They are refused `RATE_LIMITED` with no penalty. While `alg = 1` is offered,
+  they can fall back to it. On a verifier that has dropped `alg = 1` (migration step 3), they wait
+  for the next window.
 - **Clients without the HashX compiler** solve with an interpreter, which is several times slower:
   browsers and Wasm hosts, and platforms that forbid JIT code, such as iOS. They pay more under
   `alg = 2` than under `alg = 1`. Verification is cheap with or without the compiler, so small and
@@ -397,7 +402,8 @@ a nonce. No message links two DIDs.
      alternative. A client solves `alg = 2` whenever it is offered, unless it has no HashX
      compiler and the `alg = 1` alternative is cheaper for it.
   3. **Sole.** The reference verifiers stop offering `alg = 1` by default. An operator MAY keep
-     it, and accepts that a GPU then picks it.
+     it, and accepts that a GPU then picks it. Without it, clients behind a shared address lose
+     their fallback when a flooder there spends the Equi-X budget (rule 10a).
 
   Each step needs `digests_per_solution` measured on #337's set-up first.
 
