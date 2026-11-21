@@ -242,7 +242,30 @@ the root keys and every section in one file.
 > front of it.** The signed welcome carries the connection's TLS exporter (#234),
 > so a server behind a proxy that terminates TLS signs an empty exporter, and
 > every remote client refuses it. If something must sit in front of jig-server,
-> it passes TLS through (TCP or SNI passthrough). `[tls] enabled = false` serves
+> it passes TLS through (TCP or SNI passthrough).
+>
+> **Behind a passthrough proxy, enable PROXY protocol on both sides**, or every
+> client has the proxy's address and shares one per-address rate bucket and one
+> set of REST relay slots. Have the proxy send PROXY protocol **v2**
+> (HAProxy: `send-proxy-v2`; nginx 1.31.4+ `stream`: `proxy_protocol v2`. nginx's
+> `proxy_protocol on` sends v1, which jig-server refuses), and list it in
+> jig-server's config:
+>
+> ```toml
+> [server.proxy_protocol]
+> trusted = ["10.0.0.5"]        # the proxy's address, or a CIDR
+> header_timeout_ms = 5000
+> ```
+>
+> This fails closed. A connection from a listed proxy that does not open with a
+> valid v2 header within `header_timeout_ms` is closed, never served as the
+> proxy. That includes no header, v1 text, and a header over 536 bytes: a load
+> balancer that adds many TLVs can exceed that. A connection from any other
+> address is served as before, and a PROXY header from it is never read.
+> jig-server never trusts `X-Forwarded-For` or any other forwarded header. The
+> nameserver does not read PROXY protocol yet (#419).
+>
+> `[tls] enabled = false` serves
 > plaintext for loopback or local testing only: the server lists
 > `tls.enabled=false` in `/.well-known/jig`'s `unsafe_options_active` and logs a
 > startup warning, and a `jig` CLI refuses a plaintext `http://` server that is
