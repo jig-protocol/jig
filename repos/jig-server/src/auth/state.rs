@@ -433,13 +433,19 @@ impl jig_pipeline::ingest::Admission for AuthState {
             .map_err(admission_refusal)
     }
 
-    /// JEP-0014 rule 8: a `member` is a DID in the member pool (recorded, or
-    /// aged in); anyone else admission let through is a `guest`.
+    /// JEP-0014 rule 8: a `member` is a DID the admission records make one;
+    /// anyone else admission let through is a `guest`. A DID in the member
+    /// pool by aged proof alone draws on the members' capacity (JEP-0008
+    /// rule 23) but joins channels as a guest: the age of a proof is cheap
+    /// to wait out, so it does not open `join = member` channels.
+    ///
+    /// The role is worked out when a join is checked and never stored, so
+    /// this decides new self-joins only: a membership made before stays.
     fn server_role(&self, sender_did: &str) -> jig_pipeline::ingest::ServerRole {
         use jig_pipeline::ingest::ServerRole;
         match self.pool_of(sender_did, chrono::Utc::now().timestamp()) {
-            Pool::Member | Pool::AgedMember => ServerRole::Member,
-            Pool::Invited | Pool::Stranger => ServerRole::Guest,
+            Pool::Member => ServerRole::Member,
+            Pool::AgedMember | Pool::Invited | Pool::Stranger => ServerRole::Guest,
         }
     }
 }
@@ -669,6 +675,54 @@ mod tests {
         assert_eq!(state.pool_of(&fresh, proven_at + 1_000), Pool::Stranger);
         assert_eq!(state.pool_of(&proven, proven_at + 99), Pool::Stranger);
         assert_eq!(state.pool_of(&proven, proven_at + 100), Pool::AgedMember);
+    }
+
+    /// A DID in the member pool by aged proof alone is a `guest`: it may
+    /// self-join a `join = guest` channel and not a `join = member` one.
+    #[test]
+    fn an_aged_proof_self_joins_as_a_guest() {
+        use jig_core::tier::JoinRole;
+        use jig_pipeline::ingest::{Admission as _, ServerRole};
+        let proven = did_for(3);
+        let mut section = AuthSection::default();
+        section.pools.local_member_age_secs = 0;
+        let store = Arc::new(jig_pipeline::persist::SqliteStore::open_in_memory().unwrap());
+        let state = AuthState::from_config(&section)
+            .unwrap()
+            .with_proofs(store.clone());
+        state.record_proof(&proven, 20).unwrap();
+        let proven_at = store.admission_proven_at(&proven).unwrap().unwrap();
+
+        assert_eq!(state.pool_of(&proven, proven_at), Pool::AgedMember);
+        let role = state.server_role(&proven);
+        assert_eq!(role, ServerRole::Guest);
+        assert!(role.may_join(JoinRole::Guest));
+        assert!(!role.may_join(JoinRole::Member));
+    }
+
+    /// Records win over age: a recorded member who also holds an aged proof
+    /// is in the member pool and is a `member`.
+    #[test]
+    fn a_recorded_member_with_an_aged_proof_stays_a_member() {
+        use jig_config::v0_0_2_server::ReputationRecord;
+        use jig_pipeline::ingest::{Admission as _, ServerRole};
+        let recorded = did_for(1);
+        let mut section = AuthSection::default();
+        section.pools.local_member_age_secs = 0;
+        section.admission.records = vec![ReputationRecord {
+            did: recorded.clone(),
+            ruleset_key: "r".to_string(),
+            score: 0,
+        }];
+        let store = Arc::new(jig_pipeline::persist::SqliteStore::open_in_memory().unwrap());
+        let state = AuthState::from_config(&section)
+            .unwrap()
+            .with_proofs(store.clone());
+        state.record_proof(&recorded, 20).unwrap();
+        let proven_at = store.admission_proven_at(&recorded).unwrap().unwrap();
+
+        assert_eq!(state.pool_of(&recorded, proven_at), Pool::Member);
+        assert_eq!(state.server_role(&recorded), ServerRole::Member);
     }
 
     /// A tiny-burst config that booted before the member split still boots:

@@ -5130,6 +5130,43 @@ mod tests {
         assert!(ctx.store.is_member_by_id(&chan, &member.did).unwrap());
     }
 
+    /// The server role is checked when a join is, and never stored (JEP-0014
+    /// rule 9): a DID that joined while it was a `member` keeps that
+    /// membership after it becomes a `guest` (a server that stops counting
+    /// aged proofs as membership), and later joins are held to the new role.
+    #[tokio::test]
+    async fn an_existing_membership_survives_a_role_change() {
+        let mut ctx = all_channel_kinds();
+        let owner = person();
+        let (early, late) = (person(), person());
+        ctx.admission = Arc::new(Recorded {
+            members: vec![early.did.clone(), late.did.clone()],
+        });
+        create_sealed_as(&ctx, &owner, Some("server")).await;
+        let chan = ctx
+            .store
+            .get_channel_by_slug("#sealed")
+            .unwrap()
+            .unwrap()
+            .id;
+        join_sealed(&ctx, &early).await.unwrap();
+
+        // Both are guests from now on.
+        ctx.admission = Arc::new(Recorded { members: vec![] });
+        assert!(
+            matches!(
+                join_sealed(&ctx, &late).await,
+                Err(IngestError::NotChannelOwner { .. })
+            ),
+            "a join checked after the change is held to the new role"
+        );
+        assert!(!ctx.store.is_member_by_id(&chan, &late.did).unwrap());
+        assert!(
+            ctx.store.is_member_by_id(&chan, &early.did).unwrap(),
+            "the earlier membership stays"
+        );
+    }
+
     /// The REST member route is a client of this server too: a self-join
     /// through it is held to the same server role as one over a connection.
     #[tokio::test]
