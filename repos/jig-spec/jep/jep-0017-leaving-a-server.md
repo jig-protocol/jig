@@ -102,6 +102,7 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
     | R3 | `POST /api/v1/erase/{did}` | `202 ERASE_PENDING {request_digest, acts_at}` (rule 21a); `409 STILL_A_MEMBER`, `409 STILL_AN_OWNER` (rule 26); `409 ERASE_PENDING` while another R3 is pending; `410 ERASED` once `S` has acted |
     | Cancel R3 | `DELETE /api/v1/erase/{did}` with a `jig-erase-cancel-v1` | `200 {cancelled: request_digest}`; `404` if nothing is pending; `410 ERASED` once `S` has acted |
     | R3 receipt | `GET /api/v1/erase/{did}/receipt`, a signed read by `D` | `200` with the receipt once `S` has acted, re-signed from the tombstone; `202` with the pending state before; `404` to anyone else |
+    | Stock state | `GET /api/v1/mls/key-packages/{did}/stock` (existing), no signed object | `200 {available, last_resort, stocked}`; `stocked` is new and is `false` once R1 and R2 are both in force here (rule 19) |
 
 ## R1: end custody
 
@@ -149,6 +150,12 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
       uploads (`POST /api/v1/mls/key-packages`) with `403 NOT_STOCKED_HERE`.
     - This server-side refusal is what holds when one of `D`'s devices sends R2 while another
       keeps publishing. A client SHOULD also keep the state per server, to stop trying.
+    - `S` reports this state as `stocked: false` on the stock route (rule 11). The field is
+      additive: a client that does not know it ignores it, and a server without it is read as
+      `stocked: true`. A client MUST delete the private keys of its stock at `S` only on
+      `stocked: false`, never on an empty stock (`available = 0`): `S` answers a repeat of a
+      request it already served with the same released package, so that package's key is
+      still needed.
 20. **Undo:** a `jig-local-adds-v1` with `allow = true` at a higher `seq`. Uploads are accepted
     again.
 
