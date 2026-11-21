@@ -104,12 +104,14 @@ impl Bucket {
 /// The write capacity, split into the three pools, the member pool in two.
 pub struct WritePools {
     buckets: Mutex<[Bucket; 4]>,
+    warnings: Vec<String>,
 }
 
 impl WritePools {
     /// `None` when `writes_per_second` is 0: the pools are off. Fails on
     /// shares that leave members nothing, an aged share above 100, and a
-    /// nonzero share whose burst is under one write.
+    /// nonzero member, invited or stranger share whose burst is under one
+    /// write. An aged part under one write is raised to one, with a warning.
     pub fn new(section: &PoolsSection, now: Instant) -> anyhow::Result<Option<Self>> {
         let (stranger, invited) = (section.stranger_share_pct, section.invited_share_pct);
         if u16::from(stranger) + u16::from(invited) >= 100 {
@@ -138,35 +140,60 @@ impl WritePools {
             demand: None,
         };
         let member = 100.0 - f64::from(stranger) - f64::from(invited);
-        let aged = member * f64::from(aged_pct) / 100.0;
-        let established = member - aged;
         // A share whose burst is under one token could never serve a write
-        // from its own bucket.
+        // from its own bucket. These shares were checked before the member
+        // split, so a config that booted before still boots.
         for (name, pct) in [
-            ("established member", established),
-            ("aged member", aged),
+            ("member", member),
             ("invited", f64::from(invited)),
             ("stranger", f64::from(stranger)),
         ] {
             if pct > 0.0 && burst * pct / 100.0 < 1.0 {
-                let fix = if name == "aged member" {
-                    "raise writes_burst, or set aged_share_pct to 0 or 100"
-                } else {
-                    "raise writes_burst or set that share to 0"
-                };
                 anyhow::bail!(
-                    "[auth.pools] the {name} share of writes_burst {burst} is under one write; {fix}"
+                    "[auth.pools] the {name} share of writes_burst {burst} is under one write; \
+                     raise writes_burst or set that share to 0"
                 );
             }
         }
+        // The member pool's split. Established members own both parts, so
+        // their part may hold under one write. The aged part may not, and
+        // refusing to boot over it would turn an upgrade into an outage: it
+        // is raised to one write, taken from the established part, and the
+        // operator is told.
+        let member_burst = burst * member / 100.0;
+        let mut aged_burst = member_burst * f64::from(aged_pct) / 100.0;
+        let mut warnings = Vec::new();
+        if aged_pct > 0 && aged_burst < 1.0 {
+            warnings.push(format!(
+                "[auth.pools] aged_share_pct {aged_pct} of the member share of writes_burst \
+                 {burst} is under one write; members by aged proof get one write of burst \
+                 instead. Raise writes_burst, or set aged_share_pct to 0 or 100"
+            ));
+            aged_burst = 1.0;
+        }
+        let aged_rate = rate * member / 100.0 * f64::from(aged_pct) / 100.0;
+        let part = |burst: f64, per_second: f64| Bucket {
+            tokens: burst,
+            burst,
+            per_second,
+            at: now,
+            demand: None,
+        };
         Ok(Some(Self {
             buckets: Mutex::new([
-                bucket(established),
-                bucket(aged),
+                part(member_burst - aged_burst, rate * member / 100.0 - aged_rate),
+                part(aged_burst, aged_rate),
                 bucket(f64::from(invited)),
                 bucket(f64::from(stranger)),
             ]),
+            warnings,
         }))
+    }
+
+    /// What boot should log as a warning: a setting the pools adjusted
+    /// rather than refused.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     /// One token's refill in the buckets `pool` owns. `None` when its share
@@ -511,10 +538,13 @@ mod tests {
         assert_eq!(pools.refill_interval(Pool::Member), Some(ms(1_000) / 70));
     }
 
-    /// A burst small enough for every pool before the split can leave the
-    /// aged part under one write: boot says how to fix it.
+    /// A burst small enough for every pool before the split leaves the aged
+    /// part under one write. The config booted before the split, so it still
+    /// boots: the aged part gets one write of burst, taken from established
+    /// members, and boot is told to warn.
     #[test]
-    fn an_aged_part_under_one_write_is_refused_with_its_fix() {
+    fn a_tiny_aged_part_boots_with_one_write_and_a_warning() {
+        let t0 = Instant::now();
         let section = PoolsSection {
             writes_per_second: 3,
             writes_burst: 3,
@@ -522,21 +552,34 @@ mod tests {
             invited_share_pct: 0,
             ..PoolsSection::default()
         };
-        let err = match WritePools::new(&section, Instant::now()) {
-            Ok(_) => panic!("an aged part of 0.75 writes must be refused"),
-            Err(e) => e,
+        let pools = WritePools::new(&section, t0).unwrap().unwrap();
+        let [warning] = pools.warnings() else {
+            panic!("one warning, got {:?}", pools.warnings())
         };
+        assert!(warning.contains("aged_share_pct 25"), "{warning}");
         assert!(
-            err.to_string().contains("aged_share_pct to 0 or 100"),
-            "{err}"
+            warning.contains("set aged_share_pct to 0 or 100"),
+            "{warning}"
         );
+        // While members write, the aged part holds one write, and the member
+        // pool still holds three in all.
+        assert!(pools.try_take(Pool::Member, t0), "members are active");
+        assert!(pools.try_take(Pool::AgedMember, t0));
+        assert!(!pools.try_take(Pool::AgedMember, t0), "only one");
+        assert_eq!(take_all(&pools, Pool::Member, t0), 1);
+        // Shares that need no adjusting give no warning.
         for aged_share_pct in [0, 100] {
             let section = PoolsSection {
                 aged_share_pct,
                 ..section.clone()
             };
-            assert!(WritePools::new(&section, Instant::now()).unwrap().is_some());
+            let pools = WritePools::new(&section, t0).unwrap().unwrap();
+            assert!(pools.warnings().is_empty(), "{aged_share_pct}");
         }
+        let pools = WritePools::new(&PoolsSection::default(), t0)
+            .unwrap()
+            .unwrap();
+        assert!(pools.warnings().is_empty());
     }
 
     #[test]

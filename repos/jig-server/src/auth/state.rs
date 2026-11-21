@@ -127,7 +127,13 @@ impl AuthState {
                 limits.max_tracked,
             ),
             effort,
-            write_pools: WritePools::new(&auth.pools, std::time::Instant::now())?,
+            write_pools: {
+                let pools = WritePools::new(&auth.pools, std::time::Instant::now())?;
+                for warning in pools.iter().flat_map(WritePools::warnings) {
+                    tracing::warn!("{warning}");
+                }
+                pools
+            },
             local_member_age_secs: auth.pools.local_member_age_secs,
             aged_share_pct: auth.pools.aged_share_pct,
             proofs: None,
@@ -663,6 +669,20 @@ mod tests {
         assert_eq!(state.pool_of(&fresh, proven_at + 1_000), Pool::Stranger);
         assert_eq!(state.pool_of(&proven, proven_at + 99), Pool::Stranger);
         assert_eq!(state.pool_of(&proven, proven_at + 100), Pool::AgedMember);
+    }
+
+    /// A tiny-burst config that booted before the member split still boots:
+    /// the pools raise the aged part to one write and boot logs a warning.
+    #[test]
+    fn a_tiny_burst_config_still_boots() {
+        let mut section = AuthSection::default();
+        section.pools.writes_per_second = 3;
+        section.pools.writes_burst = 3;
+        section.pools.stranger_share_pct = 0;
+        section.pools.invited_share_pct = 0;
+        let state = AuthState::from_config(&section).unwrap();
+        let pools = state.write_pools.as_ref().unwrap();
+        assert_eq!(pools.warnings().len(), 1);
     }
 
     /// An aged share of 0 (`high-sec`): an aged proof is no membership, so
