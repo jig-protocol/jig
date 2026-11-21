@@ -77,6 +77,8 @@ pub struct ReleasedBody {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LogEntryBody {
+    /// `custody` or `local` (JEP-0017 rule 32).
+    pub kind: String,
     pub requester: String,
     pub channel_id: String,
     pub last_resort: bool,
@@ -277,6 +279,7 @@ pub async fn request_key_package(
         // Re-checked inside the release's transaction: a withdrawal stored
         // since `listing_record` read it stops this release.
         listing: Some(&listing.envelope),
+        kind: jig_pipeline::persist::ReleaseKind::Custody,
     };
     match state
         .ingest_ctx
@@ -358,6 +361,7 @@ pub async fn release_log(
         .map_err(persist_err)?
         .into_iter()
         .map(|e| LogEntryBody {
+            kind: e.kind.as_str().to_string(),
             requester: e.requester,
             channel_id: e.channel_id,
             last_resort: e.last_resort,
@@ -578,6 +582,38 @@ mod tests {
             .unwrap();
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].requester, did_of(3));
+    }
+
+    #[tokio::test]
+    async fn the_release_log_tells_custody_releases_from_local_takes() {
+        let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
+        config.auth.require_authenticated_reads = false;
+        let state = Arc::new(AppState::for_test_with_config(config).unwrap());
+        stock(&state, 4, 3).await;
+        let _ = keep(&state, 4, vec![(ours(&state), "u".into())], 1)
+            .await
+            .unwrap();
+        let _ = ask(&state, 3, 4, &ours(&state), now()).await.unwrap();
+        let _ = crate::v0_0_2_mls::take_key_package(
+            State(state.clone()),
+            Path(did_of(4)),
+            format!("/api/v1/mls/key-packages/{}", did_of(4))
+                .parse()
+                .unwrap(),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let mut kinds: Vec<_> = state
+            .ingest_ctx
+            .store
+            .key_package_releases(&did_of(4), 10)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.kind.as_str(), e.channel_id.is_empty()))
+            .collect();
+        kinds.sort();
+        assert_eq!(kinds, [("custody", false), ("local", true)]);
     }
 
     #[tokio::test]

@@ -37,6 +37,32 @@ pub enum PersistError {
 
 pub type Result<T> = std::result::Result<T, PersistError>;
 
+/// How a package left the server, as the release log records it (JEP-0017
+/// rule 32): to another server's member through custody, or by this server's
+/// own key-package route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseKind {
+    Custody,
+    Local,
+}
+
+impl ReleaseKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReleaseKind::Custody => "custody",
+            ReleaseKind::Local => "local",
+        }
+    }
+
+    fn parse(s: &str) -> Self {
+        if s == "custody" {
+            ReleaseKind::Custody
+        } else {
+            ReleaseKind::Local
+        }
+    }
+}
+
 /// What [`SqliteStore::release_key_package`] is asked: one verified request,
 /// and the limits to hold it to.
 #[derive(Debug, Clone)]
@@ -65,6 +91,8 @@ pub struct ReleaseAsk<'a> {
     /// still the record kept, checked in the same transaction, so a
     /// withdrawal stored meanwhile wins. `None` for a server's own take.
     pub listing: Option<&'a [u8]>,
+    /// Which route this release is for, as the log records it.
+    pub kind: ReleaseKind,
 }
 
 /// Which hourly limit a release hit.
@@ -99,6 +127,7 @@ pub struct ReleaseLogEntry {
     pub last_resort: bool,
     pub request: Vec<u8>,
     pub released_at: i64,
+    pub kind: ReleaseKind,
 }
 
 /// SQLite-backed store. Internally serializes all access via `Mutex<Connection>`.
@@ -1307,7 +1336,11 @@ impl SqliteStore {
                 -- 0 for a request answered with a package released before:
                 -- logged so that request gets the same answer again, but
                 -- not counted against the limits.
-                counted       INTEGER NOT NULL DEFAULT 1
+                counted       INTEGER NOT NULL DEFAULT 1,
+                -- `custody` for a release to a signed custody request,
+                -- `local` for a take by this server's own key-package route
+                -- (JEP-0017 rule 32).
+                kind          TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS kp_releases_did
                 ON kp_releases(did, released_at);
@@ -2732,8 +2765,8 @@ impl SqliteStore {
             tx.execute(
                 "INSERT OR IGNORE INTO kp_releases
                     (request_hash, did, requester, channel_id, reference, last_resort,
-                     request, released_at, counted)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+                     request, released_at, counted, kind)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9)",
                 params![
                     ask.request_hash,
                     ask.did,
@@ -2742,7 +2775,8 @@ impl SqliteStore {
                     reference,
                     last_resort,
                     ask.request,
-                    ask.now
+                    ask.now,
+                    ask.kind.as_str()
                 ],
             )?;
             tx.commit()?;
@@ -2809,8 +2843,8 @@ impl SqliteStore {
         tx.execute(
             "INSERT INTO kp_releases
                 (request_hash, did, requester, channel_id, reference, last_resort,
-                 request, released_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 request, released_at, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 ask.request_hash,
                 ask.did,
@@ -2819,7 +2853,8 @@ impl SqliteStore {
                 reference,
                 last_resort,
                 ask.request,
-                ask.now
+                ask.now,
+                ask.kind.as_str()
             ],
         )?;
         tx.commit()?;
@@ -2833,7 +2868,7 @@ impl SqliteStore {
     pub fn key_package_releases(&self, did: &str, limit: u32) -> Result<Vec<ReleaseLogEntry>> {
         let conn = self.conn.lock().expect("poisoned");
         let mut stmt = conn.prepare(
-            "SELECT requester, channel_id, last_resort, request, released_at
+            "SELECT requester, channel_id, last_resort, request, released_at, kind
                FROM kp_releases WHERE did = ?1 AND counted = 1
               ORDER BY released_at DESC, request_hash ASC LIMIT ?2",
         )?;
@@ -2845,6 +2880,7 @@ impl SqliteStore {
                     last_resort: r.get(2)?,
                     request: r.get(3)?,
                     released_at: r.get(4)?,
+                    kind: ReleaseKind::parse(&r.get::<_, String>(5)?),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -4753,6 +4789,7 @@ mod tests {
             per_did: 3,
             per_requester: 2,
             listing: None,
+            kind: ReleaseKind::Custody,
         }
     }
 

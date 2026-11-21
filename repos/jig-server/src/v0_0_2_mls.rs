@@ -179,6 +179,7 @@ pub async fn take_key_package(
         per_did: custody.per_member_per_hour,
         per_requester: custody.per_requester_per_hour,
         listing: None,
+        kind: jig_pipeline::persist::ReleaseKind::Local,
     };
     match state
         .ingest_ctx
@@ -360,14 +361,15 @@ mod tests {
             state.ingest_ctx.store.key_package_stock(&did).unwrap(),
             (3, false)
         );
-        assert_eq!(
-            state
-                .ingest_ctx
-                .store
-                .key_package_releases(&did, 10)
-                .unwrap()
-                .len(),
-            2
+        let log = state
+            .ingest_ctx
+            .store
+            .key_package_releases(&did, 10)
+            .unwrap();
+        assert_eq!(log.len(), 2);
+        assert!(
+            log.iter()
+                .all(|e| e.kind == jig_pipeline::persist::ReleaseKind::Local)
         );
     }
 
