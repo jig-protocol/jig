@@ -87,7 +87,9 @@ In units. `null-sec` weighs only offences that prove themselves.
 `high-sec`'s useful-work block uses JEP-0016's starting points: `n` 5, `k` 3, `n_escalate` 11,
 `k_escalate` 7. It credits 0.1 unit for `witness` and `retrieve`, and 0.2 for `validate` and
 `reexecute`. `credit_cap_per_period` is half of accrual. `fraud_weight` is −5 units, more than a
-period's capped credit (JEP-0016 rule 35).
+period's capped credit (JEP-0016 rule 35). Its windows close no sooner than their floors in
+epoch time (JEP-0016 rule 6b): `commit_min` and `reveal_min` 20 000 ppm (about 29 minutes of a
+one-day epoch), and `beacon_reveal_min` 10 000 ppm (about 14 minutes).
 
 ## Consequences (recommended, local)
 

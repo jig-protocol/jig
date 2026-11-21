@@ -104,6 +104,9 @@ RULESETS = {
                      "beacon_reveal_positions": 1_024, "beacon_min_reveals": 3,
                      "beacon_exclusion_epochs": 7, "beacon_withheld_weight": -10 * U,
                      "commit_positions": 2_048, "reveal_positions": 2_048, "max_carry": 3,
+                     # floors in ppm of epoch_secs (JEP-0016 rule 6b, #448): a flood of
+                     # positions cannot close a window before this much epoch time passes
+                     "commit_min": 20_000, "reveal_min": 20_000, "beacon_reveal_min": 10_000,
                      "same_subject_cooldown_epochs": 30,
                      "max_missed": 3, "miss_window_epochs": 7, "miss_pause_epochs": 7,
                      "retrievability_epochs": 7, "dispute_retention_epochs": 90,

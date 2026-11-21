@@ -123,8 +123,10 @@
   "useful_work": {
     "beacon_exclusion_epochs": 7,
     "beacon_min_reveals": 3,
+    "beacon_reveal_min": 10000,
     "beacon_reveal_positions": 1024,
     "beacon_withheld_weight": -10000000,
+    "commit_min": 20000,
     "commit_positions": 2048,
     "credit": {
       "reexecute": 200000,
@@ -162,6 +164,7 @@
     "reexecute_rate": 1000,
     "retrievability_epochs": 7,
     "retrieve_samples": 16,
+    "reveal_min": 20000,
     "reveal_positions": 2048,
     "same_subject_cooldown_epochs": 30,
     "sample_rate": 1000
