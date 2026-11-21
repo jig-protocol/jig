@@ -15,7 +15,11 @@ serde = { workspace = true }
 # See the workspace-level comment: serde_json would make this module fail
 # jig-core's determinism validation, because its number parser links f64 code.
 postcard = { workspace = true }
-unicode-normalization = "0.1"
+# Exact: the NFKC tables are part of the render output. A newer release can ship a
+# newer Unicode version, which changes how newly assigned characters normalize and
+# therefore render hashes. Move it deliberately, with a component rebuild
+# (build-artifact.sh), never through a lockfile refresh.
+unicode-normalization = "=0.1.26"
 blake3 = { workspace = true }
 # Guest bindings for the `jig:block` renderer world, used only by the component build
 # (`--features component`, see build-artifact.sh). 0.57 is the version wasip2 already
