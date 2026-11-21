@@ -339,7 +339,7 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
     | R1 | no (`NO_CUSTODY`) | yes | kept | accepted | kept | newer record listing `S` |
     | R2 | yes, for channels other servers sequence | no (`LOCAL_ADDS_ENDED`, `MEMBER_DECLINED`) | kept | accepted | kept | marker `allow = true` |
     | R1 + R2 | no | no | deleted | refused (`NOT_STOCKED_HERE`) | kept | undo either; uploads resume when either is undone |
-    | R3 pending | as before R3 | as before R3 | as before R3 | as before R3 | kept | cancel (`jig-erase-cancel-v1`) before `acts_at` |
+    | R3 pending | as before R3 | packages as before R3; `member-add` by others refused (`MEMBER_DECLINED`) | as before R3 | as before R3 | kept | cancel (`jig-erase-cancel-v1`) before `acts_at` |
     | R3 (alone or with others) | no (`NO_CUSTODY` to others) | no (`NO_KEY_PACKAGE` to others; `MEMBER_DECLINED` on `member-add`) | deleted | refused (`ERASED`, to `D`) | deleted per rule 22 | none for the data; rule 36 to come back |
 
 36. **Coming back after R3.** The data is gone and is not restored. `D` may use `S` again by
