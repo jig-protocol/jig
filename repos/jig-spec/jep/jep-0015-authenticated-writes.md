@@ -159,11 +159,11 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
 12. **Relayed and carried blocks** arrive under their own rules and are not local
     submissions:
     - a write a follower relays to the owner (JEP-0005 rule 15, `IngestSource::Relayed`);
-    - a block a follower takes on the follower stream (JEP-0005 rule 22a);
-    - a block a listed peer relays on legacy peering (`IngestSource::FederatedPeer`).
+    - a block a follower takes on the follower stream (JEP-0005 rule 22a).
 
-    The connection carrying them is proven by `peer_proof`, and the share or peer listing
-    answers for them (AB-07, OP-09). The owner records a relayed write against the
+    The connection carrying them is proven by `peer_proof`, and the share answers for them
+    (AB-07, OP-09). A block a listed peer relayed on legacy peering was a third case until
+    servers stopped taking them (JEP-0014 rule 37). The owner records a relayed write against the
     follower's proven DID as well as its author (`IngestSource::Relayed`'s `via`).
 13. **A follower applies this JEP before it relays.** It MUST apply rules 4 to 10 to the
     client that submitted to it, and MUST NOT relay a block whose signer is not that

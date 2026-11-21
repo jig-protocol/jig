@@ -160,7 +160,9 @@ Even though TLS 1.3 encrypts the connection, federation messages are **also sign
 ### Relayed Blocks
 
 A peer is a transport, not an authority. A block a peer relays is the author's claim, not
-the peer's, and the receiving server judges it by its own rules.
+the peer's, and the receiving server judges it by its own rules. A block crosses servers
+only under a share (JEP-0005): the owner streams a channel's records to a follower, and a
+follower relays its users' writes to the owner within its grant (JEP-0005 rule 15).
 
 - A server **MUST** process a relayed block through the same checks as a block a local
   client submits: the author's signature, the version and suite gates, admission, the
@@ -171,12 +173,13 @@ the peer's, and the receiving server judges it by its own rules.
   not a record of this server's work.
 - A server **MUST** accept relayed blocks only from a peer it is configured to federate
   with, over a connection whose handshake the peer signed with the DID the server pinned for
-  it.
-- A server **MUST NOT** send a block to a peer outside a share: a channel reaches another
-  server only by a share, through its owner's stream (JEP-0005). A peer on a release that
-  still relayed subscribes to the federation stream; a server **MAY** answer that with an
-  error and send nothing. It **SHOULD** answer a server it does not list as a peer with the
-  refusal it gave before (`NOT_A_PEER`), so that server reconnects once it is listed.
+  it, and only under that peer's share of the block's channel.
+- A server **MUST NOT** send a block to a peer outside a share, and **MUST NOT** take one a
+  peer sends outside a share. Servers before v0.2.0-alpha.7 ran a legacy relay: they
+  subscribed to a peer's federation stream, asked it for a catch-up on each connection, and
+  pushed every post of their open channels. A server **MAY** answer such a subscription as
+  malformed and drop the rest. It **SHOULD** keep the connection open, since it carries the
+  peer's shares too.
 
 ### Replay Protection
 
@@ -370,8 +373,8 @@ If a federation message includes a field you don't recognize and it's not in an 
 - Use mutual TLS 1.3 for all federation connections.
 - Sign all federation payloads with server keypair (E2E signatures).
 - Process relayed blocks through the same checks as local submissions, and accept them only
-  from configured, pinned peers.
-- Send a peer no block outside a share.
+  from configured, pinned peers, under a share.
+- Send a peer no block outside a share, and take none from one.
 - Perform replay detection (nonces + strict timestamp windows).
 - Negotiate protocol versions explicitly (no silent downgrades).
 - Enforce rate limiting at ingress.

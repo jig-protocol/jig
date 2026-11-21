@@ -149,10 +149,12 @@ private network:
   server's write capacity, so however many keys a flood brings, members keep
   the rest. Members are the DIDs in `records` with no negative score, plus
   those whose admission proof is `local_member_age_secs` old.
-- **Federated peers vouch for their authors.** Blocks relayed from a peer run
-  the same admission, write and suite gates as local ones, except that their
-  authors are not asked for proof-of-work: they never spoke to this server.
-  Only federate with servers you would let post on your behalf.
+- **A follower vouches for its users.** Under a `write` or `member` share, the
+  server that follows a channel relays its users' posts to this one. They run
+  the same admission, write and suite gates as local posts, and the share's
+  grant, except that their authors are not asked for proof-of-work: they never
+  spoke to this server. Only share with servers you would let post on your
+  behalf.
 - **Channel ops are on by default.** `POST /api/v1/channels*` is always
   mounted and runs the same gates as every other write: anyone who can reach
   the port can create an open channel.
@@ -716,24 +718,23 @@ this server.
 A channel reaches another server only once it is shared. Its creation block
 names the server that orders it, so a peer no longer takes a channel this
 server creates as one of its own. `naively_accept_peer_relayed_creates` (see
-`config.example.toml`) is for tests only: a server with it stores a copy of a
-peer's new channel, but clients refuse to read the copy, because its creation
-block names another server. Servers that trust each other set
-`offers = "accept"` and use `jig channel share`.
+`config.example.toml`) has no effect: this server takes no relayed blocks.
+Servers that trust each other set `offers = "accept"` and use `jig channel
+share`.
 
-The older peer relay no longer posts into channels: a server refuses any post
-a peer relays into a channel the server orders itself, whether the post names
-the channel or its id. The first refusal per peer and channel is logged at WARN
-with the reason `relayed-into-sequenced-channel`, the rest at DEBUG, and each is
-counted in `jig_federation_relayed_refused_total`. **Share any channel that
-reaches peers only through the relay**; until it is shared, peers' posts to it
-are refused and logged, and their users post on this server.
+This server neither sends nor takes relayed posts. Its posts reach another
+server only through a channel it shares, and another server's posts reach it
+the same way. **Share any channel that reached peers only through the older
+relay**: a peer on an earlier release no longer sees this server's posts in its
+own channel of the same name, and its posts no longer land here. Such a peer
+still subscribes to the relay's stream and asks for its catch-up on each
+connection. This server answers the subscription as malformed (`BAD_JSON`) and
+logs the catch-up request at DEBUG. The connection, which also carries shares,
+stays up.
 
-This server relays nothing to its peers either. Its posts reach another server
-only through a channel it shares, so a peer on an earlier release no longer sees
-them in its own channel of the same name. A peer's federation subscription is
-answered with `FEDERATION_STREAM_RETIRED` and sends nothing; the connection,
-which also carries shares, stays up.
+The relay's refusal metric, `jig_federation_relayed_refused_total`, is gone
+with it: remove it from dashboards and alerts. So is the
+`relayed-into-sequenced-channel` WARN.
 
 ---
 
