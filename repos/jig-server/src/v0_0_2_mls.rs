@@ -71,12 +71,20 @@ fn bad(code: &'static str, msg: impl Into<String>) -> (StatusCode, Json<ErrorBod
 
 /// POST /api/v1/mls/key-packages
 ///
-/// No request signature: every key package is signed by its DID's own key and
-/// names that DID in its credential (`jig_mls::credential`), which is a
-/// stronger proof than a request header — nobody can publish for a DID whose
-/// key they do not hold. The publisher still passes admission.
+/// No request signature is needed to stock: every key package is signed by
+/// its DID's own key and names that DID in its credential
+/// (`jig_mls::credential`), so nobody can make a package for a DID whose key
+/// they do not hold. The publisher still passes admission.
+///
+/// Replacing the DID's last-resort package needs more, because a package
+/// signature is not fresh: whoever was released an old last-resort package
+/// could upload it here and replace a usable one with one whose key its owner
+/// deleted. So a replacement needs the request itself signed by the DID; an
+/// unsigned upload while one is held is skipped, as before.
 pub async fn publish_key_packages(
     State(state): State<Arc<AppState>>,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
     Json(body): Json<PublishBody>,
 ) -> Result<Json<PublishResult>, (StatusCode, Json<ErrorBody>)> {
     let started = std::time::Instant::now();
@@ -102,6 +110,11 @@ pub async fn publish_key_packages(
             "every key package in a batch must belong to one DID",
         ));
     }
+    let owner_signed =
+        crate::v0_0_2_blocks::optional_caller(&state, &headers, "POST", uri.path(), started)
+            .ok()
+            .flatten()
+            .is_some_and(|caller| caller.to_did_jig_string() == did);
     state
         .auth
         .admit_and_charge(&did)
@@ -123,6 +136,9 @@ pub async fn publish_key_packages(
                 continue;
             }
             last_resort_seen = true;
+            if has_last_resort && !owner_signed {
+                continue;
+            }
             if has_last_resort {
                 if store
                     .replace_last_resort(&info.reference, &did, &bytes, now)
@@ -312,8 +328,31 @@ mod tests {
     }
 
     async fn publish(state: &Arc<AppState>, packages: &[Vec<u8>]) -> PublishResult {
+        publish_as(state, packages, None).await
+    }
+
+    /// Publish `packages`, with the request signed by `signer` if given.
+    async fn publish_as(
+        state: &Arc<AppState>,
+        packages: &[Vec<u8>],
+        signer: Option<u8>,
+    ) -> PublishResult {
+        let path = "/api/v1/mls/key-packages";
+        let mut headers = axum::http::HeaderMap::new();
+        if let Some(seed) = signer {
+            let identity = jig_client::identity::Identity::from_signing_key(
+                ed25519_dalek::SigningKey::from_bytes(&[seed; 32]),
+            );
+            for (name, value) in
+                jig_client::read_auth::ReadProof::sign(&identity, "POST", path).headers()
+            {
+                headers.insert(name, value.parse().unwrap());
+            }
+        }
         let Json(result) = publish_key_packages(
             State(state.clone()),
+            path.parse().unwrap(),
+            headers,
             Json(PublishBody {
                 key_packages_b64: packages.iter().map(|p| STANDARD.encode(p)).collect(),
             }),
@@ -339,11 +378,21 @@ mod tests {
             (3, 2, true)
         );
 
-        let again = publish(&state, &m.key_packages(2, true).unwrap()).await;
+        let unsigned = publish(&state, &m.key_packages(1, true).unwrap()).await;
+        assert_eq!(
+            unsigned.accepted, 0,
+            "an unsigned upload does not replace the held last-resort package"
+        );
+        let again = publish_as(&state, &m.key_packages(2, true).unwrap(), Some(7)).await;
         assert_eq!(
             (again.accepted, again.available, again.last_resort),
             (1, 2, true),
             "a new last-resort package replaces the old, once per batch"
+        );
+        let stranger = publish_as(&state, &m.key_packages(1, true).unwrap(), Some(8)).await;
+        assert_eq!(
+            stranger.accepted, 0,
+            "a request signed by another DID does not replace it"
         );
     }
 
@@ -396,6 +445,8 @@ mod tests {
         batch.extend(b.key_packages(1, false).unwrap());
         let refused = publish_key_packages(
             State(state),
+            "/api/v1/mls/key-packages".parse().unwrap(),
+            axum::http::HeaderMap::new(),
             Json(PublishBody {
                 key_packages_b64: batch.iter().map(|p| STANDARD.encode(p)).collect(),
             }),

@@ -1461,6 +1461,9 @@ impl SqliteStore {
         rekey_channels_by_id(conn)?;
         rebuild_channels_slug_per_sequencer(conn)?;
         add_channel_tiers(conn)?;
+        // JEP-0017 rule 32: a custody release made before a withdrawal is
+        // never repeated after it.
+        add_column_if_missing(conn, "kp_releases", "retired", "INTEGER NOT NULL DEFAULT 0")?;
         rebuild_alias_attestations_with_suffix(conn)?;
         crate::contracts::migrate(conn)?;
         crate::follow::migrate(conn)?;
@@ -2721,6 +2724,19 @@ impl SqliteStore {
         Ok(inserted > 0)
     }
 
+    /// After `did` withdrew custody here: mark every custody release of its
+    /// packages retired, so none is answered again as a repeat. Its owner
+    /// deletes those packages' keys (JEP-0017 rule 32). The rows stay in the
+    /// log, and still count against the limits.
+    pub fn retire_custody_releases(&self, did: &str) -> Result<usize> {
+        let changed = self.conn.lock().expect("poisoned").execute(
+            "UPDATE kp_releases SET retired = 1
+              WHERE did = ?1 AND kind = 'custody' AND retired = 0",
+            [did],
+        )?;
+        Ok(changed)
+    }
+
     /// Store `did`'s new last-resort package and retire any it had: they are
     /// no longer released, and their rows stay, marked `consumed_at`, so
     /// nobody holding one can upload it again to bring it back (JEP-0017
@@ -2819,7 +2835,7 @@ impl SqliteStore {
                 // its key): a repeat gets a fresh release instead.
                 "SELECT k.package, r.reference, r.last_resort
                    FROM kp_releases r JOIN mls_key_packages k ON k.reference = r.reference
-                  WHERE (k.last_resort = 0 OR k.consumed_at IS NULL)
+                  WHERE (k.last_resort = 0 OR k.consumed_at IS NULL) AND r.retired = 0
                     AND (r.request_hash = ?5
                          OR (r.did = ?1 AND r.requester = ?2 AND r.channel_id = ?3
                              AND r.released_at > ?4))
@@ -2920,15 +2936,16 @@ impl SqliteStore {
         }
         tx.execute(
             // The same request can be here already only if the package it
-            // got was a last-resort one since replaced (the repeat lookup
-            // above skips those): it now names the new one.
+            // got was a last-resort one since replaced, or it was retired by
+            // a withdrawal (the repeat lookup above skips both): it now
+            // names the new one.
             "INSERT INTO kp_releases
                 (request_hash, did, requester, channel_id, reference, last_resort,
                  request, released_at, kind)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(request_hash) DO UPDATE
                 SET reference = excluded.reference, last_resort = excluded.last_resort,
-                    released_at = excluded.released_at, counted = 1",
+                    released_at = excluded.released_at, counted = 1, retired = 0",
             params![
                 ask.request_hash,
                 ask.did,
@@ -5003,6 +5020,34 @@ mod tests {
                 last_resort: true
             }
         );
+    }
+
+    #[test]
+    fn a_withdrawal_retires_custody_releases_so_no_repeat_returns_them() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let did = "did:jig:zD";
+        store
+            .insert_key_package(b"r1", did, b"kp1", false, 1)
+            .unwrap();
+        store
+            .insert_key_package(b"r2", did, b"kp2", false, 2)
+            .unwrap();
+        let first = store
+            .release_key_package(&ask(did, "did:jig:zA", b"h1", 100))
+            .unwrap();
+        assert!(matches!(first, Release::Released { ref package, .. } if package == b"kp1"));
+        assert_eq!(store.retire_custody_releases(did).unwrap(), 1);
+        // Within the repeat window, a new request and the same request
+        // resent both get a fresh package, never the retired one.
+        let again = store
+            .release_key_package(&ask(did, "did:jig:zA", b"h2", 150))
+            .unwrap();
+        assert!(matches!(again, Release::Released { ref package, .. } if package == b"kp2"));
+        assert_eq!(store.retire_custody_releases(did).unwrap(), 1);
+        let resent = store
+            .release_key_package(&ask(did, "did:jig:zA", b"h1", 160))
+            .unwrap();
+        assert_eq!(resent, Release::Empty);
     }
 
     #[test]
