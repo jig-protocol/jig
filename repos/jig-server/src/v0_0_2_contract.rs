@@ -4139,9 +4139,11 @@ mod tests {
         let parts = signed(&author, BlockKind::TextRender, text_in(&channel, "hello"));
         let refused = client_post(&follower, &parts).await.unwrap_err();
         assert_eq!(refused.code, "OWNER_UNREACHABLE", "{refused:?}");
-        assert_eq!(refused.retry_after_ms, Some(5_000));
+        // 5 s, spread over half to one and a half times that.
+        let wait = refused.retry_after_ms.expect("a wait");
+        assert!((2_500..=7_500).contains(&wait), "{wait}");
         assert!(
-            refused.message.contains("retry_after_ms=5000"),
+            refused.message.contains(&format!("retry_after_ms={wait}")),
             "{}",
             refused.message
         );
