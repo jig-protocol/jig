@@ -17,8 +17,9 @@ does with it. The four reference rulesets cover the security levels the framing 
 Data:
 
 - [`vectors/0009/rulesets/`](https://github.com/jig-protocol/jig/tree/main/repos/jig-spec/jep/vectors/0009/rulesets):
-  each ruleset document's payload as JSON. The CBOR encoding, the signature and the CID come
-  with the `jig-core` implementation.
+  each ruleset document's payload as JSON. `jig-core`'s `ruleset` module reads them: it parses
+  and re-encodes each one as deterministic CBOR, and signs it as a `COSE_Sign1` whose CID is the
+  ruleset hash. Signed vectors come at release, when the project's DID signs `jig-reference`.
 - [`vectors/0009/standing-traces.json`](https://github.com/jig-protocol/jig/tree/main/repos/jig-spec/jep/vectors/0009/standing-traces.json):
   70 epochs of `f` under each ruleset, for a fixed set of leaves. It gives every subject's `r`,
   `s`, score, age and established flag after each epoch.
