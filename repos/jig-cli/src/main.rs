@@ -883,7 +883,9 @@ async fn run() -> Result<()> {
                         "published MLS key packages (others can now add you to encrypted \
                          channels)"
                     ),
-                    Err(e) => eprintln!("warning: key packages not published: {e:#}"),
+                    Err(e) => {
+                        eprintln!("warning: MLS key-package setup did not complete: {e:#}")
+                    }
                 }
             }
             ServerAction::Info { url } => {
