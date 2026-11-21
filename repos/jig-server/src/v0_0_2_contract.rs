@@ -2201,6 +2201,280 @@ mod tests {
         }
     }
 
+    // ---- A copy the legacy relay left, set aside by a share -----------------
+
+    /// `follower`'s copy of `owner`'s `channel`, holding `blocks` (the
+    /// channel-create first), as the legacy relay of a release before
+    /// v0.2.0-alpha.6 left it on a server peered with the owner: a row the
+    /// follower sequences, blocks marked as taken from the owner, and records
+    /// the follower signed (by the backfill an upgrade runs at boot). Made in
+    /// the store, not by a relay.
+    fn relayed_copy(owner: &AppState, follower: &AppState, channel: &str, blocks: &[&str]) {
+        let from = &owner.ingest_ctx.store;
+        let store = &follower.ingest_ctx.store;
+        let mut row = from.get_channel_by_id(channel).unwrap().unwrap();
+        row.sequencer_did = follower.server_did.to_did_jig_string();
+        store.upsert_channel(&row).unwrap();
+        for cid in blocks {
+            let block = from.get_block(cid).unwrap().unwrap();
+            store
+                .insert_block(&StoredBlock {
+                    origin_server: owner.server_url.clone(),
+                    federated_from: Some(owner.server_url.clone()),
+                    ..block
+                })
+                .unwrap();
+        }
+        store
+            .backfill_ingest_records(&follower.ingest_ctx.server_key)
+            .unwrap();
+        assert!(
+            store
+                .relayed_copies()
+                .unwrap()
+                .contains(&channel.to_string())
+        );
+    }
+
+    /// A post in `channel` that only `state` holds, by `key`: its user posted
+    /// it in the copy, and the owner never took it.
+    fn own_post(state: &AppState, key: &SigningKey, channel: &str) -> String {
+        let parts = signed(key, BlockKind::TextRender, text_in(channel, "only here"));
+        let bundle_bytes = serde_json::to_vec(&(&parts.0, &parts.1)).unwrap();
+        let cid = crate::v0_0_2_federation::peer_block_cid(&bundle_bytes).unwrap();
+        state
+            .ingest_ctx
+            .store
+            .insert_block(&StoredBlock {
+                cid: cid.clone(),
+                channel_id: Some(channel.to_string()),
+                block_kind: BlockKind::TextRender.as_str().to_string(),
+                sender_did: did_of(key),
+                sender_sig: parts.2,
+                bundle_bytes,
+                is_synthetic: false,
+                hlc_wall_ms: 0,
+                hlc_logical: 0,
+                hlc_origin: String::new(),
+                posted_at: 0,
+                origin_server: state.server_url.clone(),
+                federated_from: None,
+            })
+            .unwrap();
+        cid
+    }
+
+    /// A follower that holds an older relay's copy of a channel, when it
+    /// accepts the channel's share, sets the copy aside whole under its own
+    /// id, never acts as the channel's owner, and carries the owner's chain
+    /// byte for byte. What the owner's chain lands comes back into the
+    /// channel; what only the copy held stays in it.
+    #[tokio::test]
+    async fn a_relayed_copy_is_set_aside_when_its_share_is_accepted() {
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.channel().await;
+        let first = p.text(&channel, "before the share").await;
+        relayed_copy(&p.owner, &p.follower, &channel, &[&channel, &first]);
+        let own = own_post(&p.follower, &p.user, &channel);
+
+        p.share(&channel, "write").await;
+        p.both(&channel, OfferState::Accepted).await;
+
+        let store = &p.follower.ingest_ctx.store;
+        let f_did = p.follower.server_did.to_did_jig_string();
+        let o_did = p.owner.server_did.to_did_jig_string();
+        assert!(store.relayed_copies().unwrap().is_empty());
+        let copy_id = jig_pipeline::ingest_record::label_cid(&format!("relayed-copy:{channel}"));
+        let copy = store.get_channel_by_id(&copy_id).unwrap().unwrap();
+        assert!(copy.slug.starts_with("#jig/relayed-"), "{}", copy.slug);
+        assert_eq!(
+            store.quarantined_records(&copy_id).unwrap().len(),
+            2,
+            "the follower's records of its copy, kept: the create and the post"
+        );
+        for state in [OfferState::Held, OfferState::Accepted, OfferState::Refused] {
+            assert!(
+                store
+                    .contract_offers_for(&channel, &f_did, Side::Owner, state)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        for i in 0..3 {
+            p.text(&channel, &format!("after the share {i}")).await;
+        }
+        p.follows.stream.pull_all();
+        let want = p.caught_up(&channel).await;
+        let row = store.get_channel_by_id(&channel).unwrap().unwrap();
+        assert_eq!(row.sequencer_did, o_did);
+        for seq in 0..=want {
+            assert_eq!(
+                store.ingest_record_bytes(&channel, seq).unwrap(),
+                p.owner
+                    .ingest_ctx
+                    .store
+                    .ingest_record_bytes(&channel, seq)
+                    .unwrap(),
+                "seq {seq}"
+            );
+        }
+        let kinds: Vec<String> = kinds_in(&p.owner, &channel)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(
+            !kinds
+                .iter()
+                .any(|k| k == BlockKind::ContractRefuse.as_str()),
+            "no refusal of the follower's in the owner's log: {kinds:?}"
+        );
+        let own_block = store.get_block(&own).unwrap().unwrap();
+        assert_eq!(own_block.channel_id.as_deref(), Some(copy_id.as_str()));
+        let back = store.get_block(&first).unwrap().unwrap();
+        assert_eq!(back.channel_id.as_deref(), Some(channel.as_str()));
+
+        // A post on the follower goes to the owner under the share's grant
+        // (JEP-0005 rule 15) and comes back in the owner's chain.
+        let parts = signed(
+            &p.user,
+            BlockKind::TextRender,
+            text_in(&channel, "on the follower"),
+        );
+        let on_f = client_post(&p.follower, &parts).await.unwrap();
+        p.follows.stream.pull_all();
+        let want = p.caught_up(&channel).await;
+        for seq in 0..=want {
+            assert_eq!(
+                store.ingest_record_bytes(&channel, seq).unwrap(),
+                p.owner
+                    .ingest_ctx
+                    .store
+                    .ingest_record_bytes(&channel, seq)
+                    .unwrap(),
+                "seq {seq}, after the follower's post"
+            );
+        }
+        let landed = store.get_block(&on_f).unwrap().unwrap();
+        assert_eq!(landed.channel_id.as_deref(), Some(channel.as_str()));
+    }
+
+    /// A server that accepted a share while it held an older relay's copy of
+    /// the channel (as one running the release before the repair did) sets
+    /// the copy aside at boot, keeping all of it. A copy it does not follow
+    /// stays.
+    #[tokio::test]
+    async fn a_relayed_copy_of_a_followed_channel_is_set_aside_at_boot() {
+        let p = pair(OfferPolicy::Hold).await;
+        let followed = p.channel().await;
+        let text = p.text(&followed, "in the copy").await;
+        let other = post(
+            &p.owner,
+            &p.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#other", "tier": "public"}),
+        )
+        .await
+        .unwrap();
+        relayed_copy(&p.owner, &p.follower, &followed, &[&followed, &text]);
+        relayed_copy(&p.owner, &p.follower, &other, &[&other]);
+        let store = &p.follower.ingest_ctx.store;
+        // The accept, as the release before the repair kept it: the copy stays.
+        store
+            .put_contract_offer(&StoredOffer {
+                offer_id: rand::random(),
+                channel_id: followed.clone(),
+                side: Side::Follower,
+                peer_did: p.owner.server_did.to_did_jig_string(),
+                grant: Grant::Read,
+                state: OfferState::Accepted,
+                offer: vec![],
+                answer: None,
+                share_cid: None,
+            })
+            .unwrap();
+        let records = store
+            .list_ingest_records_by_id(&followed, 0, 100)
+            .unwrap()
+            .len();
+        assert_eq!(records, 2);
+
+        repair_relayed_copies(store);
+        assert!(store.get_channel_by_id(&followed).unwrap().is_none());
+        let copy_id = jig_pipeline::ingest_record::label_cid(&format!("relayed-copy:{followed}"));
+        assert!(store.get_channel_by_id(&copy_id).unwrap().is_some());
+        assert_eq!(store.quarantined_records(&copy_id).unwrap().len(), records);
+        for cid in [&followed, &text] {
+            let block = store.get_block(cid).unwrap().unwrap();
+            assert_eq!(
+                block.channel_id.as_deref(),
+                Some(copy_id.as_str()),
+                "kept, aside"
+            );
+        }
+        assert_eq!(
+            store.relayed_copies().unwrap(),
+            [other],
+            "a copy not followed stays"
+        );
+    }
+
+    /// Two servers that each have their own `#general`: a share carries the
+    /// owner's to the follower's head beside the follower's own, which keeps
+    /// only its own posts. Nothing stalls (#357).
+    #[tokio::test]
+    async fn a_same_slug_channel_is_carried_beside_the_followers_own() {
+        let p = pair(OfferPolicy::Accept).await;
+        // The follower's own `#general`, made by another user: the same
+        // author's create of the same slug is the same block.
+        let ours = post(
+            &p.follower,
+            &SigningKey::from_bytes(&rand::random()),
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#general", "tier": "public"}),
+        )
+        .await
+        .unwrap();
+        let channel = post(
+            &p.owner,
+            &p.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#general", "tier": "public"}),
+        )
+        .await
+        .unwrap();
+        let text = post(
+            &p.owner,
+            &p.user,
+            BlockKind::TextRender,
+            serde_json::json!({"channel": "#general", "body": "by slug"}),
+        )
+        .await
+        .unwrap();
+        p.share(&channel, "read").await;
+        p.both(&channel, OfferState::Accepted).await;
+        p.follows.stream.pull_all();
+        p.caught_up(&channel).await;
+
+        let store = &p.follower.ingest_ctx.store;
+        assert!(store.carried_stalls().unwrap().is_empty(), "nothing stalls");
+        let landed = store.get_block(&text).unwrap().unwrap();
+        assert_eq!(landed.channel_id.as_deref(), Some(channel.as_str()));
+        assert_eq!(
+            store.get_channel_by_slug("#general").unwrap().map(|c| c.id),
+            Some(ours.clone()),
+            "the slug names the follower's own"
+        );
+        assert_eq!(
+            store
+                .list_ingest_records_by_id(&ours, 0, 100)
+                .unwrap()
+                .len(),
+            1,
+            "the follower's own #general holds only its create"
+        );
+    }
+
     /// A follower lists a channel it carries as ordered by its owner, with
     /// the owner's offer: what lets a client hold the channel's records to
     /// the owner without taking the follower's word for it.
@@ -3785,29 +4059,29 @@ mod tests {
     /// follower starts executing carried blocks without that being decided.
     #[tokio::test]
     async fn a_post_crosses_by_a_share_and_runs_only_on_its_owner() {
-        let m = mutual().await;
+        let p = pair(OfferPolicy::Accept).await;
         let channel = post(
-            &m.a,
-            &m.user,
+            &p.owner,
+            &p.user,
             BlockKind::ChannelCreate,
             serde_json::json!({"slug": "#hello", "tier": "public"}),
         )
         .await
         .unwrap();
         post(
-            &m.a,
-            &m.user,
+            &p.owner,
+            &p.user,
             BlockKind::ChannelShare,
             serde_json::json!({
                 "channel_id": channel,
-                "to": m.b.server_did.to_did_jig_string(),
+                "to": p.follower.server_did.to_did_jig_string(),
                 "grant": "read",
             }),
         )
         .await
         .unwrap();
-        let a_did = m.a.server_did.to_did_jig_string();
-        let b_store = &m.b.ingest_ctx.store;
+        let a_did = p.owner.server_did.to_did_jig_string();
+        let b_store = &p.follower.ingest_ctx.store;
         eventually("the share accepted", || {
             b_store
                 .has_accepted_share(&channel, &a_did)
@@ -3816,20 +4090,21 @@ mod tests {
         })
         .await;
 
-        let text = m.text(&m.a, &channel, "hi from alice").await.unwrap();
+        let text = p.text(&channel, "hi from alice").await;
         // `a`'s head moves on as the contract's own records land: compare
         // with it as it stands, past the post.
-        let posted =
-            m.a.ingest_ctx
-                .store
-                .get_ingest_record(&text)
-                .unwrap()
-                .unwrap()
-                .seq;
+        let posted = p
+            .owner
+            .ingest_ctx
+            .store
+            .get_ingest_record(&text)
+            .unwrap()
+            .unwrap()
+            .seq;
         let want = eventually("b at a's head", || {
-            m.b_follows.stream.pull_all();
-            let a_head = Pair::head(&m.a, &channel);
-            (a_head >= Some(posted) && Pair::head(&m.b, &channel) == a_head)
+            p.follows.stream.pull_all();
+            let a_head = Pair::head(&p.owner, &channel);
+            (a_head >= Some(posted) && Pair::head(&p.follower, &channel) == a_head)
                 .then_some(a_head.unwrap())
         })
         .await;
@@ -3838,7 +4113,8 @@ mod tests {
         for seq in 0..=want {
             assert_eq!(
                 b_store.ingest_record_bytes(&channel, seq).unwrap(),
-                m.a.ingest_ctx
+                p.owner
+                    .ingest_ctx
                     .store
                     .ingest_record_bytes(&channel, seq)
                     .unwrap(),
@@ -3846,7 +4122,12 @@ mod tests {
             );
         }
 
-        let on_a = m.a.ingest_ctx.store.get_receipts_for_block(&text).unwrap();
+        let on_a = p
+            .owner
+            .ingest_ctx
+            .store
+            .get_receipts_for_block(&text)
+            .unwrap();
         assert!(
             on_a.iter().any(|r| r.render_hash.is_some()),
             "a executed the block: {on_a:?}"
