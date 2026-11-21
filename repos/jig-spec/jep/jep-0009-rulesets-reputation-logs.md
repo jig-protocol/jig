@@ -353,7 +353,9 @@ binds R3 (rules 7–22) as well: R3's nameservers and R2.4's single server compu
          `accrual_per_period` (rule 17). Negative evidence is not capped by accrual.
       4. **Add:** `r ← r + positive`, and `s ← s + negative`.
     - **Score**, in parts per million:
-      `score = ⌊(r − s) · 10⁶ / (r + s + 2 · 10⁶)⌋`. It lies strictly between −10⁶ and 10⁶.
+      `score = ⌊(r − s) · 10⁶ / (r + s + 2 · 10⁶)⌋`, so `−10⁶ ≤ score < 10⁶`. The floor reaches
+      −10⁶ once `s` exceeds about 2 · 10¹² micro-units, because negative evidence has no accrual
+      cap.
 41. **Age is counted in epochs:** `age = N − first_epoch + 1`. A subject is established at `N`
     when all of these hold (rule 16):
     - `score ≥ established`;
@@ -418,10 +420,15 @@ binds R3 (rules 7–22) as well: R3's nameservers and R2.4's single server compu
     `{v, log, leaf: CID, by}`: a promise to include the leaf at or before position `by`, at most
     `receipt_positions` past the log's size when it signed.
     - A receipt and a later checkpoint without the leaf is an `omission` fraud proof.
+    - **The owner's duty.** Under a ruleset that defines `good-standing-interval`, the epoch log's
+      owner MUST log one `event` with that code and `count = 1` for each acknowledged subject it
+      ingested at least one block from in epoch `N` and logged no negative leaf about in `N`.
+      The count is 1 however many blocks the subject wrote, because accrual is capped per epoch
+      (rule 17).
     - For what the owner observes itself, the subject holds receipts too: the owner-signed
       `ingest` record of each block it wrote (JEP-0002; JEP-0005 rule 12). An `ingest` record in
       epoch `N`, no negative leaf about the subject in `N`, and no `good-standing-interval`
-      applied is an `omission` fraud proof.
+      applied is an `omission` fraud proof against that duty.
     - Witnessed and gossiped checkpoints (rule 33; JEP-0016 rules 22–23) make a split view
       detectable. Something the owner never received and never signed for is outside what any
       rule can prove.
@@ -541,6 +548,9 @@ binds R3 (rules 7–22) as well: R3's nameservers and R2.4's single server compu
   never signed for, cannot be proven missing (rule 45).
 - **An unwitnessed log** sets its own epoch time (rule 36). Standing computed there is the
   owner's claim and stays local policy.
+- **A late witness.** When a checkpoint has exactly `witness_threshold` cosignatures, the latest
+  of them sets its epoch time, so one late witness can delay an epoch's close (rule 36). That only
+  slows accrual. It cannot speed it.
 - **Verdict correctness** is not checked by `f` (rule 46). It is the tribunal's, until verdicts
   carry zero-knowledge proofs.
 
