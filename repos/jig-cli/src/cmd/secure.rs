@@ -418,6 +418,55 @@ fn kept_leaves_out(body: &RecordBody, did: &str, server_did: &str) -> Option<boo
     (record.did == did).then(|| !record.servers.iter().any(|(s, _)| s == server_did))
 }
 
+/// What one server's answer to our signed read of its kept record says.
+#[derive(Debug, PartialEq, Eq)]
+enum KeptAnswer {
+    /// Its record leaves it out: withdrawn there, so it is dropped.
+    Withdrawn,
+    /// It still lists itself, or keeps no record: the new one may go there.
+    Listed,
+    /// Nothing can be concluded: it stays listed, but is not sent the record.
+    Unchecked,
+}
+
+/// Judge an answer: `None` when the request failed; otherwise its status and
+/// its body, `None` when the body could not be read in full.
+fn judge_kept_answer(
+    answer: Option<(reqwest::StatusCode, Option<&[u8]>)>,
+    did: &str,
+    server_did: &str,
+) -> KeptAnswer {
+    match answer {
+        Some((status, body)) if status.is_success() => {
+            let record = body.and_then(|b| serde_json::from_slice::<RecordBody>(b).ok());
+            match record.and_then(|r| kept_leaves_out(&r, did, server_did)) {
+                Some(true) => KeptAnswer::Withdrawn,
+                Some(false) => KeptAnswer::Listed,
+                // An answer that is not our record: not checked.
+                None => KeptAnswer::Unchecked,
+            }
+        }
+        // No record there: nothing to restore, so sending is safe.
+        Some((reqwest::StatusCode::NOT_FOUND, _)) => KeptAnswer::Listed,
+        _ => KeptAnswer::Unchecked,
+    }
+}
+
+/// Servers as (DID, URL) pairs.
+type ServerList = Vec<(String, String)>;
+
+/// Split the servers a new record lists into those it is sent to and those
+/// it is not, because their own record could not be read.
+fn split_unchecked(
+    servers: &[(String, String)],
+    unchecked: &std::collections::HashSet<String>,
+) -> (ServerList, ServerList) {
+    servers
+        .iter()
+        .cloned()
+        .partition(|(s, _)| !unchecked.contains(s))
+}
+
 /// Guards a walk of the release log's pages against a server that ignores
 /// `offset`: a page the same as the one before, or more pages than any log
 /// can hold, ends the walk with an error that names the server.
@@ -452,6 +501,73 @@ impl LogWalk {
         }
         self.previous = ids;
         Ok(())
+    }
+}
+
+/// One entry of a server's release log, as this device reads it.
+#[derive(Deserialize)]
+struct ReleaseEntry {
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    reference_hex: Option<String>,
+    #[serde(default)]
+    channel_id: String,
+    #[serde(default)]
+    request_b64: String,
+    #[serde(default)]
+    id_hex: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ReleaseLog {
+    releases: Vec<ReleaseEntry>,
+}
+
+/// Entries per page of the release log, as the server pages it.
+const RELEASE_PAGE: usize = 200;
+
+/// Walk a release log page by page, `fetch(offset)` giving each page (`None`
+/// when the server keeps no log), and collect the references of the custody
+/// releases in it. A short page ends the walk; [`LogWalk`] ends one that
+/// does not.
+async fn walk_release_log<F, Fut>(server: &str, mut fetch: F) -> Result<Vec<Vec<u8>>>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Vec<ReleaseEntry>>>>,
+{
+    let mut refs = Vec::new();
+    let mut offset = 0;
+    let mut walk = LogWalk::default();
+    loop {
+        let Some(releases) = fetch(offset).await? else {
+            return Ok(refs);
+        };
+        let n = releases.len();
+        // Each entry is told apart by its own id; a server that sends
+        // none leaves only the page cap.
+        let ids: Option<Vec<String>> = releases.iter().map(|e| e.id_hex.clone()).collect();
+        walk.page(server, ids)?;
+        for e in releases {
+            let custody = match e.kind.as_deref() {
+                Some(kind) => kind == "custody",
+                None => !e.channel_id.is_empty() || !e.request_b64.is_empty(),
+            };
+            if !custody {
+                continue;
+            }
+            match e.reference_hex.as_deref().map(hex::decode) {
+                Some(Ok(r)) => refs.push(r),
+                _ => anyhow::bail!(
+                    "{server} logs releases without the package they released; it cannot \
+                     tell this device which keys to delete"
+                ),
+            }
+        }
+        if n < RELEASE_PAGE {
+            return Ok(refs);
+        }
+        offset += n;
     }
 }
 
@@ -1079,29 +1195,27 @@ impl Secure {
             for (name, value) in proof.headers() {
                 req = req.header(name, value);
             }
-            let withdrawn = match req.send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    let body = limits::json_capped::<RecordBody>(resp, limits::MAX_DOCUMENT_BYTES)
-                        .await
-                        .ok();
-                    match body.and_then(|b| kept_leaves_out(&b, &did, &server_did)) {
-                        Some(withdrawn) => withdrawn,
-                        // An answer that is not our record: not checked.
-                        None => {
-                            unchecked.insert(server_did.clone());
-                            false
-                        }
-                    }
+            let answer = match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = if status.is_success() {
+                        limits::read_capped(resp, limits::MAX_DOCUMENT_BYTES)
+                            .await
+                            .ok()
+                    } else {
+                        None
+                    };
+                    judge_kept_answer(Some((status, body.as_deref())), &did, &server_did)
                 }
-                // No record there: nothing to restore, so sending is safe.
-                Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => false,
-                _ => {
-                    unchecked.insert(server_did.clone());
-                    false
-                }
+                Err(_) => judge_kept_answer(None, &did, &server_did),
             };
-            if !withdrawn {
-                out.push((server_did, url));
+            match answer {
+                KeptAnswer::Withdrawn => {}
+                KeptAnswer::Listed => out.push((server_did, url)),
+                KeptAnswer::Unchecked => {
+                    unchecked.insert(server_did.clone());
+                    out.push((server_did, url));
+                }
             }
         }
         (out, unchecked)
@@ -1152,18 +1266,13 @@ impl Secure {
             .collect();
         let (others, unchecked) = self.still_custodians(others).await;
         // Sent only to servers whose own state was read.
-        let send_to: Vec<_> = others
-            .iter()
-            .filter(|(s, _)| !unchecked.contains(s))
-            .cloned()
-            .collect();
+        let (send_to, skipped) = split_unchecked(&others, &unchecked);
         let mut change = CustodyChange {
-            elsewhere: others
-                .iter()
-                .filter(|(s, _)| unchecked.contains(s))
+            elsewhere: skipped
+                .into_iter()
                 .map(|(_, url)| {
                     (
-                        url.clone(),
+                        url,
                         Err("its record could not be read, so the new one was not sent".into()),
                     )
                 })
@@ -1315,66 +1424,20 @@ impl Secure {
     /// before rule 32 carries no `kind`: it is `local` when it names no
     /// channel and no request, as #440 logged a local take.
     async fn custody_releases(&self) -> Result<Vec<Vec<u8>>> {
-        #[derive(Deserialize)]
-        struct Entry {
-            #[serde(default)]
-            kind: Option<String>,
-            #[serde(default)]
-            reference_hex: Option<String>,
-            #[serde(default)]
-            channel_id: String,
-            #[serde(default)]
-            request_b64: String,
-            #[serde(default)]
-            id_hex: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct Log {
-            releases: Vec<Entry>,
-        }
-        const PAGE: usize = 200;
         let did = self.session.did().to_string();
-        let mut refs = Vec::new();
-        let mut offset = 0;
-        let mut walk = LogWalk::default();
-        loop {
-            let log: Log = match self
-                .get_json(&format!("/api/v1/custody/{did}/releases?offset={offset}"))
-                .await
-            {
-                Ok(log) => log,
-                Err(e) => match e.downcast_ref::<Refused>() {
-                    Some(r) if r.status == 404 || r.status == 405 => return Ok(refs),
-                    _ => return Err(e),
-                },
-            };
-            let n = log.releases.len();
-            // Each entry is told apart by its own id; a server that sends
-            // none leaves only the page cap.
-            let ids: Option<Vec<String>> = log.releases.iter().map(|e| e.id_hex.clone()).collect();
-            walk.page(&self.server, ids)?;
-            for e in log.releases {
-                let custody = match e.kind.as_deref() {
-                    Some(kind) => kind == "custody",
-                    None => !e.channel_id.is_empty() || !e.request_b64.is_empty(),
-                };
-                if !custody {
-                    continue;
-                }
-                match e.reference_hex.as_deref().map(hex::decode) {
-                    Some(Ok(r)) => refs.push(r),
-                    _ => anyhow::bail!(
-                        "{} logs releases without the package they released; it cannot \
-                         tell this device which keys to delete",
-                        self.server
-                    ),
+        walk_release_log(&self.server, |offset| {
+            let path = format!("/api/v1/custody/{did}/releases?offset={offset}");
+            async move {
+                match self.get_json::<ReleaseLog>(&path).await {
+                    Ok(log) => Ok(Some(log.releases)),
+                    Err(e) => match e.downcast_ref::<Refused>() {
+                        Some(r) if r.status == 404 || r.status == 405 => Ok(None),
+                        _ => Err(e),
+                    },
                 }
             }
-            if n < PAGE {
-                return Ok(refs);
-            }
-            offset += n;
-        }
+        })
+        .await
     }
 
     /// Upload `packages` here, and remember their references
@@ -2372,9 +2435,10 @@ fn shadow_note(reference: &str, own: &ChannelInfo, carried: &ChannelInfo) -> Str
 #[cfg(test)]
 mod tests {
     use super::{
-        Asked, ChannelInfo, LocalAdds, LogWalk, RecordBody, Refused, first_release, group_name,
-        kept_leaves_out, must_encrypt, ordered_here, own_group_name, pick, sequencers_for,
-        settle_local_adds, shadow_note,
+        Asked, ChannelInfo, KeptAnswer, LocalAdds, LogWalk, RELEASE_PAGE, RecordBody, Refused,
+        ReleaseEntry, first_release, group_name, judge_kept_answer, kept_leaves_out, must_encrypt,
+        ordered_here, own_group_name, pick, sequencers_for, settle_local_adds, shadow_note,
+        split_unchecked, walk_release_log,
     };
     use std::cell::RefCell;
 
@@ -2560,6 +2624,130 @@ mod tests {
         assert_eq!(kept_leaves_out(&body(b64(b"garbage")), &did, &s), None);
         let theirs = rec(&other, vec![(t.clone(), "u".into())]);
         assert_eq!(kept_leaves_out(&body(b64(&theirs)), &did, &s), None);
+    }
+
+    #[test]
+    fn an_unreadable_or_malformed_answer_is_unchecked() {
+        use base64::Engine as _;
+        use reqwest::StatusCode;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[4; 32]);
+        let did =
+            jig_core::Did::from_ed25519_pubkey(&key.verifying_key().to_bytes()).to_did_jig_string();
+        let s = {
+            let k = ed25519_dalek::SigningKey::from_bytes(&[10; 32]);
+            jig_core::Did::from_ed25519_pubkey(&k.verifying_key().to_bytes()).to_did_jig_string()
+        };
+        let kept = |servers: Vec<(String, String)>| {
+            let env = jig_core::naming::ReachabilityRecord::sign(&key, servers, 3).envelope;
+            serde_json::json!({
+                "record_b64": base64::engine::general_purpose::STANDARD.encode(env)
+            })
+            .to_string()
+            .into_bytes()
+        };
+        let judge = |a: Option<(StatusCode, Option<&[u8]>)>| judge_kept_answer(a, &did, &s);
+        let ok = StatusCode::OK;
+        // Our record, listing S or leaving it out; or no record at all.
+        let listed = kept(vec![(s.clone(), "u".into())]);
+        assert_eq!(judge(Some((ok, Some(&listed)))), KeptAnswer::Listed);
+        assert_eq!(
+            judge(Some((ok, Some(&kept(vec![]))))),
+            KeptAnswer::Withdrawn
+        );
+        assert_eq!(
+            judge(Some((StatusCode::NOT_FOUND, None))),
+            KeptAnswer::Listed
+        );
+        // A 200 whose body is malformed JSON, the wrong shape, or unread.
+        for body in [&b"{ not json"[..], b"[]", b"{\"other\": 1}"] {
+            assert_eq!(judge(Some((ok, Some(body)))), KeptAnswer::Unchecked);
+        }
+        assert_eq!(judge(Some((ok, None))), KeptAnswer::Unchecked);
+        // Any other status, or no answer.
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::INTERNAL_SERVER_ERROR] {
+            assert_eq!(judge(Some((status, Some(&listed)))), KeptAnswer::Unchecked);
+        }
+        assert_eq!(judge(None), KeptAnswer::Unchecked);
+    }
+
+    #[test]
+    fn the_new_record_is_not_sent_to_an_unchecked_server() {
+        let servers = vec![
+            ("did:a".to_string(), "https://a".to_string()),
+            ("did:b".to_string(), "https://b".to_string()),
+            ("did:c".to_string(), "https://c".to_string()),
+        ];
+        let unchecked = std::collections::HashSet::from(["did:b".to_string()]);
+        let (send_to, skipped) = split_unchecked(&servers, &unchecked);
+        assert_eq!(send_to, [servers[0].clone(), servers[2].clone()]);
+        assert_eq!(skipped, [servers[1].clone()]);
+    }
+
+    /// A page of `n` custody releases, numbered from `from`, each with its id.
+    fn release_page(from: usize, n: usize, with_ids: bool) -> Vec<ReleaseEntry> {
+        (from..from + n)
+            .map(|i| ReleaseEntry {
+                kind: Some("custody".into()),
+                reference_hex: Some(hex::encode((i as u32).to_be_bytes())),
+                channel_id: String::new(),
+                request_b64: String::new(),
+                id_hex: with_ids.then(|| format!("{i:08x}")),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn full_distinct_pages_are_walked_to_the_short_one() {
+        let mut asked = Vec::new();
+        let refs = walk_release_log("S", |offset| {
+            asked.push(offset);
+            let n = if offset < 2 * RELEASE_PAGE {
+                RELEASE_PAGE
+            } else {
+                3
+            };
+            async move { Ok(Some(release_page(offset, n, true))) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(asked, [0, RELEASE_PAGE, 2 * RELEASE_PAGE]);
+        assert_eq!(refs.len(), 2 * RELEASE_PAGE + 3);
+        assert_eq!(
+            refs.last().unwrap(),
+            &((2 * RELEASE_PAGE + 2) as u32).to_be_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_page_served_again_stops_the_walk() {
+        let mut calls = 0;
+        let err = walk_release_log("S", |_offset| {
+            calls += 1;
+            async { Ok(Some(release_page(0, RELEASE_PAGE, true))) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls, 2);
+        assert!(err.to_string().contains("ignores `offset`"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn full_pages_without_ids_stop_at_the_cap() {
+        let mut calls = 0;
+        let err = walk_release_log("S", |_offset| {
+            calls += 1;
+            async { Ok(Some(release_page(0, RELEASE_PAGE, false))) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls, LogWalk::MAX_PAGES + 1);
+        assert!(err.to_string().contains("does not end"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_server_with_no_log_releases_nothing() {
+        let refs = walk_release_log("S", |_| async { Ok(None) }).await.unwrap();
+        assert!(refs.is_empty());
     }
 
     fn ids(xs: &[&str]) -> Option<Vec<String>> {
