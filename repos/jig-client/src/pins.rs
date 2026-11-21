@@ -51,6 +51,16 @@ pub enum PinError {
         presented: String,
     },
     #[error(
+        "{server} lists channel {id} as {listed}, but this device pinned it as {pinned}: \
+         a server cannot move a channel to another slug"
+    )]
+    SlugMoved {
+        server: String,
+        id: String,
+        pinned: String,
+        listed: String,
+    },
+    #[error(
         "{server} names itself {presented}, but this device pinned it as {pinned} (if its key \
          really changed, `jig server forget` drops the pin)"
     )]
@@ -118,6 +128,13 @@ pub enum PinError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelPin {
     pub create_cid: String,
+    /// The slug the channel goes by, as data: pins are keyed by
+    /// [`Self::create_cid`] (#388), since a server's own channel and one it
+    /// carries for another server may share a slug. Set when pinned
+    /// ([`Pins::check_channel`]); a pin from before #388 gets it from the key
+    /// it was stored under.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub slug: String,
     pub suite: String,
     pub owner_did: String,
     /// The last record of the channel's `ingest` chain this device verified
@@ -146,6 +163,8 @@ impl ChannelPin {
 pub struct ServerPin {
     pub server_did: String,
     pub suites: BTreeSet<String>,
+    /// By channel id, the CID of the creation block ([`ChannelPin::create_cid`]).
+    /// Files from before #388 keyed these by slug; [`Pins::load`] rekeys them.
     #[serde(default)]
     pub channels: BTreeMap<String, ChannelPin>,
     /// A welcome from this server that advertised [`Self::suites`],
@@ -394,6 +413,43 @@ fn rekey(file: &mut PinFile) -> bool {
         let pin = file.servers.remove(key).expect("listed above");
         file.servers.entry(server_key(key)).or_insert(pin);
     }
+    let mut moved = !legacy.is_empty();
+    for pin in file.servers.values_mut() {
+        moved |= rekey_channels(&mut pin.channels);
+    }
+    moved
+}
+
+/// Channel pins keyed by slug, as before #388, rekeyed by channel id with
+/// the slug kept as data. A pin with no creation block recorded stays where
+/// it is: there is no id to file it under.
+/// A pin under one slug is never taken for a listing under another. A pin
+/// with no slug (an old file entry without one) says nothing either way.
+fn check_slug(server: &str, pinned: &ChannelPin, slug: &str) -> Result<(), PinError> {
+    if pinned.slug.is_empty() || pinned.slug == slug {
+        return Ok(());
+    }
+    Err(PinError::SlugMoved {
+        server: server.to_string(),
+        id: pinned.create_cid.clone(),
+        pinned: pinned.slug.clone(),
+        listed: slug.to_string(),
+    })
+}
+
+fn rekey_channels(channels: &mut BTreeMap<String, ChannelPin>) -> bool {
+    let legacy: Vec<String> = channels
+        .iter()
+        .filter(|(key, pin)| !pin.create_cid.is_empty() && **key != pin.create_cid)
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in &legacy {
+        let mut pin = channels.remove(key).expect("listed above");
+        if pin.slug.is_empty() {
+            pin.slug = key.clone();
+        }
+        channels.entry(pin.create_cid.clone()).or_insert(pin);
+    }
     !legacy.is_empty()
 }
 
@@ -626,63 +682,109 @@ impl Pins {
         })
     }
 
-    /// The pin for `slug` on `server`, if this device has one.
-    pub fn channel(&self, server: &str, slug: &str) -> Option<&ChannelPin> {
-        self.server(server).and_then(|p| p.channels.get(slug))
+    /// The pin for `reference` on `server`, if this device has one: the
+    /// channel whose id it is, else the channel this server orders under
+    /// that slug ([`Self::channel_by_ref`]).
+    pub fn channel(&self, server: &str, reference: &str) -> Option<&ChannelPin> {
+        self.channel_by_ref(server, reference).map(|(_, pin)| pin)
     }
 
-    /// The channel pinned on `server` under `reference`, a slug or the id of
-    /// its creation block, with the slug it is pinned under.
+    /// The channel pinned on `server` under `reference`, the id of its
+    /// creation block or a slug, with its slug. A slug names the channel the
+    /// server orders under it (JEP-0005 rule 1), and a channel it carries
+    /// for another server only when it orders none by that slug.
     pub fn channel_by_ref(&self, server: &str, reference: &str) -> Option<(&str, &ChannelPin)> {
         let pins = &self.server(server)?.channels;
-        pins.get_key_value(reference)
-            .or_else(|| pins.iter().find(|(_, c)| c.create_cid == reference))
-            .map(|(slug, pin)| (slug.as_str(), pin))
+        pins.get(reference)
+            .or_else(|| {
+                let mut by_slug = pins.values().filter(|c| c.slug == reference);
+                let first = by_slug.next()?;
+                Some(
+                    std::iter::once(first)
+                        .chain(by_slug)
+                        .find(|c| c.sequencer.is_none())
+                        .unwrap_or(first),
+                )
+            })
+            .map(|pin| (pin.slug.as_str(), pin))
     }
 
     /// Check a channel's proven creation against the pin, and pin it on first
-    /// sight. A different creation block under a pinned name is refused.
+    /// sight, under its id with `slug` as its name. A different creation
+    /// block under a slug pinned for the same orderer is refused: the server
+    /// (or the owner of a carried channel) re-created the channel under the
+    /// name. A channel another server orders may share a slug with one this
+    /// server orders (#388), so `proven.sequencer` must already say which.
     pub fn check_channel(
         &mut self,
         server: &str,
         slug: &str,
-        proven: ChannelPin,
+        mut proven: ChannelPin,
     ) -> Result<ChannelPin, PinError> {
+        proven.slug = slug.to_string();
         self.update(|file| {
             let pin = file.servers.entry(server_key(server)).or_default();
-            match pin.channels.get(slug) {
-                Some(pinned) if pinned.create_cid == proven.create_cid => {
-                    Ok((pinned.clone(), false))
-                }
-                Some(pinned) => Err(PinError::ChannelReplaced {
+            if let Some(pinned) = pin.channels.get(&proven.create_cid) {
+                check_slug(server, pinned, slug)?;
+                return Ok((pinned.clone(), false));
+            }
+            if let Some(pinned) = pin
+                .channels
+                .values()
+                .find(|c| c.slug == slug && c.sequencer == proven.sequencer)
+            {
+                return Err(PinError::ChannelReplaced {
                     server: server.to_string(),
                     slug: slug.to_string(),
                     pinned: pinned.create_cid.clone(),
                     presented: proven.create_cid,
-                }),
-                None => {
-                    pin.channels.insert(slug.to_string(), proven.clone());
-                    Ok((proven, true))
-                }
+                });
             }
+            pin.channels
+                .insert(proven.create_cid.clone(), proven.clone());
+            Ok((proven, true))
         })
     }
 
-    /// Move the pinned chain head of `slug` on `server` to `head`, which the
+    /// The pin of channel `id` on `server`, when the server lists it as
+    /// `slug`: `None` if it is not pinned, an error if it is pinned under
+    /// another slug. A channel is found by its id, so without this a server
+    /// could list one pinned channel under another's slug (#388).
+    pub fn channel_listed_as(
+        &self,
+        server: &str,
+        id: &str,
+        slug: &str,
+    ) -> Result<Option<&ChannelPin>, PinError> {
+        let Some(pin) = self.server(server).and_then(|p| p.channels.get(id)) else {
+            return Ok(None);
+        };
+        check_slug(server, pin, slug)?;
+        Ok(Some(pin))
+    }
+
+    /// Move the pinned chain head of `reference` (an id, or a slug as
+    /// [`Self::channel_by_ref`] reads it) on `server` to `head`, which the
     /// caller verified follows the pinned one ([`crate::chain::ChannelChain`]).
     /// A head behind the pinned one is ignored: pins never move backwards.
     /// Returns whether the channel is pinned at all.
     pub fn advance_chain(
         &mut self,
         server: &str,
-        slug: &str,
+        reference: &str,
         head: &crate::chain::ChainHead,
     ) -> Result<bool, PinError> {
+        let Some(id) = self
+            .channel_by_ref(server, reference)
+            .map(|(_, pin)| pin.create_cid.clone())
+        else {
+            return Ok(false);
+        };
         self.update(|file| {
             let Some(pin) = file
                 .servers
                 .get_mut(&server_key(server))
-                .and_then(|p| p.channels.get_mut(slug))
+                .and_then(|p| p.channels.get_mut(&id))
             else {
                 return Ok((false, false));
             };
@@ -714,11 +816,10 @@ impl Pins {
             .unwrap_or_default()
     }
 
-    /// Hold `slug` on `server` to the server that orders it: `None` for
-    /// `server` itself, else a DID [`prove_carried`] proved for the channel
-    /// `create_cid`. The proof is for that channel only: if `slug` is pinned
-    /// to another creation block, nothing moves and the substitution is
-    /// [`PinError::ChannelReplaced`]. A channel
+    /// Hold the channel `create_cid` (pinned as `slug`) on `server` to the
+    /// server that orders it: `None` for `server` itself, else a DID
+    /// [`prove_carried`] proved for that channel. The proof is for that
+    /// channel only, so it moves only the pin of that creation block. A channel
     /// pinned as `server`'s own may come to be carried for a proven owner
     /// (the server set its own copy aside and follows the owner, JEP-0005):
     /// its chain then starts again from the owner's records, the old head
@@ -735,18 +836,10 @@ impl Pins {
             let Some(pin) = file
                 .servers
                 .get_mut(&server_key(server))
-                .and_then(|p| p.channels.get_mut(slug))
+                .and_then(|p| p.channels.get_mut(create_cid))
             else {
                 return Ok((false, false));
             };
-            if pin.create_cid != create_cid {
-                return Err(PinError::ChannelReplaced {
-                    server: server.to_string(),
-                    slug: slug.to_string(),
-                    pinned: pin.create_cid.clone(),
-                    presented: create_cid.to_string(),
-                });
-            }
             match (pin.sequencer.as_deref(), sequencer) {
                 (None, None) => Ok((false, false)),
                 (Some(pinned), Some(presented)) if pinned == presented => Ok((false, false)),
@@ -1000,6 +1093,7 @@ pub fn prove_channel(
     }
     Ok(ChannelPin {
         create_cid: cid.to_string(),
+        slug: String::new(),
         suite: suite.as_str().to_string(),
         owner_did: Did::from_ed25519_pubkey(&key_bytes).to_did_jig_string(),
         chain_head: None,
@@ -1213,6 +1307,7 @@ mod tests {
     fn any_suite_but_none_is_encrypted() {
         let pin = |suite: &str| ChannelPin {
             create_cid: "bafy".into(),
+            slug: String::new(),
             suite: suite.into(),
             owner_did: "did:jig:zA".into(),
             chain_head: None,
@@ -1359,6 +1454,7 @@ mod tests {
 
         let first = ChannelPin {
             create_cid: "bafyFirst".into(),
+            slug: "#ops".into(),
             suite: "mls".into(),
             owner_did: "did:jig:zOwner".into(),
             chain_head: None,
@@ -1372,6 +1468,7 @@ mod tests {
         assert_eq!(again, first);
         let replaced = ChannelPin {
             create_cid: "bafySecond".into(),
+            slug: String::new(),
             suite: "none".into(),
             ..first.clone()
         };
@@ -1443,6 +1540,7 @@ mod tests {
         let (mut chat, mut send) = (Pins::load(&path).unwrap(), Pins::load(&path).unwrap());
         let pin = |cid: &str| ChannelPin {
             create_cid: cid.into(),
+            slug: String::new(),
             suite: "mls".into(),
             owner_did: "did:jig:zOwner".into(),
             chain_head: None,
@@ -1451,8 +1549,12 @@ mod tests {
         chat.check_channel(server, "#a", pin("bafyA")).unwrap();
         send.check_channel(server, "#b", pin("bafyB")).unwrap();
         let on_disk = Pins::load(&path).unwrap();
-        assert_eq!(on_disk.channel(server, "#a"), Some(&pin("bafyA")));
-        assert_eq!(on_disk.channel(server, "#b"), Some(&pin("bafyB")));
+        let named = |cid: &str, slug: &str| ChannelPin {
+            slug: slug.into(),
+            ..pin(cid)
+        };
+        assert_eq!(on_disk.channel(server, "#a"), Some(&named("bafyA", "#a")));
+        assert_eq!(on_disk.channel(server, "#b"), Some(&named("bafyB", "#b")));
         // And a later change is checked against what another process pinned.
         assert!(matches!(
             chat.check_channel(server, "#b", pin("bafyOther")),
@@ -1484,6 +1586,7 @@ mod tests {
             "#ops",
             ChannelPin {
                 create_cid: "bafyC".into(),
+                slug: String::new(),
                 suite: "mls".into(),
                 owner_did: "did:jig:zOwner".into(),
                 chain_head: None,
@@ -2098,6 +2201,7 @@ mod tests {
             "#team",
             ChannelPin {
                 create_cid: "bafycreate".to_string(),
+                slug: String::new(),
                 suite: "none".to_string(),
                 owner_did: "did:jig:zuser".to_string(),
                 chain_head: None,
@@ -2147,8 +2251,9 @@ mod tests {
     /// A follower cannot re-point a pinned slug at another channel with a
     /// valid proof for that other channel. `#team` is pinned on the follower
     /// as its own channel Y; the follower then lists `#team` as X, a channel
-    /// it does carry for the owner, with the owner's real offer for X. The
-    /// proof holds for X, but the slug stays bound to Y.
+    /// it does carry for the owner, with the owner's real offer for X. As its
+    /// own, X is refused; as carried, with the proof, X is a second channel
+    /// reached by its id (#388), and `#team` still names Y.
     #[test]
     fn a_valid_proof_for_one_channel_cannot_re_point_a_slug_pinned_to_another() {
         let dir = tempfile::tempdir().unwrap();
@@ -2157,6 +2262,7 @@ mod tests {
         let local = "bafylocalteam".to_string();
         let pin = |create_cid: &str| ChannelPin {
             create_cid: create_cid.to_string(),
+            slug: String::new(),
             suite: "none".to_string(),
             owner_did: "did:jig:zuser".to_string(),
             chain_head: None,
@@ -2180,20 +2286,237 @@ mod tests {
             .unwrap(),
             owner
         );
-        // The creation check refuses X under the slug pinned to Y.
+        // Listed as the follower's own, X would replace Y: refused.
         assert!(matches!(
             pins.check_channel(server, "#team", pin(&x.channel_id)),
             Err(PinError::ChannelReplaced { .. })
         ));
-        // And so does the anchor, on its own.
-        assert!(matches!(
-            pins.anchor_channel(server, "#team", &x.channel_id, Some(&owner)),
-            Err(PinError::ChannelReplaced { .. })
-        ));
+        assert!(pins.carried(server).is_empty());
+        assert_eq!(pins.channel_by_ref(server, &x.channel_id), None);
+        // Carried, with the owner the offer proved, X pins beside Y.
+        let carried_x = ChannelPin {
+            sequencer: Some(owner.clone()),
+            ..pin(&x.channel_id)
+        };
+        pins.check_channel(server, "#team", carried_x).unwrap();
+        assert!(
+            !pins
+                .anchor_channel(server, "#team", &x.channel_id, Some(&owner))
+                .unwrap()
+        );
         let after = pins.channel(server, "#team").unwrap();
         assert_eq!(after.create_cid, local);
         assert_eq!(after.sequencer, None);
-        assert!(pins.carried(server).is_empty());
-        assert_eq!(pins.channel_by_ref(server, &x.channel_id), None);
+        assert_eq!(
+            pins.carried(server)
+                .get(x.channel_id.as_str())
+                .map(String::as_str),
+            Some(owner.as_str())
+        );
+    }
+
+    /// #388: on a follower, one of the server's own channels and a channel
+    /// it carries for another server may share a slug (JEP-0005 allows both,
+    /// reached by id). The device pins both, as `jig` does for each: the
+    /// creation block proven, a carried one with the owner its offer proved,
+    /// then anchored. Neither replaces the other, the carried one is found by
+    /// its id, and the server's own keeps the slug.
+    #[test]
+    fn a_carried_channel_and_the_servers_own_may_share_a_slug() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        let mut pins = Pins::load(&path).unwrap();
+        let server = "wss://follower";
+        pins.check_server_did(server, "did:jig:zFollower").unwrap();
+        let pin = |cid: &str| ChannelPin {
+            create_cid: cid.into(),
+            slug: String::new(),
+            suite: "mls".into(),
+            owner_did: "did:jig:zUser".into(),
+            chain_head: None,
+            sequencer: None,
+        };
+
+        pins.check_channel(server, "#team", pin("bafyOwn")).unwrap();
+        let carried = ChannelPin {
+            sequencer: Some("did:jig:zOwner".into()),
+            ..pin("bafyCarried")
+        };
+        pins.check_channel(server, "#team", carried)
+            .expect("the carried #team does not replace the server's own #team");
+        pins.anchor_channel(server, "#team", "bafyCarried", Some("did:jig:zOwner"))
+            .unwrap();
+
+        for pins in [&pins, &Pins::load(&path).unwrap()] {
+            let (_, carried) = pins.channel_by_ref(server, "bafyCarried").unwrap();
+            assert_eq!(carried.create_cid, "bafyCarried");
+            assert_eq!(carried.sequencer.as_deref(), Some("did:jig:zOwner"));
+            let (_, own) = pins.channel_by_ref(server, "bafyOwn").unwrap();
+            assert_eq!(own.sequencer, None);
+            assert_eq!(
+                pins.channel(server, "#team").map(|c| c.create_cid.as_str()),
+                Some("bafyOwn"),
+                "the slug names the channel this server orders"
+            );
+            assert_eq!(
+                pins.carried(server).get("bafyCarried").map(String::as_str),
+                Some("did:jig:zOwner")
+            );
+        }
+    }
+
+    /// A pin file from before #388 keys channels by slug. It opens with
+    /// every pin under its channel id and its slug kept, a carried one still
+    /// carried, and is saved that way; reading it again changes nothing.
+    #[test]
+    fn a_slug_keyed_pin_file_is_rekeyed_by_channel_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        // What v0.2.0-alpha.6 writes: one of the server's own channels and
+        // one it carries, under their slugs. Two that share a slug cannot
+        // both be in such a file: that is #388.
+        let old = serde_json::json!({
+            "servers": {
+                "follower:443": {
+                    "server_did": "did:jig:zfollower",
+                    "suites": ["mls", "none"],
+                    "channels": {
+                        "#team": {
+                            "create_cid": "bafyown",
+                            "suite": "mls",
+                            "owner_did": "did:jig:zuser"
+                        },
+                        "#ops": {
+                            "create_cid": "bafycarried",
+                            "suite": "mls",
+                            "owner_did": "did:jig:zuser",
+                            "sequencer": "did:jig:zowner"
+                        }
+                    }
+                }
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&old).unwrap()).unwrap();
+
+        let pins = Pins::load(&path).unwrap();
+        let server = "https://follower:443";
+        let ids: Vec<&String> = pins.server(server).unwrap().channels.keys().collect();
+        assert_eq!(ids, ["bafycarried", "bafyown"]);
+        let own = pins.channel(server, "#team").unwrap();
+        assert_eq!(
+            (own.create_cid.as_str(), own.slug.as_str()),
+            ("bafyown", "#team")
+        );
+        let carried = pins.channel(server, "bafycarried").unwrap();
+        assert_eq!(carried.slug, "#ops");
+        assert_eq!(carried.sequencer.as_deref(), Some("did:jig:zowner"));
+        assert_eq!(
+            pins.carried(server).get("bafycarried").map(String::as_str),
+            Some("did:jig:zowner")
+        );
+
+        // Saved rekeyed: the file itself is keyed by id now, and stays so.
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let channels = &saved["servers"]["follower:443"]["channels"];
+        assert_eq!(channels["bafyown"]["slug"], "#team");
+        assert!(channels.get("#team").is_none(), "{channels}");
+        let again = std::fs::read(&path).unwrap();
+        let _ = Pins::load(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), again);
+    }
+
+    /// A channel this server orders, re-created under a pinned slug, is still
+    /// refused (OP-03), and so is a carried one its owner re-created; one of
+    /// each under the same slug is two channels (#388).
+    #[test]
+    fn only_the_same_orderer_replaces_a_pinned_slug() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pins = Pins::load(&dir.path().join("pins.json")).unwrap();
+        let server = "wss://follower";
+        let pin = |cid: &str, sequencer: Option<&str>| ChannelPin {
+            create_cid: cid.into(),
+            slug: String::new(),
+            suite: "mls".into(),
+            owner_did: "did:jig:zUser".into(),
+            chain_head: None,
+            sequencer: sequencer.map(str::to_string),
+        };
+        pins.check_channel(server, "#team", pin("bafyOwn", None))
+            .unwrap();
+        pins.check_channel(server, "#team", pin("bafyCarried", Some("did:jig:zOwner")))
+            .unwrap();
+        assert!(matches!(
+            pins.check_channel(server, "#team", pin("bafyOwnAgain", None)),
+            Err(PinError::ChannelReplaced { pinned, .. }) if pinned == "bafyOwn"
+        ));
+        assert!(matches!(
+            pins.check_channel(server, "#team", pin("bafyCarriedAgain", Some("did:jig:zOwner"))),
+            Err(PinError::ChannelReplaced { pinned, .. }) if pinned == "bafyCarried"
+        ));
+        // The chain of each moves alone, by its id.
+        let head = crate::chain::ChainHead {
+            format: crate::chain::RECORD_FORMAT.to_string(),
+            seq: 7,
+            hash: "aa".to_string(),
+            ingest_wall_ms: 1,
+            ingest_logical: 0,
+            record: None,
+            high: None,
+        };
+        assert!(pins.advance_chain(server, "bafyCarried", &head).unwrap());
+        assert_eq!(
+            pins.channel(server, "bafyCarried")
+                .unwrap()
+                .chain_head
+                .as_ref()
+                .map(|h| h.seq),
+            Some(7)
+        );
+        assert_eq!(pins.channel(server, "#team").unwrap().chain_head, None);
+    }
+
+    /// Found by id, a pinned channel still keeps its slug: a server that
+    /// lists one pinned channel under another's slug is refused, whether the
+    /// listing is checked against the pin or proven again.
+    #[test]
+    fn a_pinned_channel_listed_under_another_slug_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pins = Pins::load(&dir.path().join("pins.json")).unwrap();
+        let server = "wss://host";
+        let pin = |cid: &str| ChannelPin {
+            create_cid: cid.into(),
+            slug: String::new(),
+            suite: "mls".into(),
+            owner_did: "did:jig:zUser".into(),
+            chain_head: None,
+            sequencer: None,
+        };
+        pins.check_channel(server, "#alpha", pin("bafyA")).unwrap();
+        pins.check_channel(server, "#beta", pin("bafyB")).unwrap();
+
+        assert!(matches!(
+            pins.channel_listed_as(server, "bafyB", "#alpha"),
+            Err(PinError::SlugMoved { id, pinned, listed, .. })
+                if id == "bafyB" && pinned == "#beta" && listed == "#alpha"
+        ));
+        assert!(matches!(
+            pins.check_channel(server, "#alpha", pin("bafyB")),
+            Err(PinError::SlugMoved { .. })
+        ));
+        // Listed as pinned: found. Not pinned: nothing.
+        assert_eq!(
+            pins.channel_listed_as(server, "bafyB", "#beta")
+                .unwrap()
+                .map(|p| p.slug.as_str()),
+            Some("#beta")
+        );
+        assert!(
+            pins.channel_listed_as(server, "bafyC", "#alpha")
+                .unwrap()
+                .is_none()
+        );
+        // #alpha still names A.
+        assert_eq!(pins.channel(server, "#alpha").unwrap().create_cid, "bafyA");
     }
 }
