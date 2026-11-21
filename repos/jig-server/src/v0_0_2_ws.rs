@@ -231,9 +231,10 @@ pub async fn ws_handler(
 /// it. `None` for a server started without connection info (tests driving
 /// the router directly). What [`per_ip_rate`] charges and what a REST write's
 /// relay slots are keyed by (`v0_0_2_relay::rest_caller`). Behind a
-/// passthrough proxy every client has the proxy's address, so they share one
-/// bucket and one set of relay slots; no forwarded header is trusted yet
-/// (#399).
+/// TLS-passthrough proxy every client has the proxy's address, unless
+/// `[server.proxy_protocol]` lists it: the listener then sets this to the
+/// client the PROXY header names (`crate::proxy_protocol`). No forwarded HTTP
+/// header is trusted.
 pub fn client_ip(extensions: &axum::http::Extensions) -> Option<std::net::IpAddr> {
     extensions
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
@@ -441,12 +442,17 @@ async fn handle_socket(
                     // Stored in the same transaction as the block, so it is
                     // there by the time fanout delivers it. A store error
                     // sends the block without one, which the client sees as
-                    // a block it cannot place, not as a forged record.
-                    ingest: state
-                        .ingest_ctx
-                        .store
-                        .get_ingest_record(&block.cid)
-                        .unwrap_or_else(|e| {
+                    // a block it cannot place, not as a forged record. The
+                    // record is the delivery channel's: a block a carried
+                    // channel shares with another holds one in each.
+                    ingest: match &block.channel_id {
+                        Some(channel_id) => state
+                            .ingest_ctx
+                            .store
+                            .get_chain_record(channel_id, &block.cid),
+                        None => state.ingest_ctx.store.get_ingest_record(&block.cid),
+                    }
+                    .unwrap_or_else(|e| {
                             tracing::warn!(cid = %block.cid, "ingest record lookup failed: {e}");
                             None
                         }),

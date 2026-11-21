@@ -159,6 +159,12 @@ pub fn present(opened: &OpenedBlock, receipts: &[ReceiptRef], seen: &Seen) -> Op
             d.body = format!("🔒 [cannot decrypt: {reason}]");
             Some(d)
         }
+        // MLS gives a member no keys from before it joined (#431).
+        Seen::BeforeJoin => {
+            let mut d = plain(opened, receipts);
+            d.body = "🔒 [sent before you joined]".to_string();
+            Some(d)
+        }
         Seen::Joined => {
             system("you joined — messages from here on are end-to-end encrypted".into())
         }

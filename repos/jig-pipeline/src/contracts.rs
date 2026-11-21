@@ -695,7 +695,7 @@ impl SqliteStore {
         let conn = self.conn.lock().expect("poisoned");
         let bytes: Option<Vec<u8>> = conn
             .query_row(
-                "SELECT record FROM ingest_records WHERE channel_id = ?1 ORDER BY seq DESC LIMIT 1",
+                "SELECT record FROM chain_records WHERE channel_id = ?1 ORDER BY seq DESC LIMIT 1",
                 [channel_id],
                 |r| r.get(0),
             )

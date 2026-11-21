@@ -627,3 +627,58 @@ async fn away(serves: Serves) -> (usize, String, String) {
     let (shown, warnings) = read_with_warnings(device.path(), AWAY + 10);
     (shared.forward_pages.load(Ordering::SeqCst), shown, warnings)
 }
+
+/// #431: added to a channel after messages were sent in it, the device's
+/// first read shows those as sent before it joined, not as failures to
+/// decrypt, and what was sent after as text. In epoch order those messages
+/// come before the welcome that adds the device; `jig read` syncs through
+/// the welcome before it shows anything.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_joiner_reads_what_came_before_as_sent_before_it_joined() {
+    let server = TestJigServer::start().await.expect("start");
+    let owner = Member::new();
+    let device = tempfile::tempdir().unwrap();
+    let out = jig(device.path()).args(["init", "me"]).output().unwrap();
+    assert!(out.status.success(), "jig init: {out:?}");
+    let out = jig(device.path())
+        .args(["server", "set", &server.http_url()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "jig server set: {out:?}");
+    let cfg: toml::Table = toml::from_str(
+        &std::fs::read_to_string(device.path().join(".jig").join("cli.toml")).unwrap(),
+    )
+    .unwrap();
+    let did = cfg["user"]["did"].as_str().unwrap().to_string();
+
+    let created = owner
+        .session
+        .create_group(&server.http_url(), "#sec")
+        .unwrap();
+    let create = build_with_metadata(
+        &owner.id,
+        BlockKind::ChannelCreate,
+        owner.hlc(),
+        json!({"slug": "#sec", "suite": "mls", "visibility": "open",
+               "sequencer": server.server_did_string,
+               "mls_group_info": STANDARD.encode(&created.group_info),
+               "mls_ratchet_tree": STANDARD.encode(&created.ratchet_tree)}),
+    );
+    post(&server, "/api/v1/channels", &create).await;
+    say(&server, &owner, "#sec", "early-one").await;
+    say(&server, &owner, "#sec", "early-two").await;
+    add(&server, &owner, "#sec", &did).await;
+    say(&server, &owner, "#sec", "after-join").await;
+
+    for pass in ["first read", "second read"] {
+        let shown = read(device.path(), 20);
+        assert!(shown.contains("after-join"), "{pass}:\n{shown}");
+        assert_eq!(
+            shown.matches("sent before you joined").count(),
+            2,
+            "{pass}:\n{shown}"
+        );
+        assert!(!shown.contains("cannot decrypt"), "{pass}:\n{shown}");
+        assert!(!shown.contains("early-"), "{pass}:\n{shown}");
+    }
+}

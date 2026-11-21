@@ -103,6 +103,19 @@ impl JigServer {
             .parse()
             .map_err(|e| ServerError::Config(format!("invalid bind address: {e}")))?;
 
+        let proxy =
+            crate::proxy_protocol::ProxyProtocol::from_config(&self.config.server.proxy_protocol)
+                .map_err(ServerError::Config)?
+                .map(Arc::new);
+        if let Some(proxy) = &proxy {
+            let trusted: Vec<String> = proxy.trusted().iter().map(|n| n.to_string()).collect();
+            tracing::info!(
+                trusted = %trusted.join(", "),
+                "PROXY protocol v2 required from these proxies; their connections are served \
+                 under the client address the header names"
+            );
+        }
+
         let listener = TcpListener::bind(addr)
             .await
             .map_err(|e| ServerError::Server(format!("binding {addr}: {e}")))?;
@@ -132,15 +145,19 @@ impl JigServer {
                 "HTTPS (rustls) listening on https://{}",
                 listener.local_addr()?
             );
-            serve_tls(listener, router, rustls_config).await?;
+            serve_tls(listener, router, rustls_config, proxy).await?;
         } else {
             tracing::info!("HTTP API listening on http://{}", listener.local_addr()?);
-            axum::serve(
-                listener,
-                router.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            .map_err(|e| ServerError::Server(format!("HTTP server error: {e}")))?;
+            match proxy {
+                // Without PROXY protocol, axum's own server, exactly as before.
+                None => axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await
+                .map_err(|e| ServerError::Server(format!("HTTP server error: {e}")))?,
+                Some(proxy) => serve_plain(listener, router, proxy).await,
+            }
         }
 
         Ok(())
@@ -159,20 +176,29 @@ fn load_rustls_config(
 /// TCP connection is handed to its own task that performs the TLS handshake
 /// (so a slow handshake can't block accept) and serves it via hyper-util's
 /// auto (http1/http2) builder WITH upgrade support (required for WSS).
+///
+/// With `proxy`, a connection from a trusted proxy first gives up its PROXY
+/// protocol v2 header, in its own task, and is served under the client it
+/// names; without a valid one it is closed.
 async fn serve_tls(
     listener: TcpListener,
     router: Router,
     rustls_config: RustlsServerConfig,
+    proxy: Option<Arc<crate::proxy_protocol::ProxyProtocol>>,
 ) -> Result<()> {
     let acceptor = TlsAcceptor::from(std::sync::Arc::new(rustls_config));
     loop {
-        let (tcp, peer) = listener
+        let (mut tcp, peer) = listener
             .accept()
             .await
             .map_err(|e| ServerError::Server(format!("accept error: {e}")))?;
         let acceptor = acceptor.clone();
         let router = router.clone();
+        let proxy = proxy.clone();
         tokio::spawn(async move {
+            let Some(peer) = client_addr(proxy.as_deref(), &mut tcp, peer).await else {
+                return;
+            };
             let tls = match acceptor.accept(tcp).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -196,6 +222,66 @@ async fn serve_tls(
             );
             if let Err(e) = AutoBuilder::new(TokioExecutor::new())
                 .serve_connection_with_upgrades(io, service)
+                .await
+            {
+                tracing::debug!("connection error: {e}");
+            }
+        });
+    }
+}
+
+/// The address to serve `tcp` under: `peer`, or with `proxy` the client a
+/// trusted proxy's PROXY header names. `None` closes the connection.
+async fn client_addr(
+    proxy: Option<&crate::proxy_protocol::ProxyProtocol>,
+    tcp: &mut tokio::net::TcpStream,
+    peer: SocketAddr,
+) -> Option<SocketAddr> {
+    let Some(proxy) = proxy else {
+        return Some(peer);
+    };
+    match proxy.client_addr(tcp, peer).await {
+        Ok(client) => Some(client),
+        Err(e) => {
+            tracing::info!(proxy = %peer, error = %e, "PROXY header refused; connection closed");
+            None
+        }
+    }
+}
+
+/// Plain HTTP with PROXY protocol: [`serve_tls`]'s accept loop without the
+/// TLS step. Accept errors are handled as `axum::serve` handles them, by
+/// waiting a second, so running out of file descriptors does not end the
+/// server. Without PROXY protocol the plain listener stays on `axum::serve`.
+async fn serve_plain(
+    listener: TcpListener,
+    router: Router,
+    proxy: Arc<crate::proxy_protocol::ProxyProtocol>,
+) -> ! {
+    loop {
+        let (mut tcp, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                tracing::error!("accept error: {e}");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        let router = router.clone();
+        let proxy = proxy.clone();
+        tokio::spawn(async move {
+            let Some(peer) = client_addr(Some(&proxy), &mut tcp, peer).await else {
+                return;
+            };
+            let service = hyper::service::service_fn(
+                move |mut req: hyper::Request<hyper::body::Incoming>| {
+                    req.extensions_mut()
+                        .insert(axum::extract::ConnectInfo(peer));
+                    router.clone().oneshot(req)
+                },
+            );
+            if let Err(e) = AutoBuilder::new(TokioExecutor::new())
+                .serve_connection_with_upgrades(TokioIo::new(tcp), service)
                 .await
             {
                 tracing::debug!("connection error: {e}");
@@ -265,7 +351,7 @@ mod tests {
         let bound = listener.local_addr().unwrap();
 
         let task = tokio::spawn(async move {
-            let _ = serve_tls(listener, router, rustls_config).await;
+            let _ = serve_tls(listener, router, rustls_config, None).await;
         });
 
         // use_rustls_tls: force the reqwest 0.11 client onto the rustls backend
@@ -309,7 +395,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bound = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
-            let _ = serve_tls(listener, router, rustls_config).await;
+            let _ = serve_tls(listener, router, rustls_config, None).await;
         });
 
         let mut roots = rustls::RootCertStore::empty();
@@ -395,7 +481,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bound = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
-            let _ = serve_tls(listener, router, rustls_config).await;
+            let _ = serve_tls(listener, router, rustls_config, None).await;
         });
 
         // Trust exactly the server's own certificate, by name, so the check
@@ -429,5 +515,164 @@ mod tests {
         assert_ne!(seen[0], seen[1]);
 
         task.abort();
+    }
+
+    /// A router that answers with the address a request is served under, as
+    /// `per_ip_rate` and the REST relay-slot key read it.
+    fn addr_router() -> Router {
+        use axum::routing::get;
+        Router::new().route(
+            "/addr",
+            get(|extensions: axum::http::Extensions| async move {
+                let ip = crate::v0_0_2_ws::client_ip(&extensions);
+                format!(
+                    "ip={} slot={}",
+                    ip.map(|ip| ip.to_string()).unwrap_or_default(),
+                    crate::v0_0_2_relay::rest_caller(ip, "did:jig:zauthor")
+                )
+            }),
+        )
+    }
+
+    fn trusting(entries: &[&str]) -> Arc<crate::proxy_protocol::ProxyProtocol> {
+        Arc::new(
+            crate::proxy_protocol::ProxyProtocol::from_config(
+                &jig_config::v0_0_2_server::ProxyProtocolSection {
+                    trusted: entries.iter().map(|e| e.to_string()).collect(),
+                    header_timeout_ms: 2_000,
+                },
+            )
+            .unwrap()
+            .unwrap(),
+        )
+    }
+
+    const GET_ADDR: &[u8] = b"GET /addr HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+
+    fn client_header(server: SocketAddr) -> Vec<u8> {
+        crate::proxy_protocol::tests::v2_header("198.51.100.7:40000".parse().unwrap(), server, 0)
+    }
+
+    /// Write `prefix`, then read everything the server sends until it closes.
+    async fn exchange(server: SocketAddr, prefix: &[u8]) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut tcp = tokio::net::TcpStream::connect(server).await.unwrap();
+        tcp.write_all(prefix).await.unwrap();
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), tcp.read_to_end(&mut out))
+            .await
+            .expect("the server closes the connection");
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[tokio::test]
+    async fn plain_http_behind_a_trusted_proxy_serves_the_client_it_names() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        let task = tokio::spawn(serve_plain(
+            listener,
+            addr_router(),
+            trusting(&["127.0.0.1"]),
+        ));
+
+        let mut request = client_header(bound);
+        request.extend_from_slice(GET_ADDR);
+        let answer = exchange(bound, &request).await;
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(
+            answer.ends_with("ip=198.51.100.7 slot=rest:ip:198.51.100.7"),
+            "the per-address limit and the relay slot count the client: {answer}"
+        );
+
+        // Fails closed: a trusted proxy's connection without a header is
+        // closed unanswered, never served as the proxy.
+        assert_eq!(exchange(bound, GET_ADDR).await, "");
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_proxy_header_from_an_untrusted_peer_is_never_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        let task = tokio::spawn(serve_plain(
+            listener,
+            addr_router(),
+            trusting(&["10.0.0.5"]),
+        ));
+
+        // Not a trusted proxy: served as itself.
+        let answer = exchange(bound, GET_ADDR).await;
+        assert!(
+            answer.ends_with("ip=127.0.0.1 slot=rest:ip:127.0.0.1"),
+            "{answer}"
+        );
+        // Its PROXY header is just bytes in front of the request, which HTTP refuses.
+        let mut spoofed = client_header(bound);
+        spoofed.extend_from_slice(GET_ADDR);
+        let answer = exchange(bound, &spoofed).await;
+        assert!(!answer.contains("198.51.100.7"), "{answer}");
+        assert!(!answer.starts_with("HTTP/1.1 200"), "{answer}");
+
+        task.abort();
+    }
+
+    /// The TLS listener reads the header before the handshake, and only from a
+    /// trusted proxy: from anyone else it breaks the handshake.
+    #[tokio::test]
+    async fn tls_behind_a_trusted_proxy_reads_the_header_before_the_handshake() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("self-signed cert");
+        let dir = tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, ck.cert.pem()).unwrap();
+        std::fs::write(&key_path, ck.signing_key.serialize_pem()).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ck.cert.der().clone()).unwrap();
+        let client_config = Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+        );
+        let connector = tokio_rustls::TlsConnector::from(client_config);
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+
+        for (trusted, served) in [("127.0.0.1", true), ("10.0.0.5", false)] {
+            let (rustls_config, _) =
+                load_rustls_config(&cert_path, &key_path).expect("rustls config");
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let bound = listener.local_addr().unwrap();
+            let router = addr_router();
+            let proxy = trusting(&[trusted]);
+            let task = tokio::spawn(async move {
+                let _ = serve_tls(listener, router, rustls_config, Some(proxy)).await;
+            });
+
+            let mut tcp = tokio::net::TcpStream::connect(bound).await.unwrap();
+            tcp.write_all(&client_header(bound)).await.unwrap();
+            let tls = connector.connect(name.clone(), tcp).await;
+            if !served {
+                assert!(tls.is_err(), "a header from an untrusted peer breaks TLS");
+                task.abort();
+                continue;
+            }
+            let mut tls = tls.expect("the handshake follows the header");
+            tls.write_all(GET_ADDR).await.unwrap();
+            let mut out = Vec::new();
+            let _ = tls.read_to_end(&mut out).await;
+            let answer = String::from_utf8_lossy(&out);
+            assert!(
+                answer.ends_with("ip=198.51.100.7 slot=rest:ip:198.51.100.7"),
+                "{answer}"
+            );
+            task.abort();
+        }
     }
 }

@@ -2478,6 +2478,163 @@ mod tests {
         );
     }
 
+    /// A carried channel an older relay stalled (#357, #427): the owner's
+    /// slug-named post sits in the follower's own `#general`, under a record
+    /// the follower signed. The share now lands it in the carried channel
+    /// too: the block stays in the follower's channel, whose chain is
+    /// unchanged; the carried chain names it under the owner's record, byte
+    /// for byte; and the carried channel's subscribers get it live, the
+    /// follower's own channel's do not.
+    #[tokio::test]
+    async fn a_channel_an_older_relay_stalled_lands_beside_the_followers_own() {
+        use jig_pipeline::fanout::{SubscriberIdentity, SubscriptionScope};
+        let p = pair(OfferPolicy::Accept).await;
+        let ours = post(
+            &p.follower,
+            &SigningKey::from_bytes(&rand::random()),
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#general", "tier": "public"}),
+        )
+        .await
+        .unwrap();
+        let channel = post(
+            &p.owner,
+            &p.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#general", "tier": "public"}),
+        )
+        .await
+        .unwrap();
+        let text = post(
+            &p.owner,
+            &p.user,
+            BlockKind::TextRender,
+            serde_json::json!({"channel": "#general", "body": "by slug"}),
+        )
+        .await
+        .unwrap();
+        // As an older relay left it, signed into the follower's own chain by
+        // the backfill an upgrade runs at boot.
+        let store = &p.follower.ingest_ctx.store;
+        let block = p.owner.ingest_ctx.store.get_block(&text).unwrap().unwrap();
+        store
+            .insert_block(&StoredBlock {
+                channel_id: Some(ours.clone()),
+                origin_server: p.owner.server_url.clone(),
+                federated_from: Some(p.owner.server_url.clone()),
+                ..block
+            })
+            .unwrap();
+        store
+            .backfill_ingest_records(&p.follower.ingest_ctx.server_key)
+            .unwrap();
+        let ours_chain = || {
+            (0..3)
+                .map(|seq| store.ingest_record_bytes(&ours, seq).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let before = ours_chain();
+        assert!(before[1].is_some(), "the follower's record of the post");
+
+        let fanout = &p.follower.ingest_ctx.fanout;
+        let reader = SubscriberIdentity::Did(did_of(&SigningKey::from_bytes(&rand::random())));
+        let (to_carried, mut carried_rx) = tokio::sync::mpsc::unbounded_channel();
+        fanout
+            .subscribe_local(
+                SubscriptionScope::Channel(channel.clone()),
+                reader.clone(),
+                to_carried,
+            )
+            .await;
+        let (to_ours, mut ours_rx) = tokio::sync::mpsc::unbounded_channel();
+        fanout
+            .subscribe_local(SubscriptionScope::Channel(ours.clone()), reader, to_ours)
+            .await;
+
+        p.share(&channel, "read").await;
+        p.both(&channel, OfferState::Accepted).await;
+        p.follows.stream.pull_all();
+        let want = p.caught_up(&channel).await;
+
+        assert!(store.carried_stalls().unwrap().is_empty(), "nothing stalls");
+        assert_eq!(
+            ours_chain(),
+            before,
+            "the follower's own chain is unchanged"
+        );
+        assert_eq!(
+            store
+                .get_block(&text)
+                .unwrap()
+                .unwrap()
+                .channel_id
+                .as_deref(),
+            Some(ours.as_str()),
+            "the block stays in the follower's channel"
+        );
+        for seq in 0..=want {
+            assert_eq!(
+                store.ingest_record_bytes(&channel, seq).unwrap(),
+                p.owner
+                    .ingest_ctx
+                    .store
+                    .ingest_record_bytes(&channel, seq)
+                    .unwrap(),
+                "seq {seq}"
+            );
+        }
+        let carried: Vec<String> = store
+            .list_blocks_by_channel_id(&channel, 50, None)
+            .unwrap()
+            .into_iter()
+            .map(|b| b.cid)
+            .collect();
+        assert!(carried.contains(&text), "{carried:?}");
+        // Read through the carried channel, the block comes with the owner's
+        // record, not the one the follower's own chain holds it by.
+        let path = format!("/api/v1/channels/{channel}/blocks");
+        let reader = jig_client::identity::Identity::from_signing_key(SigningKey::from_bytes(
+            &rand::random(),
+        ));
+        let mut headers = axum::http::HeaderMap::new();
+        for (name, value) in jig_client::read_auth::ReadProof::sign(&reader, "GET", &path).headers()
+        {
+            headers.insert(name, value.parse().unwrap());
+        }
+        let uri: axum::http::Uri = path.parse().unwrap();
+        let page = crate::v0_0_2_blocks::get_channel_history(
+            axum::extract::State(p.follower.clone()),
+            axum::extract::Path(channel.clone()),
+            axum::extract::Query::try_from_uri(&uri).unwrap(),
+            uri,
+            headers,
+        )
+        .await
+        .map_err(|(status, body)| (status, body.0.code.clone()))
+        .unwrap();
+        let owners = p.owner.ingest_ctx.store.get_ingest_record(&text).unwrap();
+        assert!(owners.is_some());
+        assert!(
+            page.0.iter().any(|entry| entry.ingest == owners),
+            "the timeline places it by the owner's record"
+        );
+
+        let mut live = Vec::new();
+        while let Ok((block, _)) = carried_rx.try_recv() {
+            live.push((block.cid, block.channel_id));
+        }
+        assert!(
+            live.contains(&(text.clone(), Some(channel.clone()))),
+            "the carried channel's subscribers get it: {live:?}"
+        );
+        while let Ok((block, _)) = ours_rx.try_recv() {
+            assert_ne!(
+                block.cid, text,
+                "the follower's own channel does not get it again"
+            );
+        }
+    }
+
     /// A peer on a release before this one asks, on each connection, for a
     /// catch-up of the legacy relay (`federation-catch-up`). Nothing here
     /// speaks that frame any more: it is logged and dropped, and the link,
@@ -4152,9 +4309,11 @@ mod tests {
         let parts = signed(&author, BlockKind::TextRender, text_in(&channel, "hello"));
         let refused = client_post(&follower, &parts).await.unwrap_err();
         assert_eq!(refused.code, "OWNER_UNREACHABLE", "{refused:?}");
-        assert_eq!(refused.retry_after_ms, Some(5_000));
+        // 5 s, spread over half to one and a half times that.
+        let wait = refused.retry_after_ms.expect("a wait");
+        assert!((2_500..=7_500).contains(&wait), "{wait}");
         assert!(
-            refused.message.contains("retry_after_ms=5000"),
+            refused.message.contains(&format!("retry_after_ms={wait}")),
             "{}",
             refused.message
         );
