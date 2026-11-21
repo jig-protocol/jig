@@ -121,8 +121,9 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
      - A valid `LOCAL` header, such as a proxy's own health check, keeps the proxy's
        address.
      - A connection from any other address keeps its own address, and its PROXY header is
-       not read. No forwarded HTTP header is trusted.
-     - The nameserver does not read PROXY protocol yet (#419).
+       not read. The server trusts no forwarded HTTP header.
+     - The nameserver keeps its own `proxy_ip_header` setting and does not read PROXY
+       protocol yet (#419).
 
 ## 3. WebSocket
 
