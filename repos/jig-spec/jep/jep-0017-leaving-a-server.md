@@ -213,8 +213,8 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
       replay.
 
     R3 MUST NOT delete or alter those blocks. On an encrypted channel `S` holds only ciphertext.
-    What happens to a channel once its last member has left is outside this JEP; R3 does not
-    change it.
+    Blocks of a channel `D` was the only member of are nobody else's history; R3 deletes them
+    (rule 22).
 28. **Tombstone.** For each erased DID, `S` MUST keep exactly:
     - `did`;
     - the highest reachability `seq` and the highest `jig-local-adds-v1` `seq` it has seen;
