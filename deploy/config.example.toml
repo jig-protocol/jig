@@ -266,8 +266,9 @@ list_handles = false
 # a COSE_Sign1 envelope. Unset, it declares none. Set, every welcome to a client
 # that asks and the manifest log name it by id, version and hash, and
 # GET /api/v1/ruleset/<hash> serves it. A missing or unverifiable file stops the
-# server from booting. Declaring is not applying: nothing is enforced under it
-# until acknowledgements (R2.3) and standing (R2.4) land.
+# server from booting, and so do pool shares that differ from [auth.pools]: the
+# pools are the one part of a ruleset enforced today. Its standing and other
+# parameters are not applied until acknowledgements (R2.3) and standing (R2.4).
 # path = "/var/lib/jig/ruleset.cose"
 # An https:// mirror clients fetch it from instead of this server. They check
 # what they fetch against the signed hash either way.

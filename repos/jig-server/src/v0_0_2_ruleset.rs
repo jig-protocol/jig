@@ -16,7 +16,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use jig_config::v0_0_2_server::RulesetSection;
+use jig_config::v0_0_2_server::{PoolsSection, RulesetSection};
 use jig_core::ruleset::SignedRuleset;
 use jig_pipeline::handshake::RulesetRef;
 
@@ -44,8 +44,9 @@ pub struct Declared {
 /// The ruleset `[ruleset]` names, or `None` when it names none. A section
 /// that is invalid, a file that cannot be read, or a document that does not
 /// open is a boot error: a server that declared a ruleset it could not show
-/// would sign a claim no client can check.
-pub fn load(section: &RulesetSection) -> anyhow::Result<Option<Declared>> {
+/// would sign a claim no client can check. So is a ruleset whose pool shares
+/// `pools` does not enforce ([`check_enforced`]).
+pub fn load(section: &RulesetSection, pools: &PoolsSection) -> anyhow::Result<Option<Declared>> {
     section.validate().map_err(anyhow::Error::msg)?;
     let Some(path) = &section.path else {
         return Ok(None);
@@ -55,6 +56,7 @@ pub fn load(section: &RulesetSection) -> anyhow::Result<Option<Declared>> {
         std::fs::read(&path).with_context(|| format!("[ruleset] reading path {path:?}"))?;
     let signed = SignedRuleset::open(&envelope)
         .with_context(|| format!("[ruleset] path {path:?} is not a signed ruleset"))?;
+    check_enforced(&signed, pools).map_err(anyhow::Error::msg)?;
     let declared = declared(signed, section.url.as_deref());
     tracing::info!(
         id = %declared.reference.id,
@@ -64,6 +66,44 @@ pub fn load(section: &RulesetSection) -> anyhow::Result<Option<Declared>> {
         "declaring a ruleset"
     );
     Ok(Some(declared))
+}
+
+/// Refuse to declare a ruleset whose pool shares this server does not
+/// enforce: declaring is signing a claim (JEP-0009 rule 4), and a server
+/// that enforces other shares signs evidence against itself. The pools are
+/// the one part of a ruleset enforced today; standing and the rest have no
+/// enforcement until R2.4, so they are not checked here.
+pub fn check_enforced(signed: &SignedRuleset, pools: &PoolsSection) -> Result<(), String> {
+    let declared = &signed.document().parameters.pools;
+    let id = &signed.document().id;
+    if pools.writes_per_second == 0 {
+        return Err(format!(
+            "[ruleset] {id} declares pool shares, but [auth.pools] writes_per_second = 0 turns the \
+             pools off: set it, or declare no ruleset"
+        ));
+    }
+    let mut mismatches = Vec::new();
+    if declared.stranger_share != pools.stranger_share_pct {
+        mismatches.push(format!(
+            "stranger_share {} vs stranger_share_pct {}",
+            declared.stranger_share, pools.stranger_share_pct
+        ));
+    }
+    if declared.invited_share != pools.invited_share_pct {
+        mismatches.push(format!(
+            "invited_share {} vs invited_share_pct {}",
+            declared.invited_share, pools.invited_share_pct
+        ));
+    }
+    if mismatches.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "[ruleset] {id} declares pool shares [auth.pools] does not enforce ({}): make them \
+             agree, or declare no ruleset",
+            mismatches.join("; ")
+        ))
+    }
 }
 
 /// What `signed` is declared as, served at `url` or, unset, at this server's
@@ -131,6 +171,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
         config.ruleset.path = Some(write(&dir, signed.envelope()));
+        config.auth.pools = enforced();
         (dir, AppState::for_test_with_config(config).unwrap())
     }
 
@@ -183,9 +224,70 @@ pub(crate) mod tests {
         assert_eq!(get(none, &path_for(&hash)).await.0, StatusCode::NOT_FOUND);
     }
 
+    /// `[auth.pools]` as `jig-reference` declares them.
+    fn enforced() -> PoolsSection {
+        let signed = signed_ruleset();
+        let declared = &signed.document().parameters.pools;
+        PoolsSection {
+            stranger_share_pct: declared.stranger_share,
+            invited_share_pct: declared.invited_share,
+            ..PoolsSection::default()
+        }
+    }
+
+    /// The shares a ruleset declares are the ones `[auth.pools]` enforces,
+    /// or the server does not boot; the message names both values.
+    #[test]
+    fn pool_shares_the_server_does_not_enforce_refuse_boot() {
+        let signed = signed_ruleset();
+        assert_eq!(check_enforced(&signed, &enforced()), Ok(()));
+        let declared = signed.document().parameters.pools.stranger_share;
+        let other = PoolsSection {
+            stranger_share_pct: declared + 1,
+            ..enforced()
+        };
+        let err = check_enforced(&signed, &other).unwrap_err();
+        assert!(
+            err.contains(&format!(
+                "stranger_share {declared} vs stranger_share_pct {}",
+                declared + 1
+            )),
+            "{err}"
+        );
+        let invited = PoolsSection {
+            invited_share_pct: 0,
+            ..enforced()
+        };
+        assert!(
+            check_enforced(&signed, &invited)
+                .unwrap_err()
+                .contains("invited_share")
+        );
+        let off = PoolsSection {
+            writes_per_second: 0,
+            ..enforced()
+        };
+        assert!(
+            check_enforced(&signed, &off)
+                .unwrap_err()
+                .contains("turns the pools off")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let section = RulesetSection {
+            path: Some(write(&dir, signed.envelope())),
+            url: None,
+        };
+        assert!(load(&section, &other).is_err(), "and boot refuses it");
+    }
+
     #[test]
     fn no_section_declares_none() {
-        assert!(load(&RulesetSection::default()).unwrap().is_none());
+        assert!(
+            load(&RulesetSection::default(), &enforced())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -196,7 +298,7 @@ pub(crate) mod tests {
             path: Some(write(&dir, signed.envelope())),
             url: None,
         };
-        let declared = load(&section).unwrap().unwrap();
+        let declared = load(&section, &enforced()).unwrap().unwrap();
         let hash = signed.hash().to_string();
         assert_eq!(declared.reference.hash, hash);
         assert_eq!(declared.reference.id, signed.document().id);
@@ -213,7 +315,7 @@ pub(crate) mod tests {
             path: Some(write(&dir, signed.envelope())),
             url: Some("https://mirror.example/r.cose".into()),
         };
-        let declared = load(&section).unwrap().unwrap();
+        let declared = load(&section, &enforced()).unwrap().unwrap();
         assert_eq!(declared.reference.url, "https://mirror.example/r.cose");
     }
 
@@ -224,7 +326,7 @@ pub(crate) mod tests {
             path: Some(dir.path().join("absent").to_string_lossy().into_owned()),
             url: None,
         };
-        assert!(load(&missing).is_err());
+        assert!(load(&missing, &enforced()).is_err());
         let mut bytes = signed_ruleset().envelope().to_vec();
         let last = bytes.len() - 1;
         bytes[last] ^= 1;
@@ -232,7 +334,7 @@ pub(crate) mod tests {
             path: Some(write(&dir, &bytes)),
             url: None,
         };
-        let err = load(&tampered).unwrap_err();
+        let err = load(&tampered, &enforced()).unwrap_err();
         assert!(
             format!("{err:#}").contains("not a signed ruleset"),
             "{err:#}"
@@ -245,12 +347,12 @@ pub(crate) mod tests {
             path: None,
             url: Some("https://mirror.example/r.cose".into()),
         };
-        assert!(load(&no_path).is_err());
+        assert!(load(&no_path, &enforced()).is_err());
         let dir = tempfile::tempdir().unwrap();
         let plain = RulesetSection {
             path: Some(write(&dir, signed_ruleset().envelope())),
             url: Some("http://mirror.example/r.cose".into()),
         };
-        assert!(load(&plain).is_err());
+        assert!(load(&plain, &enforced()).is_err());
     }
 }

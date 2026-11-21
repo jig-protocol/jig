@@ -406,8 +406,11 @@ ruleset` with its id, version, hash and URL, and serves it at
 `GET /api/v1/ruleset/<hash>`. Clients that ask are told it in the signed
 welcome; the manifest log names it too, so a change of ruleset publishes a
 new manifest entry. Clients from before rulesets never ask and see the
-welcome they always did. Declaring is a public, signed claim: nothing is yet
-enforced under it.
+welcome they always did. Declaring is a public, signed claim, so the server
+refuses to boot when the ruleset's pool shares are not the ones
+`[auth.pools]` enforces (or the pools are off), naming both values. The pools
+are all it enforces today: standing and the ruleset's other parameters are
+not applied until acknowledgements and earned standing land.
 
 ---
 

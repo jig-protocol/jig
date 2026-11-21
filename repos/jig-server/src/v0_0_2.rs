@@ -290,7 +290,8 @@ impl AppState {
             );
         }
         let server_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
-        let ruleset = crate::v0_0_2_ruleset::load(&config.ruleset)?.map(Arc::new);
+        let ruleset =
+            crate::v0_0_2_ruleset::load(&config.ruleset, &config.auth.pools)?.map(Arc::new);
         let (key_link, prior_key_links) = load_key_chain(
             Path::new(shellexpand::tilde(&config.server.server_did_keyfile).as_ref()),
             &server_did,
@@ -460,7 +461,8 @@ impl AppState {
         signing_key: SigningKey,
     ) -> Result<Self> {
         let server_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
-        let ruleset = crate::v0_0_2_ruleset::load(&config.ruleset)?.map(Arc::new);
+        let ruleset =
+            crate::v0_0_2_ruleset::load(&config.ruleset, &config.auth.pools)?.map(Arc::new);
 
         checked_identity(&config)?;
         let identity: Arc<dyn IdentityResolver> = Arc::new(TofuResolver::new(store.clone()));

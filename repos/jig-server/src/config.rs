@@ -468,7 +468,8 @@ list_handles = {list_handles}
 # The ruleset this server declares (JEP-0009 rule 4): a signed ruleset document
 # (COSE_Sign1). Unset, it declares none. Set, the welcome and the manifest log
 # name it by id, version and hash, and GET /api/v1/ruleset/<hash> serves it.
-# A file that is missing or does not verify stops the server from booting.
+# A file that is missing or does not verify stops the server from booting, and
+# so do pool shares in it that differ from [auth.pools].
 # path = "/etc/jig/ruleset.cose"
 # Where clients fetch it, when not from this server: an https:// mirror. They
 # check what they fetch against the signed hash either way.
