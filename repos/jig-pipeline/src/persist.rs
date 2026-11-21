@@ -151,6 +151,9 @@ pub enum Stocked {
 /// One entry of a custodian's release log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseLogEntry {
+    /// The entry's own identity: the hash of the request it answered, unique
+    /// per row (a local take's is a fresh random one).
+    pub id: Vec<u8>,
     /// The released package's hash reference, so its owner can delete that
     /// package's private init key (JEP-0017 rule 32).
     pub reference: Vec<u8>,
@@ -3223,13 +3226,15 @@ impl SqliteStore {
     ) -> Result<Vec<ReleaseLogEntry>> {
         let conn = self.conn.lock().expect("poisoned");
         let mut stmt = conn.prepare(
-            "SELECT requester, channel_id, last_resort, request, released_at, kind, reference
+            "SELECT requester, channel_id, last_resort, request, released_at, kind, reference,
+                    request_hash
                FROM kp_releases WHERE did = ?1 AND counted = 1
               ORDER BY released_at DESC, request_hash ASC LIMIT ?2 OFFSET ?3",
         )?;
         let rows = stmt
             .query_map(params![did, limit, offset], |r| {
                 Ok(ReleaseLogEntry {
+                    id: r.get(7)?,
                     reference: r.get(6)?,
                     requester: r.get(0)?,
                     channel_id: r.get(1)?,
@@ -5502,6 +5507,43 @@ mod tests {
     }
 
     #[test]
+    fn a_withdrawal_whose_retirement_fails_is_not_kept() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let did = "did:jig:zD";
+        store
+            .insert_key_package(b"r1", did, b"kp1", false, 1)
+            .unwrap();
+        let _ = store
+            .release_key_package(&ask(did, "did:jig:zA", b"h1", 100))
+            .unwrap();
+        assert!(
+            store
+                .put_reachability(did, 1, b"listing", "did:jig:zserver", 100)
+                .unwrap()
+        );
+        // Make the retirement step fail inside the transaction.
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_retire BEFORE UPDATE OF retired ON kp_releases
+                 BEGIN SELECT RAISE(ABORT, 'retirement fails'); END;",
+            )
+            .unwrap();
+        assert!(
+            store
+                .put_reachability_retiring(did, 2, b"withdrawal", "did:jig:zserver", 120, true)
+                .is_err()
+        );
+        // Rolled back whole: the listing is still the kept record.
+        assert_eq!(
+            store.reachability(did).unwrap().as_deref(),
+            Some(&b"listing"[..])
+        );
+    }
+
+    #[test]
     fn the_release_log_names_each_package_and_pages_newest_first() {
         let store = SqliteStore::open_in_memory().unwrap();
         let did = "did:jig:zD";
@@ -5532,6 +5574,11 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        // Each entry has its own id, even where package and time could repeat.
+        let mut ids: Vec<_> = first.iter().chain(&rest).map(|e| e.id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 3);
     }
 
     #[test]
