@@ -832,6 +832,23 @@ async fn handle_client_frame(
                 }
             }
 
+            // The federation stream is retired: a channel reaches another
+            // server only by a share, whose records go out as peer frames. A
+            // listed peer on an older release gets an error it logs and lives
+            // with (only `NOT_A_PEER`, which an unlisted one still gets above,
+            // ends its connection, and that connection carries its shares).
+            if federation {
+                let _ = send_error(
+                    socket,
+                    Some(410),
+                    FEDERATION_STREAM_RETIRED,
+                    None,
+                    "this server relays no blocks; a channel reaches it only by a share",
+                )
+                .await;
+                return Ok(());
+            }
+
             // Who this subscription belongs to, for the per-delivery check.
             // Only the identity `authenticate_subscribe` RETURNED is bound;
             // `Unchecked` is reserved for a server that does not authenticate
@@ -921,7 +938,8 @@ async fn handle_client_frame(
                     SubscriptionScope::Channel(channel.map(|c| c.id).unwrap_or(slug))
                 }
                 Scope::ChannelId { channel_id } => SubscriptionScope::Channel(channel_id),
-                Scope::Federation { block_kinds } => SubscriptionScope::Federation { block_kinds },
+                // Refused above.
+                Scope::Federation { .. } => return Ok(()),
             };
             // A connection holds ONE subscription. A re-Subscribe replaces it,
             // and the old one must actually go: left in the fanout map it
@@ -1286,6 +1304,10 @@ fn channel_label(state: &AppState, manifest_bytes: &[u8]) -> Option<String> {
 
 /// The shared metrics label for channels whose slug is not disclosed.
 pub const RESTRICTED_LABEL: &str = "(restricted)";
+
+/// The error code a federation-scope subscribe gets: the legacy relay's
+/// stream is retired, and a channel reaches another server only by a share.
+pub const FEDERATION_STREAM_RETIRED: &str = "FEDERATION_STREAM_RETIRED";
 
 /// Invariant: every Error answers exactly one client frame (Subscribe or
 /// Submit), and names it by `ref_cid` where it can. The client matches
@@ -1784,11 +1806,14 @@ mod tests {
         }
     }
 
-    /// The federation stream is for listed peers. A stranger with a valid
-    /// proof is refused, and on a server that does not authenticate reads an
-    /// unsigned federation subscribe is still refused.
+    /// The federation stream is retired, and still answers only listed
+    /// peers as such: a stranger with a valid proof is refused as not a peer
+    /// (so an older dialer not yet listed reconnects and asks again), a listed
+    /// peer is told the stream is retired and is sent nothing, and on a server
+    /// that does not authenticate reads an unsigned federation subscribe is
+    /// still refused.
     #[tokio::test]
-    async fn only_a_listed_peer_may_subscribe_to_the_federation_stream() {
+    async fn the_federation_stream_is_retired_and_refuses_strangers_as_before() {
         let federation = || Scope::Federation {
             block_kinds: vec![],
         };
@@ -1807,7 +1832,8 @@ mod tests {
             other => panic!("expected NOT_A_PEER, got {other:?}"),
         }
 
-        // Listed, the same caller's next subscribe registers and delivers.
+        // Listed, the same caller is told the stream is retired: this server
+        // relays no blocks, and a block landing here is not sent to it.
         state
             .auth
             .trust_federation_peer(&stranger.did_string())
@@ -1817,7 +1843,15 @@ mod tests {
         ws.send(TMessage::Text(serde_json::to_string(&sub).unwrap().into()))
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        match next_frame(&mut ws).await.frame {
+            Frame::Error { status, code, .. } => {
+                assert_eq!(
+                    (status, code.as_str()),
+                    (Some(410), FEDERATION_STREAM_RETIRED)
+                );
+            }
+            other => panic!("expected FEDERATION_STREAM_RETIRED, got {other:?}"),
+        }
         let author = test_identity();
         let block = build_text_render(&author, "#hello", "hi", test_hlc(&author));
         let submit = Envelope::new(Frame::Submit {
@@ -1829,24 +1863,15 @@ mod tests {
         ))
         .await
         .unwrap();
-        let mut got_block = false;
-        for _ in 0..2 {
-            match next_frame(&mut ws).await.frame {
-                Frame::Block { ingest, .. } => {
-                    got_block = true;
-                    let record = ingest.expect("a live block carries its record");
-                    record
-                        .verify(&state.server_did.to_did_jig_string())
-                        .unwrap();
-                    assert!(record.is_genesis(), "the first block of the seeded channel");
-                }
-                Frame::Ack { .. } => {}
-                other => panic!("unexpected frame {other:?}"),
-            }
+        match next_frame(&mut ws).await.frame {
+            Frame::Ack { .. } => {}
+            other => panic!("expected the submit's ack, got {other:?}"),
         }
         assert!(
-            got_block,
-            "a listed peer's federation subscription delivers"
+            tokio::time::timeout(Duration::from_millis(300), next_frame(&mut ws))
+                .await
+                .is_err(),
+            "nothing is relayed to a peer"
         );
 
         let mut open_reads = jig_config::v0_0_2_server::JigServerConfig::default();
@@ -1909,31 +1934,18 @@ mod tests {
 
     #[tokio::test]
     async fn ws_subscribe_then_submit_delivers_block_to_subscriber() {
-        // Single client subscribes federation-scope (matches all blocks), then
-        // submits a text-render block and expects both Ack and Block frames.
-        //
-        // Federation scope with empty block_kinds is the kind-filter-off path,
-        // which is what this test covers. Channel scope is exercised by
-        // integration-tests/tests/h2_single_server.rs: `ingest` lifts the slug
-        // from manifest metadata into `StoredBlock.channel_id`, so
-        // `SubscriptionScope::Channel` does match text-render blocks. (An
-        // earlier revision of this comment claimed otherwise — that caveat is
-        // obsolete.)
+        // Single client subscribes to the channel, then submits a text-render
+        // block into it and expects both Ack and Block frames.
         let (state, url) = start_test_server().await;
         seed_channel(&state, "#hello");
         let mut ws = established(&url).await;
 
-        // 1. Subscribe federation-scope (no kind filter = all kinds), signed —
-        //    the server refuses an unsigned subscribe — as a listed peer.
+        // 1. Subscribe, signed: the server refuses an unsigned subscribe.
         let subscriber = test_identity();
-        state
-            .auth
-            .trust_federation_peer(&subscriber.did_string())
-            .unwrap();
         let sub = signed_subscribe_frame(
             &subscriber,
-            Scope::Federation {
-                block_kinds: vec![],
+            Scope::Channel {
+                slug: "#hello".to_string(),
             },
         );
         ws.send(TMessage::Text(serde_json::to_string(&sub).unwrap().into()))
@@ -1970,7 +1982,14 @@ mod tests {
             let env: Envelope = serde_json::from_str(&text).unwrap();
             match env.frame {
                 Frame::Ack { .. } => got_ack = true,
-                Frame::Block { .. } => got_block = true,
+                Frame::Block { ingest, .. } => {
+                    got_block = true;
+                    let record = ingest.expect("a live block carries its record");
+                    record
+                        .verify(&state.server_did.to_did_jig_string())
+                        .unwrap();
+                    assert!(record.is_genesis(), "the first block of the seeded channel");
+                }
                 _ => {}
             }
         }
@@ -2291,8 +2310,9 @@ mod tests {
     }
 
     /// A dialing server that proves its DID in the handshake (JEP-0002 rule
-    /// 12) is that DID on the connection: a listed peer subscribes to the
-    /// federation stream without a second proof.
+    /// 12) is that DID on the connection: a listed peer's federation
+    /// subscribe needs no second proof, and passes the gate to be told the
+    /// stream is retired rather than that it is not authenticated.
     #[tokio::test]
     async fn a_peer_that_proves_its_did_needs_no_second_proof() {
         let (state, url) = start_test_server().await;
@@ -2300,7 +2320,6 @@ mod tests {
         let peer_did =
             jig_core::Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
         state.auth.trust_federation_peer(&peer_did).unwrap();
-        seed_channel(&state, "#hello");
 
         let (mut ws, _) = connect_async(&url).await.unwrap();
         crate::v0_0_2_federation::complete_peer_handshake(
@@ -2320,27 +2339,10 @@ mod tests {
         ws.send(TMessage::Text(serde_json::to_string(&sub).unwrap().into()))
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let author = test_identity();
-        let block = build_text_render(&author, "#hello", "hi", test_hlc(&author));
-        let submit = Envelope::new(Frame::Submit {
-            bundle_b64: base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
-            sig_b64: base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
-        });
-        ws.send(TMessage::Text(
-            serde_json::to_string(&submit).unwrap().into(),
-        ))
-        .await
-        .unwrap();
-        let mut got_block = false;
-        for _ in 0..2 {
-            match next_frame(&mut ws).await.frame {
-                Frame::Block { .. } => got_block = true,
-                Frame::Ack { .. } => {}
-                other => panic!("unexpected frame {other:?}"),
-            }
+        match next_frame(&mut ws).await.frame {
+            Frame::Error { code, .. } => assert_eq!(code, FEDERATION_STREAM_RETIRED),
+            other => panic!("expected FEDERATION_STREAM_RETIRED, got {other:?}"),
         }
-        assert!(got_block, "the proven peer's subscription delivers");
     }
 
     /// A hello that names a peer DID ends with that DID's proof over this

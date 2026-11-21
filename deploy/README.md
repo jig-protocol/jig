@@ -729,6 +729,12 @@ counted in `jig_federation_relayed_refused_total`. **Share any channel that
 reaches peers only through the relay**; until it is shared, peers' posts to it
 are refused and logged, and their users post on this server.
 
+This server relays nothing to its peers either. Its posts reach another server
+only through a channel it shares, so a peer on an earlier release no longer sees
+them in its own channel of the same name. A peer's federation subscription is
+answered with `FEDERATION_STREAM_RETIRED` and sends nothing; the connection,
+which also carries shares, stays up.
+
 ---
 
 ## The nameserver
