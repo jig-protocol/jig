@@ -2006,6 +2006,7 @@ mod tests {
             key_link: None,
             admit: None,
             prior_key_links: Vec::new(),
+            ruleset: None,
             sig: String::new(),
         }))
         .unwrap();

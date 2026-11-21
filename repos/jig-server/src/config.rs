@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use jig_config::v0_0_2_server::{
     AuthSection, BridgesSection, DebugSection, FederationSection, IdentitySection, JigServerConfig,
-    KeysSection, LimitsSection, NameserverSection, ServerSection,
+    KeysSection, LimitsSection, NameserverSection, RulesetSection, ServerSection,
 };
 
 use crate::runtime::ExecutionConfig;
@@ -64,6 +64,8 @@ pub struct ServerConfig {
     pub keys: KeysSection,
     #[serde(default)]
     pub limits: LimitsSection,
+    #[serde(default)]
+    pub ruleset: RulesetSection,
 }
 
 /// Keys jig-server once accepted and no longer does, as a dotted path and the
@@ -138,6 +140,7 @@ impl Default for ServerConfig {
             auth: AuthSection::default(),
             keys: KeysSection::default(),
             limits: LimitsSection::default(),
+            ruleset: RulesetSection::default(),
         }
     }
 }
@@ -191,6 +194,7 @@ impl ServerConfig {
             auth: self.auth.clone(),
             keys: self.keys.clone(),
             limits: self.limits.clone(),
+            ruleset: self.ruleset.clone(),
         }
     }
 
@@ -459,6 +463,16 @@ list_handles = {list_handles}
 # max_request_body_bytes = {envelope}
 # max_ws_message_bytes = {envelope}
 # max_ws_frame_bytes = {envelope}
+
+[ruleset]
+# The ruleset this server declares (JEP-0009 rule 4): a signed ruleset document
+# (COSE_Sign1). Unset, it declares none. Set, the welcome and the manifest log
+# name it by id, version and hash, and GET /api/v1/ruleset/<hash> serves it.
+# A file that is missing or does not verify stops the server from booting.
+# path = "/etc/jig/ruleset.cose"
+# Where clients fetch it, when not from this server: an https:// mirror. They
+# check what they fetch against the signed hash either way.
+# url = "https://example.org/ruleset.cose"
 "#,
         listen = listen,
         keyfile = defaults.server.server_did_keyfile,

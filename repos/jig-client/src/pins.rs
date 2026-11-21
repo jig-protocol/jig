@@ -1257,6 +1257,7 @@ mod tests {
             tls_exporter: Vec::new(),
             manifest: None,
             admit: None,
+            ruleset: None,
             moved_from: None,
             evidence: String::new(),
         }
@@ -1752,6 +1753,7 @@ mod tests {
                 key_link: newest,
                 admit: None,
                 prior_key_links: prior,
+                ruleset: None,
                 sig: String::new(),
             }))
             .unwrap();
@@ -1863,6 +1865,7 @@ mod tests {
                 key_link: newest,
                 admit: None,
                 prior_key_links: prior,
+                ruleset: None,
                 sig: String::new(),
             }))
             .unwrap();

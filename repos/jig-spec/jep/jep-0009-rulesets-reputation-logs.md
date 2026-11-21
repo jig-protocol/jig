@@ -94,6 +94,13 @@ Non-goals:
      linked vouching (rule 27), person-binding (rule 28).
 4. **Declaration.** A server that applies a ruleset MUST name it in its signed welcome and
    `server-manifest` (JEP-0002) as `{id, version, hash, url}`.
+   - In the welcome, it is signed only to a hello that asks (JEP-0002 rule 2, tag 5), so a
+     client from before rulesets is answered as it always was. In the manifest log, it rides
+     beside the document in the `server-manifest` block, under `server_ruleset` (JEP-0002
+     rule 12), for the same reason (DJ, 2026-11-21).
+   - `url` is where the document is fetched. A path is on the declaring server, which
+     serves it at `GET /api/v1/ruleset/{hash}` by default. A client MUST check that what it
+     fetches has the canonical CID `hash` and opens to the declared `id` and `version`.
    - A server applies at most one ruleset per security context. A server MAY apply none.
    - A server that enforces anything other than what it declared has signed evidence against
      itself (OP-02).

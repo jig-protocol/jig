@@ -435,6 +435,7 @@ mod tests {
             prior_dids: Vec::new(),
             peer_frames: Default::default(),
             peers: Default::default(),
+            ruleset: None,
             relay: Default::default(),
         })
     }

@@ -44,6 +44,46 @@ pub struct JigServerConfig {
     pub keys: KeysSection,
     #[serde(default)]
     pub limits: LimitsSection,
+    #[serde(default)]
+    pub ruleset: RulesetSection,
+}
+
+/// `[ruleset]`: the ruleset this server declares (JEP-0009 rule 4).
+///
+/// Unset, the server declares none, which rule 4 allows. Set, `path` names a
+/// signed ruleset document (a COSE_Sign1 envelope, as `jig-core`'s
+/// `SignedRuleset` writes it). The server refuses to boot on a file that is
+/// missing or does not open, names the document in its welcome and its
+/// manifest log, and serves it at `GET /api/v1/ruleset/{hash}`.
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RulesetSection {
+    pub path: Option<String>,
+    /// Where clients fetch the document. Unset, the path this server serves
+    /// it at, `/api/v1/ruleset/{hash}`, which a client resolves against the
+    /// server it is connected to. Set it to an absolute `https://` URL to
+    /// name a mirror; the client still checks what it fetches against the
+    /// signed hash.
+    pub url: Option<String>,
+}
+
+impl RulesetSection {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.path.as_deref().is_some_and(|p| p.trim().is_empty()) {
+            return Err("[ruleset] path is empty: remove it to declare no ruleset".to_string());
+        }
+        if self.url.is_some() && self.path.is_none() {
+            return Err(
+                "[ruleset] url is set without a path: there is nothing to serve".to_string(),
+            );
+        }
+        if let Some(url) = &self.url
+            && !url.starts_with("https://")
+        {
+            return Err(format!("[ruleset] url {url:?} is not an https:// URL"));
+        }
+        Ok(())
+    }
 }
 
 /// `[limits]`: the most bytes one HTTP request body or one WebSocket message

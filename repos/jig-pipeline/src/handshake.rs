@@ -107,6 +107,14 @@ pub struct Capabilities {
     /// bytes it always did.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tiers: bool,
+    /// Ruleset declarations (JEP-0009 rule 4). In a hello, the client asks to
+    /// be told the ruleset; in a welcome, the server implements declarations
+    /// and the hello asked, and the welcome then signs [`RulesetRef`] or its
+    /// absence under its own tag. Like `tiers`, never part of
+    /// [`Capabilities::canonical_bytes`], so a client that predates it checks
+    /// the bytes it always did.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ruleset: bool,
 }
 
 fn default_future_skew_ms() -> u64 {
@@ -121,6 +129,7 @@ impl Default for Capabilities {
             federation: false,
             max_future_skew_ms: DEFAULT_FUTURE_SKEW_MS,
             tiers: false,
+            ruleset: false,
         }
     }
 }
@@ -207,6 +216,8 @@ impl Default for ClientOffer {
             // as a dialing server, so it asks for them.
             capabilities: Capabilities {
                 tiers: true,
+                // It reads ruleset declarations (JEP-0009 rule 4).
+                ruleset: true,
                 ..Capabilities::default()
             },
             pinned_server_did: None,
@@ -223,6 +234,29 @@ impl Default for ClientOffer {
 pub struct ManifestRef {
     pub cid: String,
     pub seq: u64,
+}
+
+/// The ruleset a server applies, as it declares it (JEP-0009 rule 4): the
+/// document's `id` and `version`, its `hash` (the canonical CID of the
+/// signed envelope, base32 text), and the `url` it is served at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RulesetRef {
+    pub id: String,
+    pub version: u64,
+    pub hash: String,
+    pub url: String,
+}
+
+impl RulesetRef {
+    fn canonical_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        push(&mut out, self.id.as_bytes());
+        push(&mut out, &self.version.to_le_bytes());
+        push(&mut out, self.hash.as_bytes());
+        push(&mut out, self.url.as_bytes());
+        out
+    }
 }
 
 /// Work a verifier asks for one action (JEP-0008 rules 15, 16): what a
@@ -281,6 +315,9 @@ pub struct ServerOffer {
     /// The work asked of a DID this server has not admitted (JEP-0008
     /// rule 15); `None` when admission asks none.
     pub admit: Option<PowOffer>,
+    /// The ruleset this server applies; `None` when it declares none. Signed
+    /// only into a welcome to a hello that asked ([`Capabilities::ruleset`]).
+    pub ruleset: Option<RulesetRef>,
 }
 
 /// The client's hello, after it has parsed.
@@ -314,6 +351,8 @@ pub struct WelcomeStatement {
     pub admit: Option<PowOffer>,
     /// base64 COSE_Sign of the links before `key_link`, oldest first.
     pub prior_key_links: Vec<String>,
+    /// The declared ruleset. Signed only when `capabilities.ruleset` is set.
+    pub ruleset: Option<RulesetRef>,
 }
 
 impl WelcomeStatement {
@@ -365,6 +404,19 @@ impl WelcomeStatement {
             push(&mut out, &[4]);
             push(&mut out, jig_core::tier::TIERS_FEATURE.as_bytes());
         }
+        // The ruleset declaration (JEP-0009 rule 4), signed only into a
+        // welcome to a hello that asked, and then signed present or absent:
+        // a server that declares none says so, under its key.
+        if self.capabilities.ruleset {
+            push(&mut out, &[5]);
+            match &self.ruleset {
+                None => push(&mut out, &[0]),
+                Some(ruleset) => {
+                    push(&mut out, &[1]);
+                    push(&mut out, &ruleset.canonical_bytes());
+                }
+            }
+        }
         out
     }
 
@@ -386,6 +438,14 @@ impl WelcomeStatement {
             .is_some_and(|admit| admit.salt_id != jig_core::pow::EMPTY_SALT_ID)
         {
             return Some("welcome asks admission work under a salt admission does not use");
+        }
+        if self.ruleset.is_some() && !self.capabilities.ruleset {
+            return Some("welcome names a ruleset outside the ruleset capability");
+        }
+        if let Some(ruleset) = &self.ruleset
+            && !jig_core::canonical_cid::is_canonical_text(&ruleset.hash)
+        {
+            return Some("welcome names a ruleset hash that is not a canonical CID");
         }
         None
     }
@@ -490,6 +550,10 @@ pub struct VerifiedWelcome {
     /// The admission work the server asks of a DID it has not admitted,
     /// signed (JEP-0008 rule 15). `None` when it asks none, or predates it.
     pub admit: Option<PowOffer>,
+    /// The ruleset the server declares, signed (JEP-0009 rule 4). `None`
+    /// when it declares none, or when the hello did not ask. Boxed: most
+    /// welcomes carry none, and every handshake result is this size.
+    pub ruleset: Option<Box<RulesetRef>>,
     /// Set when the welcome is signed by another DID than the pinned one and
     /// carries a public key link from the pinned DID to it, signed by both
     /// keys: the pinned DID it moved from. The caller moves its pin.
@@ -640,6 +704,8 @@ pub fn negotiate(
         capabilities: Capabilities {
             // Only to a hello that asked: see `Capabilities::tiers`.
             tiers: server.capabilities.tiers && hello.capabilities.tiers,
+            // Likewise: see `Capabilities::ruleset`.
+            ruleset: server.capabilities.ruleset && hello.capabilities.ruleset,
             ..server.capabilities.clone()
         },
         reputation: Reputation::none(),
@@ -654,6 +720,11 @@ pub fn negotiate(
             .iter()
             .map(|l| STANDARD.encode(l))
             .collect(),
+        ruleset: if server.capabilities.ruleset && hello.capabilities.ruleset {
+            server.ruleset.clone()
+        } else {
+            None
+        },
     })
 }
 
@@ -677,6 +748,7 @@ pub fn seal(key: &SigningKey, mut statement: WelcomeStatement) -> Envelope {
         key_link: statement.key_link,
         admit: statement.admit,
         prior_key_links: statement.prior_key_links,
+        ruleset: statement.ruleset,
         sig,
     })
 }
@@ -895,6 +967,7 @@ fn interpret_envelope(
         key_link,
         admit,
         prior_key_links,
+        ruleset,
         sig,
     } = &env.frame
     else {
@@ -922,6 +995,7 @@ fn interpret_envelope(
         key_link: key_link.clone(),
         admit: *admit,
         prior_key_links: prior_key_links.clone(),
+        ruleset: ruleset.clone(),
     };
 
     if echoed != nonce {
@@ -1015,6 +1089,7 @@ fn interpret_envelope(
         tls_exporter: bound,
         manifest: manifest.clone(),
         admit: *admit,
+        ruleset: ruleset.clone().map(Box::new),
         moved_from,
         evidence: text.to_string(),
     })
@@ -1080,6 +1155,9 @@ fn outside_offer(statement: &WelcomeStatement, offer: &ClientOffer) -> Option<&'
     // client did not ask for is outside its offer like any other.
     if statement.capabilities.tiers && !offer.capabilities.tiers {
         return Some("welcome grants tiers, which the client did not request");
+    }
+    if statement.capabilities.ruleset && !offer.capabilities.ruleset {
+        return Some("welcome declares a ruleset, which the client did not ask for");
     }
     None
 }
@@ -1541,6 +1619,171 @@ mod tests {
         assert_eq!(
             statement.capabilities.canonical_bytes(),
             with.capabilities.canonical_bytes()
+        );
+    }
+
+    fn declared_ruleset() -> RulesetRef {
+        let hash = jig_core::canonical_cid::of(b"a ruleset envelope").to_string();
+        RulesetRef {
+            id: "jig-reference".into(),
+            version: 1,
+            url: format!("/api/v1/ruleset/{hash}"),
+            hash,
+        }
+    }
+
+    /// A server that implements declarations and declares `ruleset`.
+    fn declaring_server(ruleset: Option<RulesetRef>) -> ServerOffer {
+        let mut server = offer_server();
+        server.capabilities.ruleset = true;
+        server.ruleset = ruleset;
+        server
+    }
+
+    /// The hello `begin` sends for `offer`, as the server parses it, and the
+    /// client state that checks the answer.
+    fn hello_for(offer: &ClientOffer) -> (HelloView, PendingHello) {
+        let (hello, pending) = begin(offer);
+        let Frame::Hello {
+            nonce,
+            capabilities,
+            ..
+        } = hello.frame
+        else {
+            panic!("hello");
+        };
+        let mut view = hello_view(&nonce);
+        view.capabilities = capabilities;
+        (view, pending)
+    }
+
+    /// A client that predates rulesets never asks, so a server that declares
+    /// one answers it with exactly the welcome it answered before: the same
+    /// signed bytes and no `ruleset` on the wire. This is what keeps alpha.6
+    /// clients verifying welcomes from a server that declares a ruleset.
+    #[test]
+    fn a_welcome_to_a_hello_that_did_not_ask_signs_what_it_always_did() {
+        let view = hello_view("bm9uY2U=");
+        assert!(!view.capabilities.ruleset);
+        let mut declaring = negotiate(&view, &declaring_server(Some(declared_ruleset()))).unwrap();
+        let mut before = negotiate(&view, &offer_server()).unwrap();
+        before.server_nonce = String::new();
+        declaring.server_nonce = String::new();
+        assert_eq!(declaring, before);
+        assert_eq!(declaring.canonical_bytes(), before.canonical_bytes());
+        let text = serde_json::to_string(&seal(&generate_signing_key(), declaring)).unwrap();
+        assert!(!text.contains("ruleset"), "{text}");
+    }
+
+    /// JEP-0009 rule 4: a server signs its declaration into a welcome only
+    /// when the hello asked, and then signs it present or absent.
+    #[test]
+    fn a_ruleset_is_signed_only_into_a_welcome_whose_hello_asked() {
+        let key = generate_signing_key();
+        for (asked, declared) in [(true, true), (true, false), (false, true), (false, false)] {
+            let offer = ClientOffer {
+                capabilities: Capabilities {
+                    ruleset: asked,
+                    ..ClientOffer::default().capabilities
+                },
+                ..ClientOffer::default()
+            };
+            let (view, pending) = hello_for(&offer);
+            let server = declaring_server(declared.then(declared_ruleset));
+            let welcome = seal(&key, negotiate(&view, &server).unwrap());
+            let text = serde_json::to_string(&welcome).unwrap();
+            assert_eq!(text.contains("\"ruleset\":{"), asked && declared, "{text}");
+            let HandshakeResult::Established(verified) = pending.interpret(&text) else {
+                panic!("asked {asked}, declared {declared}: not established");
+            };
+            assert_eq!(verified.capabilities.ruleset, asked);
+            assert_eq!(
+                verified.ruleset.as_deref(),
+                (asked && declared).then(declared_ruleset).as_ref(),
+                "asked {asked}, declared {declared}"
+            );
+        }
+    }
+
+    /// The declaration is signed: removing it, changing it, or removing the
+    /// capability that says one was signed fails the signature.
+    #[test]
+    fn a_signed_ruleset_cannot_be_stripped_or_changed() {
+        let key = generate_signing_key();
+        let tamper: [fn(&mut Option<RulesetRef>, &mut Capabilities); 3] = [
+            |ruleset, _| *ruleset = None,
+            |ruleset, _| ruleset.as_mut().unwrap().version = 2,
+            |_, capabilities| capabilities.ruleset = false,
+        ];
+        for change in tamper {
+            let (view, pending) = hello_for(&ClientOffer::default());
+            let mut welcome = seal(
+                &key,
+                negotiate(&view, &declaring_server(Some(declared_ruleset()))).unwrap(),
+            );
+            if let Frame::Welcome {
+                ruleset,
+                capabilities,
+                ..
+            } = &mut welcome.frame
+            {
+                change(ruleset, capabilities);
+            }
+            let text = serde_json::to_string(&welcome).unwrap();
+            let HandshakeResult::FailClosed { reason, .. } = pending.interpret(&text) else {
+                panic!("a tampered declaration must fail closed: {text}");
+            };
+            assert!(
+                reason.contains("signature does not verify")
+                    || reason.contains("outside the ruleset capability"),
+                "{reason}"
+            );
+        }
+    }
+
+    /// A declaration the client did not ask for is outside its offer, as an
+    /// unasked `tiers` grant is.
+    #[test]
+    fn a_ruleset_declared_to_a_hello_that_did_not_ask_is_refused() {
+        let key = generate_signing_key();
+        let offer = ClientOffer {
+            capabilities: Capabilities {
+                ruleset: false,
+                ..ClientOffer::default().capabilities
+            },
+            ..ClientOffer::default()
+        };
+        let (mut view, pending) = hello_for(&offer);
+        // A server that answers as if the hello had asked.
+        view.capabilities.ruleset = true;
+        let welcome = seal(
+            &key,
+            negotiate(&view, &declaring_server(Some(declared_ruleset()))).unwrap(),
+        );
+        let HandshakeResult::FailClosed { reason, .. } =
+            pending.interpret(&serde_json::to_string(&welcome).unwrap())
+        else {
+            panic!("an unasked declaration must fail closed");
+        };
+        assert!(reason.contains("did not ask"), "{reason}");
+    }
+
+    /// A ruleset outside the capability, or named by a hash that is not a
+    /// canonical CID, is a welcome contradicting itself, signed or not.
+    #[test]
+    fn a_ruleset_outside_its_capability_or_hash_contradicts_the_welcome() {
+        let mut statement = negotiate(&hello_view("bm9uY2U="), &offer_server()).unwrap();
+        statement.ruleset = Some(declared_ruleset());
+        assert_eq!(
+            statement.contradicts_itself(),
+            Some("welcome names a ruleset outside the ruleset capability")
+        );
+        statement.capabilities.ruleset = true;
+        assert_eq!(statement.contradicts_itself(), None);
+        statement.ruleset.as_mut().unwrap().hash = "bafyNotCanonical".into();
+        assert_eq!(
+            statement.contradicts_itself(),
+            Some("welcome names a ruleset hash that is not a canonical CID")
         );
     }
 
@@ -2054,6 +2297,7 @@ mod tests {
             } else {
                 vec![]
             },
+            ruleset: None,
         };
         let none = statement(false, false, false).canonical_bytes();
         let link = statement(true, false, false).canonical_bytes();
