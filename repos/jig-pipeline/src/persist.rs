@@ -54,11 +54,14 @@ impl ReleaseKind {
         }
     }
 
-    fn parse(s: &str) -> Self {
-        if s == "custody" {
-            ReleaseKind::Custody
-        } else {
-            ReleaseKind::Local
+    /// Strict: an unknown value is an error, never a default. A misread
+    /// `custody` row taken as `local` would keep a released package's init key
+    /// alive through R1's rotation (JEP-0017 rule 32).
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "custody" => Some(ReleaseKind::Custody),
+            "local" => Some(ReleaseKind::Local),
+            _ => None,
         }
     }
 }
@@ -148,6 +151,9 @@ pub enum Stocked {
 /// One entry of a custodian's release log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseLogEntry {
+    /// The released package's hash reference, so its owner can delete that
+    /// package's private init key (JEP-0017 rule 32).
+    pub reference: Vec<u8>,
     pub requester: String,
     pub channel_id: String,
     pub last_resort: bool,
@@ -2896,20 +2902,24 @@ impl SqliteStore {
             [did],
             |r| r.get(0),
         )?;
-        let mut has_last_resort: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM mls_key_packages WHERE did = ? AND last_resort = 1)",
+        let has_last_resort: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mls_key_packages
+                            WHERE did = ? AND last_resort = 1 AND consumed_at IS NULL)",
             [did],
             |r| r.get(0),
         )?;
         let mut accepted = 0;
+        let mut last_resort_seen = false;
         for (reference, package, last_resort) in packages {
-            // One last-resort package per DID is all it needs, and each
-            // carries a fresh reference, so without this a DID could store
-            // unboundedly many of them past `max_stock`.
+            // One last-resort package per DID is in use at a time. A new one
+            // replaces the old, which its owner rotates out after withdrawing
+            // custody (JEP-0017 rule 32); only the DID can sign a new one, and
+            // a batch replaces it at most once.
             if *last_resort {
-                if has_last_resort {
+                if last_resort_seen {
                     continue;
                 }
+                last_resort_seen = true;
             } else if available as u64 >= max_stock {
                 continue;
             }
@@ -2918,14 +2928,24 @@ impl SqliteStore {
                     (reference, did, package, last_resort, published_at)
                  VALUES (?,?,?,?,?)",
                 params![reference, did, package, last_resort, now],
-            )?;
-            if inserted > 0 {
-                accepted += 1;
-                if *last_resort {
-                    has_last_resort = true;
-                } else {
-                    available += 1;
+            )? > 0;
+            if !inserted {
+                continue;
+            }
+            accepted += 1;
+            if *last_resort {
+                // The rows retired stay, marked consumed, so the package is
+                // never released or accepted again.
+                if has_last_resort {
+                    tx.execute(
+                        "UPDATE mls_key_packages SET consumed_at = ?
+                          WHERE did = ? AND last_resort = 1 AND consumed_at IS NULL
+                            AND reference != ?",
+                        params![now, did, reference],
+                    )?;
                 }
+            } else {
+                available += 1;
             }
         }
         tx.commit()?;
@@ -2986,11 +3006,14 @@ impl SqliteStore {
             tx.query_row(
                 // The exact request first: its own answer, even when a later
                 // request for the same tuple got another package.
+                // A replaced last-resort package is dead (its owner deleted
+                // its key): a repeat gets a fresh release instead.
                 "SELECT k.package, r.reference, r.last_resort
                    FROM kp_releases r JOIN mls_key_packages k ON k.reference = r.reference
-                  WHERE r.request_hash = ?5
-                     OR (r.did = ?1 AND r.requester = ?2 AND r.channel_id = ?3
-                         AND r.released_at > ?4)
+                  WHERE (k.last_resort = 0 OR k.consumed_at IS NULL)
+                    AND (r.request_hash = ?5
+                         OR (r.did = ?1 AND r.requester = ?2 AND r.channel_id = ?3
+                             AND r.released_at > ?4))
                   ORDER BY (r.request_hash = ?5) DESC, r.released_at DESC LIMIT 1",
                 params![
                     ask.did,
@@ -3049,7 +3072,7 @@ impl SqliteStore {
                 let resort: Option<(Vec<u8>, Vec<u8>)> = tx
                     .query_row(
                         "SELECT reference, package FROM mls_key_packages
-                          WHERE did = ? AND last_resort = 1
+                          WHERE did = ? AND last_resort = 1 AND consumed_at IS NULL
                           ORDER BY published_at DESC, reference DESC LIMIT 1",
                         [ask.did],
                         |r| Ok((r.get(0)?, r.get(1)?)),
@@ -3087,10 +3110,16 @@ impl SqliteStore {
             )?;
         }
         tx.execute(
+            // The same request can be here already only if the package it
+            // got was a last-resort one since replaced (the repeat lookup
+            // above skips those): it now names the new one.
             "INSERT INTO kp_releases
                 (request_hash, did, requester, channel_id, reference, last_resort,
                  request, released_at, kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(request_hash) DO UPDATE
+                SET reference = excluded.reference, last_resort = excluded.last_resort,
+                    released_at = excluded.released_at, counted = 1",
             params![
                 ask.request_hash,
                 ask.did,
@@ -3112,21 +3141,43 @@ impl SqliteStore {
 
     /// The custodian's log of `did`'s releases, newest first, at most `limit`.
     pub fn key_package_releases(&self, did: &str, limit: u32) -> Result<Vec<ReleaseLogEntry>> {
+        self.key_package_releases_page(did, limit, 0)
+    }
+
+    /// [`Self::key_package_releases`], skipping the `offset` newest entries.
+    /// A release logged between two pages shifts the next page by one, so a
+    /// reader paging through sees an entry twice, never misses one.
+    pub fn key_package_releases_page(
+        &self,
+        did: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<ReleaseLogEntry>> {
         let conn = self.conn.lock().expect("poisoned");
         let mut stmt = conn.prepare(
-            "SELECT requester, channel_id, last_resort, request, released_at, kind
+            "SELECT requester, channel_id, last_resort, request, released_at, kind, reference
                FROM kp_releases WHERE did = ?1 AND counted = 1
-              ORDER BY released_at DESC, request_hash ASC LIMIT ?2",
+              ORDER BY released_at DESC, request_hash ASC LIMIT ?2 OFFSET ?3",
         )?;
         let rows = stmt
-            .query_map(params![did, limit], |r| {
+            .query_map(params![did, limit, offset], |r| {
                 Ok(ReleaseLogEntry {
+                    reference: r.get(6)?,
                     requester: r.get(0)?,
                     channel_id: r.get(1)?,
                     last_resort: r.get(2)?,
                     request: r.get(3)?,
                     released_at: r.get(4)?,
-                    kind: ReleaseKind::parse(&r.get::<_, String>(5)?),
+                    kind: {
+                        let raw: String = r.get(5)?;
+                        ReleaseKind::parse(&raw).ok_or_else(|| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                5,
+                                rusqlite::types::Type::Text,
+                                format!("unknown release kind `{raw}`").into(),
+                            )
+                        })?
+                    },
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3178,7 +3229,8 @@ impl SqliteStore {
             |r| r.get(0),
         )?;
         let last_resort: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM mls_key_packages WHERE did = ? AND last_resort = 1)",
+            "SELECT EXISTS(SELECT 1 FROM mls_key_packages
+                            WHERE did = ? AND last_resort = 1 AND consumed_at IS NULL)",
             [did],
             |r| r.get(0),
         )?;
@@ -5186,6 +5238,97 @@ mod tests {
     }
 
     #[test]
+    fn a_new_last_resort_package_retires_the_old_for_good() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let did = "did:jig:zD";
+        store
+            .insert_key_package(b"old", did, b"kpOld", true, 1)
+            .unwrap();
+        assert_eq!(
+            store
+                .release_key_package(&ask(did, "did:jig:zA", b"h1", 100))
+                .unwrap(),
+            Release::Released {
+                package: b"kpOld".to_vec(),
+                last_resort: true
+            }
+        );
+        let stock = |r: &[u8], p: &[u8], now| {
+            store
+                .stock_key_packages(
+                    did,
+                    &[(r.to_vec(), p.to_vec(), true)],
+                    10,
+                    "did:jig:zS",
+                    now,
+                )
+                .unwrap()
+        };
+        assert_eq!(stock(b"new", b"kpNew", 200), Stocked::Accepted(1));
+        assert_eq!(store.key_package_stock(did).unwrap(), (0, true));
+        // A repeat of the earlier request gets the new package, not the dead one.
+        assert_eq!(
+            store
+                .release_key_package(&ask(did, "did:jig:zA", b"h1", 300))
+                .unwrap(),
+            Release::Released {
+                package: b"kpNew".to_vec(),
+                last_resort: true
+            }
+        );
+        // The old one cannot be brought back, by either route.
+        assert_eq!(stock(b"old", b"kpOld", 400), Stocked::Accepted(0));
+        assert!(
+            !store
+                .insert_key_package(b"old", did, b"kpOld", true, 400)
+                .unwrap()
+        );
+        let resort = store
+            .release_key_package(&ask(did, "did:jig:zB", b"h2", 500))
+            .unwrap();
+        assert_eq!(
+            resort,
+            Release::Released {
+                package: b"kpNew".to_vec(),
+                last_resort: true
+            }
+        );
+    }
+
+    #[test]
+    fn the_release_log_names_each_package_and_pages_newest_first() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let did = "did:jig:zD";
+        for (n, r) in [b"r1", b"r2", b"r3"].iter().enumerate() {
+            store
+                .insert_key_package(*r, did, b"kp", false, n as i64)
+                .unwrap();
+        }
+        for (n, h) in [b"h1", b"h2", b"h3"].iter().enumerate() {
+            let requester = format!("did:jig:zA{n}");
+            let released = store
+                .release_key_package(&ask(did, &requester, *h, 100 + n as i64 * 10_000))
+                .unwrap();
+            assert!(matches!(released, Release::Released { .. }));
+        }
+        let first = store.key_package_releases_page(did, 2, 0).unwrap();
+        let rest = store.key_package_releases_page(did, 2, 2).unwrap();
+        let refs: Vec<_> = first
+            .iter()
+            .chain(&rest)
+            .map(|e| e.reference.clone())
+            .collect();
+        // Oldest package released first, so the newest entry names r3.
+        assert_eq!(refs, [b"r3".to_vec(), b"r2".to_vec(), b"r1".to_vec()]);
+        assert!(
+            store
+                .key_package_releases_page(did, 2, 3)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn a_custodian_hands_out_last_resort_without_consuming_it() {
         let store = SqliteStore::open_in_memory().unwrap();
         let did = "did:jig:zD";
@@ -5657,6 +5800,34 @@ mod tests {
                 "{channel}"
             );
         }
+    }
+
+    #[test]
+    fn a_release_kind_parses_strictly() {
+        assert_eq!(ReleaseKind::parse("custody"), Some(ReleaseKind::Custody));
+        assert_eq!(ReleaseKind::parse("local"), Some(ReleaseKind::Local));
+        for bad in ["", "Custody", "remote", "local "] {
+            assert_eq!(ReleaseKind::parse(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_release_row_of_unknown_kind_is_an_error_not_a_default() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let did = "did:jig:zD";
+        store
+            .insert_key_package(b"r1", did, b"kp1", false, 1)
+            .unwrap();
+        store
+            .release_key_package(&ask(did, "did:jig:zA", b"h1", 100))
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE kp_releases SET kind = 'remote'", [])
+            .unwrap();
+        assert!(store.key_package_releases(did, 10).is_err());
     }
 
     #[test]

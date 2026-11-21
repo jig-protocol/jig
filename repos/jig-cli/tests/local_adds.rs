@@ -1,7 +1,7 @@
 //! Ending local adds at a server (JEP-0017 R2), through the real `jig`
-//! binary: `jig server local-adds end` stops others adding the member to
+//! binary: `jig server local-adds off` stops others adding the member to
 //! channels that server sequences, whatever server the key package would
-//! come from, and `allow` undoes it.
+//! come from, and `on` undoes it.
 //!
 //! Each person runs with `HOME` in a tempdir.
 
@@ -96,7 +96,7 @@ async fn a_member_who_ended_local_adds_cannot_be_added_until_they_allow_it_again
     person(owner_home.path(), &a);
     ok(owner_home.path(), &["channel", "create", "#sec"]);
 
-    let said = ok(member_home.path(), &["server", "local-adds", "end"]);
+    let said = ok(member_home.path(), &["server", "local-adds", "off"]);
     assert!(said.contains("no longer add you"), "{said}");
     let states = server_states(member_home.path(), &member);
     let state = states["servers"]
@@ -133,8 +133,8 @@ async fn a_member_who_ended_local_adds_cannot_be_added_until_they_allow_it_again
     // The member can still join a channel by their own act.
     ok(member_home.path(), &["channel", "join", "#pub"]);
 
-    let said = ok(member_home.path(), &["server", "local-adds", "allow"]);
-    assert!(said.contains("can add you"), "{said}");
+    let said = ok(member_home.path(), &["server", "local-adds", "on"]);
+    assert!(said.contains("can again add you"), "{said}");
     let states = server_states(member_home.path(), &member);
     let state = states["servers"]
         .as_object()
@@ -162,7 +162,7 @@ async fn ended_local_adds_are_not_routed_around_through_another_custodian() {
     let member_home = tempfile::tempdir().unwrap();
     let member = person(member_home.path(), &b);
     ok(member_home.path(), &["server", "set", &a.http_url()]);
-    ok(member_home.path(), &["server", "local-adds", "end"]);
+    ok(member_home.path(), &["server", "local-adds", "off"]);
     let on_b = available(&b, &member).await;
     assert!(on_b > 0);
 
@@ -178,4 +178,123 @@ async fn ended_local_adds_are_not_routed_around_through_another_custodian() {
     );
     assert!(err.contains("LOCAL_ADDS_ENDED"), "{err}");
     assert_eq!(available(&b, &member).await, on_b, "B released nothing");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ended_local_adds_leave_custody_for_channels_other_servers_sequence() {
+    let (a, b) = (
+        TestJigServer::start().await.unwrap(),
+        TestJigServer::start().await.unwrap(),
+    );
+    let member_home = tempfile::tempdir().unwrap();
+    let member = person(member_home.path(), &a);
+    ok(member_home.path(), &["server", "local-adds", "off"]);
+    let on_a = available(&a, &member).await;
+
+    // B sequences #away; A, the member's custodian, holds no such channel
+    // and releases a package for it.
+    let away_home = tempfile::tempdir().unwrap();
+    person(away_home.path(), &b);
+    ok(away_home.path(), &["channel", "create", "#away"]);
+    let added = ok(
+        away_home.path(),
+        &["channel", "add", "#away", &member, "--via", &a.http_url()],
+    );
+    assert!(
+        added.contains(&format!("added {member} to #away")),
+        "{added}"
+    );
+    assert_eq!(available(&a, &member).await, on_a - 1, "A released one");
+
+    // A channel A sequences is refused.
+    let here_home = tempfile::tempdir().unwrap();
+    person(here_home.path(), &a);
+    ok(here_home.path(), &["channel", "create", "#here"]);
+    let err = refused(here_home.path(), &["channel", "add", "#here", &member]);
+    assert!(err.contains("LOCAL_ADDS_ENDED"), "{err}");
+    assert_eq!(
+        available(&a, &member).await,
+        on_a - 1,
+        "nothing more released"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn custody_and_local_adds_both_ended_end_the_stock_on_every_device() {
+    let a = TestJigServer::start().await.unwrap();
+    let member_home = tempfile::tempdir().unwrap();
+    let member = person(member_home.path(), &a);
+    let stocked = |home: &Path| {
+        let states = server_states(home, &member);
+        let state = states["servers"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        (
+            state["packages"].as_array().map_or(0, Vec::len),
+            state["last_resort"].is_string(),
+        )
+    };
+    assert!(stocked(member_home.path()).0 > 0);
+
+    // Local adds alone keep the stock, for custody.
+    ok(member_home.path(), &["server", "local-adds", "off"]);
+    assert!(available(&a, &member).await > 0);
+    // Custody withdrawn second: the server deletes the stock and this device
+    // its keys and references.
+    ok(member_home.path(), &["server", "custody", "off"]);
+    assert_eq!(available(&a, &member).await, 0);
+    assert_eq!(stocked(member_home.path()), (0, false));
+
+    // This device no longer uploads.
+    let out = ok(member_home.path(), &["server", "set", &a.http_url()]);
+    assert!(out.contains("published no MLS key packages"), "{out}");
+    assert_eq!(available(&a, &member).await, 0);
+
+    // Another device, which knows of neither, is refused by the server and
+    // deletes the keys it made for the upload.
+    let other = tempfile::tempdir().unwrap();
+    copy_except(
+        &member_home.path().join(".jig"),
+        &other.path().join(".jig"),
+        &["mls", "servers"],
+    );
+    let out = run(other.path(), &["server", "set", &a.http_url()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(said.contains("keeps no key packages for you"), "{said}");
+    assert_eq!(available(&a, &member).await, 0);
+
+    // Either undone, uploads resume.
+    ok(member_home.path(), &["server", "local-adds", "on"]);
+    let out = ok(member_home.path(), &["server", "set", &a.http_url()]);
+    assert!(out.contains("published MLS key packages"), "{out}");
+    assert!(available(&a, &member).await > 0);
+}
+
+fn copy_except(from: &Path, to: &Path, skip: &[&str]) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        if skip.iter().any(|s| name == *s) {
+            continue;
+        }
+        if entry.file_type().unwrap().is_dir() {
+            copy_except(&entry.path(), &to.join(&name), &[]);
+        } else {
+            std::fs::copy(entry.path(), to.join(&name)).unwrap();
+        }
+    }
 }

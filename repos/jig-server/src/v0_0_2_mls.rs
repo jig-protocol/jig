@@ -313,7 +313,8 @@ mod tests {
     }
 
     /// Each last-resort package has a fresh reference, so without a cap one
-    /// DID could store as many as it liked.
+    /// DID could store as many as it liked. A new one replaces the old
+    /// (JEP-0017 rule 32), and one batch replaces it at most once.
     #[tokio::test]
     async fn a_did_keeps_one_last_resort_package() {
         let state = Arc::new(AppState::for_test().unwrap());
@@ -329,8 +330,9 @@ mod tests {
 
         let again = publish(&state, &m.key_packages(2, true).unwrap()).await;
         assert_eq!(
-            again.accepted, 0,
-            "a second last-resort package is not stored"
+            (again.accepted, again.available, again.last_resort),
+            (1, 2, true),
+            "a new last-resort package replaces the old, once per batch"
         );
     }
 

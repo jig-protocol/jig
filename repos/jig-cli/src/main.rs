@@ -465,20 +465,25 @@ enum ServerAction {
         url: Option<String>,
     },
 
-    /// Whether others may add you to channels the configured server
-    /// sequences (JEP-0017 R2). `end` stops it: members there see
-    /// `LOCAL_ADDS_ENDED` or `MEMBER_DECLINED`. Channels you are in stay as
-    /// they are, and you can still join one yourself. `allow` undoes it.
+    /// End (`off`) or restore (`on`) the configured server's custody of
+    /// your key packages: whether it releases them to members of other
+    /// servers who add you (JEP-0017 R1). Members of this server can still
+    /// add you. `off` publishes a record without this server here and to
+    /// each other server it lists, and deletes this device's keys for the
+    /// packages it already released elsewhere.
+    Custody {
+        #[arg(value_enum)]
+        state: cmd::server::Switch,
+    },
+
+    /// End (`off`) or allow again (`on`) others adding you to channels the
+    /// configured server sequences (JEP-0017 R2). While off, members there
+    /// see `LOCAL_ADDS_ENDED` or `MEMBER_DECLINED`. Channels you are in stay
+    /// as they are, and you can still join one yourself.
     LocalAdds {
         #[arg(value_enum)]
-        action: LocalAddsAction,
+        state: cmd::server::Switch,
     },
-}
-
-#[derive(clap::ValueEnum, Clone, Copy, Debug)]
-enum LocalAddsAction {
-    End,
-    Allow,
 }
 
 // Parsed once per process; boxing `Run`'s fields would buy nothing.
@@ -878,12 +883,20 @@ async fn run() -> Result<()> {
                 // Publish MLS key packages to the new server so others can
                 // add this identity to encrypted channels and DMs straight
                 // away. Best effort: the server may be down, or predate v0.2.
-                if let Ok(secure) = cmd::secure::Secure::open(&ctx)
-                    && secure.ensure_key_packages().await.is_ok()
-                {
-                    println!(
-                        "published MLS key packages (others can now add you to encrypted channels)"
-                    );
+                let published = match cmd::secure::Secure::open(&ctx) {
+                    Ok(secure) => secure.ensure_key_packages().await,
+                    Err(e) => Err(e),
+                };
+                match published {
+                    Ok(false) => println!(
+                        "published no MLS key packages: you ended both custody and local adds \
+                         at this server"
+                    ),
+                    Ok(true) => println!(
+                        "published MLS key packages (others can now add you to encrypted \
+                         channels)"
+                    ),
+                    Err(e) => eprintln!("warning: key packages not published: {e:#}"),
                 }
             }
             ServerAction::Info { url } => {
@@ -892,21 +905,11 @@ async fn run() -> Result<()> {
             ServerAction::Forget { url } => {
                 cmd::server::forget(&ctx, url.as_deref())?;
             }
-            ServerAction::LocalAdds { action } => {
-                let allow = matches!(action, LocalAddsAction::Allow);
-                let secure = cmd::secure::Secure::open(&ctx)?;
-                let kept = secure.set_local_adds(allow).await?;
-                if kept.allow {
-                    println!(
-                        "others can add you to channels {} sequences",
-                        secure.server()
-                    );
-                } else {
-                    println!(
-                        "others can no longer add you to channels {} sequences",
-                        secure.server()
-                    );
-                }
+            ServerAction::Custody { state } => {
+                cmd::server::custody(&ctx, state).await?;
+            }
+            ServerAction::LocalAdds { state } => {
+                cmd::server::local_adds(&ctx, state).await?;
             }
         }
         return Ok(());
