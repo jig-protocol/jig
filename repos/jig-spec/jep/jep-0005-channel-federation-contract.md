@@ -334,7 +334,10 @@ Non-goals for v0.2:
        including its own channels' adds.
      - A record that leaves the custodian out, with a higher `seq` than the one it holds,
        withdraws custody: the custodian keeps it so no older record restores custody, and
-       answers `NO_CUSTODY` from then on.
+       answers `NO_CUSTODY` from then on. Withdrawal ends releases to other servers'
+       requesters only: the server's own channels can still add the DID from its stock.
+       Ending those adds, or erasing the DID's data, are separate requests, not yet
+       defined (#449).
      - The requester MUST check that a released package verifies and is the DID's before
        it commits.
 21b. *v0.2 interim, until DIDs sign release policies:* a server's own configured policy
