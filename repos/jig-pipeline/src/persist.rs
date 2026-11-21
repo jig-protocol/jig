@@ -2772,9 +2772,26 @@ impl SqliteStore {
     /// with this `seq` or a higher one is kept already. Returns whether it was
     /// stored. The caller verifies the record.
     pub fn put_reachability(&self, did: &str, seq: u64, envelope: &[u8], now: i64) -> Result<bool> {
+        self.put_reachability_retiring(did, seq, envelope, now, false)
+    }
+
+    /// [`Self::put_reachability`]; with `withdrawal`, a stored record also
+    /// retires `did`'s custody releases ([`Self::retire_custody_releases`])
+    /// in the same transaction, so a crash cannot keep the record and leave
+    /// the releases repeatable.
+    pub fn put_reachability_retiring(
+        &self,
+        did: &str,
+        seq: u64,
+        envelope: &[u8],
+        now: i64,
+        withdrawal: bool,
+    ) -> Result<bool> {
         // Big-endian bytes compare as the numbers do, across all of u64.
         let seq = seq.to_be_bytes().to_vec();
-        let changed = self.conn.lock().expect("poisoned").execute(
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
             "INSERT INTO reachability_records (did, seq, envelope, stored_at)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(did) DO UPDATE
@@ -2783,6 +2800,14 @@ impl SqliteStore {
               WHERE excluded.seq > reachability_records.seq",
             params![did, seq, envelope, now],
         )?;
+        if changed > 0 && withdrawal {
+            tx.execute(
+                "UPDATE kp_releases SET retired = 1
+                  WHERE did = ?1 AND kind = 'custody' AND retired = 0",
+                [did],
+            )?;
+        }
+        tx.commit()?;
         Ok(changed > 0)
     }
 
@@ -5036,7 +5061,12 @@ mod tests {
             .release_key_package(&ask(did, "did:jig:zA", b"h1", 100))
             .unwrap();
         assert!(matches!(first, Release::Released { ref package, .. } if package == b"kp1"));
-        assert_eq!(store.retire_custody_releases(did).unwrap(), 1);
+        // Stored with the withdrawal, in one transaction.
+        assert!(
+            store
+                .put_reachability_retiring(did, 2, b"w", 120, true)
+                .unwrap()
+        );
         // Within the repeat window, a new request and the same request
         // resent both get a fresh package, never the retired one.
         let again = store
