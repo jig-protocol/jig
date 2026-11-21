@@ -108,33 +108,29 @@ pub async fn publish_key_packages(
         .map_err(|outcome| refuse(&state, &outcome, started))?;
 
     let store = &state.ingest_ctx.store;
-    let (mut available, mut has_last_resort) =
-        store.key_package_stock(&did).map_err(persist_err)?;
     let now = chrono::Utc::now().timestamp();
-    let mut accepted = 0;
-    for (bytes, info) in validated {
-        // One last-resort package per DID is all it needs, and each carries a
-        // fresh reference, so without this a DID could store unboundedly
-        // many of them past `MAX_STOCK`.
-        if info.last_resort {
-            if has_last_resort {
-                continue;
-            }
-        } else if available >= MAX_STOCK {
-            continue;
+    let packages: Vec<(Vec<u8>, Vec<u8>, bool)> = validated
+        .into_iter()
+        .map(|(bytes, info)| (info.reference, bytes, info.last_resort))
+        .collect();
+    let ours = state.server_did.to_did_jig_string();
+    let accepted = match store
+        .stock_key_packages(&did, &packages, MAX_STOCK, &ours, now)
+        .map_err(persist_err)?
+    {
+        jig_pipeline::persist::Stocked::Accepted(n) => n as usize,
+        // JEP-0017 rule 19: custody and local adds are both ended here.
+        jig_pipeline::persist::Stocked::NotStockedHere => {
+            return Err(err(
+                StatusCode::FORBIDDEN,
+                "NOT_STOCKED_HERE",
+                format!(
+                    "{did} has ended both custody and local adds at this server, so its key \
+                     packages have no use here"
+                ),
+            ));
         }
-        if store
-            .insert_key_package(&info.reference, &did, &bytes, info.last_resort, now)
-            .map_err(persist_err)?
-        {
-            accepted += 1;
-            if info.last_resort {
-                has_last_resort = true;
-            } else {
-                available += 1;
-            }
-        }
-    }
+    };
     let (available, last_resort) = store.key_package_stock(&did).map_err(persist_err)?;
     Ok(Json(PublishResult {
         did,
@@ -167,6 +163,7 @@ pub async fn take_key_package(
     let requester = caller.map(|c| c.as_str().to_string()).unwrap_or_default();
     let take_id: [u8; 32] = rand::random();
     let custody = &state.config.custody;
+    let ours = state.server_did.to_did_jig_string();
     let ask = jig_pipeline::persist::ReleaseAsk {
         did: &did,
         requester: &requester,
@@ -180,6 +177,7 @@ pub async fn take_key_package(
         per_requester: custody.per_requester_per_hour,
         listing: None,
         kind: jig_pipeline::persist::ReleaseKind::Local,
+        server_did: &ours,
     };
     match state
         .ingest_ctx
@@ -196,6 +194,9 @@ pub async fn take_key_package(
             "RATE_LIMITED",
             format!("{did}'s key packages were taken too often in the last hour; try again later"),
         )),
+        jig_pipeline::persist::Release::LocalAddsEnded => {
+            Err(crate::v0_0_2_custody::local_adds_ended(&did))
+        }
         jig_pipeline::persist::Release::Empty | jig_pipeline::persist::Release::NotListed => {
             Err(err(
                 StatusCode::NOT_FOUND,

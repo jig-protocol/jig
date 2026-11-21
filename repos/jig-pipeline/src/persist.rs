@@ -93,6 +93,9 @@ pub struct ReleaseAsk<'a> {
     pub listing: Option<&'a [u8]>,
     /// Which route this release is for, as the log records it.
     pub kind: ReleaseKind,
+    /// This server's DID, which a channel it sequences names, so that a
+    /// release for one can be refused under the DID's local-adds marker.
+    pub server_did: &'a str,
 }
 
 /// Which hourly limit a release hit.
@@ -117,6 +120,29 @@ pub enum Release {
     /// The record `listing` named is no longer the one kept: custody was
     /// withdrawn or replaced since it was checked. Nothing was released.
     NotListed,
+    /// The DID has ended local adds here (JEP-0017 R2), and this release was
+    /// for a channel this server sequences, or by this server's own route.
+    /// Nothing was released.
+    LocalAddsEnded,
+}
+
+/// A DID's newest `jig-local-adds-v1` marker kept here (JEP-0017 R2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalAddsMarker {
+    pub seq: u64,
+    pub allow: bool,
+    /// The DID's own COSE_Sign1, kept as it was sent.
+    pub envelope: Vec<u8>,
+}
+
+/// What [`SqliteStore::stock_key_packages`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stocked {
+    /// This many packages were stored.
+    Accepted(u64),
+    /// The DID has ended both custody and local adds here (JEP-0017 rule
+    /// 19): its stock has no use, so nothing was stored.
+    NotStockedHere,
 }
 
 /// One entry of a custodian's release log.
@@ -1317,6 +1343,18 @@ impl SqliteStore {
             CREATE TABLE IF NOT EXISTS reachability_records (
                 did        TEXT PRIMARY KEY,
                 seq        BLOB NOT NULL,
+                envelope   BLOB NOT NULL,
+                stored_at  INTEGER NOT NULL
+            );
+
+            -- Each DID's newest local-adds marker (JEP-0017 R2): whether
+            -- others may add it to the channels this server sequences. The
+            -- envelope is the DID's own `jig-local-adds-v1`. `seq` is 8
+            -- big-endian bytes, as in `reachability_records`.
+            CREATE TABLE IF NOT EXISTS local_adds (
+                did        TEXT PRIMARY KEY,
+                seq        BLOB NOT NULL,
+                allow      INTEGER NOT NULL,
                 envelope   BLOB NOT NULL,
                 stored_at  INTEGER NOT NULL
             );
@@ -2680,10 +2718,23 @@ impl SqliteStore {
     /// Keep `envelope`, `did`'s reachability record at `seq`, unless a record
     /// with this `seq` or a higher one is kept already. Returns whether it was
     /// stored. The caller verifies the record.
-    pub fn put_reachability(&self, did: &str, seq: u64, envelope: &[u8], now: i64) -> Result<bool> {
+    ///
+    /// In the same transaction: if the record kept now withdraws custody from
+    /// `server_did` while `did` has ended local adds here, `did`'s stock has
+    /// no use and is deleted (JEP-0017 rule 19).
+    pub fn put_reachability(
+        &self,
+        did: &str,
+        seq: u64,
+        envelope: &[u8],
+        server_did: &str,
+        now: i64,
+    ) -> Result<bool> {
         // Big-endian bytes compare as the numbers do, across all of u64.
         let seq = seq.to_be_bytes().to_vec();
-        let changed = self.conn.lock().expect("poisoned").execute(
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
             "INSERT INTO reachability_records (did, seq, envelope, stored_at)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(did) DO UPDATE
@@ -2692,7 +2743,116 @@ impl SqliteStore {
               WHERE excluded.seq > reachability_records.seq",
             params![did, seq, envelope, now],
         )?;
+        if stock_ended_on(&tx, did, server_did)? {
+            purge_stock_on(&tx, did)?;
+        }
+        tx.commit()?;
         Ok(changed > 0)
+    }
+
+    /// Keep `envelope`, `did`'s local-adds marker at `seq` (JEP-0017 R2),
+    /// unless one with this `seq` or a higher one is kept already. Returns the
+    /// marker kept afterwards, whichever it is. The caller verifies the
+    /// marker.
+    ///
+    /// In the same transaction, as [`Self::put_reachability`]: once custody
+    /// and local adds are both ended here, `did`'s stock is deleted.
+    pub fn put_local_adds(
+        &self,
+        did: &str,
+        seq: u64,
+        allow: bool,
+        envelope: &[u8],
+        server_did: &str,
+        now: i64,
+    ) -> Result<LocalAddsMarker> {
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO local_adds (did, seq, allow, envelope, stored_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(did) DO UPDATE
+                SET seq = excluded.seq, allow = excluded.allow,
+                    envelope = excluded.envelope, stored_at = excluded.stored_at
+              WHERE excluded.seq > local_adds.seq",
+            params![did, seq.to_be_bytes().to_vec(), allow, envelope, now],
+        )?;
+        let kept = local_adds_on(&tx, did)?.expect("a marker was just kept");
+        if stock_ended_on(&tx, did, server_did)? {
+            purge_stock_on(&tx, did)?;
+        }
+        tx.commit()?;
+        Ok(kept)
+    }
+
+    /// `did`'s kept local-adds marker, if it sent one.
+    pub fn local_adds(&self, did: &str) -> Result<Option<LocalAddsMarker>> {
+        local_adds_on(&self.conn.lock().expect("poisoned"), did)
+    }
+
+    /// Whether `did` has ended local adds here: its kept marker says
+    /// `allow = false`.
+    pub fn local_adds_ended(&self, did: &str) -> Result<bool> {
+        local_adds_ended_on(&self.conn.lock().expect("poisoned"), did)
+    }
+
+    /// Store `did`'s validated packages, `(reference, bytes, last_resort)`,
+    /// in one transaction: at most one last-resort package, and ordinary ones
+    /// up to `max_stock` unconsumed. Nothing is stored while `did` has ended
+    /// both custody and local adds at `server_did` (JEP-0017 rule 19).
+    pub fn stock_key_packages(
+        &self,
+        did: &str,
+        packages: &[(Vec<u8>, Vec<u8>, bool)],
+        max_stock: u64,
+        server_did: &str,
+        now: i64,
+    ) -> Result<Stocked> {
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        if stock_ended_on(&tx, did, server_did)? {
+            return Ok(Stocked::NotStockedHere);
+        }
+        let mut available: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM mls_key_packages
+              WHERE did = ? AND consumed_at IS NULL AND last_resort = 0",
+            [did],
+            |r| r.get(0),
+        )?;
+        let mut has_last_resort: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mls_key_packages WHERE did = ? AND last_resort = 1)",
+            [did],
+            |r| r.get(0),
+        )?;
+        let mut accepted = 0;
+        for (reference, package, last_resort) in packages {
+            // One last-resort package per DID is all it needs, and each
+            // carries a fresh reference, so without this a DID could store
+            // unboundedly many of them past `max_stock`.
+            if *last_resort {
+                if has_last_resort {
+                    continue;
+                }
+            } else if available as u64 >= max_stock {
+                continue;
+            }
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO mls_key_packages
+                    (reference, did, package, last_resort, published_at)
+                 VALUES (?,?,?,?,?)",
+                params![reference, did, package, last_resort, now],
+            )?;
+            if inserted > 0 {
+                accepted += 1;
+                if *last_resort {
+                    has_last_resort = true;
+                } else {
+                    available += 1;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(Stocked::Accepted(accepted))
     }
 
     /// `did`'s kept reachability record, as its envelope.
@@ -2735,6 +2895,15 @@ impl SqliteStore {
             if kept.as_deref() != Some(listing) {
                 return Ok(Release::NotListed);
             }
+        }
+        // JEP-0017 R2, in the same transaction as the release: a marker
+        // stored meanwhile wins. Custody for channels other servers sequence,
+        // or that this server does not know, is unaffected.
+        if local_adds_ended_on(&tx, ask.did)?
+            && (ask.kind == ReleaseKind::Local
+                || channel_sequenced_here_on(&tx, ask.channel_id, ask.server_did)?)
+        {
+            return Ok(Release::LocalAddsEnded);
         }
         let earlier: Option<(Vec<u8>, Vec<u8>, bool)> = if ask.repeat {
             tx.query_row(
@@ -3418,6 +3587,101 @@ pub(crate) fn archive_channel_by_id_on(
     )?;
     Ok(changed > 0)
 }
+/// `did`'s kept local-adds marker, read on `conn` (a transaction's, so the
+/// caller's checks see what it will commit against).
+fn local_adds_on(conn: &Connection, did: &str) -> Result<Option<LocalAddsMarker>> {
+    conn.query_row(
+        "SELECT seq, allow, envelope FROM local_adds WHERE did = ?",
+        [did],
+        |r| {
+            let seq: Vec<u8> = r.get(0)?;
+            Ok((seq, r.get::<_, bool>(1)?, r.get::<_, Vec<u8>>(2)?))
+        },
+    )
+    .optional()?
+    .map(|(seq, allow, envelope)| {
+        let seq: [u8; 8] = seq
+            .try_into()
+            .map_err(|_| PersistError::Corrupt("a local-adds seq is not 8 bytes".into()))?;
+        Ok(LocalAddsMarker {
+            seq: u64::from_be_bytes(seq),
+            allow,
+            envelope,
+        })
+    })
+    .transpose()
+}
+
+/// Whether `did`'s kept marker ends local adds here (JEP-0017 R2).
+fn local_adds_ended_on(conn: &Connection, did: &str) -> Result<bool> {
+    Ok(local_adds_on(conn, did)?.is_some_and(|m| !m.allow))
+}
+
+/// Whether `did`'s kept reachability record withdraws custody from
+/// `server_did` (JEP-0005 rule 21a): one is kept and it does not list this
+/// server. A record that does not parse was verified when kept, so this
+/// does not happen; it is read as not withdrawing.
+fn custody_withdrawn_on(conn: &Connection, did: &str, server_did: &str) -> Result<bool> {
+    let kept: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT envelope FROM reachability_records WHERE did = ?",
+            [did],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(envelope) = kept else {
+        return Ok(false);
+    };
+    let ours = crate::effect::canonical_did_string(server_did);
+    Ok(
+        jig_core::naming::ReachabilityRecord::from_envelope(&envelope).is_ok_and(|record| {
+            !record
+                .servers
+                .iter()
+                .any(|(server, _)| crate::effect::canonical_did_string(server) == ours)
+        }),
+    )
+}
+
+/// Whether `did` has ended both custody and local adds at `server_did`, so
+/// its stock there has no use (JEP-0017 rule 19).
+fn stock_ended_on(conn: &Connection, did: &str, server_did: &str) -> Result<bool> {
+    Ok(local_adds_ended_on(conn, did)? && custody_withdrawn_on(conn, did, server_did)?)
+}
+
+/// Delete `did`'s stock: its unconsumed packages and its last-resort one.
+/// Consumed packages stay, so their references cannot be stored again.
+fn purge_stock_on(conn: &Connection, did: &str) -> Result<usize> {
+    Ok(conn.execute(
+        "DELETE FROM mls_key_packages
+          WHERE did = ? AND (consumed_at IS NULL OR last_resort = 1)",
+        [did],
+    )?)
+}
+
+/// Whether the channel `channel_id` names is one this server sequences: a
+/// channel it holds whose sequencer is `server_did`, or names none (a
+/// channel from before sequencers were recorded is this server's own). A
+/// channel it does not hold is not.
+fn channel_sequenced_here_on(
+    conn: &Connection,
+    channel_id: &str,
+    server_did: &str,
+) -> Result<bool> {
+    let sequencer: Option<String> = conn
+        .query_row(
+            "SELECT sequencer_did FROM channels WHERE id = ?",
+            [channel_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(sequencer.is_some_and(|s| {
+        s.is_empty()
+            || crate::effect::canonical_did_string(&s)
+                == crate::effect::canonical_did_string(server_did)
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4790,6 +5054,7 @@ mod tests {
             per_requester: 2,
             listing: None,
             kind: ReleaseKind::Custody,
+            server_did: "did:jig:zserver",
         }
     }
 
@@ -4924,10 +5189,26 @@ mod tests {
         let store = SqliteStore::open_in_memory().unwrap();
         let did = "did:jig:zD";
         let edge = i64::MAX as u64;
-        assert!(store.put_reachability(did, edge, b"edge", 1).unwrap());
-        assert!(store.put_reachability(did, edge + 1, b"past", 2).unwrap());
-        assert!(store.put_reachability(did, u64::MAX, b"top", 3).unwrap());
-        assert!(!store.put_reachability(did, edge + 1, b"older", 4).unwrap());
+        assert!(
+            store
+                .put_reachability(did, edge, b"edge", "did:jig:zserver", 1)
+                .unwrap()
+        );
+        assert!(
+            store
+                .put_reachability(did, edge + 1, b"past", "did:jig:zserver", 2)
+                .unwrap()
+        );
+        assert!(
+            store
+                .put_reachability(did, u64::MAX, b"top", "did:jig:zserver", 3)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .put_reachability(did, edge + 1, b"older", "did:jig:zserver", 4)
+                .unwrap()
+        );
         assert_eq!(store.reachability(did).unwrap().unwrap(), b"top");
     }
 
@@ -5058,9 +5339,13 @@ mod tests {
         store
             .insert_key_package(b"r1", did, b"kp1", false, 1)
             .unwrap();
-        store.put_reachability(did, 1, b"listing", 1).unwrap();
+        store
+            .put_reachability(did, 1, b"listing", "did:jig:zserver", 1)
+            .unwrap();
         // A withdrawal lands between the handler's check and the release.
-        store.put_reachability(did, 2, b"withdrawal", 2).unwrap();
+        store
+            .put_reachability(did, 2, b"withdrawal", "did:jig:zserver", 2)
+            .unwrap();
         let mut a = ask(did, "did:jig:zA", b"h1", 100);
         a.listing = Some(b"listing");
         assert_eq!(store.release_key_package(&a).unwrap(), Release::NotListed);
@@ -5077,16 +5362,252 @@ mod tests {
         ));
     }
 
+    /// A member, the server, and a record of the member's that lists or
+    /// withdraws the server, signed as they are on the wire (JEP-0017 R2).
+    struct R2 {
+        did: String,
+        server: String,
+        key: ed25519_dalek::SigningKey,
+    }
+
+    impl R2 {
+        fn new() -> Self {
+            let key = ed25519_dalek::SigningKey::from_bytes(&[0x21; 32]);
+            let did_of = |k: &ed25519_dalek::SigningKey| {
+                jig_core::Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+            };
+            let server = did_of(&ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]));
+            Self {
+                did: did_of(&key),
+                server,
+                key,
+            }
+        }
+
+        /// Store a record at `seq` that lists this server, or withdraws it.
+        fn reach(&self, store: &SqliteStore, seq: u64, lists_here: bool) {
+            let servers = if lists_here {
+                vec![(self.server.clone(), "https://here.example".to_string())]
+            } else {
+                vec![]
+            };
+            let record = jig_core::naming::ReachabilityRecord::sign(&self.key, servers, seq);
+            store
+                .put_reachability(&self.did, seq, &record.envelope, &self.server, 1)
+                .unwrap();
+        }
+
+        fn local_adds(&self, store: &SqliteStore, seq: u64, allow: bool) -> LocalAddsMarker {
+            store
+                .put_local_adds(&self.did, seq, allow, b"marker", &self.server, 1)
+                .unwrap()
+        }
+
+        fn stock(&self, store: &SqliteStore) -> Stocked {
+            store
+                .stock_key_packages(
+                    &self.did,
+                    &[
+                        (b"r1".to_vec(), b"kp1".to_vec(), false),
+                        (b"lr".to_vec(), b"kplr".to_vec(), true),
+                    ],
+                    200,
+                    &self.server,
+                    1,
+                )
+                .unwrap()
+        }
+
+        fn ask<'a>(&'a self, channel_id: &'a str, kind: ReleaseKind) -> ReleaseAsk<'a> {
+            ReleaseAsk {
+                did: &self.did,
+                requester: "did:jig:zA",
+                channel_id,
+                request_hash: b"h",
+                request: b"signed request",
+                now: 100,
+                repeat_window: 0,
+                repeat: false,
+                per_did: 10,
+                per_requester: 10,
+                listing: None,
+                kind,
+                server_did: &self.server,
+            }
+        }
+    }
+
+    #[test]
+    fn a_local_adds_marker_is_kept_only_at_a_higher_seq() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let r2 = R2::new();
+        assert_eq!(store.local_adds(&r2.did).unwrap(), None);
+        assert!(!store.local_adds_ended(&r2.did).unwrap());
+        let kept = r2.local_adds(&store, 5, false);
+        assert_eq!((kept.seq, kept.allow), (5, false));
+        // A lower or equal seq changes nothing, and the answer is what holds.
+        let kept = r2.local_adds(&store, 5, true);
+        assert_eq!((kept.seq, kept.allow), (5, false));
+        let kept = r2.local_adds(&store, 4, true);
+        assert_eq!((kept.seq, kept.allow), (5, false));
+        assert!(store.local_adds_ended(&r2.did).unwrap());
+        // `allow = true` at a higher seq undoes it.
+        let kept = r2.local_adds(&store, u64::MAX, true);
+        assert_eq!((kept.seq, kept.allow), (u64::MAX, true));
+        assert!(!store.local_adds_ended(&r2.did).unwrap());
+    }
+
+    #[test]
+    fn ending_local_adds_alone_keeps_the_stock_for_custody() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let r2 = R2::new();
+        r2.reach(&store, 1, true);
+        assert_eq!(r2.stock(&store), Stocked::Accepted(2));
+        r2.local_adds(&store, 1, false);
+        assert_eq!(store.key_package_stock(&r2.did).unwrap(), (1, true));
+        // Uploads are still accepted: custody may use them.
+        assert_eq!(r2.stock(&store), Stocked::Accepted(0), "already held");
+    }
+
+    #[test]
+    fn custody_and_local_adds_both_ended_delete_the_stock_whichever_comes_second() {
+        for r1_first in [true, false] {
+            let store = SqliteStore::open_in_memory().unwrap();
+            let r2 = R2::new();
+            r2.reach(&store, 1, true);
+            assert_eq!(r2.stock(&store), Stocked::Accepted(2));
+            if r1_first {
+                r2.reach(&store, 2, false);
+                assert_eq!(store.key_package_stock(&r2.did).unwrap(), (1, true));
+                r2.local_adds(&store, 1, false);
+            } else {
+                r2.local_adds(&store, 1, false);
+                assert_eq!(store.key_package_stock(&r2.did).unwrap(), (1, true));
+                r2.reach(&store, 2, false);
+            }
+            assert_eq!(
+                store.key_package_stock(&r2.did).unwrap(),
+                (0, false),
+                "the stock has no use (r1_first = {r1_first})"
+            );
+            assert_eq!(r2.stock(&store), Stocked::NotStockedHere);
+            assert_eq!(store.key_package_stock(&r2.did).unwrap(), (0, false));
+        }
+    }
+
+    #[test]
+    fn uploads_resume_when_either_side_is_undone() {
+        for undo_r1 in [true, false] {
+            let store = SqliteStore::open_in_memory().unwrap();
+            let r2 = R2::new();
+            r2.reach(&store, 1, false);
+            r2.local_adds(&store, 1, false);
+            assert_eq!(r2.stock(&store), Stocked::NotStockedHere);
+            if undo_r1 {
+                r2.reach(&store, 2, true);
+            } else {
+                r2.local_adds(&store, 2, true);
+            }
+            // References of deleted stock are fresh ones again.
+            assert_eq!(
+                r2.stock(&store),
+                Stocked::Accepted(2),
+                "undo_r1 = {undo_r1}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_local_take_under_ended_local_adds_releases_nothing() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let r2 = R2::new();
+        r2.stock(&store);
+        r2.local_adds(&store, 1, false);
+        assert_eq!(
+            store
+                .release_key_package(&r2.ask("", ReleaseKind::Local))
+                .unwrap(),
+            Release::LocalAddsEnded
+        );
+        assert_eq!(store.key_package_stock(&r2.did).unwrap(), (1, true));
+        assert!(store.key_package_releases(&r2.did, 10).unwrap().is_empty());
+        r2.local_adds(&store, 2, true);
+        assert!(matches!(
+            store
+                .release_key_package(&r2.ask("", ReleaseKind::Local))
+                .unwrap(),
+            Release::Released { .. }
+        ));
+    }
+
+    /// Custody under R2 is refused only for a channel this server sequences:
+    /// one another server sequences, or one it does not know, is released
+    /// (JEP-0017 rule 16). A `member-add` to a channel sequenced here is
+    /// refused at ingest whatever the package's source.
+    #[test]
+    fn custody_under_ended_local_adds_is_refused_only_for_channels_sequenced_here() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let r2 = R2::new();
+        let mut here = sample_channel("chan-here", "#here");
+        here.sequencer_did = r2.server.clone();
+        store.upsert_channel(&here).unwrap();
+        store
+            .upsert_channel(&sample_channel("chan-legacy", "#legacy"))
+            .unwrap();
+        let mut elsewhere = sample_channel("chan-elsewhere", "#elsewhere");
+        elsewhere.sequencer_did = "did:jig:zelsewhere".to_string();
+        store.upsert_channel(&elsewhere).unwrap();
+        r2.stock(&store);
+        r2.local_adds(&store, 1, false);
+        for channel in ["chan-here", "chan-legacy"] {
+            assert_eq!(
+                store
+                    .release_key_package(&r2.ask(channel, ReleaseKind::Custody))
+                    .unwrap(),
+                Release::LocalAddsEnded,
+                "{channel}"
+            );
+        }
+        for channel in ["chan-elsewhere", "chan-unknown"] {
+            let mut ask = r2.ask(channel, ReleaseKind::Custody);
+            let hash = format!("h-{channel}");
+            ask.request_hash = hash.as_bytes();
+            assert!(
+                matches!(
+                    store.release_key_package(&ask).unwrap(),
+                    Release::Released { .. } | Release::Again { .. }
+                ),
+                "{channel}"
+            );
+        }
+    }
+
     #[test]
     fn a_reachability_record_is_replaced_only_by_a_higher_seq() {
         let store = SqliteStore::open_in_memory().unwrap();
         let did = "did:jig:zD";
         assert_eq!(store.reachability(did).unwrap(), None);
-        assert!(store.put_reachability(did, 5, b"five", 1).unwrap());
-        assert!(!store.put_reachability(did, 5, b"other five", 2).unwrap());
-        assert!(!store.put_reachability(did, 4, b"four", 3).unwrap());
+        assert!(
+            store
+                .put_reachability(did, 5, b"five", "did:jig:zserver", 1)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .put_reachability(did, 5, b"other five", "did:jig:zserver", 2)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .put_reachability(did, 4, b"four", "did:jig:zserver", 3)
+                .unwrap()
+        );
         assert_eq!(store.reachability(did).unwrap().unwrap(), b"five");
-        assert!(store.put_reachability(did, 6, b"six", 4).unwrap());
+        assert!(
+            store
+                .put_reachability(did, 6, b"six", "did:jig:zserver", 4)
+                .unwrap()
+        );
         assert_eq!(store.reachability(did).unwrap().unwrap(), b"six");
     }
 
