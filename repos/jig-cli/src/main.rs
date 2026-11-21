@@ -874,12 +874,16 @@ async fn run() -> Result<()> {
                 // Publish MLS key packages to the new server so others can
                 // add this identity to encrypted channels and DMs straight
                 // away. Best effort: the server may be down, or predate v0.2.
-                if let Ok(secure) = cmd::secure::Secure::open(&ctx)
-                    && secure.ensure_key_packages().await.is_ok()
-                {
-                    println!(
-                        "published MLS key packages (others can now add you to encrypted channels)"
-                    );
+                let published = match cmd::secure::Secure::open(&ctx) {
+                    Ok(secure) => secure.ensure_key_packages().await,
+                    Err(e) => Err(e),
+                };
+                match published {
+                    Ok(()) => println!(
+                        "published MLS key packages (others can now add you to encrypted \
+                         channels)"
+                    ),
+                    Err(e) => eprintln!("warning: key packages not published: {e:#}"),
                 }
             }
             ServerAction::Info { url } => {
