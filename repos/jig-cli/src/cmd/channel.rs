@@ -444,11 +444,27 @@ pub(crate) async fn create_with(
             // This server's own channel under the slug: one it carries for
             // another server is not the create this device left pending.
             if let Some(info) = secure.own_channel(slug).await? {
-                // A create the server never answered, and took.
-                secure
-                    .session
-                    .rename_group(secure.server(), &pending, &info.id)?;
-                return already();
+                // A create the server never answered, and took: only if the
+                // channel was created with this group (#455). Another device
+                // under this identity may have created the slug with its own.
+                let listed = secure.created_group_id(&info).await?;
+                if secure.session.group_id(secure.server(), &pending)?.as_ref() == Some(&listed) {
+                    secure
+                        .session
+                        .rename_group(secure.server(), &pending, &info.id)?;
+                    return already();
+                }
+                secure.session.discard_group(secure.server(), &pending)?;
+                let exists = format!(
+                    "{slug} already exists, created from another device. To take part in it \
+                     here, run `jig channel join {slug}`"
+                );
+                if exist_ok {
+                    println!("channel already exists: {slug}");
+                    eprintln!("note: {exists}");
+                    return Ok(false);
+                }
+                anyhow::bail!(exists);
             }
             // Left over from a create the server never answered and never took.
             secure.session.discard_group(secure.server(), &pending)?;
