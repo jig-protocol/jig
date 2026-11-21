@@ -464,6 +464,21 @@ enum ServerAction {
         #[arg(long)]
         url: Option<String>,
     },
+
+    /// Whether others may add you to channels the configured server
+    /// sequences (JEP-0017 R2). `end` stops it: members there see
+    /// `LOCAL_ADDS_ENDED` or `MEMBER_DECLINED`. Channels you are in stay as
+    /// they are, and you can still join one yourself. `allow` undoes it.
+    LocalAdds {
+        #[arg(value_enum)]
+        action: LocalAddsAction,
+    },
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum LocalAddsAction {
+    End,
+    Allow,
 }
 
 // Parsed once per process; boxing `Run`'s fields would buy nothing.
@@ -876,6 +891,22 @@ async fn run() -> Result<()> {
             }
             ServerAction::Forget { url } => {
                 cmd::server::forget(&ctx, url.as_deref())?;
+            }
+            ServerAction::LocalAdds { action } => {
+                let allow = matches!(action, LocalAddsAction::Allow);
+                let secure = cmd::secure::Secure::open(&ctx)?;
+                let kept = secure.set_local_adds(allow).await?;
+                if kept.allow {
+                    println!(
+                        "others can add you to channels {} sequences",
+                        secure.server()
+                    );
+                } else {
+                    println!(
+                        "others can no longer add you to channels {} sequences",
+                        secure.server()
+                    );
+                }
             }
         }
         return Ok(());

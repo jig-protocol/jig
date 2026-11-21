@@ -20,6 +20,7 @@ use jig_client::pins::{
 };
 use jig_client::read_auth::{ReadProof, signable_path};
 use jig_client::secure::{CommitLock, ReadIn, Seen, Session, history_reaches, replay_order};
+use jig_client::servers::{LocalAdds, ServerState, ServerStates};
 use jig_client::{Client, ClientError, DeliveredBlock, Identity};
 use jig_core::naming::ReachabilityRecord;
 use jig_mls::member::Commit;
@@ -69,6 +70,17 @@ impl Refused {
     pub fn is_definite(&self) -> bool {
         (400..500).contains(&self.status)
     }
+}
+
+/// Whether `e` is a server saying the member it was asked to add ended local
+/// adds there (JEP-0017 R2): `LOCAL_ADDS_ENDED` for a key package,
+/// `MEMBER_DECLINED` for the `member-add`. Both are final for that channel
+/// (rule 18).
+pub fn local_adds_ended(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<Refused>()
+            .is_some_and(|r| r.code == "LOCAL_ADDS_ENDED" || r.code == "MEMBER_DECLINED")
+    })
 }
 
 /// Whether `e` is the server definitely turning a request down.
@@ -720,6 +732,16 @@ impl Secure {
             last_resort: bool,
         }
         let did = self.session.did().to_string();
+        let server_did = self.server_did().await?;
+        // Custody withdrawn and local adds ended: the server keeps no stock
+        // for this identity and refuses uploads (JEP-0017 rule 19). Not
+        // publishing reachability either keeps R1's record as it is.
+        if self
+            .server_state(&server_did)?
+            .is_some_and(|s| s.stock_ended())
+        {
+            return Ok(());
+        }
         let stock: Stock = self
             .get_json(&format!("/api/v1/mls/key-packages/{did}/stock"))
             .await?;
@@ -750,9 +772,101 @@ impl Secure {
             .await
             .with_context(|| format!("POST {url}"))?;
         if !resp.status().is_success() {
-            return Err(Self::refusal(resp).await.into());
+            let refused = Self::refusal(resp).await;
+            // Another of this identity's devices ended both custody and local
+            // adds here: the server, not this device's state, is what says so.
+            if refused.code == "NOT_STOCKED_HERE" {
+                return Ok(());
+            }
+            return Err(refused.into());
         }
         self.ensure_reachable().await
+    }
+
+    /// End (`allow = false`) or allow again (`allow = true`) local adds at
+    /// this server (JEP-0017 R2): while ended, nobody else can add this
+    /// identity to a channel the server sequences. Answers the marker the
+    /// server keeps afterwards, and records it for this device.
+    pub async fn set_local_adds(&self, allow: bool) -> Result<LocalAdds> {
+        let did = self.session.did().to_string();
+        let server_did = self.server_did().await?;
+        let path = ServerStates::default_path(&did);
+        let sent = ServerStates::load(&path)?
+            .get(&server_did)
+            .and_then(|s| s.local_adds)
+            .map_or(0, |l| l.seq);
+        // Like reachability records, the clock keeps each marker above any
+        // another device of this identity sent.
+        let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
+        let mut kept = self
+            .put_local_adds(&did, &server_did, allow, sent.saturating_add(1).max(now))
+            .await?;
+        // The server kept a later marker than ours, from another device:
+        // say this one once more, above it.
+        if kept.allow != allow {
+            kept = self
+                .put_local_adds(&did, &server_did, allow, kept.seq.saturating_add(1))
+                .await?;
+        }
+        let stock_ended = ServerStates::update(&path, |s| {
+            let state = s.entry(&server_did, &self.base);
+            state.local_adds = Some(kept);
+            state.stock_ended()
+        })?;
+        if stock_ended {
+            // TODO(R1): delete_stock_keys(server_did): the server deleted
+            // the stock, so its private init keys are of no further use
+            // (JEP-0017 rule 32).
+        }
+        Ok(kept)
+    }
+
+    async fn put_local_adds(
+        &self,
+        did: &str,
+        server_did: &str,
+        allow: bool,
+        seq: u64,
+    ) -> Result<LocalAdds> {
+        #[derive(Deserialize)]
+        struct Kept {
+            allow: bool,
+            seq: u64,
+        }
+        let marker = self.identity.sign_local_adds(server_did, allow, seq);
+        let url = format!("{}/api/v1/local-adds/{did}", self.base);
+        let resp = self
+            .http()
+            .await?
+            .put(&url)
+            .json(&serde_json::json!({"request_b64": STANDARD.encode(&marker.envelope)}))
+            .send()
+            .await
+            .with_context(|| format!("PUT {url}"))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND
+            || resp.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED
+        {
+            anyhow::bail!(
+                "{} does not support ending local adds (JEP-0017)",
+                self.server
+            );
+        }
+        if !resp.status().is_success() {
+            return Err(Self::refusal(resp).await.into());
+        }
+        let kept: Kept = limits::json_capped(resp, limits::MAX_DOCUMENT_BYTES)
+            .await
+            .with_context(|| format!("PUT {url} answered something other than a marker"))?;
+        Ok(LocalAdds {
+            allow: kept.allow,
+            seq: kept.seq,
+        })
+    }
+
+    /// This device's state at its server ([`ServerStates`]), if it has any.
+    fn server_state(&self, server_did: &str) -> Result<Option<ServerState>> {
+        let path = ServerStates::default_path(self.session.did());
+        Ok(ServerStates::load(&path)?.get(server_did).cloned())
     }
 
     /// The DID this device pinned for its server.
@@ -842,6 +956,12 @@ impl Secure {
         for (server_did, url) in &record.servers {
             match self.ask_custodian(did, channel_id, server_did, url).await {
                 Ok(package) => return Ok(package),
+                // The custodian sequences the channel and `did` ended local
+                // adds there: it would refuse the member-add too, so no other
+                // custodian is asked (JEP-0017 rule 18).
+                Err(e) if local_adds_ended(&e) => {
+                    return Err(e.context(format!("{url} ({server_did})")));
+                }
                 Err(e) => tried.push(format!("  {url} ({server_did}): {e:#}")),
             }
         }
