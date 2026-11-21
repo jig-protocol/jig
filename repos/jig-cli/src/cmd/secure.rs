@@ -445,6 +445,73 @@ impl LogWalk {
     }
 }
 
+/// One entry of a server's release log, as this device reads it.
+#[derive(Deserialize)]
+struct ReleaseEntry {
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    reference_hex: Option<String>,
+    #[serde(default)]
+    channel_id: String,
+    #[serde(default)]
+    request_b64: String,
+    #[serde(default)]
+    id_hex: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ReleaseLog {
+    releases: Vec<ReleaseEntry>,
+}
+
+/// Entries per page of the release log, as the server pages it.
+const RELEASE_PAGE: usize = 200;
+
+/// Walk a release log page by page, `fetch(offset)` giving each page (`None`
+/// when the server keeps no log), and collect the references of the custody
+/// releases in it. A short page ends the walk; [`LogWalk`] ends one that
+/// does not.
+async fn walk_release_log<F, Fut>(server: &str, mut fetch: F) -> Result<Vec<Vec<u8>>>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Vec<ReleaseEntry>>>>,
+{
+    let mut refs = Vec::new();
+    let mut offset = 0;
+    let mut walk = LogWalk::default();
+    loop {
+        let Some(releases) = fetch(offset).await? else {
+            return Ok(refs);
+        };
+        let n = releases.len();
+        // Each entry is told apart by its own id; a server that sends
+        // none leaves only the page cap.
+        let ids: Option<Vec<String>> = releases.iter().map(|e| e.id_hex.clone()).collect();
+        walk.page(server, ids)?;
+        for e in releases {
+            let custody = match e.kind.as_deref() {
+                Some(kind) => kind == "custody",
+                None => !e.channel_id.is_empty() || !e.request_b64.is_empty(),
+            };
+            if !custody {
+                continue;
+            }
+            match e.reference_hex.as_deref().map(hex::decode) {
+                Some(Ok(r)) => refs.push(r),
+                _ => anyhow::bail!(
+                    "{server} logs releases without the package they released; it cannot \
+                     tell this device which keys to delete"
+                ),
+            }
+        }
+        if n < RELEASE_PAGE {
+            return Ok(refs);
+        }
+        offset += n;
+    }
+}
+
 /// What [`Secure::set_custody`] did.
 #[derive(Debug, Default)]
 pub struct CustodyChange {
@@ -1258,66 +1325,20 @@ impl Secure {
     /// before rule 32 carries no `kind`: it is `local` when it names no
     /// channel and no request, as #440 logged a local take.
     async fn custody_releases(&self) -> Result<Vec<Vec<u8>>> {
-        #[derive(Deserialize)]
-        struct Entry {
-            #[serde(default)]
-            kind: Option<String>,
-            #[serde(default)]
-            reference_hex: Option<String>,
-            #[serde(default)]
-            channel_id: String,
-            #[serde(default)]
-            request_b64: String,
-            #[serde(default)]
-            id_hex: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct Log {
-            releases: Vec<Entry>,
-        }
-        const PAGE: usize = 200;
         let did = self.session.did().to_string();
-        let mut refs = Vec::new();
-        let mut offset = 0;
-        let mut walk = LogWalk::default();
-        loop {
-            let log: Log = match self
-                .get_json(&format!("/api/v1/custody/{did}/releases?offset={offset}"))
-                .await
-            {
-                Ok(log) => log,
-                Err(e) => match e.downcast_ref::<Refused>() {
-                    Some(r) if r.status == 404 || r.status == 405 => return Ok(refs),
-                    _ => return Err(e),
-                },
-            };
-            let n = log.releases.len();
-            // Each entry is told apart by its own id; a server that sends
-            // none leaves only the page cap.
-            let ids: Option<Vec<String>> = log.releases.iter().map(|e| e.id_hex.clone()).collect();
-            walk.page(&self.server, ids)?;
-            for e in log.releases {
-                let custody = match e.kind.as_deref() {
-                    Some(kind) => kind == "custody",
-                    None => !e.channel_id.is_empty() || !e.request_b64.is_empty(),
-                };
-                if !custody {
-                    continue;
-                }
-                match e.reference_hex.as_deref().map(hex::decode) {
-                    Some(Ok(r)) => refs.push(r),
-                    _ => anyhow::bail!(
-                        "{} logs releases without the package they released; it cannot \
-                         tell this device which keys to delete",
-                        self.server
-                    ),
+        walk_release_log(&self.server, |offset| {
+            let path = format!("/api/v1/custody/{did}/releases?offset={offset}");
+            async move {
+                match self.get_json::<ReleaseLog>(&path).await {
+                    Ok(log) => Ok(Some(log.releases)),
+                    Err(e) => match e.downcast_ref::<Refused>() {
+                        Some(r) if r.status == 404 || r.status == 405 => Ok(None),
+                        _ => Err(e),
+                    },
                 }
             }
-            if n < PAGE {
-                return Ok(refs);
-            }
-            offset += n;
-        }
+        })
+        .await
     }
 
     /// Upload `packages` here, and remember their references
@@ -2221,9 +2242,9 @@ fn shadow_note(reference: &str, own: &ChannelInfo, carried: &ChannelInfo) -> Str
 #[cfg(test)]
 mod tests {
     use super::{
-        ChannelInfo, KeptAnswer, LogWalk, RecordBody, group_name, judge_kept_answer,
-        kept_leaves_out, must_encrypt, ordered_here, own_group_name, pick, sequencers_for,
-        shadow_note, split_unchecked,
+        ChannelInfo, KeptAnswer, LogWalk, RELEASE_PAGE, RecordBody, ReleaseEntry, group_name,
+        judge_kept_answer, kept_leaves_out, must_encrypt, ordered_here, own_group_name, pick,
+        sequencers_for, shadow_note, split_unchecked, walk_release_log,
     };
 
     #[test]
@@ -2311,6 +2332,73 @@ mod tests {
         let (send_to, skipped) = split_unchecked(&servers, &unchecked);
         assert_eq!(send_to, [servers[0].clone(), servers[2].clone()]);
         assert_eq!(skipped, [servers[1].clone()]);
+    }
+
+    /// A page of `n` custody releases, numbered from `from`, each with its id.
+    fn release_page(from: usize, n: usize, with_ids: bool) -> Vec<ReleaseEntry> {
+        (from..from + n)
+            .map(|i| ReleaseEntry {
+                kind: Some("custody".into()),
+                reference_hex: Some(hex::encode((i as u32).to_be_bytes())),
+                channel_id: String::new(),
+                request_b64: String::new(),
+                id_hex: with_ids.then(|| format!("{i:08x}")),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn full_distinct_pages_are_walked_to_the_short_one() {
+        let mut asked = Vec::new();
+        let refs = walk_release_log("S", |offset| {
+            asked.push(offset);
+            let n = if offset < 2 * RELEASE_PAGE {
+                RELEASE_PAGE
+            } else {
+                3
+            };
+            async move { Ok(Some(release_page(offset, n, true))) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(asked, [0, RELEASE_PAGE, 2 * RELEASE_PAGE]);
+        assert_eq!(refs.len(), 2 * RELEASE_PAGE + 3);
+        assert_eq!(
+            refs.last().unwrap(),
+            &((2 * RELEASE_PAGE + 2) as u32).to_be_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_page_served_again_stops_the_walk() {
+        let mut calls = 0;
+        let err = walk_release_log("S", |_offset| {
+            calls += 1;
+            async { Ok(Some(release_page(0, RELEASE_PAGE, true))) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls, 2);
+        assert!(err.to_string().contains("ignores `offset`"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn full_pages_without_ids_stop_at_the_cap() {
+        let mut calls = 0;
+        let err = walk_release_log("S", |_offset| {
+            calls += 1;
+            async { Ok(Some(release_page(0, RELEASE_PAGE, false))) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls, LogWalk::MAX_PAGES + 1);
+        assert!(err.to_string().contains("does not end"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_server_with_no_log_releases_nothing() {
+        let refs = walk_release_log("S", |_| async { Ok(None) }).await.unwrap();
+        assert!(refs.is_empty());
     }
 
     fn ids(xs: &[&str]) -> Option<Vec<String>> {
