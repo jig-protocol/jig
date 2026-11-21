@@ -143,6 +143,10 @@ rulesets. Two established peers report in the group rulesets.
 - State leaves, `standing_root` and fraud proofs. They need the CBOR encoding, so they come with
   the `jig-core` implementation.
 - Epoch boundaries from cosigned checkpoints. The traces take epoch numbers as given.
+- `covers` (JEP-0009 rule 45). The traces list each leaf under the epoch in which `f` applies it.
+  A real `good-standing-interval` is logged one epoch later than the activity it covers, so a
+  log replaying these traces would carry each one in the next epoch with `covers` set to the
+  previous one.
 
 ## Open for tuning
 
