@@ -112,12 +112,24 @@ pub async fn publish_key_packages(
         store.key_package_stock(&did).map_err(persist_err)?;
     let now = chrono::Utc::now().timestamp();
     let mut accepted = 0;
+    let mut last_resort_seen = false;
     for (bytes, info) in validated {
-        // One last-resort package per DID is all it needs, and each carries a
-        // fresh reference, so without this a DID could store unboundedly
-        // many of them past `MAX_STOCK`.
+        // One last-resort package per DID is in use at a time. A new one
+        // replaces the old, which its owner rotates out after withdrawing
+        // custody (JEP-0017 rule 32); only the DID can sign a new one, and a
+        // batch replaces it at most once.
         if info.last_resort {
+            if last_resort_seen {
+                continue;
+            }
+            last_resort_seen = true;
             if has_last_resort {
+                if store
+                    .replace_last_resort(&info.reference, &did, &bytes, now)
+                    .map_err(persist_err)?
+                {
+                    accepted += 1;
+                }
                 continue;
             }
         } else if available >= MAX_STOCK {
@@ -312,7 +324,8 @@ mod tests {
     }
 
     /// Each last-resort package has a fresh reference, so without a cap one
-    /// DID could store as many as it liked.
+    /// DID could store as many as it liked. A new one replaces the old
+    /// (JEP-0017 rule 32), and one batch replaces it at most once.
     #[tokio::test]
     async fn a_did_keeps_one_last_resort_package() {
         let state = Arc::new(AppState::for_test().unwrap());
@@ -328,8 +341,9 @@ mod tests {
 
         let again = publish(&state, &m.key_packages(2, true).unwrap()).await;
         assert_eq!(
-            again.accepted, 0,
-            "a second last-resort package is not stored"
+            (again.accepted, again.available, again.last_resort),
+            (1, 2, true),
+            "a new last-resort package replaces the old, once per batch"
         );
     }
 

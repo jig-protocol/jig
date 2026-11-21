@@ -2721,6 +2721,37 @@ impl SqliteStore {
         Ok(inserted > 0)
     }
 
+    /// Store `did`'s new last-resort package and retire any it had: they are
+    /// no longer released, and their rows stay, marked `consumed_at`, so
+    /// nobody holding one can upload it again to bring it back (JEP-0017
+    /// rule 32). Returns whether the package was new.
+    pub fn replace_last_resort(
+        &self,
+        reference: &[u8],
+        did: &str,
+        package: &[u8],
+        now: i64,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO mls_key_packages
+                (reference, did, package, last_resort, published_at)
+             VALUES (?,?,?,1,?)",
+            params![reference, did, package, now],
+        )? > 0;
+        if inserted {
+            tx.execute(
+                "UPDATE mls_key_packages SET consumed_at = ?
+                  WHERE did = ? AND last_resort = 1 AND consumed_at IS NULL
+                    AND reference != ?",
+                params![now, did, reference],
+            )?;
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
     /// Keep `envelope`, `did`'s reachability record at `seq`, unless a record
     /// with this `seq` or a higher one is kept already. Returns whether it was
     /// stored. The caller verifies the record.
@@ -2784,11 +2815,14 @@ impl SqliteStore {
             tx.query_row(
                 // The exact request first: its own answer, even when a later
                 // request for the same tuple got another package.
+                // A replaced last-resort package is dead (its owner deleted
+                // its key): a repeat gets a fresh release instead.
                 "SELECT k.package, r.reference, r.last_resort
                    FROM kp_releases r JOIN mls_key_packages k ON k.reference = r.reference
-                  WHERE r.request_hash = ?5
-                     OR (r.did = ?1 AND r.requester = ?2 AND r.channel_id = ?3
-                         AND r.released_at > ?4)
+                  WHERE (k.last_resort = 0 OR k.consumed_at IS NULL)
+                    AND (r.request_hash = ?5
+                         OR (r.did = ?1 AND r.requester = ?2 AND r.channel_id = ?3
+                             AND r.released_at > ?4))
                   ORDER BY (r.request_hash = ?5) DESC, r.released_at DESC LIMIT 1",
                 params![
                     ask.did,
@@ -2847,7 +2881,7 @@ impl SqliteStore {
                 let resort: Option<(Vec<u8>, Vec<u8>)> = tx
                     .query_row(
                         "SELECT reference, package FROM mls_key_packages
-                          WHERE did = ? AND last_resort = 1
+                          WHERE did = ? AND last_resort = 1 AND consumed_at IS NULL
                           ORDER BY published_at DESC, reference DESC LIMIT 1",
                         [ask.did],
                         |r| Ok((r.get(0)?, r.get(1)?)),
@@ -2885,10 +2919,16 @@ impl SqliteStore {
             )?;
         }
         tx.execute(
+            // The same request can be here already only if the package it
+            // got was a last-resort one since replaced (the repeat lookup
+            // above skips those): it now names the new one.
             "INSERT INTO kp_releases
                 (request_hash, did, requester, channel_id, reference, last_resort,
                  request, released_at, kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(request_hash) DO UPDATE
+                SET reference = excluded.reference, last_resort = excluded.last_resort,
+                    released_at = excluded.released_at, counted = 1",
             params![
                 ask.request_hash,
                 ask.did,
@@ -2998,7 +3038,8 @@ impl SqliteStore {
             |r| r.get(0),
         )?;
         let last_resort: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM mls_key_packages WHERE did = ? AND last_resort = 1)",
+            "SELECT EXISTS(SELECT 1 FROM mls_key_packages
+                            WHERE did = ? AND last_resort = 1 AND consumed_at IS NULL)",
             [did],
             |r| r.get(0),
         )?;
@@ -4907,6 +4948,61 @@ mod tests {
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].requester, "did:jig:zA");
         assert_eq!(log[0].request, b"signed request");
+    }
+
+    #[test]
+    fn a_new_last_resort_package_retires_the_old_for_good() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let did = "did:jig:zD";
+        store
+            .insert_key_package(b"old", did, b"kpOld", true, 1)
+            .unwrap();
+        assert_eq!(
+            store
+                .release_key_package(&ask(did, "did:jig:zA", b"h1", 100))
+                .unwrap(),
+            Release::Released {
+                package: b"kpOld".to_vec(),
+                last_resort: true
+            }
+        );
+        assert!(
+            store
+                .replace_last_resort(b"new", did, b"kpNew", 200)
+                .unwrap()
+        );
+        assert_eq!(store.key_package_stock(did).unwrap(), (0, true));
+        // A repeat of the earlier request gets the new package, not the dead one.
+        assert_eq!(
+            store
+                .release_key_package(&ask(did, "did:jig:zA", b"h1", 300))
+                .unwrap(),
+            Release::Released {
+                package: b"kpNew".to_vec(),
+                last_resort: true
+            }
+        );
+        // The old one cannot be brought back, by either route.
+        assert!(
+            !store
+                .replace_last_resort(b"old", did, b"kpOld", 400)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .insert_key_package(b"old", did, b"kpOld", true, 400)
+                .unwrap()
+        );
+        let resort = store
+            .release_key_package(&ask(did, "did:jig:zB", b"h2", 500))
+            .unwrap();
+        assert_eq!(
+            resort,
+            Release::Released {
+                package: b"kpNew".to_vec(),
+                last_resort: true
+            }
+        );
     }
 
     #[test]
