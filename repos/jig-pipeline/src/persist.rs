@@ -3504,19 +3504,22 @@ mod tests {
     }
 
     /// A store from a release that ran the legacy relay's catch-up opens
-    /// without its two tables: nothing reads them, and what they held was
-    /// only where that catch-up resumed.
+    /// without its two tables and its index on `blocks.federated_from`:
+    /// nothing reads them, and what they held was only where that catch-up
+    /// resumed.
     #[test]
     fn migrate_drops_the_legacy_relays_catch_up_tables() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("jig.db");
+        drop(SqliteStore::open(&path).unwrap());
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(
                 "CREATE TABLE catch_up_cursors (peer_server_url TEXT PRIMARY KEY, after_cid TEXT NOT NULL);
                  CREATE TABLE catch_up_seen (peer_server_url TEXT PRIMARY KEY, last_cid TEXT NOT NULL);
                  INSERT INTO catch_up_cursors VALUES ('wss://peer', 'bafy-a');
-                 INSERT INTO catch_up_seen VALUES ('wss://peer', 'bafy-b');",
+                 INSERT INTO catch_up_seen VALUES ('wss://peer', 'bafy-b');
+                 CREATE INDEX blocks_federated_from ON blocks(federated_from);",
             )
             .unwrap();
         }
@@ -3525,6 +3528,15 @@ mod tests {
         for gone in ["catch_up_cursors", "catch_up_seen"] {
             assert!(!tables.contains(&gone.to_string()), "{gone} is still there");
         }
+        let index: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'blocks_federated_from'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 0, "blocks_federated_from is still there");
     }
 
     /// `CREATE TABLE IF NOT EXISTS` never adds columns to a table that already

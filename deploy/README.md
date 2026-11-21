@@ -152,9 +152,11 @@ private network:
 - **A follower vouches for its users.** Under a `write` or `member` share, the
   server that follows a channel relays its users' posts to this one. They run
   the same admission, write and suite gates as local posts, and the share's
-  grant, except that their authors are not asked for proof-of-work: they never
-  spoke to this server. Only share with servers you would let post on your
-  behalf.
+  grant, with two exceptions. Their authors are not asked for proof-of-work:
+  they never spoke to this server. And they do not draw on `[auth.pools]`, so
+  the pool guarantee above does not bound them: what bounds them is the
+  per-DID rate limit and `[federation.relayed_writes]`, per peer and channel.
+  Only share with servers you would let post on your behalf.
 - **Channel ops are on by default.** `POST /api/v1/channels*` is always
   mounted and runs the same gates as every other write: anyone who can reach
   the port can create an open channel.
