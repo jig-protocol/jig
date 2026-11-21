@@ -7,6 +7,7 @@
 - [Crypto Primitives](crypto.md)
 - [Encryption](encryption.md)
 - [Identity and Reputation](identity-and-reputation.md)
+  - [Reference Rulesets](reference-rulesets.md)
 - [Handshake](handshake.md)
 - [Message Format](message-format.md)
 - [Blocks](blocks.md)
