@@ -331,6 +331,19 @@ mod tests {
         assert_eq!(verify(&d, &opened), Verification::Agree);
     }
 
+    /// A server running another text-block build (another release, another Unicode version
+    /// for NFKC) is not compared against this client's: its receipt is unverified, never a
+    /// divergence, even when its outcome differs. Otherwise an older client would flag a newer
+    /// server's honest renders.
+    #[test]
+    fn a_server_on_another_component_is_unverified_not_a_divergence() {
+        let (d, opened, mut exec) = delivered("hello");
+        exec.component = [0x5a; 32];
+        exec.outcome = Outcome::Ok { hash: [0xee; 32] };
+        let d = with_receipt(d, exec, &server_key());
+        assert!(matches!(verify(&d, &opened), Verification::Unverified(_)));
+    }
+
     /// The server's `exec` for `d`, re-run on this client's build `index`, as a server on that
     /// build would have reported it.
     fn exec_on_build(d: &DeliveredBlock, opened: &OpenedBlock, base: &Exec, index: usize) -> Exec {
@@ -351,18 +364,18 @@ mod tests {
         exec
     }
 
-    /// During a two-step rollout a server may already render with the next build. This client
-    /// carries it, so it checks that server's render on that build, not the canonical one: it
-    /// agrees with an honest render, including text the two builds render differently, and
-    /// still catches a forged one.
+    /// During a two-step rollout a server may still render with the previous build. This
+    /// client carries it, so it checks that server's render on that build, not the canonical
+    /// one: it agrees with an honest render, including text the two builds render differently,
+    /// and still catches a forged one.
     #[test]
-    fn a_server_on_the_next_build_is_checked_on_that_build() {
+    fn a_server_on_the_previous_build_is_checked_on_that_build() {
         assert!(!canonical::OTHER_BUILDS.is_empty());
-        let next = 1;
-        // U+0558 is newly assigned in Unicode 18 and normalizes only on the next build.
+        let previous = 1;
+        // U+0558 is newly assigned in Unicode 18 and normalizes only on the canonical build.
         for body in ["hello", "armenian \u{0558} letter"] {
             let (d, opened, canonical_exec) = delivered(body);
-            let exec = exec_on_build(&d, &opened, &canonical_exec, next);
+            let exec = exec_on_build(&d, &opened, &canonical_exec, previous);
             if body.contains('\u{0558}') {
                 assert_ne!(
                     exec.outcome, canonical_exec.outcome,
@@ -385,8 +398,9 @@ mod tests {
         }
     }
 
-    /// The canonical build's render of text the next build renders differently still agrees
-    /// with a server on the canonical build: the next build is used only when a receipt names it.
+    /// The canonical build's render of text the previous build renders differently agrees
+    /// with a server on the canonical build: the previous build is used only when a receipt
+    /// names it.
     #[test]
     fn a_server_on_the_canonical_build_is_still_checked_on_it() {
         let (d, opened, exec) = delivered("armenian \u{0558} letter");
