@@ -1,9 +1,8 @@
 # Reference Rulesets
 
-> **Draft (R2.1).** These are four reference rulesets, given as data before any code. They use
-> JEP-0009's verifiable-standing rules 35–52, which are still under review in #418. Every
-> number here is a starting point, to be tuned against R1's pool metrics. None is final until
-> DJ approves it.
+> **R2.1.** These are four reference rulesets, given as data before any code. They use
+> JEP-0009's verifiable-standing rules 35–52 (#418). Every number here is a starting point, to
+> be tuned against R1's pool metrics.
 
 A ruleset document (JEP-0009 rule 3) fixes how standing is computed, and recommends what a server
 does with it. The four reference rulesets cover the security levels the framing names:
@@ -58,6 +57,14 @@ half-life in epochs, written as its per-epoch fraction in ppm.
 | `minor` | 1 unit | 1 unit | 2 units | 1 unit |
 | `admit_age_epochs` (rule 49) | 7 | none | 3 | 7 |
 | `receipt_positions` | 4 096 | 1 024 | 4 096 | 4 096 |
+
+Pool shares (JEP-0008 rule 23, percentages; `f` does not read them):
+
+| Share | `jig-reference` | `high-sec` | `community` | `null-sec` |
+| --- | --- | --- | --- | --- |
+| `stranger_share` | 20 | 10 | 30 | 50 |
+| `invited_share` | 10 | 10 | 15 | 0 |
+| `aged_share` (of the member pool) | 25 | 0: no aged-proof members | 25 | 100: no one is ever established |
 
 ## Event weights
 
@@ -135,7 +142,10 @@ rulesets. Two established peers report in the group rulesets.
   the `jig-core` implementation.
 - Epoch boundaries from cosigned checkpoints. The traces take epoch numbers as given.
 
-## For DJ
+## Open for tuning
+
+These are starting points, to be tuned against R1's pool metrics. They do not block the rules
+they illustrate.
 
 1. **The numbers.** Every row above is a proposal. The three that matter most:
    - `min_age_epochs`: 30, 60 and 14 epochs;

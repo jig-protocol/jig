@@ -69,6 +69,7 @@
       "invites_per_window": 0
     },
     "pools": {
+      "aged_share": 100,
       "invited_share": 0,
       "stranger_share": 50
     },
