@@ -99,6 +99,7 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
     | R1 | `PUT /api/v1/reach/{did}` (existing) | `200 {stored, seq}` |
     | R2 | `PUT /api/v1/local-adds/{did}` | `200 {allow, seq}` |
     | R3 | `POST /api/v1/erase/{did}` | `200` with a receipt signed by `S` (rule 30); `409 STILL_A_MEMBER`, `409 STILL_AN_OWNER` (rule 26); `410 ERASED` for a repeat |
+    | R3 receipt | `GET /api/v1/erase/{did}/receipt`, a signed read by `D` | `200` with the receipt, re-signed from the tombstone; `404` to anyone else |
 
 ## R1: end custody
 
@@ -177,18 +178,21 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
 
     | Party | Effect |
     | --- | --- |
-    | Member's devices | Before sending R3, the client leaves every affected channel (rule 26). After `S`'s receipt, it deletes, per device: its MLS state for channels on `S`; the private init keys of every key package it stocked at `S` (rule 31); its pins for `S`. It stops publishing to `S`. It keeps `S`'s signed receipt as evidence. |
-    | This server | Applies rule 22 and keeps the tombstone (rule 28). Refuses uploads, records and writes from `D` with `410 ERASED`. Serves nothing about `D` except what rules 27–29 keep. |
+    | Member's devices | Before sending R3, the client leaves every affected channel (rule 26). After `S`'s receipt, it deletes, per device: its MLS state for channels on `S`; the private init keys of every key package it stocked at `S` (rule 31); its pins for `S`. It stops publishing to `S`. It keeps `S`'s signed receipt as evidence. A device that was offline during R3 and later gets `410 ERASED` from `S` fetches the receipt (rule 11), checks it, and then runs the same deletion. |
+    | This server | Applies rule 22 and keeps the tombstone (rule 28). Refuses `D`'s own signed uploads, records and writes with `410 ERASED`. Answers anyone else as for a DID it never knew (rule 25). Serves nothing about `D` except what rules 27–29 keep. |
     | Other members of affected channels | They saw `D` leave: a `member-remove` naming `D`, then a commit removing `D`'s leaf (rule 26). They keep their history, including `D`'s messages. |
     | Other servers | `S` sends nothing. The client SHOULD publish a higher-`seq` reachability record without `S` to every other server and nameserver it uses (R1 everywhere), and MAY send R3 to them separately. Sequencers of federated channels saw `D`'s self-leave (rule 26). Copies other servers hold are theirs: rule 34. |
 
 24. R3 has the effects of R1 and R2 at `S`. They are recorded as R3's effects, not as separate
     requests.
-25. Adders see:
-    - `410 ERASED` from `S` for a custody request or a local package;
-    - `403 MEMBER_DECLINED` for a `member-add` of `D` to a channel `S` sequences.
+25. To anyone but `D`, `S` answers as it would for a DID it never knew, so the answer does not
+    reveal that `D` used `S` and left:
+    - `404 NO_CUSTODY` to a custody request;
+    - `404 NO_KEY_PACKAGE` for a local package;
+    - `404 NO_RECORD` for the reachability record.
 
-    A client treats both as definite.
+    A `member-add` of `D` to a channel `S` sequences is refused with `403 MEMBER_DECLINED`, as
+    under R2. `S` sends `410 ERASED` only in answer to a request `D` signed.
 26. **Leaving first.** `S` MUST refuse R3 with:
     - `409 STILL_A_MEMBER`, listing the channels, while `D` holds a membership in a channel `S`
       sequences or carries;
@@ -198,9 +202,15 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
     Whoever can sign R3 holds `D`'s key and so can sign the leaves. The client therefore:
     1. archives each channel `D` owns. No transfer of ownership is defined; JEP-0005 rule 11a
        moves a channel's sequencer, not its owner;
-    2. sends a self-leave (`member-remove` naming `D`, no commit) to each channel, through `S`;
-       for a channel another server sequences, `S` relays it to that sequencer;
+    2. sends a self-leave (`member-remove` naming `D`, no commit) to each channel, through `S`.
+       For a channel another server sequences, `S` relays it to that sequencer; a follower
+       relays a self-leave under any grant (JEP-0005 rule 7a);
     3. then sends R3.
+
+    A membership ends when its self-leave lands, before any commit (Encryption chapter,
+    Leaving). So `STILL_A_MEMBER` clears at the self-leave block. R3 never waits for a remaining
+    member's commit. A channel `S` no longer carries, because its contract ended, is not an
+    affected channel of `S`: `D` leaves it at its sequencer directly.
 
     The MLS removal is committed by a remaining member, as for any self-leave (Encryption
     chapter, Leaving): the next remaining member online commits `D`'s leaf out. On a federated channel that member commits through its own server to the channel's
@@ -245,15 +255,23 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
 31. No request recalls a key package `S` already released. A released package stays usable, by
     whoever holds it, until the first of:
     - its leaf lifetime ends: jig's packages carry openmls's default of 84 days plus a one-hour
-      margin, unless the client sets a shorter one, and an adder's client refuses an expired
-      package;
+      margin, unless the client sets a shorter one. An adder's client MUST refuse an expired
+      package, and a sequencer MUST refuse a commit that adds one. Both follow from MLS's leaf
+      validation (RFC 9420 section 7.3, openmls `valn0106`), which jig's adder and sequencer
+      run on every Add;
     - `D` deletes the package's private init key: a Welcome to that package can then not be
       opened, so an add made with it gives the adder a group `D` is not in.
 
     A last-resort package is reused by everyone who receives it until one of those happens.
 32. **Rotation:**
-    - On R1, the client does not rotate. Local adds still use the stock. The release log
-      (`GET /api/v1/custody/{did}/releases`) shows the member which packages left and to whom.
+    - On R1, the client carries out R1's own intent and keeps local adds working:
+      - it publishes a fresh last-resort package at `S` and deletes the old one's private init
+        key, so the last-resort package other servers' requesters received is dead;
+      - it deletes the private init keys of the ordinary packages the release log
+        (`GET /api/v1/custody/{did}/releases`) shows went to other servers' requesters. If one was
+        used, `D` already joined with it and its key is gone; if not, it can no longer be used.
+
+      The rest of the stock stays for local adds.
     - On R2 together with R1, and on R3, the client MUST delete the private init keys of every
       package it stocked at `S`, the last-resort package included. It publishes a fresh
       last-resort package only to servers where it still keeps a stock.
@@ -275,7 +293,7 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
     | R1 | no (`NO_CUSTODY`) | yes | kept | accepted | kept | newer record listing `S` |
     | R2 | yes, for channels other servers sequence | no (`LOCAL_ADDS_ENDED`, `MEMBER_DECLINED`) | kept | accepted | kept | marker `allow = true` |
     | R1 + R2 | no | no | deleted | refused (`NOT_STOCKED_HERE`) | kept | undo either; uploads resume when either is undone |
-    | R3 (alone or with others) | no (`ERASED`) | no (`MEMBER_DECLINED`) | deleted | refused (`ERASED`) | deleted per rule 22 | none for the data; rule 36 to come back |
+    | R3 (alone or with others) | no (`NO_CUSTODY` to others) | no (`NO_KEY_PACKAGE` to others; `MEMBER_DECLINED` on `member-add`) | deleted | refused (`ERASED`, to `D`) | deleted per rule 22 | none for the data; rule 36 to come back |
 
 36. **Coming back after R3.** The data is gone and is not restored. `D` may use `S` again by
     sending a `jig-local-adds-v1` with `allow = true` and a reachability record that lists `S`,
@@ -311,18 +329,55 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
 
 # Reference Implementation
 
-None yet. The sizing below is for DJ to decide what ships in alpha.7.
+None yet. The work, by request:
 
-| Request | Work | Size |
-| --- | --- | --- |
-| R1 | Done in #440 (server). Remaining: an explicit client command that publishes the withdrawal to every server and nameserver the member uses, and its test. | S: about 100 lines with tests |
-| R2 | `jig-local-adds-v1` with vectors; a marker table; `PUT /api/v1/local-adds/{did}`; refusals on the key-package route, on the custody route for channels sequenced here, and on `member-add` ingest; the purge and upload refusal under R1 + R2; client per-server state, the explicit command and the CLI's handling of the new codes; integration tests. | M: about 500–700 lines with tests |
-| R3 | `jig-erase-v1` and `jig-erase-receipt-v1` with vectors; preconditions (`STILL_A_MEMBER`, `STILL_AN_OWNER`); deletion across about ten tables; the tombstone and its checks on every upload route; the client's leave-archive-erase sequence and its local key and state deletion; per-server package references; integration tests across two servers, including a federated channel. JEP-0009 salt deletion waits for those logs to exist. | L: about 1,200–1,600 lines with tests |
+- **R1:** the server side is #440. Still to do: an explicit client command that publishes the
+  withdrawal to every server and nameserver the member uses, and the R1 rotation of rule 32.
+- **R2:**
+  - `jig-local-adds-v1` with vectors, a marker table and `PUT /api/v1/local-adds/{did}`;
+  - the refusals on the key-package route, on the custody route for channels sequenced here,
+    and on `member-add` ingest;
+  - the purge and upload refusal under R1 + R2;
+  - client per-server state, the explicit command and the client's handling of the new codes.
+- **R3:**
+  - `jig-erase-v1` and `jig-erase-receipt-v1` with vectors, and the receipt route;
+  - the preconditions (`STILL_A_MEMBER`, `STILL_AN_OWNER`);
+  - deletion across the store, the tombstone and its checks on every upload route, and rule
+    25's answers to third parties;
+  - the client's leave-archive-erase sequence, its local deletion, offline devices, and
+    per-server package references.
+
+  JEP-0009 salt deletion waits for those logs to exist.
+- **Tests:** an expired key package is refused by the adder and by the sequencer (rule 31);
+  each request across two servers, including a federated channel.
 
 # Test Vectors
 
 To be added with the implementation: one `jig-local-adds-v1` and one `jig-erase-v1` under
 fixed test keys, as deterministic payload and `COSE_Sign1`, in hex, in `vectors/0017/`.
+
+# Open Questions
+
+These change what R3 means. They are DJ's to decide before this JEP leaves Draft.
+
+1. **Moderation across R3 and a return.**
+   - **The problem.** Rule 10 lets a DID `S` has banned send R3, and rule 22 deletes `S`'s
+     admission, rate-limit and reputation inputs about `D`. Rules 28 and 36 then let `D` return
+     as a new DID. Together, R3 followed by a return clears a ban or a low standing at `S`.
+     Rule 29's salt deletion also stops any later proof about `D`'s earlier leaves.
+   - **Proposal.** The tombstone also keeps `S`'s own moderation decisions about `D`: a ban, and
+     a standing floor. A return under rule 36 starts from the lower of a stranger's standing and
+     `D`'s standing at erasure.
+2. **A delay before R3 acts.**
+   - **The problem.** R3 is irreversible and needs one signature. Every device holds `D`'s key
+     (Encryption chapter: a leaf's signature key is the DID's Ed25519 key), so a lost device or
+     a single mistake erases `D`'s data at `S`.
+   - **Proposal.** `S` records R3 as pending, and acts after `erase_delay_secs` (a reference
+     default, for example 72 hours).
+     - `D` can cancel during that window with a signed `jig-erase-cancel-v1`.
+     - Every authenticated answer to `D` during the window says the erasure is pending, so
+       `D`'s other devices see it.
+     - The receipt is issued when the erasure runs.
 
 # Rejected Alternatives
 
