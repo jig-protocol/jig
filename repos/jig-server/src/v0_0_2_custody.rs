@@ -98,8 +98,9 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-/// The record `did` keeps here, if it lists this server and verifies.
-fn listing_record(state: &AppState, did: &str) -> Result<Option<ReachabilityRecord>, Refusal> {
+/// The newest record `did` keeps here, if it verifies: one that lists this
+/// server, or one that withdrew it.
+fn kept_record(state: &AppState, did: &str) -> Result<Option<ReachabilityRecord>, Refusal> {
     let Some(envelope) = state
         .ingest_ctx
         .store
@@ -108,10 +109,16 @@ fn listing_record(state: &AppState, did: &str) -> Result<Option<ReachabilityReco
     else {
         return Ok(None);
     };
-    let ours = state.server_did.to_did_jig_string();
     Ok(ReachabilityRecord::from_envelope(&envelope)
         .ok()
-        .filter(|r| r.did == did && r.servers.iter().any(|(s, _)| *s == ours)))
+        .filter(|r| r.did == did))
+}
+
+/// The record `did` keeps here, if it verifies and still lists this server.
+/// After a withdrawal there is none: no custody, and nothing served.
+fn listing_record(state: &AppState, did: &str) -> Result<Option<ReachabilityRecord>, Refusal> {
+    let ours = state.server_did.to_did_jig_string();
+    Ok(kept_record(state, did)?.filter(|r| r.servers.iter().any(|(s, _)| *s == ours)))
 }
 
 /// PUT /api/v1/reach/:did
@@ -145,7 +152,11 @@ pub async fn put_reachability(
         ));
     }
     let ours = state.server_did.to_did_jig_string();
-    if !record.servers.iter().any(|(s, _)| *s == ours) {
+    // A record that leaves this server out is kept only as a withdrawal: it
+    // replaces one that listed it, so an older record cannot bring custody
+    // back. A server never starts keeping a record that does not list it.
+    let listed = record.servers.iter().any(|(s, _)| *s == ours);
+    if !listed && kept_record(&state, &did)?.is_none() {
         return Err(err(
             StatusCode::FORBIDDEN,
             "NOT_LISTED",
@@ -160,10 +171,7 @@ pub async fn put_reachability(
     let stored = store
         .put_reachability(&did, record.seq, &envelope, now())
         .map_err(persist_err)?;
-    let seq = match listing_record(&state, &did)? {
-        Some(kept) => kept.seq,
-        None => record.seq,
-    };
+    let seq = kept_record(&state, &did)?.map_or(record.seq, |kept| kept.seq);
     Ok(Json(StoredBody { stored, seq }))
 }
 
@@ -263,6 +271,7 @@ pub async fn request_key_package(
         request: &envelope,
         now,
         repeat_window: REPEAT_WINDOW_SECS,
+        repeat: true,
         per_did: custody.per_member_per_hour,
         per_requester: custody.per_requester_per_hour,
     };
@@ -469,6 +478,50 @@ mod tests {
         let Json(older) = keep(&state, 1, vec![here], 1).await.unwrap();
         assert!(!older.stored, "a lower seq never replaces a higher one");
         assert_eq!(older.seq, 2);
+    }
+
+    #[tokio::test]
+    async fn a_member_who_withdraws_this_server_is_no_longer_released() {
+        let state = state();
+        stock(&state, 4, 3).await;
+        let here = (ours(&state), "https://here.example".to_string());
+        let elsewhere = (did_of(90), "https://elsewhere.example".to_string());
+        let _ = keep(&state, 4, vec![here.clone()], 1).await.unwrap();
+        let _ = ask(&state, 3, 4, &ours(&state), now()).await.unwrap();
+
+        // A higher record without this server is kept, as a withdrawal.
+        let Json(withdrawn) = keep(&state, 4, vec![elsewhere.clone()], 2).await.unwrap();
+        assert!(withdrawn.stored);
+        let refused = ask(&state, 5, 4, &ours(&state), now()).await.unwrap_err();
+        assert_eq!(code(&refused), (StatusCode::NOT_FOUND, "NO_CUSTODY".into()));
+        assert!(
+            listing_record(&state, &did_of(4)).unwrap().is_none(),
+            "a withdrawn record is not served"
+        );
+
+        // The older listing cannot bring custody back; a newer one can.
+        let Json(older) = keep(&state, 4, vec![here.clone()], 1).await.unwrap();
+        assert!(!older.stored);
+        assert_eq!(older.seq, 2);
+        assert!(ask(&state, 5, 4, &ours(&state), now()).await.is_err());
+        let _ = keep(&state, 4, vec![here], 3).await.unwrap();
+        assert!(ask(&state, 5, 4, &ours(&state), now()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_record_that_never_listed_this_server_is_not_kept() {
+        let state = state();
+        let elsewhere = (did_of(90), "https://elsewhere.example".to_string());
+        let refused = keep(&state, 4, vec![elsewhere], 5).await.unwrap_err();
+        assert_eq!(code(&refused), (StatusCode::FORBIDDEN, "NOT_LISTED".into()));
+        assert!(
+            state
+                .ingest_ctx
+                .store
+                .reachability(&did_of(4))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

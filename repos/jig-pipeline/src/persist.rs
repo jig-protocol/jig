@@ -50,8 +50,12 @@ pub struct ReleaseAsk<'a> {
     pub request: &'a [u8],
     pub now: i64,
     /// Seconds within which the same requester, DID and channel get the
-    /// package they were already given.
+    /// package they were already given. Ignored without `repeat`.
     pub repeat_window: i64,
+    /// Whether a repeat of an earlier request gets its earlier answer. Off
+    /// for a take that names no channel: two channels must never share a
+    /// package.
+    pub repeat: bool,
     /// Most releases of one DID per hour.
     pub per_did: u64,
     /// Most releases to one requester per hour.
@@ -1271,9 +1275,11 @@ impl SqliteStore {
             -- Reachability records (JEP-0004 rule 21) of DIDs that list this
             -- server: the highest `seq` each DID signed. The envelope is the
             -- DID's own COSE_Sign1, served back unchanged.
+            -- `seq` is the record's u64 as 8 big-endian bytes, so SQLite's
+            -- byte-wise BLOB order is numeric order over the whole range.
             CREATE TABLE IF NOT EXISTS reachability_records (
                 did        TEXT PRIMARY KEY,
-                seq        INTEGER NOT NULL,
+                seq        BLOB NOT NULL,
                 envelope   BLOB NOT NULL,
                 stored_at  INTEGER NOT NULL
             );
@@ -1289,7 +1295,11 @@ impl SqliteStore {
                 reference     BLOB NOT NULL,
                 last_resort   INTEGER NOT NULL,
                 request       BLOB NOT NULL,
-                released_at   INTEGER NOT NULL
+                released_at   INTEGER NOT NULL,
+                -- 0 for a request answered with a package released before:
+                -- logged so that request gets the same answer again, but
+                -- not counted against the limits.
+                counted       INTEGER NOT NULL DEFAULT 1
             );
             CREATE INDEX IF NOT EXISTS kp_releases_did
                 ON kp_releases(did, released_at);
@@ -2661,9 +2671,8 @@ impl SqliteStore {
     /// with this `seq` or a higher one is kept already. Returns whether it was
     /// stored. The caller verifies the record.
     pub fn put_reachability(&self, did: &str, seq: u64, envelope: &[u8], now: i64) -> Result<bool> {
-        // SQLite integers are signed; a record past i64::MAX is clamped
-        // there, so it still outranks every lower one.
-        let seq = i64::try_from(seq).unwrap_or(i64::MAX);
+        // Big-endian bytes compare as the numbers do, across all of u64.
+        let seq = seq.to_be_bytes().to_vec();
         let changed = self.conn.lock().expect("poisoned").execute(
             "INSERT INTO reachability_records (did, seq, envelope, stored_at)
              VALUES (?1, ?2, ?3, ?4)
@@ -2705,25 +2714,49 @@ impl SqliteStore {
     pub fn release_key_package(&self, ask: &ReleaseAsk<'_>) -> Result<Release> {
         let mut conn = self.conn.lock().expect("poisoned");
         let tx = conn.transaction()?;
-        let earlier: Option<(Vec<u8>, bool)> = tx
-            .query_row(
-                "SELECT k.package, r.last_resort
+        let earlier: Option<(Vec<u8>, Vec<u8>, bool)> = if ask.repeat {
+            tx.query_row(
+                // The exact request first: its own answer, even when a later
+                // request for the same tuple got another package.
+                "SELECT k.package, r.reference, r.last_resort
                    FROM kp_releases r JOIN mls_key_packages k ON k.reference = r.reference
                   WHERE r.request_hash = ?5
                      OR (r.did = ?1 AND r.requester = ?2 AND r.channel_id = ?3
                          AND r.released_at > ?4)
-                  ORDER BY r.released_at DESC LIMIT 1",
+                  ORDER BY (r.request_hash = ?5) DESC, r.released_at DESC LIMIT 1",
                 params![
                     ask.did,
                     ask.requester,
                     ask.channel_id,
-                    ask.now - ask.repeat_window,
+                    ask.now.saturating_sub(ask.repeat_window),
                     ask.request_hash
                 ],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
-            .optional()?;
-        if let Some((package, last_resort)) = earlier {
+            .optional()?
+        } else {
+            None
+        };
+        if let Some((package, reference, last_resort)) = earlier {
+            // Remember this request's answer too, uncounted, so resending it
+            // after the first request has left the window still gets it.
+            tx.execute(
+                "INSERT OR IGNORE INTO kp_releases
+                    (request_hash, did, requester, channel_id, reference, last_resort,
+                     request, released_at, counted)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+                params![
+                    ask.request_hash,
+                    ask.did,
+                    ask.requester,
+                    ask.channel_id,
+                    reference,
+                    last_resort,
+                    ask.request,
+                    ask.now
+                ],
+            )?;
+            tx.commit()?;
             return Ok(Release::Again {
                 package,
                 last_resort,
@@ -2731,7 +2764,8 @@ impl SqliteStore {
         }
         let hour_ago = ask.now - 3600;
         let by_did: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM kp_releases WHERE did = ?1 AND released_at > ?2",
+            "SELECT COUNT(*) FROM kp_releases
+              WHERE did = ?1 AND released_at > ?2 AND counted = 1",
             params![ask.did, hour_ago],
             |r| r.get(0),
         )?;
@@ -2739,7 +2773,8 @@ impl SqliteStore {
             return Ok(Release::Limited(LimitHit::Did));
         }
         let by_requester: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM kp_releases WHERE requester = ?1 AND released_at > ?2",
+            "SELECT COUNT(*) FROM kp_releases
+              WHERE requester = ?1 AND released_at > ?2 AND counted = 1",
             params![ask.requester, hour_ago],
             |r| r.get(0),
         )?;
@@ -2807,7 +2842,7 @@ impl SqliteStore {
         let conn = self.conn.lock().expect("poisoned");
         let mut stmt = conn.prepare(
             "SELECT requester, channel_id, last_resort, request, released_at
-               FROM kp_releases WHERE did = ?1
+               FROM kp_releases WHERE did = ?1 AND counted = 1
               ORDER BY released_at DESC, request_hash ASC LIMIT ?2",
         )?;
         let rows = stmt
@@ -4722,6 +4757,7 @@ mod tests {
             request: b"signed request",
             now,
             repeat_window: 600,
+            repeat: true,
             per_did: 3,
             per_requester: 2,
         }
@@ -4851,6 +4887,108 @@ mod tests {
             store.release_key_package(&c).unwrap(),
             Release::Released { .. }
         ));
+    }
+
+    #[test]
+    fn a_reachability_record_above_i64_max_still_replaces_a_lower_one() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let did = "did:jig:zD";
+        let edge = i64::MAX as u64;
+        assert!(store.put_reachability(did, edge, b"edge", 1).unwrap());
+        assert!(store.put_reachability(did, edge + 1, b"past", 2).unwrap());
+        assert!(store.put_reachability(did, u64::MAX, b"top", 3).unwrap());
+        assert!(!store.put_reachability(did, edge + 1, b"older", 4).unwrap());
+        assert_eq!(store.reachability(did).unwrap().unwrap(), b"top");
+    }
+
+    #[test]
+    fn a_repeated_request_keeps_its_answer_after_the_first_leaves_the_window() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let did = "did:jig:zD";
+        for i in 0..3u8 {
+            store
+                .insert_key_package(&[b'r', i], did, &[b'k', i], false, i64::from(i))
+                .unwrap();
+        }
+        let first = Release::Released {
+            package: vec![b'k', 0],
+            last_resort: false,
+        };
+        let again = Release::Again {
+            package: vec![b'k', 0],
+            last_resort: false,
+        };
+        assert_eq!(
+            store
+                .release_key_package(&ask(did, "did:jig:zA", b"h1", 10_000))
+                .unwrap(),
+            first
+        );
+        // h2 inside h1's window: h1's package, and h2 is remembered.
+        assert_eq!(
+            store
+                .release_key_package(&ask(did, "did:jig:zA", b"h2", 10_599))
+                .unwrap(),
+            again
+        );
+        // h2 resent once h1 has left the window: still h1's package.
+        assert_eq!(
+            store
+                .release_key_package(&ask(did, "did:jig:zA", b"h2", 10_601))
+                .unwrap(),
+            again
+        );
+        assert_eq!(store.key_package_stock(did).unwrap(), (2, false));
+        assert_eq!(
+            store.key_package_releases(did, 10).unwrap().len(),
+            1,
+            "one release logged"
+        );
+    }
+
+    #[test]
+    fn a_resent_request_gets_its_own_answer_not_a_later_one() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let did = "did:jig:zD";
+        for i in 0..3u8 {
+            store
+                .insert_key_package(&[b'r', i], did, &[b'k', i], false, i64::from(i))
+                .unwrap();
+        }
+        let p = |i: u8| vec![b'k', i];
+        assert!(
+            matches!(store.release_key_package(&ask(did, "did:jig:zA", b"h1", 1_000)).unwrap(),
+            Release::Released { package, .. } if package == p(0))
+        );
+        // h3 is past h1's window: a new package.
+        assert!(
+            matches!(store.release_key_package(&ask(did, "did:jig:zA", b"h3", 1_700)).unwrap(),
+            Release::Released { package, .. } if package == p(1))
+        );
+        // h1 resent inside h3's window: h1's own package, not h3's.
+        assert!(
+            matches!(store.release_key_package(&ask(did, "did:jig:zA", b"h1", 1_701)).unwrap(),
+            Release::Again { package, .. } if package == p(0))
+        );
+    }
+
+    #[test]
+    fn a_take_without_repeat_never_hands_one_package_out_twice() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let did = "did:jig:zD";
+        for i in 0..2u8 {
+            store
+                .insert_key_package(&[b'r', i], did, &[b'k', i], false, i64::from(i))
+                .unwrap();
+        }
+        let mut a = ask(did, "did:jig:zA", b"t1", 100);
+        a.repeat = false;
+        a.channel_id = "";
+        let one = store.release_key_package(&a).unwrap();
+        a.request_hash = b"t2";
+        let two = store.release_key_package(&a).unwrap();
+        assert_ne!(one, two);
+        assert_eq!(store.key_package_stock(did).unwrap(), (0, false));
     }
 
     #[test]
