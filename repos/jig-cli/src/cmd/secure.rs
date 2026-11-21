@@ -364,7 +364,9 @@ impl LogWalk {
     /// releases at most a few hundred a day, within a package's lifetime.
     const MAX_PAGES: usize = 1000;
 
-    fn page(&mut self, server: &str, requests: Vec<&str>) -> Result<()> {
+    /// One page, as the identities of its entries, or `None` when the server
+    /// gives entries no identity (then only the cap applies).
+    fn page(&mut self, server: &str, ids: Option<Vec<String>>) -> Result<()> {
         self.pages += 1;
         if self.pages > Self::MAX_PAGES {
             anyhow::bail!(
@@ -372,13 +374,15 @@ impl LogWalk {
                 Self::MAX_PAGES
             );
         }
-        let page: Vec<String> = requests.into_iter().map(str::to_string).collect();
-        if !page.is_empty() && self.previous.as_ref() == Some(&page) {
+        if let Some(page) = &ids
+            && !page.is_empty()
+            && self.previous.as_ref() == Some(page)
+        {
             anyhow::bail!(
                 "{server} answers every page of the release log the same; it ignores `offset`"
             );
         }
-        self.previous = Some(page);
+        self.previous = ids;
         Ok(())
     }
 }
@@ -945,11 +949,16 @@ impl Secure {
     /// (a withdrawal from another device), are dropped. Copying an older
     /// record's list would otherwise list them again, and sending it to them
     /// would restore custody there unasked. A server that cannot be asked
-    /// stays: what it keeps is unchanged either way.
-    async fn still_custodians(&self, servers: Vec<(String, String)>) -> Vec<(String, String)> {
+    /// stays listed, but comes back among the unchecked: the new record is
+    /// not sent to it, since it may keep a withdrawal this device has not seen.
+    async fn still_custodians(
+        &self,
+        servers: Vec<(String, String)>,
+    ) -> (Vec<(String, String)>, std::collections::HashSet<String>) {
         let states = ServerStates::load(&self.server_states_path()).unwrap_or_default();
         let did = self.session.did().to_string();
         let mut out = Vec::new();
+        let mut unchecked = std::collections::HashSet::new();
         for (server_did, url) in servers {
             if states
                 .get(&server_did)
@@ -963,6 +972,7 @@ impl Secure {
                 match crate::cmd::trust::http(&url, std::time::Duration::from_secs(15)).await {
                     Ok(client) => client.get(&reach),
                     Err(_) => {
+                        unchecked.insert(server_did.clone());
                         out.push((server_did, url));
                         continue;
                     }
@@ -980,13 +990,18 @@ impl Secure {
                         .filter(|r| r.did == did)
                         .is_some_and(|r| !r.servers.iter().any(|(s, _)| *s == server_did))
                 }
-                _ => false,
+                // No record there: nothing to restore, so sending is safe.
+                Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => false,
+                _ => {
+                    unchecked.insert(server_did.clone());
+                    false
+                }
             };
             if !withdrawn {
                 out.push((server_did, url));
             }
         }
-        out
+        (out, unchecked)
     }
 
     fn note_reach(&self, server_did: &str, seq: u64, withdrawn: bool) -> Result<()> {
@@ -1025,8 +1040,26 @@ impl Secure {
             .into_iter()
             .filter(|(s, _)| *s != server_did)
             .collect();
-        let others = self.still_custodians(others).await;
-        let mut change = CustodyChange::default();
+        let (others, unchecked) = self.still_custodians(others).await;
+        // Sent only to servers whose own state was read.
+        let send_to: Vec<_> = others
+            .iter()
+            .filter(|(s, _)| !unchecked.contains(s))
+            .cloned()
+            .collect();
+        let mut change = CustodyChange {
+            elsewhere: others
+                .iter()
+                .filter(|(s, _)| unchecked.contains(s))
+                .map(|(_, url)| {
+                    (
+                        url.clone(),
+                        Err("its record could not be read, so the new one was not sent".into()),
+                    )
+                })
+                .collect(),
+            ..CustodyChange::default()
+        };
         if on {
             let mut servers = vec![here];
             servers.extend(others.iter().cloned());
@@ -1034,7 +1067,9 @@ impl Secure {
             self.put_record(&self.base, &record).await?;
             self.note_reach(&server_did, record.seq, false)?;
             change.seq = record.seq;
-            change.elsewhere = self.put_elsewhere(&others, &record).await;
+            change
+                .elsewhere
+                .extend(self.put_elsewhere(&send_to, &record).await);
             return Ok(change);
         }
         let record = self.sign_record(others.clone(), floor);
@@ -1044,7 +1079,9 @@ impl Secure {
         // With no record here ever, custody was never in force: noting the
         // withdrawal keeps this device from listing the server later.
         change.seq = record.seq;
-        change.elsewhere = self.put_elsewhere(&others, &record).await;
+        change
+            .elsewhere
+            .extend(self.put_elsewhere(&send_to, &record).await);
         // This device rotated for the withdrawal in force already (the state
         // is noted only once a rotation finished): rotating again would delete
         // the key of the last-resort package stocked then, which local adds
@@ -1176,6 +1213,8 @@ impl Secure {
             channel_id: String,
             #[serde(default)]
             request_b64: String,
+            #[serde(default)]
+            released_at: i64,
         }
         #[derive(Deserialize)]
         struct Log {
@@ -1198,13 +1237,18 @@ impl Secure {
                 },
             };
             let n = log.releases.len();
-            walk.page(
-                &self.server,
-                log.releases
-                    .iter()
-                    .map(|e| e.request_b64.as_str())
-                    .collect(),
-            )?;
+            // Each entry is told apart by its package and time; a server that
+            // sends no references leaves only the page cap.
+            let ids: Option<Vec<String>> = log
+                .releases
+                .iter()
+                .map(|e| {
+                    e.reference_hex
+                        .as_ref()
+                        .map(|r| format!("{r}@{}", e.released_at))
+                })
+                .collect();
+            walk.page(&self.server, ids)?;
             for e in log.releases {
                 let custody = match e.kind.as_deref() {
                     Some(kind) => kind == "custody",
@@ -1234,13 +1278,20 @@ impl Secure {
     async fn publish_packages(&self, packages: &[Vec<u8>]) -> Result<()> {
         self.ensure_pinned().await?;
         let url = format!("{}/api/v1/mls/key-packages", self.base);
-        let body = serde_json::json!({
+        let body = serde_json::to_vec(&serde_json::json!({
             "key_packages_b64": packages.iter().map(|p| STANDARD.encode(p)).collect::<Vec<_>>(),
-        });
-        // Signed, so the server lets a new last-resort package replace the
-        // one it holds (rule 32); stocking alone would not need it.
-        let proof = ReadProof::sign(&self.identity, "POST", signable_path(&url));
-        let mut req = self.http().await?.post(&url).json(&body);
+        }))
+        .expect("the upload serializes");
+        // Signed over the exact body, so the server lets a new last-resort
+        // package replace the one it holds (rule 32) and the proof cannot be
+        // replayed with other packages; stocking alone would not need it.
+        let proof = ReadProof::sign_body(&self.identity, "POST", signable_path(&url), &body);
+        let mut req = self
+            .http()
+            .await?
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
         for (name, value) in proof.headers() {
             req = req.header(name, value);
         }
@@ -2127,22 +2178,39 @@ mod tests {
         sequencers_for, shadow_note,
     };
 
+    fn ids(xs: &[&str]) -> Option<Vec<String>> {
+        Some(xs.iter().map(|x| x.to_string()).collect())
+    }
+
     #[test]
     fn a_log_that_ignores_offset_stops_the_walk() {
         let mut walk = LogWalk::default();
-        walk.page("S", vec!["a", "b"]).unwrap();
-        walk.page("S", vec!["c", "d"]).unwrap();
-        let err = walk.page("S", vec!["c", "d"]).unwrap_err().to_string();
+        walk.page("S", ids(&["a@1", "b@2"])).unwrap();
+        walk.page("S", ids(&["c@3", "d@4"])).unwrap();
+        let err = walk
+            .page("S", ids(&["c@3", "d@4"]))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("S answers every page"), "{err}");
+    }
+
+    #[test]
+    fn distinct_pages_of_local_takes_are_not_a_repeat() {
+        // Local takes carry no request; their packages and times differ.
+        let mut walk = LogWalk::default();
+        walk.page("S", ids(&["a@1", "b@1"])).unwrap();
+        walk.page("S", ids(&["c@1", "d@1"])).unwrap();
+        // Entries with no identity at all are never called a repeat.
+        walk.page("S", None).unwrap();
+        walk.page("S", None).unwrap();
     }
 
     #[test]
     fn a_log_that_never_ends_stops_the_walk() {
         let mut walk = LogWalk::default();
-        let pages: Vec<String> = (0..=LogWalk::MAX_PAGES).map(|n| n.to_string()).collect();
         let mut result = Ok(());
-        for p in &pages {
-            result = walk.page("S", vec![p.as_str()]);
+        for n in 0..=LogWalk::MAX_PAGES {
+            result = walk.page("S", Some(vec![n.to_string()]));
             if result.is_err() {
                 break;
             }
