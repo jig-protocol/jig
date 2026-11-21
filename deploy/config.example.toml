@@ -163,12 +163,16 @@ replay_per_did = 2000
 # else is a stranger. Each nonzero share needs at least one write of burst.
 # Strangers get stranger_share_pct of the writes. They borrow members' share
 # only while no member is writing, so a flood of fresh keys cannot crowd out
-# members. writes_per_second = 0 turns the pools off.
+# members. Members by aged proof draw only from aged_share_pct of the member
+# share, so proofs that age in together cannot crowd out recorded members
+# either; 0 makes an aged proof no membership. writes_per_second = 0 turns
+# the pools off.
 [auth.pools]
 writes_per_second = 1000
 writes_burst = 2000
 stranger_share_pct = 20
 invited_share_pct = 10
+aged_share_pct = 25
 local_member_age_secs = 604800
 
 [keys]

@@ -359,7 +359,8 @@ impl Default for RateLimitSection {
 ///
 /// - **Members** are DIDs with a nonempty `[auth.admission] records` entry
 ///   holding no negative score, and DIDs whose admission proof of work is at
-///   least `local_member_age_secs` old.
+///   least `local_member_age_secs` old. The second kind, members by aged
+///   proof, draw only from `aged_share_pct` of the member share.
 /// - **Invited** is empty until invites exist (JEP-0009).
 /// - **Strangers** are everyone else.
 ///
@@ -383,6 +384,11 @@ pub struct PoolsSection {
     pub stranger_share_pct: u8,
     /// Percent of capacity the invited pool gets (rule 23: 10).
     pub invited_share_pct: u8,
+    /// Percent of the member share that members by aged proof may draw from
+    /// (rule 23, `aged_share`: 25). Recorded members draw from all of it.
+    /// `0` gives aged proofs no membership: those DIDs stay strangers. `100`
+    /// lets them draw from the whole member share.
+    pub aged_share_pct: u8,
     /// How long ago a DID must have done this server's admission proof of
     /// work to count as a member (rule 21's `local_member_age`).
     pub local_member_age_secs: u64,
@@ -395,6 +401,7 @@ impl Default for PoolsSection {
             writes_burst: 2_000,
             stranger_share_pct: 20,
             invited_share_pct: 10,
+            aged_share_pct: 25,
             local_member_age_secs: 7 * 24 * 60 * 60,
         }
     }

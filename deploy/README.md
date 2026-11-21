@@ -148,7 +148,9 @@ private network:
   `[auth.pools]`: strangers share `stranger_share_pct` (20 %) of the
   server's write capacity, so however many keys a flood brings, members keep
   the rest. Members are the DIDs in `records` with no negative score, plus
-  those whose admission proof is `local_member_age_secs` old.
+  those whose admission proof is `local_member_age_secs` old. The second
+  kind share `aged_share_pct` (25 %) of the member share, so a batch of
+  proofs that ages in together cannot crowd out the recorded members.
 - **Federated peers vouch for their authors.** Blocks relayed from a peer run
   the same admission, write and suite gates as local ones, except that their
   authors are not asked for proof-of-work: they never spoke to this server.
