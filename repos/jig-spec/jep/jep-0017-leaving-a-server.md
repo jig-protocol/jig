@@ -111,8 +111,8 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
 
     | Party | Effect |
     | --- | --- |
-    | Member's devices | The record kept on every other server and nameserver should drop `S` too. The client publishes the same higher-`seq` record to each, best effort. Packages already released stay usable (rule 31). Local stock at `S` is kept: local adds continue. |
-    | This server | Keeps the record as a withdrawal. Answers `404 NO_CUSTODY` to custody requests from then on. The check runs inside the release's transaction, so a request racing the withdrawal releases nothing. `GET /api/v1/reach/{did}` answers `404 NO_RECORD`. Stock, memberships and data are untouched. |
+    | Member's devices | The record kept on every other server and nameserver should drop `S` too. The client publishes the same higher-`seq` record to each, best effort. Packages already released stay usable (rule 31). Local stock at `S` is kept: local adds continue. Each other device of `D` learns of the withdrawal from the record `S` serves `D` (below), MUST NOT list `S` again on its own, and runs rule 32's rotation for the keys it holds. |
+    | This server | Keeps the record as a withdrawal. Answers `404 NO_CUSTODY` to custody requests from then on. The check runs inside the release's transaction, so a request racing the withdrawal releases nothing. `GET /api/v1/reach/{did}` answers `404 NO_RECORD` to anyone but `D`, and serves `D`'s own signed read the withdrawal record, so `D`'s devices can tell a withdrawal from no record. Stock, memberships and data are untouched. |
     | Other members of affected channels | Nothing changes. They can still add `D` through `S` (local adds). |
     | Other servers | Custodians, nameservers and sequencers are not told by `S`. A server that still keeps an older record that names `S` sends adders to `S`, which answers `NO_CUSTODY`, so the adder's client tries the record's next entry. |
 
@@ -307,10 +307,16 @@ This JEP describes protocol behaviour. It makes no claim about any legal regime.
 32. **Rotation:**
     - On R1, the client carries out R1's own intent and keeps local adds working:
       - it publishes a fresh last-resort package at `S` and deletes the old one's private init
-        key, so the last-resort package other servers' requesters received is dead;
+        key, so the last-resort package other servers' requesters received is dead. `S` MUST
+        let `D`'s new last-resort package replace the one it holds, and MUST NOT release or
+        accept again the one it replaced;
       - it deletes the private init keys of the ordinary packages the release log
-        (`GET /api/v1/custody/{did}/releases`) shows went to other servers' requesters. If one was
-        used, `D` already joined with it and its key is gone; if not, it can no longer be used.
+        (`GET /api/v1/custody/{did}/releases`) shows went to other servers' requesters. Each
+        entry names the released package's reference (`reference_hex`), and the log pages with
+        `?offset=`, so the client reads every release still within a package's lifetime. If a
+        package was used and the device has processed the Welcome, its key is already gone. If
+        the device has not yet processed it, the add is lost on that device: an add committed
+        before R1 to a device that was offline gives the adder a group `D` is not in.
       - Each release-log entry carries `kind`: `custody` for a release to a signed custody
         request, `local` for a take by `S`'s own key-package route. The client deletes keys for
         `custody` entries only. An entry without `kind`, from a server before this rule, is
