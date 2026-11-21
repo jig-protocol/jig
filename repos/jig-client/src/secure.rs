@@ -518,6 +518,13 @@ impl Session {
         self.with_member(|m, g| Ok(group_of(g, &key).is_some_and(|gid| m.has_group(&gid))))
     }
 
+    /// The id of the MLS group this device holds for `server`/`slug`, if it
+    /// holds one: what [`created_group_id`] is compared against.
+    pub fn group_id(&self, server: &str, slug: &str) -> Result<Option<Vec<u8>>> {
+        let key = group_key(server, slug);
+        self.with_member(|m, g| Ok(group_of(g, &key).filter(|gid| m.has_group(gid))))
+    }
+
     /// This device's epoch in the channel's group; `None` with no group here.
     pub fn epoch(&self, server: &str, slug: &str) -> Result<Option<u64>> {
         let key = group_key(server, slug);
@@ -1376,6 +1383,14 @@ fn group_of(g: &Groups, key: &str) -> Option<Vec<u8>> {
     g.groups.get(key).and_then(|h| hex::decode(h).ok())
 }
 
+/// The id of the MLS group a channel's creation block starts, from the
+/// block's `mls_group_info` field (base64, as the block carries it).
+pub fn created_group_id(mls_group_info_b64: &str) -> Result<Vec<u8>> {
+    let info = b64(mls_group_info_b64, "mls_group_info")?;
+    let (group_id, _) = jig_mls::delivery::group_info_epoch(&info)?;
+    Ok(group_id)
+}
+
 fn b64(s: &str, field: &'static str) -> Result<Vec<u8>> {
     STANDARD.decode(s).map_err(|_| SecureError::Field(field))
 }
@@ -2170,6 +2185,36 @@ mod tests {
         assert!(matches!(
             alice.rename_group(SERVER, "creating:#new", &id),
             Err(SecureError::GroupTaken(_))
+        ));
+    }
+
+    /// A creation block's `mls_group_info` names the group it starts, the
+    /// one [`Session::group_id`] files; anything else is refused.
+    #[test]
+    fn a_creation_blocks_group_info_names_its_group() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let created = alice.create_group(SERVER, "creating:#new").unwrap();
+        let carried = STANDARD.encode(&created.group_info);
+        assert_eq!(created_group_id(&carried).unwrap(), created.group_id);
+        assert_eq!(
+            alice.group_id(SERVER, "creating:#new").unwrap(),
+            Some(created.group_id.clone())
+        );
+        assert_eq!(alice.group_id(SERVER, "#other").unwrap(), None);
+
+        let other = alice.create_group(SERVER, "creating:#other").unwrap();
+        assert_ne!(
+            created_group_id(&STANDARD.encode(&other.group_info)).unwrap(),
+            created.group_id
+        );
+        assert!(matches!(
+            created_group_id("not base64!"),
+            Err(SecureError::Field("mls_group_info"))
+        ));
+        assert!(matches!(
+            created_group_id(&STANDARD.encode(b"not a group info")),
+            Err(SecureError::Mls(_))
         ));
     }
 
