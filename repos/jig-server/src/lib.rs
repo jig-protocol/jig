@@ -4,6 +4,7 @@ pub mod auth;
 pub mod config;
 pub mod error;
 pub mod handler;
+pub mod proxy_protocol;
 pub mod runtime;
 pub mod server;
 pub mod v0_0_2;

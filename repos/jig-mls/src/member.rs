@@ -446,6 +446,21 @@ pub fn message_epoch(bytes: &[u8]) -> Option<u64> {
     Some(message.epoch().as_u64())
 }
 
+/// The group and epoch an MLS commit or application message names in its
+/// framing, read without decrypting anything. `None` for anything else.
+/// Unauthenticated until decrypted: a caller may only use it to describe a
+/// message it could not read, never to trust one.
+pub fn message_group_epoch(bytes: &[u8]) -> Option<(Vec<u8>, u64)> {
+    let message: ProtocolMessage = MlsMessageIn::tls_deserialize_exact(bytes)
+        .ok()?
+        .try_into_protocol_message()
+        .ok()?;
+    Some((
+        message.group_id().as_slice().to_vec(),
+        message.epoch().as_u64(),
+    ))
+}
+
 fn serialize_group_info(info: openmls::messages::group_info::GroupInfo) -> Result<Vec<u8>> {
     MlsMessageOut::from(info)
         .tls_serialize_detached()

@@ -360,6 +360,22 @@ server_did_keyfile = "{keyfile}"
 # To restrict it, uncomment that line and remove kinds. A list here is fixed:
 # kinds added in later releases stay refused until you add them.
 
+# Behind a TLS-passthrough proxy (TCP or SNI passthrough), every client has the
+# proxy's address unless the proxy sends PROXY protocol v2 (HAProxy:
+# `send-proxy-v2`; nginx 1.31.4+ stream: `proxy_protocol v2`, since `on` sends
+# v1, which is refused). List the proxy here and
+# its connections are served under the client address the header names: the
+# per-address rate limit and relay slots then count each client. It fails
+# closed: a connection from a listed proxy that does not open with a valid v2
+# header within header_timeout_ms is closed. That includes no header, v1 text,
+# and a header over 536 bytes (a load balancer that adds many TLVs can exceed
+# it). A valid LOCAL header (the proxy's own health check) keeps the proxy's
+# address. A connection from any other address is served as before, and a PROXY
+# header from it is never read. No forwarded HTTP header is trusted.
+# [server.proxy_protocol]
+# trusted = ["10.0.0.5", "10.0.1.0/24"]
+# header_timeout_ms = 5000
+
 [identity]
 # tofu = trust the first key seen for a DID and pin it. No nameserver needed.
 mode = "tofu"
@@ -404,9 +420,11 @@ banned_dids = []
 # and every write it authors) and per remote address (every request and every
 # WebSocket frame). A bucket holds `*_burst` and refills at `*_per_second`;
 # a rate of 0 turns that limit off. Behind a reverse proxy every request has
-# the proxy's address: raise the per-IP limit or turn it off there. The address
-# also keys a REST write's relay slots on a carried channel, so clients behind
-# one proxy share those too; forwarded headers are not trusted yet (#399).
+# the proxy's address: raise the per-IP limit or turn it off there, or, behind a
+# TLS-passthrough proxy, enable [server.proxy_protocol] above. The address also
+# keys a REST write's relay slots on a carried channel, so clients behind one
+# proxy without PROXY protocol share those too. Forwarded HTTP headers are
+# never trusted.
 [auth.rate_limit]
 per_did_burst = {per_did_burst}
 per_did_per_second = {per_did_per_second}

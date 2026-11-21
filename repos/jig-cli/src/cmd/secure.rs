@@ -366,6 +366,17 @@ impl Secure {
         let server = ctx.server_url()?;
         let session = Session::open(&jig_client::secure::default_dir(), ctx.identity()?)
             .context("opening local MLS state (~/.jig/mls)")?;
+        // State an older build filed under a server's own channel's slug is
+        // filed under its channel id, once (#432). Pins that do not open now
+        // are tried again next time.
+        if let Ok(pins) = Pins::load(&Pins::default_path()) {
+            for note in session
+                .key_by_channel_id(&pins)
+                .context("filing local MLS state by channel id")?
+            {
+                eprintln!("warning: {note}");
+            }
+        }
         Ok(Self {
             session: Arc::new(session),
             identity: ctx.identity()?,
@@ -400,12 +411,41 @@ impl Secure {
         &self.server
     }
 
+    /// The name this device files `reference`'s MLS state under: the
+    /// channel's id, for a server's own channels as for carried ones (#432),
+    /// so that a slug a server gives to a new channel never finds the old
+    /// one's group. `reference` itself while it names no pinned channel.
+    pub fn key(&self, reference: &str) -> String {
+        let pins = Pins::load(&Pins::default_path()).ok();
+        group_name(pins.as_ref(), &self.server, reference)
+    }
+
+    /// [`Self::key`] for the channel this server itself orders under `slug`:
+    /// `None` when none is pinned, though a channel it carries for another
+    /// server may go by the same slug.
+    pub fn own_key(&self, slug: &str) -> Option<String> {
+        let pins = Pins::load(&Pins::default_path()).ok();
+        own_group_name(pins.as_ref(), &self.server, slug)
+    }
+
+    /// [`Self::key`], once the channel `reference` names is pinned: proven
+    /// from the server's listing if it is not yet. Before a channel's MLS
+    /// state is first written, so it is filed under its id from the start.
+    pub async fn pin(&self, reference: &str) -> Result<String> {
+        let key = self.key(reference);
+        if key == reference && !jig_core::canonical_cid::is_canonical_text(reference) {
+            self.channel(reference).await?;
+            return Ok(self.key(reference));
+        }
+        Ok(key)
+    }
+
     /// Wait for the channel's commit lock, in this process or any other for
     /// this DID ([`Session::commit_lock`]). Hold it from before a commit,
     /// create or join is prepared until its outcome is settled.
     pub async fn hold(&self, slug: &str) -> Result<CommitLock> {
         let session = Arc::clone(&self.session);
-        let (server, slug) = (self.server.clone(), slug.to_string());
+        let (server, slug) = (self.server.clone(), self.pin(slug).await?);
         tokio::task::spawn_blocking(move || session.commit_lock(&server, &slug))
             .await
             .context("waiting for the channel's commit lock")?
@@ -493,6 +533,17 @@ impl Secure {
     /// creation block is pinned on first sight, so a channel re-created
     /// under the same name is refused rather than silently trusted.
     pub async fn channel(&self, slug: &str) -> Result<Option<ChannelInfo>> {
+        self.listed(slug, false).await
+    }
+
+    /// [`Self::channel`], for the channel this server itself orders under
+    /// `slug`: `None` when it orders none, though it may carry a channel for
+    /// another server under the same slug.
+    pub async fn own_channel(&self, slug: &str) -> Result<Option<ChannelInfo>> {
+        self.listed(slug, true).await
+    }
+
+    async fn listed(&self, slug: &str, own_only: bool) -> Result<Option<ChannelInfo>> {
         #[derive(Deserialize)]
         struct Listing {
             channels: Vec<ChannelInfo>,
@@ -502,7 +553,12 @@ impl Secure {
             .server(&self.server)
             .map(|p| p.sequencers())
             .unwrap_or_default();
-        let Some(mut info) = pick(listing.channels, slug, &ours)? else {
+        let channels = if own_only {
+            ordered_here(listing.channels, &ours)
+        } else {
+            listing.channels
+        };
+        let Some(mut info) = pick(channels, slug, &ours)? else {
             return Ok(None);
         };
         let pin = self.proven(&info).await?;
@@ -566,9 +622,8 @@ impl Secure {
     /// same block, else fetched, verified and pinned.
     async fn proven(&self, info: &ChannelInfo) -> Result<ChannelPin> {
         let mut pins = Pins::load(&Pins::default_path())?;
-        if let Some(pin) = pins.channel(&self.server, &info.slug)
-            && pin.create_cid == info.id
-        {
+        // Pinned by id, and listed under the slug it was pinned as.
+        if let Some(pin) = pins.channel_listed_as(&self.server, &info.id, &info.slug)? {
             return Ok(pin.clone());
         }
         if info.id.is_empty() {
@@ -600,14 +655,37 @@ impl Secure {
             .server(&self.server)
             .map(|p| p.sequencers())
             .unwrap_or_default();
-        let orders = if names_another_server(&ours, &info.sequencer) {
+        let carried = names_another_server(&ours, &info.sequencer);
+        let orders = if carried {
             vec![info.sequencer.clone()]
         } else {
-            ours
+            ours.clone()
         };
-        let proven =
+        let mut proven =
             prove_channel_ordered_by(&info.slug, &info.id, &served.bundle_b64, &sig, &orders)?;
-        Ok(pins.check_channel(&self.server, &info.slug, proven)?)
+        // Which server orders it is part of what is pinned: a carried channel
+        // may share its slug with one of this server's own (#388), and only
+        // a channel of the same orderer can replace it. The owner is taken
+        // only as its signed offer proves ([`Self::anchor`] does the same).
+        if carried {
+            proven.sequencer = Some(prove_carried(
+                &self.server,
+                &info.slug,
+                &info.id,
+                &info.sequencer,
+                &ours,
+                info.share.as_deref(),
+            )?);
+        }
+        let pinned = pins.check_channel(&self.server, &info.slug, proven)?;
+        if let Some(owner) = &pinned.sequencer {
+            eprintln!(
+                "note: {} is now carried here for {owner}, which orders it; its history is \
+                 checked against that server's records from now on",
+                info.slug
+            );
+        }
+        Ok(pinned)
     }
 
     /// Whether what is sent to `slug` must be encrypted. This device's own
@@ -617,7 +695,7 @@ impl Secure {
     /// Failing to find out is an error, never a reason to send in the clear.
     /// Also returns the tier the server lists, for a label (JEP-0014 rule 5).
     pub async fn encrypted_with_tier(&self, slug: &str) -> Result<(bool, Option<String>)> {
-        let held = self.session.has_group(&self.server, slug)?;
+        let held = self.session.has_group(&self.server, &self.key(slug))?;
         let pinned = Pins::load(&Pins::default_path())?
             .channel(&self.server, slug)
             .map(ChannelPin::encrypted);
@@ -867,7 +945,8 @@ impl Secure {
     /// pages until history reaches back to this device's epoch
     /// ([`history_reaches`]) or to the start of the channel.
     pub async fn sync(&self, slug: &str) -> Result<Synced> {
-        let Some(head) = self.session.head(&self.server, slug)? else {
+        let key = self.pin(slug).await?;
+        let Some(head) = self.session.head(&self.server, &key)? else {
             let delivered = self.newest_to_epoch(slug).await?;
             return self.process(slug, &delivered);
         };
@@ -943,8 +1022,12 @@ impl Secure {
             .rev()
             .find_map(|d| open(d).ok().map(|o| (d, o)))
         {
-            self.session
-                .set_head(&self.server, slug, &newest.cid, d.ingest.as_ref())?;
+            self.session.set_head(
+                &self.server,
+                &self.key(slug),
+                &newest.cid,
+                d.ingest.as_ref(),
+            )?;
         }
         Ok(())
     }
@@ -1048,7 +1131,7 @@ impl Secure {
     fn chain_from_head(&self, slug: &str) -> Result<Option<ChannelChain>> {
         Ok(self
             .session
-            .head_record(&self.server, slug)?
+            .head_record(&self.server, &self.key(slug))?
             .and_then(|h| h.record.clone().map(|r| (h, r)))
             .map(|(h, r)| ChannelChain::across(&r.channel_id, self.sequencers(&r), Some(h))))
     }
@@ -1205,7 +1288,7 @@ impl Secure {
         // blocks than asked, to keep a page within a byte budget, so a short
         // page is not the start of the channel.
         let mut more = !delivered.is_empty();
-        let epoch = self.session.epoch(&self.server, slug)?;
+        let epoch = self.session.epoch(&self.server, &self.key(slug))?;
         let me = self.session.did().to_string();
         let mut pages = 1;
         while more && !history_reaches(&opened(&delivered), epoch, &me) {
@@ -1311,8 +1394,9 @@ impl Secure {
     /// history.
     pub fn observe(&self, reference: &str, block: &jig_client::open::OpenedBlock) -> Seen {
         let (id, slug) = self.names(reference);
+        let key = self.key(reference);
         let channel = ReadIn {
-            key: reference,
+            key: &key,
             id: &id,
             slug: &slug,
         };
@@ -1343,8 +1427,9 @@ impl Secure {
         r.deliveries
             .extend(delivered.iter().map(|d| d.delivery_cid.clone()));
         let (id, slug) = self.names(reference);
+        let key = self.key(reference);
         let channel = ReadIn {
-            key: reference,
+            key: &key,
             id: &id,
             slug: &slug,
         };
@@ -1369,7 +1454,7 @@ impl Secure {
         // later block in the same history may already have removed them.
         let still = self
             .session
-            .group_members(&self.server, reference)
+            .group_members(&self.server, &self.key(reference))
             .unwrap_or_default();
         let tidy = r.left.into_iter().filter(|d| still.contains(d)).collect();
         Synced {
@@ -1390,7 +1475,7 @@ impl Secure {
     pub async fn commit(
         &self,
         slug: &str,
-        prepare: impl Fn(&Session) -> Result<Commit>,
+        prepare: impl Fn(&Session, &str) -> Result<Commit>,
         block_for: impl Fn(&Commit) -> BuiltBlock,
     ) -> Result<String> {
         let _held = self.hold(slug).await?;
@@ -1399,19 +1484,20 @@ impl Secure {
             // Still pending after a sync: an earlier commit whose answer never
             // came, and which did not land (had it, its echo would have
             // merged it). It would block this one.
-            if self.session.has_pending_commit(&self.server, slug)? {
-                self.session.abandon(&self.server, slug)?;
+            let key = self.key(slug);
+            if self.session.has_pending_commit(&self.server, &key)? {
+                self.session.abandon(&self.server, &key)?;
             }
-            let commit = prepare(&self.session)?;
+            let commit = prepare(&self.session, &key)?;
             let block = block_for(&commit);
             match self.submit(&block).await {
                 Ok(cid) => {
-                    self.session.confirm(&self.server, slug)?;
+                    self.session.confirm(&self.server, &key)?;
                     return Ok(cid);
                 }
                 Err(e) if refused(&e) => {
                     // Best effort: the refusal is the error worth reporting.
-                    self.session.abandon(&self.server, slug).ok();
+                    self.session.abandon(&self.server, &key).ok();
                     let stale = e
                         .downcast_ref::<Refused>()
                         .is_some_and(|r| r.code == "STALE_EPOCH");
@@ -1433,19 +1519,20 @@ impl Secure {
                 "no answer from the server; the commit is kept until the next sync shows whether it landed",
             ));
         };
+        let key = self.key(slug);
         if synced.cids.contains(&block.cid()) {
-            self.session.confirm(&self.server, slug)?;
+            self.session.confirm(&self.server, &key)?;
             return Ok(block.cid());
         }
         // Best effort: a commit still pending is dropped by the next one.
-        self.session.abandon(&self.server, slug).ok();
+        self.session.abandon(&self.server, &key).ok();
         Err(sent)
     }
 
     /// Commit the removal of a member who left. Losing the race to another
     /// member doing the same is success.
     pub async fn tidy(&self, slug: &str, did: &str) -> Result<()> {
-        let prepare = |s: &Session| Ok(s.prepare_remove(&self.server, slug, did)?);
+        let prepare = |s: &Session, key: &str| Ok(s.prepare_remove(&self.server, key, did)?);
         let block_for = |c: &Commit| {
             jig_client::blocks::build_member_remove(
                 &self.identity,
@@ -1467,7 +1554,7 @@ impl Secure {
     pub async fn send(&self, slug: &str, text: &str) -> Result<String> {
         let (message, epoch) = self
             .session
-            .encrypt(&self.server, slug, text)
+            .encrypt(&self.server, &self.key(slug), text)
             .with_context(|| format!("encrypting for {slug}"))?;
         let block = jig_client::blocks::build_sealed_text(
             &self.identity,
@@ -1482,6 +1569,27 @@ impl Secure {
             .remember(&block.cid(), self.session.did(), text)?;
         self.submit(&block).await
     }
+}
+
+/// [`Secure::key`] against `pins`: the id of the channel `reference` names on
+/// `server`, by id or as its pin's slug reads it, else `reference`.
+fn group_name(pins: Option<&Pins>, server: &str, reference: &str) -> String {
+    if jig_core::canonical_cid::is_canonical_text(reference) {
+        return reference.to_string();
+    }
+    pins.and_then(|p| p.channel(server, reference))
+        .map(|pin| pin.create_cid.clone())
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| reference.to_string())
+}
+
+/// [`Secure::own_key`] against `pins`: the id of the channel `server` itself
+/// orders under `slug`, never one it carries.
+fn own_group_name(pins: Option<&Pins>, server: &str, slug: &str) -> Option<String> {
+    pins.and_then(|p| p.channel(server, slug))
+        .filter(|pin| pin.sequencer.is_none())
+        .map(|pin| pin.create_cid.clone())
+        .filter(|id| !id.is_empty())
 }
 
 /// The blocks that open; the rest are dropped (and reported) by `replay`.
@@ -1520,16 +1628,22 @@ fn pick(
         if !channel.id.is_empty() && channel.id == reference {
             return Ok(Some(channel));
         }
-        if channel.slug == reference && by_slug.is_none() {
+        if channel.slug == reference {
             if names_another_server(ours, &channel.sequencer) {
                 carried.get_or_insert(channel);
             } else {
-                by_slug = Some(channel);
+                by_slug.get_or_insert(channel);
             }
         }
     }
     match (by_slug, carried) {
-        (Some(own), _) => Ok(Some(own)),
+        // Both: the slug names this server's own (JEP-0005 rule 1), but
+        // never silently (#388).
+        (Some(own), Some(c)) => {
+            eprintln!("note: {}", shadow_note(reference, &own, &c));
+            Ok(Some(own))
+        }
+        (Some(own), None) => Ok(Some(own)),
         (None, Some(c)) => anyhow::bail!(
             "{reference} here is a channel this server carries for {}; name it by its id, {}",
             c.sequencer,
@@ -1539,9 +1653,32 @@ fn pick(
     }
 }
 
+/// The channels in a listing that this server orders itself, leaving out
+/// those it carries for another server.
+fn ordered_here(channels: Vec<ChannelInfo>, ours: &[String]) -> Vec<ChannelInfo> {
+    channels
+        .into_iter()
+        .filter(|c| !names_another_server(ours, &c.sequencer))
+        .collect()
+}
+
+/// What `jig` says when `reference` names both this server's own channel
+/// `own` and a channel it carries for another server, `carried` (#388): the
+/// slug reads the server's own, and the other is named by its id.
+fn shadow_note(reference: &str, own: &ChannelInfo, carried: &ChannelInfo) -> String {
+    format!(
+        "{reference} here is this server's channel {}; {} is also {reference}, carried for {}. \
+         Name it by its id to read it.",
+        own.id, carried.id, carried.sequencer
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ChannelInfo, must_encrypt, pick, sequencers_for};
+    use super::{
+        ChannelInfo, group_name, must_encrypt, ordered_here, own_group_name, pick, sequencers_for,
+        shadow_note,
+    };
     use jig_client::pins::{ChannelPin, Pins};
 
     /// A carried channel's records are held to its owner; the server's own
@@ -1559,6 +1696,7 @@ mod tests {
                 slug,
                 ChannelPin {
                     create_cid: cid.to_string(),
+                    slug: String::new(),
                     suite: "mls".to_string(),
                     owner_did: "did:jig:zuser".to_string(),
                     chain_head: None,
@@ -1611,6 +1749,11 @@ mod tests {
             let got = pick(listing, "bafycarried", &ours).unwrap().unwrap();
             assert_eq!(got.id, "bafycarried");
         }
+        // Both: what `jig` says names the one read and the one shadowed.
+        let note = shadow_note("#shared", &own, &carried);
+        assert!(note.contains("bafyown"), "{note}");
+        assert!(note.contains("bafycarried"), "{note}");
+        assert!(note.contains("did:jig:zowner"), "{note}");
         // Only a carried channel under the slug: refused, naming its id.
         let error = pick(vec![carried], "#shared", &ours)
             .unwrap_err()
@@ -1623,6 +1766,87 @@ mod tests {
             "bafylegacy"
         );
         assert!(pick(vec![], "#none", &ours).unwrap().is_none());
+    }
+
+    /// A `channel create` retry asks whether this server took the create it
+    /// left pending: a channel the server carries for another under the slug
+    /// is not that create, and is no error.
+    #[test]
+    fn a_retry_reads_past_a_carried_channel_with_the_slug() {
+        let ours = vec!["did:jig:zfollower".to_string()];
+        let carried = listed("bafycarried", "#shared", "did:jig:zowner");
+        let own = listed("bafyown", "#shared", "did:jig:zfollower");
+        assert!(
+            pick(ordered_here(vec![carried.clone()], &ours), "#shared", &ours)
+                .unwrap()
+                .is_none()
+        );
+        let got = pick(ordered_here(vec![carried, own], &ours), "#shared", &ours)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.id, "bafyown");
+    }
+
+    /// #432: a server's own channel's MLS state is filed under the id its
+    /// slug is pinned to, as a carried channel's is under the id it is named
+    /// by; a slug nothing is pinned to stays itself.
+    #[test]
+    fn mls_state_is_filed_under_the_pinned_channel_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pins = Pins::load(&dir.path().join("pins.json")).unwrap();
+        let server = "wss://host";
+        let id = jig_core::canonical_cid::of(b"team").to_string();
+        pins.check_channel(
+            server,
+            "#team",
+            ChannelPin {
+                create_cid: id.clone(),
+                slug: String::new(),
+                suite: "mls".to_string(),
+                owner_did: "did:jig:zuser".to_string(),
+                chain_head: None,
+                sequencer: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(group_name(Some(&pins), server, "#team"), id);
+        assert_eq!(group_name(Some(&pins), server, &id), id);
+        let carried = jig_core::canonical_cid::of(b"carried").to_string();
+        assert_eq!(group_name(Some(&pins), server, &carried), carried);
+        assert_eq!(group_name(Some(&pins), server, "#new"), "#new");
+        assert_eq!(group_name(None, server, "#team"), "#team");
+        // Another server's `#team` is not this one's.
+        assert_eq!(group_name(Some(&pins), "wss://elsewhere", "#team"), "#team");
+    }
+
+    /// `channel create` asks whether this server's own channel is already
+    /// here: a channel the server carries for another under the same slug is
+    /// not it, though [`group_name`] resolves the slug to the carried one
+    /// while the server orders none by that slug.
+    #[test]
+    fn a_carried_channel_is_not_the_servers_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pins = Pins::load(&dir.path().join("pins.json")).unwrap();
+        let server = "wss://host";
+        let pin = |id: &str, sequencer: Option<&str>| ChannelPin {
+            create_cid: id.to_string(),
+            slug: String::new(),
+            suite: "mls".to_string(),
+            owner_did: "did:jig:zuser".to_string(),
+            chain_head: None,
+            sequencer: sequencer.map(str::to_string),
+        };
+        let carried = jig_core::canonical_cid::of(b"shared, carried").to_string();
+        pins.check_channel(server, "#shared", pin(&carried, Some("did:jig:zother")))
+            .unwrap();
+        assert_eq!(group_name(Some(&pins), server, "#shared"), carried);
+        assert_eq!(own_group_name(Some(&pins), server, "#shared"), None);
+
+        let own = jig_core::canonical_cid::of(b"shared, own").to_string();
+        pins.check_channel(server, "#shared", pin(&own, None))
+            .unwrap();
+        assert_eq!(own_group_name(Some(&pins), server, "#shared"), Some(own));
+        assert_eq!(own_group_name(None, server, "#shared"), None);
     }
 
     /// A server can say anything about a channel's suite. A device that
