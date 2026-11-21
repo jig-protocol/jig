@@ -347,6 +347,9 @@ reads no encrypted tier.
       Until then, a `public` channel reaches a peer only by a share, as every other channel
       does: rule 1 refuses its relayed `channel-create`, and the next bullet refuses relayed
       posts into it.
+    - **A server relays nothing** (DJ, 2026-11-15). A server MUST NOT send a peer a block over
+      the legacy relay: its channels reach other servers only by a share. It MAY answer a
+      configured peer's federation-scope subscription with an error and send nothing on it.
     - **A server refuses a relayed post into a channel it sequences** (DJ, 2026-11-10; #357).
       A block (other than the `channel-create` that makes it) that a configured peer relays
       over the legacy relay into a channel this server sequences MUST be refused, whether the
