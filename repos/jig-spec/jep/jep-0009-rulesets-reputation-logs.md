@@ -63,7 +63,8 @@ Non-goals:
 1. Every signed object in this JEP is a COSE_Sign1 (RFC 9052) over a deterministic-CBOR payload
    (RFC 8949 §4.2.1):
    - `alg` is EdDSA;
-   - `kid` is the signer's DID as UTF-8;
+   - there is no `kid`: the payload names who may have signed, and a verifier tries each one's key
+     (a ruleset document: its `authors`);
    - the payload is a map with text keys, and field `v` is the object's version;
    - a verifier MUST refuse a payload that is not in deterministic encoding;
    - a verifier MUST refuse an unknown critical field. A field is critical unless its name begins
