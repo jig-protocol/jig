@@ -144,6 +144,14 @@ A server SHOULD serve published key packages (`/api/v1/mls/key-packages`) and th
 group info of a channel (`/api/v1/channels/{slug}/mls/group-info`) to callers who may read
 the channel.
 
+To add a member who stocked no packages on the channel's server, the adding client asks
+one of the member's custodians: a server the member's signed reachability record lists
+(JEP-0004 rule 21). The request is signed by the adder, names the channel and the
+custodian, and goes to `POST /api/v1/custody/{did}/requests` on the custodian
+(JEP-0005 rule 21a). The channel's server takes no part. A custodian can withhold a
+package but cannot forge one: the adder checks the package is the member's before it
+commits.
+
 ### Leaving
 
 A member leaves with a `member-remove` naming itself and carrying no commit. The server

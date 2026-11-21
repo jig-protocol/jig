@@ -302,6 +302,7 @@ pub fn build_v0_0_2_router(state: Arc<AppState>) -> Router {
         .merge(crate::v0_0_2_blocks::build_blocks_router(state.clone()))
         .merge(crate::v0_0_2_admin::build_channel_ops_router(state.clone()))
         .merge(crate::v0_0_2_mls::build_mls_router(state.clone()))
+        .merge(crate::v0_0_2_custody::build_custody_router(state.clone()))
         .merge(crate::v0_0_2_admission::build_admission_router(
             state.clone(),
         ));

@@ -169,8 +169,10 @@ each says what would change it.
    protocol fit as a suite with its own group semantics, or only as PQ-hybrid MLS? v0.2
    shows suites are pluggable with the test suite and conformance vectors instead. A
    production second suite is a stretch goal.
-3. ~~Key-package distribution~~ *v0.2*: the home server, which validates each package's
-   binding to its DID. Nameserver distribution is deferred.
+3. ~~Key-package distribution~~ *v0.2*: the servers a DID publishes its packages to,
+   each validating every package's binding to its DID. A member of another server gets one
+   from a custodian the DID's reachability record lists (JEP-0005 rules 21–21b).
+   Nameserver distribution is deferred.
 4. Multi-device membership and key rotation. *v0.2*: one DID is one MLS client, and the
    DID's key is the MLS signature key, so rotating it means rejoining.
 5. ~~Who signs membership changes on a DM?~~ *v0.2*: there is no ownerless DM; whoever

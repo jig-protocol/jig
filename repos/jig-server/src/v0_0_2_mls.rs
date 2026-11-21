@@ -146,6 +146,14 @@ pub async fn publish_key_packages(
 
 /// GET /api/v1/mls/key-packages/:did — hand out one package, consuming it
 /// unless it is the DID's last resort.
+///
+/// Held to the same hourly limits as a custodian's releases
+/// (`[custody] per_member_per_hour`, `per_requester_per_hour`) and logged in
+/// the same release log, so this route cannot drain a DID's stock past them.
+/// The caller is the requester; with unauthenticated reads, every caller
+/// shares one anonymous bucket. Nothing names the channel here, so a repeat
+/// is never answered with an earlier package: one package must not serve two
+/// channels.
 pub async fn take_key_package(
     State(state): State<Arc<AppState>>,
     Path(did): Path<String>,
@@ -153,25 +161,50 @@ pub async fn take_key_package(
     headers: axum::http::HeaderMap,
 ) -> Result<Json<KeyPackageBody>, (StatusCode, Json<ErrorBody>)> {
     let started = std::time::Instant::now();
-    admit_caller(&state, &headers, "GET", uri.path(), started)?;
+    let caller = admit_caller(&state, &headers, "GET", uri.path(), started)?;
     let did = jig_pipeline::effect::canonical_did_string(&did);
     let now = chrono::Utc::now().timestamp();
+    let requester = caller.map(|c| c.as_str().to_string()).unwrap_or_default();
+    let take_id: [u8; 32] = rand::random();
+    let custody = &state.config.custody;
+    let ask = jig_pipeline::persist::ReleaseAsk {
+        did: &did,
+        requester: &requester,
+        channel_id: "",
+        request_hash: &take_id,
+        request: &[],
+        now,
+        repeat_window: 0,
+        repeat: false,
+        per_did: custody.per_member_per_hour,
+        per_requester: custody.per_requester_per_hour,
+        listing: None,
+        kind: jig_pipeline::persist::ReleaseKind::Local,
+    };
     match state
         .ingest_ctx
         .store
-        .take_key_package(&did, now)
+        .release_key_package(&ask)
         .map_err(persist_err)?
     {
-        Some(bytes) => Ok(Json(KeyPackageBody {
-            key_package_b64: STANDARD.encode(bytes),
+        jig_pipeline::persist::Release::Released { package, .. }
+        | jig_pipeline::persist::Release::Again { package, .. } => Ok(Json(KeyPackageBody {
+            key_package_b64: STANDARD.encode(package),
         })),
-        None => Err(err(
-            StatusCode::NOT_FOUND,
-            "NO_KEY_PACKAGE",
-            format!(
-                "{did} has published no MLS key packages here; they need to run a jig client against this server once"
-            ),
+        jig_pipeline::persist::Release::Limited(_) => Err(err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "RATE_LIMITED",
+            format!("{did}'s key packages were taken too often in the last hour; try again later"),
         )),
+        jig_pipeline::persist::Release::Empty | jig_pipeline::persist::Release::NotListed => {
+            Err(err(
+                StatusCode::NOT_FOUND,
+                "NO_KEY_PACKAGE",
+                format!(
+                    "{did} has published no MLS key packages here; they need to run a jig client against this server once"
+                ),
+            ))
+        }
     }
 }
 
@@ -297,6 +330,46 @@ mod tests {
         assert_eq!(
             again.accepted, 0,
             "a second last-resort package is not stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn taking_packages_here_is_held_to_the_custody_limits_and_logged() {
+        let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
+        config.auth.require_authenticated_reads = false;
+        config.custody.per_member_per_hour = 2;
+        let state = Arc::new(AppState::for_test_with_config(config).unwrap());
+        let (m, did) = member(7);
+        publish(&state, &m.key_packages(5, false).unwrap()).await;
+        let take = || {
+            take_key_package(
+                State(state.clone()),
+                Path(did.clone()),
+                format!("/api/v1/mls/key-packages/{did}").parse().unwrap(),
+                axum::http::HeaderMap::new(),
+            )
+        };
+        let Json(one) = take().await.unwrap();
+        let Json(two) = take().await.unwrap();
+        assert_ne!(
+            one.key_package_b64, two.key_package_b64,
+            "never one package twice"
+        );
+        let refused = take().await.unwrap_err();
+        assert_eq!(refused.0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            state.ingest_ctx.store.key_package_stock(&did).unwrap(),
+            (3, false)
+        );
+        let log = state
+            .ingest_ctx
+            .store
+            .key_package_releases(&did, 10)
+            .unwrap();
+        assert_eq!(log.len(), 2);
+        assert!(
+            log.iter()
+                .all(|e| e.kind == jig_pipeline::persist::ReleaseKind::Local)
         );
     }
 

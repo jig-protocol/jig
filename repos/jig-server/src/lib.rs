@@ -15,6 +15,7 @@ pub mod v0_0_2_bridge_storage;
 pub mod v0_0_2_bridges;
 pub mod v0_0_2_catch_up;
 pub mod v0_0_2_contract;
+pub mod v0_0_2_custody;
 pub mod v0_0_2_federation;
 pub mod v0_0_2_federation_tls;
 pub mod v0_0_2_ingest_error;
