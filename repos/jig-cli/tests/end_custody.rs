@@ -183,9 +183,29 @@ async fn a_member_who_ends_custody_is_added_only_locally_until_they_restore_it()
         note.contains("was withdrawn, from another device"),
         "{note}"
     );
+    // It finished: it noted the withdrawal, which it does only after rotating.
+    let state: Value = serde_json::from_slice(
+        &std::fs::read(
+            other
+                .path()
+                .join(".jig")
+                .join("servers")
+                .join(format!("{}.json", member.replace(':', "_"))),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let withdrawn = state["servers"]
+        .as_object()
+        .unwrap()
+        .values()
+        .any(|s| s["reach"]["withdrawn"] == Value::Bool(true));
+    assert!(withdrawn, "{state}");
     ok(owner_home.path(), &["channel", "create", "#three"]);
     let out = add_via(owner_home.path(), "#three", &member, &b);
     assert!(!out.status.success(), "the other device did not undo R1");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("NO_CUSTODY"), "{stderr}");
 
     // Restored: added through B again, and the member joins.
     let restored = ok(member_home.path(), &["server", "custody", "on"]);

@@ -12,8 +12,11 @@
 //! names the server by DID, and a URL can move while the DID stays. `url` is
 //! the last URL this device used for it.
 //!
-//! Fields this version does not know are kept through a load and a save, so
-//! an older client does not erase what a newer one wrote.
+//! Fields this version does not know, at the top level and in each server's
+//! entry, are kept through a load and a save, so an older client does not
+//! erase what a newer one wrote. The small `reach` and `local_adds` objects
+//! are replaced whole whenever they change; a newer field belongs in the
+//! entry beside them, not inside them.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -70,6 +73,11 @@ pub struct ServerState {
     /// The last-resort package stocked there, the same way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_resort: Option<String>,
+    /// Packages whose keys are being deleted: moved here before a
+    /// replacement is published, cleared once the keys are gone, so a run
+    /// cut short finishes the deletion next time (JEP-0017 rule 32).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retiring: Vec<String>,
     /// Fields from a newer version, kept as they are.
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
