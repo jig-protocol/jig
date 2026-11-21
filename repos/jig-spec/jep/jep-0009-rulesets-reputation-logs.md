@@ -63,8 +63,9 @@ Non-goals:
 1. Every signed object in this JEP is a COSE_Sign1 (RFC 9052) over a deterministic-CBOR payload
    (RFC 8949 §4.2.1):
    - `alg` is EdDSA;
-   - there is no `kid`: the payload names who may have signed, and a verifier tries each one's key
-     (a ruleset document: its `authors`);
+   - there is no `kid`: each object's rule says whose key must verify it. A ruleset document is
+     signed by one of its `authors`, an `ack` by its `subject`, and a report by its `reporter`;
+     a verifier tries those keys;
    - the payload is a map with text keys, and field `v` is the object's version;
    - a verifier MUST refuse a payload that is not in deterministic encoding;
    - a verifier MUST refuse an unknown critical field. A field is critical unless its name begins
@@ -97,7 +98,8 @@ Non-goals:
    - A server that enforces anything other than what it declared has signed evidence against
      itself (OP-02).
 5. **Acknowledgement.** Before a server applies a ruleset to a subject, the subject MUST have
-   signed an `ack` object `{v, ruleset_hash, server, at}`.
+   signed an `ack` object `{v, ruleset_hash, server, subject, at}`, where `subject` is the
+   subject's DID.
    - The server MUST keep the `ack` and MUST NOT lower the subject's standing under a ruleset
      hash the subject has not acknowledged (GV-03).
    - When the ruleset changes version, the server MUST ask for a new `ack` before applying the new

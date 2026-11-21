@@ -1,7 +1,7 @@
 //! The ruleset document (JEP-0009 rule 3).
 //!
 //! A ruleset fixes how standing is computed and recommends what a server does with it. It is a
-//! signed object: a `COSE_Sign1` ([`crate::cose`]) over a deterministic-CBOR payload (rule 1),
+//! signed object: a `COSE_Sign1` over a deterministic-CBOR payload (rule 1),
 //! and its **hash** is the CID of the envelope ([`crate::canonical_cid`]). A server declares the
 //! hash in its welcome and `server-manifest` (rule 4), and a subject acknowledges it (rule 5).
 //!
@@ -278,7 +278,7 @@ pub struct UsefulWork {
     pub k: BTreeMap<WorkKind, u64>,
     pub n_escalate: u64,
     pub k_escalate: u64,
-    /// Micro-units.
+    /// ppm of `accrual_per_period` (JEP-0016 rule 31).
     pub credit_cap_per_period: u64,
     /// Micro-units, at most 0.
     pub fraud_weight: i64,
@@ -368,6 +368,15 @@ impl<'a> Obj<'a> {
                     .ok_or_else(|| field(self.path(key), "not an unsigned integer"))
             })
             .transpose()
+    }
+
+    /// A multiplier or divisor: 1 means none, and 0 is undefined.
+    fn positive(&self, key: &str) -> Result<u64, RulesetError> {
+        let n = self.u64(key)?;
+        if n == 0 {
+            return Err(field(self.path(key), "0; 1 means none"));
+        }
+        Ok(n)
     }
 
     fn ppm(&self, key: &str) -> Result<u64, RulesetError> {
@@ -587,8 +596,8 @@ fn parse_parameters(p: &Obj<'_>) -> Result<Parameters, RulesetError> {
     }
     let pow = Pow {
         admit,
-        max_penalty_multiplier: pow.u64("max_penalty_multiplier")?,
-        max_standing_discount: pow.u64("max_standing_discount")?,
+        max_penalty_multiplier: pow.positive("max_penalty_multiplier")?,
+        max_standing_discount: pow.positive("max_standing_discount")?,
     };
 
     let pools = p.obj("pools", &["stranger_share", "invited_share", "aged_share"])?;
@@ -711,8 +720,8 @@ fn parse_consequence(value: &Value, path: &str) -> Result<Consequence, RulesetEr
         v => {
             let bound = |v: &Value| {
                 v.as_i64()
-                    .filter(|n| n.unsigned_abs() < PPM)
-                    .ok_or_else(|| field(c.path("score_ppm"), "not a score in (−10⁶, 10⁶)"))
+                    .filter(|n| (-(PPM as i64)..PPM as i64).contains(n))
+                    .ok_or_else(|| field(c.path("score_ppm"), "not a score in [−10⁶, 10⁶)"))
             };
             let [lo, hi] = v.as_array().unwrap_or_default() else {
                 return Err(field(c.path("score_ppm"), "not null or [low, high]"));
@@ -825,7 +834,7 @@ fn parse_useful_work(value: &Value) -> Result<UsefulWork, RulesetError> {
         k: per_kind("k")?,
         n_escalate: u.u64("n_escalate")?,
         k_escalate: u.u64("k_escalate")?,
-        credit_cap_per_period: u.u64("credit_cap_per_period")?,
+        credit_cap_per_period: u.ppm("credit_cap_per_period")?,
         fraud_weight: u.penalty("fraud_weight")?,
         beacon_withheld_weight: u.penalty("beacon_withheld_weight")?,
         beacon_exclusion_epochs: u.u64("beacon_exclusion_epochs")?,
@@ -1065,32 +1074,40 @@ fn useful_work_value(u: &UsefulWork) -> Value {
 // ---------------------------------------------------------------------------
 // Signing
 
-/// A signed ruleset: the envelope, the document it carries, and its hash.
+/// A signed ruleset: the envelope, the document it carries, and its hash. Its fields are
+/// read-only, so the document and hash always describe the envelope; to change a document,
+/// clone it and sign the copy.
 #[cfg(feature = "ed25519")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedRuleset {
-    pub envelope: Vec<u8>,
-    pub document: RulesetDocument,
-    /// The ruleset's **hash** (rule 3): the canonical CID of the envelope.
-    pub hash: Cid,
-    /// The author whose key signed it.
-    pub signer: String,
+    envelope: Vec<u8>,
+    document: RulesetDocument,
+    hash: Cid,
+    signer: String,
 }
 
 #[cfg(feature = "ed25519")]
 impl SignedRuleset {
-    /// Sign `document` with `key`, which must be one of its `authors`; [`Self::open`] refuses
-    /// the envelope otherwise.
-    pub fn sign(document: RulesetDocument, key: &ed25519_dalek::SigningKey) -> Self {
-        let envelope = crate::cose::sign1(key, &document.to_payload());
+    /// Sign `document` with `key`. Refuses a document that [`Self::open`] would refuse: one that
+    /// does not parse back from its own payload, or whose `authors` do not include the key's DID.
+    pub fn sign(
+        document: RulesetDocument,
+        key: &ed25519_dalek::SigningKey,
+    ) -> Result<Self, RulesetError> {
+        let payload = document.to_payload();
+        RulesetDocument::from_payload(&payload)?;
         let signer = crate::did::Did::from_ed25519_pubkey(&key.verifying_key().to_bytes())
             .to_did_jig_string();
-        Self {
+        if !document.authors.contains(&signer) {
+            return Err(RulesetError::NotByAnAuthor);
+        }
+        let envelope = crate::cose::sign1(key, &payload);
+        Ok(Self {
             hash: crate::canonical_cid::of(&envelope),
             envelope,
             document,
             signer,
-        }
+        })
     }
 
     /// Parse and verify an envelope: a deterministic, well-formed document, signed by one of the
@@ -1110,6 +1127,26 @@ impl SignedRuleset {
             document,
             signer,
         })
+    }
+
+    /// The `COSE_Sign1` bytes.
+    pub fn envelope(&self) -> &[u8] {
+        &self.envelope
+    }
+
+    /// The document the envelope carries.
+    pub fn document(&self) -> &RulesetDocument {
+        &self.document
+    }
+
+    /// The ruleset's **hash** (rule 3): the canonical CID of the envelope.
+    pub fn hash(&self) -> &Cid {
+        &self.hash
+    }
+
+    /// The author whose key signed it.
+    pub fn signer(&self) -> &str {
+        &self.signer
     }
 }
 
@@ -1331,11 +1368,51 @@ mod tests {
                 "ascending",
             ),
             (&["invites"], Some(Value::Unsigned(0)), "boolean"),
+            (
+                &["parameters", "pow", "max_standing_discount"],
+                Some(Value::Unsigned(0)),
+                "1 means none",
+            ),
+            (
+                &["parameters", "pow", "max_penalty_multiplier"],
+                Some(Value::Unsigned(0)),
+                "1 means none",
+            ),
         ];
         for (path, new, want) in cases {
             let err = with("jig-reference", path, new.clone()).unwrap_err();
             assert!(err.to_string().contains(want), "{path:?}: {err}");
         }
+    }
+
+    /// Scores run over [−10⁶, 10⁶) (rule 40), so a consequence row may start at −10⁶ but not
+    /// reach 10⁶.
+    #[test]
+    fn consequence_scores_cover_the_whole_range() {
+        let row = |lo: i64, hi: i64| {
+            let mut v = vector("jig-reference");
+            let Value::Map(top) = &mut v else {
+                unreachable!()
+            };
+            let (_, Value::Array(rows)) = top
+                .iter_mut()
+                .find(|(k, _)| k.as_text() == Some("consequences"))
+                .unwrap()
+            else {
+                unreachable!()
+            };
+            set(
+                &mut rows[0],
+                &["score_ppm"],
+                Some(Value::Array(vec![Value::int(lo), Value::int(hi)])),
+            );
+            RulesetDocument::from_payload(&dcbor::encode(&v).unwrap())
+        };
+        let doc = row(-1_000_000, -1).unwrap();
+        assert_eq!(doc.consequences[0].score_ppm, Some((-1_000_000, -1)));
+        assert!(row(-1_000_001, -1).is_err());
+        assert!(row(0, 1_000_000).is_err());
+        assert!(row(0, 999_999).is_ok());
     }
 
     #[test]
@@ -1355,6 +1432,11 @@ mod tests {
                 &["useful_work", "fraud_weight"],
                 Value::Unsigned(5),
                 "above 0",
+            ),
+            (
+                &["useful_work", "credit_cap_per_period"],
+                Value::Unsigned(1_000_001),
+                "above 10⁶",
             ),
         ];
         for (path, new, want) in cases {
@@ -1391,27 +1473,34 @@ mod tests {
         fn a_signed_ruleset_opens_with_the_same_hash() {
             let (alice, alice_did) = key(1);
             let (_, bob_did) = key(2);
-            let signed = SignedRuleset::sign(authored(vec![alice_did.clone(), bob_did]), &alice);
-            let opened = SignedRuleset::open(&signed.envelope).unwrap();
+            let signed =
+                SignedRuleset::sign(authored(vec![alice_did.clone(), bob_did]), &alice).unwrap();
+            let opened = SignedRuleset::open(signed.envelope()).unwrap();
             assert_eq!(opened, signed);
-            assert_eq!(opened.signer, alice_did);
-            assert_eq!(opened.hash, hash_of(&signed.envelope));
-            crate::canonical_cid::check(&opened.hash).unwrap();
+            assert_eq!(opened.signer(), alice_did);
+            assert_eq!(*opened.hash(), hash_of(signed.envelope()));
+            crate::canonical_cid::check(opened.hash()).unwrap();
         }
 
         #[test]
         fn a_ruleset_signed_by_a_non_author_is_refused() {
             let (_, alice_did) = key(1);
             let (mallory, _) = key(3);
-            let signed = SignedRuleset::sign(authored(vec![alice_did]), &mallory);
+            let doc = authored(vec![alice_did]);
             assert_eq!(
-                SignedRuleset::open(&signed.envelope),
+                SignedRuleset::sign(doc.clone(), &mallory),
+                Err(RulesetError::NotByAnAuthor)
+            );
+            // An envelope made outside `sign` is refused on open too.
+            let forged = crate::cose::sign1(&mallory, &doc.to_payload());
+            assert_eq!(
+                SignedRuleset::open(&forged),
                 Err(RulesetError::NotByAnAuthor)
             );
             // With no authors, nobody vouches for it.
-            let signed = SignedRuleset::sign(authored(Vec::new()), &mallory);
+            let unsigned = crate::cose::sign1(&mallory, &authored(Vec::new()).to_payload());
             assert_eq!(
-                SignedRuleset::open(&signed.envelope),
+                SignedRuleset::open(&unsigned),
                 Err(RulesetError::NotByAnAuthor)
             );
         }
@@ -1420,11 +1509,22 @@ mod tests {
         fn any_change_changes_the_hash() {
             let (alice, alice_did) = key(1);
             let doc = authored(vec![alice_did]);
-            let a = SignedRuleset::sign(doc.clone(), &alice);
+            let a = SignedRuleset::sign(doc.clone(), &alice).unwrap();
             let mut next = doc;
             next.version += 1;
-            let b = SignedRuleset::sign(next, &alice);
-            assert_ne!(a.hash, b.hash);
+            let b = SignedRuleset::sign(next, &alice).unwrap();
+            assert_ne!(a.hash(), b.hash());
+        }
+
+        /// `sign` refuses what `open` would refuse, so it never returns an envelope nobody can
+        /// open.
+        #[test]
+        fn an_invalid_document_is_not_signed() {
+            let (alice, alice_did) = key(1);
+            let mut doc = authored(vec![alice_did]);
+            doc.epoch.epoch_secs = 0;
+            let err = SignedRuleset::sign(doc, &alice).unwrap_err();
+            assert!(err.to_string().contains("epoch_secs"), "{err}");
         }
     }
 }
