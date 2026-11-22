@@ -90,10 +90,8 @@ impl BridgeRegistry {
         // managed-DID registrar -> fanout bridge-sink. A single mpsc carries
         // fanout deliveries for every managed DID this bridge owns; the
         // outbound task (below) turns them into Bridge::outbound calls.
-        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::unbounded_channel::<(
-            jig_pipeline::persist::StoredBlock,
-            jig_pipeline::persist::StoredReceipt,
-        )>();
+        let (sink_tx, mut sink_rx) =
+            tokio::sync::mpsc::unbounded_channel::<jig_pipeline::fanout::BridgeDelivery>();
         let fanout_for_reg = fanout.clone();
         let sink_tx_for_reg = sink_tx.clone();
         let registrar = jig_bridge_core::ManagedDidRegistrar::new(move |did: String| {
@@ -127,16 +125,8 @@ impl BridgeRegistry {
         let bridge_arc: LoadedBridge = Arc::new(Mutex::new(bridge));
         let bridge_for_outbound = bridge_arc.clone();
         tokio::spawn(async move {
-            while let Some((blk, rcpt)) = sink_rx.recv().await {
-                let delivered = jig_bridge_core::DeliveredBlock {
-                    bundle_b64: base64::engine::general_purpose::STANDARD.encode(&blk.bundle_bytes),
-                    receipts: vec![jig_bridge_core::ReceiptRef {
-                        receipt_cid: rcpt.cid.clone(),
-                        render_hash: rcpt.render_hash.clone(),
-                        produced_at: rcpt.produced_at,
-                    }],
-                    delivery_cid: blk.cid.clone(),
-                };
+            while let Some(delivery) = sink_rx.recv().await {
+                let delivered = delivered_to_bridge(&delivery);
                 let b = bridge_for_outbound.lock().await;
                 if let Err(e) = b.outbound(&delivered).await {
                     tracing::warn!("bridge {} outbound error: {e}", b.name());
@@ -165,6 +155,28 @@ impl BridgeRegistry {
         }
         loaded.clear();
         Ok(())
+    }
+}
+
+/// What a bridge is handed for one fanout delivery. A carried block (#454)
+/// has no receipt of this server's, so it lists none, and says it was not
+/// sequenced here.
+fn delivered_to_bridge(
+    delivery: &jig_pipeline::fanout::BridgeDelivery,
+) -> jig_bridge_core::DeliveredBlock {
+    jig_bridge_core::DeliveredBlock {
+        bundle_b64: base64::engine::general_purpose::STANDARD.encode(&delivery.block.bundle_bytes),
+        receipts: delivery
+            .receipt
+            .iter()
+            .map(|r| jig_bridge_core::ReceiptRef {
+                receipt_cid: r.cid.clone(),
+                render_hash: r.render_hash.clone(),
+                produced_at: r.produced_at,
+            })
+            .collect(),
+        delivery_cid: delivery.block.cid.clone(),
+        sequenced_here: delivery.sequenced_here,
     }
 }
 
@@ -404,6 +416,55 @@ mod tests {
     };
     use std::sync::Arc;
     use tokio::sync::Mutex;
+
+    /// A block this server sequenced is handed with its receipt; a carried
+    /// one (#454) with none, and marked as not sequenced here.
+    #[test]
+    fn a_carried_delivery_lists_no_receipt_and_says_so() {
+        use jig_pipeline::fanout::BridgeDelivery;
+        use jig_pipeline::persist::{StoredBlock, StoredReceipt};
+        let block = StoredBlock {
+            cid: "bafy-post".to_string(),
+            channel_id: Some("bafy-channel".to_string()),
+            block_kind: "text-render".to_string(),
+            sender_did: "did:jig:zBob".to_string(),
+            sender_sig: vec![0; 64],
+            bundle_bytes: b"{}".to_vec(),
+            is_synthetic: false,
+            hlc_wall_ms: 0,
+            hlc_logical: 0,
+            hlc_origin: "did:jig:zBob".to_string(),
+            posted_at: 0,
+            origin_server: "wss://owner".to_string(),
+            federated_from: None,
+        };
+        let receipt = StoredReceipt {
+            cid: "bafy-receipt".to_string(),
+            block_cid: "bafy-post".to_string(),
+            server_id: "did:jig:zHere".to_string(),
+            receipt_bytes: b"{}".to_vec(),
+            render_hash: Some("h".to_string()),
+            produced_at: 7,
+        };
+        let here = delivered_to_bridge(&BridgeDelivery {
+            block: block.clone(),
+            receipt: Some(receipt),
+            sequenced_here: true,
+        });
+        assert!(here.sequenced_here);
+        assert_eq!(here.receipts.len(), 1);
+        assert_eq!(here.receipts[0].receipt_cid, "bafy-receipt");
+        assert_eq!(here.delivery_cid, "bafy-post");
+
+        let carried = delivered_to_bridge(&BridgeDelivery {
+            block,
+            receipt: None,
+            sequenced_here: false,
+        });
+        assert!(!carried.sequenced_here);
+        assert!(carried.receipts.is_empty(), "this server executed nothing");
+        assert_eq!(carried.delivery_cid, "bafy-post");
+    }
 
     struct TestBridge {
         name: &'static str,

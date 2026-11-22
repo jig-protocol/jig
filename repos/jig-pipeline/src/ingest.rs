@@ -4742,8 +4742,9 @@ mod tests {
             .await
             .expect("bridge sink should receive within timeout")
             .expect("a delivery");
-        assert_eq!(got.0.channel_id.as_deref(), Some(channel_cid.as_str()));
-        assert_eq!(got.0.sender_did, bob_did);
+        assert_eq!(got.block.channel_id.as_deref(), Some(channel_cid.as_str()));
+        assert_eq!(got.block.sender_did, bob_did);
+        assert!(got.sequenced_here, "ingest sequences what it dispatches");
     }
 
     #[tokio::test]
@@ -4813,8 +4814,8 @@ mod tests {
             .await
             .expect("bridge sink should receive within timeout — slug->CID resolution must fire")
             .expect("a delivery");
-        assert_eq!(got.0.channel_id.as_deref(), Some(channel_cid.as_str()));
-        assert_eq!(got.0.sender_did, bob_did);
+        assert_eq!(got.block.channel_id.as_deref(), Some(channel_cid.as_str()));
+        assert_eq!(got.block.sender_did, bob_did);
     }
 
     #[tokio::test]

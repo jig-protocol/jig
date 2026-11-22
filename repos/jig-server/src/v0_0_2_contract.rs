@@ -3118,6 +3118,89 @@ mod tests {
     /// the receiver, could give. Cross-server render agreement is
     /// `integration-tests/tests/federated_render_agrees.rs`. This fails if a
     /// follower starts executing carried blocks without that being decided.
+    /// #454: a member of a shared channel whose DID a bridge on the follower
+    /// manages gets the owner's posts at that bridge's sink, as from a
+    /// channel the follower sequences. The delivery says it was not sequenced
+    /// on the follower and carries no receipt of its.
+    #[tokio::test]
+    async fn a_shared_channels_post_reaches_a_bridged_member_on_the_follower() {
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = post(
+            &p.owner,
+            &p.user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#bridged", "tier": "public"}),
+        )
+        .await
+        .unwrap();
+        let managed = Did::from_ed25519_pubkey(
+            SigningKey::from_bytes(&rand::random())
+                .verifying_key()
+                .as_bytes(),
+        )
+        .to_did_jig_string();
+        post(
+            &p.owner,
+            &p.user,
+            BlockKind::MemberAdd,
+            serde_json::json!({"channel_id": channel, "member_did": managed}),
+        )
+        .await
+        .unwrap();
+        let (tx, sink) = tokio::sync::mpsc::unbounded_channel();
+        let sink = std::sync::Mutex::new(sink);
+        p.follower
+            .ingest_ctx
+            .fanout
+            .register_bridge_did(managed.clone(), tx);
+        post(
+            &p.owner,
+            &p.user,
+            BlockKind::ChannelShare,
+            serde_json::json!({
+                "channel_id": channel,
+                "to": p.follower.server_did.to_did_jig_string(),
+                "grant": "read",
+            }),
+        )
+        .await
+        .unwrap();
+        let a_did = p.owner.server_did.to_did_jig_string();
+        eventually("the share accepted", || {
+            p.follower
+                .ingest_ctx
+                .store
+                .has_accepted_share(&channel, &a_did)
+                .unwrap()
+                .then_some(())
+        })
+        .await;
+
+        let text = p.text(&channel, "to the bridged member").await;
+        let got = eventually("the post at the follower's bridge sink", || {
+            p.follows.stream.pull_all();
+            while let Ok(d) = sink.lock().unwrap().try_recv() {
+                if d.block.cid == text {
+                    return Some(d);
+                }
+            }
+            None
+        })
+        .await;
+        assert!(!got.sequenced_here, "the owner sequenced it");
+        assert!(got.receipt.is_none(), "the follower executed nothing");
+        assert!(
+            p.owner
+                .ingest_ctx
+                .store
+                .get_receipts_for_block(&text)
+                .unwrap()
+                .iter()
+                .all(|r| r.server_id == a_did),
+            "the only receipt is the owner's"
+        );
+    }
+
     #[tokio::test]
     async fn a_post_crosses_by_a_share_and_runs_only_on_its_owner() {
         let p = pair(OfferPolicy::Accept).await;

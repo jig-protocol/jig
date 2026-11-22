@@ -770,7 +770,7 @@ async fn deliver(
     };
     if let Err(e) = ctx
         .fanout
-        .broadcast_local_only(block, &receipt, Some(&policy))
+        .broadcast_carried(block, &receipt, Some(&policy))
         .await
     {
         tracing::warn!(block = %block.cid, "carried block not delivered: {e:#}");
@@ -1025,6 +1025,121 @@ mod tests {
             &owner.did(),
         )
         .await
+    }
+
+    /// A bridge sink on `follower` for `managed`.
+    fn bridge_sink(
+        follower: &IngestContext,
+        managed: &str,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<crate::fanout::BridgeDelivery> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        follower.fanout.register_bridge_did(managed.to_string(), tx);
+        rx
+    }
+
+    /// #454: a carried post reaches the bridge sink of a member the follower
+    /// mirrors, as a post the server sequenced does. It is marked as not
+    /// sequenced here and has no receipt, since the follower executed
+    /// nothing. A managed DID that is not a member gets nothing.
+    #[tokio::test]
+    async fn a_carried_post_reaches_a_bridged_members_sink() {
+        let mut owner = Owner::new().await;
+        let member = did(&SigningKey::from_bytes(&[6; 32]));
+        owner
+            .post(
+                BlockKind::MemberAdd,
+                serde_json::json!({"channel_id": owner.channel, "member_did": member}),
+            )
+            .await;
+        let follower = owner.follower();
+        for sent in &owner.sent {
+            take(&follower, &owner, sent).await.unwrap();
+        }
+        let mut members_sink = bridge_sink(&follower, &member);
+        let mut strangers_sink = bridge_sink(&follower, &did(&SigningKey::from_bytes(&[7; 32])));
+
+        let post = owner.text("for the member").await;
+        take(&follower, &owner, owner.sent.last().unwrap())
+            .await
+            .unwrap();
+
+        let got = members_sink
+            .try_recv()
+            .expect("the member's sink gets the post");
+        assert_eq!(got.block.cid, post);
+        assert!(!got.sequenced_here, "the owner sequenced it");
+        assert!(got.receipt.is_none(), "the follower executed nothing");
+        assert!(
+            strangers_sink.try_recv().is_err(),
+            "not to a non-member's sink"
+        );
+    }
+
+    /// A carried post is not echoed to its author's own sink, though the
+    /// author is a member.
+    #[tokio::test]
+    async fn a_carried_post_is_not_echoed_to_its_authors_sink() {
+        let mut owner = Owner::new().await;
+        let author = did(&owner.user);
+        owner
+            .post(
+                BlockKind::MemberAdd,
+                serde_json::json!({"channel_id": owner.channel, "member_did": author}),
+            )
+            .await;
+        let follower = owner.follower();
+        for sent in &owner.sent {
+            take(&follower, &owner, sent).await.unwrap();
+        }
+        let mut authors_sink = bridge_sink(&follower, &author);
+        owner.text("mine").await;
+        take(&follower, &owner, owner.sent.last().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            authors_sink.try_recv().is_err(),
+            "the author's sink gets nothing"
+        );
+    }
+
+    /// A removed bridged member's sink gets its own removal, as a removed
+    /// member's client does, and nothing posted after it.
+    #[tokio::test]
+    async fn a_removed_bridged_member_gets_its_removal_and_nothing_after() {
+        let mut owner = Owner::new().await;
+        let member = did(&SigningKey::from_bytes(&[8; 32]));
+        owner
+            .post(
+                BlockKind::MemberAdd,
+                serde_json::json!({"channel_id": owner.channel, "member_did": member}),
+            )
+            .await;
+        let follower = owner.follower();
+        for sent in &owner.sent {
+            take(&follower, &owner, sent).await.unwrap();
+        }
+        let mut sink = bridge_sink(&follower, &member);
+
+        let removal = owner
+            .post(
+                BlockKind::MemberRemove,
+                serde_json::json!({"channel_id": owner.channel, "member_did": member}),
+            )
+            .await;
+        take(&follower, &owner, owner.sent.last().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            sink.try_recv().expect("its removal").block.cid,
+            removal,
+            "the removed member's sink gets its removal"
+        );
+
+        owner.text("after").await;
+        take(&follower, &owner, owner.sent.last().unwrap())
+            .await
+            .unwrap();
+        assert!(sink.try_recv().is_err(), "nothing after the removal");
     }
 
     #[tokio::test]
