@@ -68,8 +68,8 @@ pub fn load(section: &RulesetSection, pools: &PoolsSection) -> anyhow::Result<Op
     Ok(Some(declared))
 }
 
-/// Refuse to declare a ruleset whose pool shares this server does not
-/// enforce: declaring is signing a claim (JEP-0009 rule 4), and a server
+/// Refuse to declare a ruleset whose pool shares (stranger, invited and
+/// aged) this server does not enforce: declaring is signing a claim (JEP-0009 rule 4), and a server
 /// that enforces other shares signs evidence against itself. The pools are
 /// the one part of a ruleset enforced today; standing and the rest have no
 /// enforcement until R2.4, so they are not checked here.
@@ -93,6 +93,12 @@ pub fn check_enforced(signed: &SignedRuleset, pools: &PoolsSection) -> Result<()
         mismatches.push(format!(
             "invited_share {} vs invited_share_pct {}",
             declared.invited_share, pools.invited_share_pct
+        ));
+    }
+    if declared.aged_share != pools.aged_share_pct {
+        mismatches.push(format!(
+            "aged_share {} vs aged_share_pct {}",
+            declared.aged_share, pools.aged_share_pct
         ));
     }
     if mismatches.is_empty() {
@@ -231,6 +237,7 @@ pub(crate) mod tests {
         PoolsSection {
             stranger_share_pct: declared.stranger_share,
             invited_share_pct: declared.invited_share,
+            aged_share_pct: declared.aged_share,
             ..PoolsSection::default()
         }
     }
@@ -262,6 +269,19 @@ pub(crate) mod tests {
             check_enforced(&signed, &invited)
                 .unwrap_err()
                 .contains("invited_share")
+        );
+        let aged = signed.document().parameters.pools.aged_share;
+        let other_aged = PoolsSection {
+            aged_share_pct: if aged == 100 { 99 } else { aged + 1 },
+            ..enforced()
+        };
+        let err = check_enforced(&signed, &other_aged).unwrap_err();
+        assert!(
+            err.contains(&format!(
+                "aged_share {aged} vs aged_share_pct {}",
+                other_aged.aged_share_pct
+            )),
+            "{err}"
         );
         let off = PoolsSection {
             writes_per_second: 0,
