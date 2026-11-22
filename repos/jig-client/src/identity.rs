@@ -775,6 +775,37 @@ impl Identity {
         jig_core::naming::sign_proof(&self.signing, action, ns_did, alias, challenge)
     }
 
+    /// A reachability record for this DID listing `servers` as
+    /// `(server DID, URL)` pairs (JEP-0004 rule 21).
+    pub fn sign_reachability(
+        &self,
+        servers: Vec<(String, String)>,
+        seq: u64,
+    ) -> jig_core::naming::ReachabilityRecord {
+        jig_core::naming::ReachabilityRecord::sign(&self.signing, servers, seq)
+    }
+
+    /// A request, signed by this DID, for one of `did`'s key packages from
+    /// the custodian `custodian` for the channel `channel_id` (JEP-0005
+    /// rule 21).
+    pub fn sign_kp_request(
+        &self,
+        did: &str,
+        channel_id: cid::Cid,
+        custodian: &str,
+        nonce: [u8; 16],
+        issued_at: i64,
+    ) -> jig_core::contract::KpRequest {
+        jig_core::contract::KpRequest::sign(
+            &self.signing,
+            did,
+            channel_id,
+            custodian,
+            nonce,
+            issued_at,
+        )
+    }
+
     /// The DID's own key as an MLS group member. The same key signs blocks
     /// and MLS messages — see `jig_mls::credential`. Crate-private so the
     /// seed never leaves this crate.

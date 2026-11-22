@@ -112,8 +112,18 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
      - WebSocket slots are per connection. Under rule 7 that is also per submitter.
    - **The client address** is the one per-address limits use: the connection's address.
      Behind a proxy that passes TLS through, that is the proxy's address, so clients
-     behind it share one key. This holds until the server can trust a proxy to report
-     the client's address (#399, not yet specified).
+     behind it share one key, unless the operator lists the proxy in
+     `[server.proxy_protocol]` (#423).
+     - A connection from a listed proxy MUST open with a PROXY protocol v2 header. Its
+       client address is the one the header reports.
+     - This fails closed. A connection from a listed proxy without a valid v2 header is
+       closed, never served under the proxy's address.
+     - A valid `LOCAL` header, such as a proxy's own health check, keeps the proxy's
+       address.
+     - A connection from any other address keeps its own address, and its PROXY header is
+       not read. The server trusts no forwarded HTTP header.
+     - The nameserver keeps its own `proxy_ip_header` setting and does not read PROXY
+       protocol yet (#419).
 
 ## 3. WebSocket
 
@@ -159,11 +169,11 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
 12. **Relayed and carried blocks** arrive under their own rules and are not local
     submissions:
     - a write a follower relays to the owner (JEP-0005 rule 15, `IngestSource::Relayed`);
-    - a block a follower takes on the follower stream (JEP-0005 rule 22a);
-    - a block a listed peer relays on legacy peering (`IngestSource::FederatedPeer`).
+    - a block a follower takes on the follower stream (JEP-0005 rule 22a).
 
-    The connection carrying them is proven by `peer_proof`, and the share or peer listing
-    answers for them (AB-07, OP-09). The owner records a relayed write against the
+    The connection carrying them is proven by `peer_proof`, and the share answers for them
+    (AB-07, OP-09). A block a listed peer relayed on legacy peering was a third case until
+    servers stopped taking them (JEP-0014 rule 37). The owner records a relayed write against the
     follower's proven DID as well as its author (`IngestSource::Relayed`'s `via`).
 13. **A follower applies this JEP before it relays.** It MUST apply rules 4 to 10 to the
     client that submitted to it, and MUST NOT relay a block whose signer is not that
@@ -240,8 +250,8 @@ OP-09 (federation abuse), GV-03 (penalty propagation without consent or evidence
 - **Held blocks.** A caller with no proven DID cannot use a resubmission to learn whether a
   server holds a block (rule 4a).
 - **Shared addresses.** Per-address limits stay, because DIDs are free (rule 5). Clients
-  behind one proxy share them unless the server trusts the proxy to report client addresses
-  (#399).
+  behind one proxy share them unless the operator lists it in `[server.proxy_protocol]` and
+  it sends a PROXY protocol v2 header, which fails closed (rule 5, #423).
   - A hostile follower can still relay what it should not. It answers for that through its
     share (AB-07).
 - **Transcript binding.** `client_proof` signs over `tls_exporter`, so a TLS terminator in

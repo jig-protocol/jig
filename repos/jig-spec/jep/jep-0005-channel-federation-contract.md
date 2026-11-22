@@ -315,6 +315,38 @@ Non-goals for v0.2:
     - A custodian MUST stop releasing a DID's key packages once it holds that DID's
       revocation (lane I).
     - The sequencer takes no part in fetching key packages.
+21a. A **key-package request** is a `COSE_Sign1` by `requester` (rule 0, domain
+     `jig-kp-request-v1`) over
+     `{domain, requester, did, channel_id, custodian, nonce, issued_at}`: `channel_id` is
+     the binary CID of the channel the package is for, `custodian` the custodian's server
+     DID, `nonce` 16 fresh bytes and `issued_at` Unix seconds on the requester's clock.
+     Vectors are in `vectors/0005/kp-request.json`.
+     - A requester finds custodians in the DID's reachability record: from the nameserver
+       that verified its name, or from a server the requester is told the DID uses. It
+       holds each to the record's `server_did` by its signed welcome before asking.
+     - A custodian MUST refuse a request not signed by its `requester`, naming another
+       custodian, or with `issued_at` outside its acceptance window. It answers `404
+       NO_CUSTODY` for a DID whose record it does not keep, or of which it holds no
+       package.
+     - The same request, or the same requester asking again for the same DID and channel
+       within a short window, gets the package already released: a lost answer costs the
+       DID no second package.
+     - A custodian MUST bound releases per DID and per requester (`429 RATE_LIMITED`). A
+       last-resort package is released but never consumed, so a drained stock leaves the
+       DID reachable. The bounds and the log cover every way a package leaves the server,
+       including its own channels' adds.
+     - A record that leaves the custodian out, with a higher `seq` than the one it holds,
+       withdraws custody: the custodian keeps it so no older record restores custody, and
+       answers `NO_CUSTODY` from then on. Withdrawal ends releases to other servers'
+       requesters only: the server's own channels can still add the DID from its stock.
+       Ending those adds, or erasing the DID's data, are separate requests, not yet
+       defined (#449).
+     - The requester MUST check that a released package verifies and is the DID's before
+       it commits.
+21b. *v0.2 interim, until DIDs sign release policies:* a server's own configured policy
+     (`open`, within the limits of 21a, or `closed`) stands in for every DID's. Held
+     requests, approvals, the Welcome mailbox and one package per device are not yet
+     defined.
 
 ## Unchanged
 
@@ -364,6 +396,14 @@ Non-goals for v0.2:
   content, which stays MLS ciphertext. A share sent encrypted is refused, not carried
   unread (PV-05).
 
+- **Key-package custody** (21–21b). A custodian can withhold a DID's packages, and can
+  log who asked for them; it cannot substitute one, since each is signed by the DID and
+  checked by the adder. Anyone it admits can ask, within its limits, so many identities
+  that each pass admission can draw a DID's ordinary stock down to its last-resort
+  package. The DID stays reachable, but adds that reuse the last-resort package share
+  its init key until the DID updates its leaf. Signed release policies (21b) are what
+  close this.
+
 **Threat register rows:** OP-06, OP-09, AB-03, AB-07, PV-01 and PV-05 are updated in
 implementation PRs.
 
@@ -384,6 +424,9 @@ In progress (milestone F2): the contract messages are `jig_core::contract`.
 deterministic payload and its `COSE_Sign1`, in hex, under fixed test keys. The offer's
 `creation_block` and `ingest_head` are placeholder bytes. The offer lists one
 `config`-rooted suffix under the owner's DID, and the accept one `dns`-rooted suffix.
+
+`vectors/0005/kp-request.json`: a `jig-kp-request-v1` (21a) under fixed test keys, as its
+deterministic payload and its `COSE_Sign1`, in hex.
 
 To be added with F2:
 

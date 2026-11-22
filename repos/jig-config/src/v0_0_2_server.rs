@@ -46,6 +46,8 @@ pub struct JigServerConfig {
     pub limits: LimitsSection,
     #[serde(default)]
     pub ruleset: RulesetSection,
+    #[serde(default)]
+    pub custody: CustodySection,
 }
 
 /// `[ruleset]`: the ruleset this server declares (JEP-0009 rule 4).
@@ -84,6 +86,48 @@ impl RulesetSection {
         }
         Ok(())
     }
+}
+
+/// `[custody]`: this server as a custodian of key packages (JEP-0005 rule
+/// 21) for the DIDs whose reachability record lists it. Another server's
+/// member asks it, with a signed request, for one package of such a DID to
+/// add them to a channel.
+///
+/// Until DIDs sign their own release policies, `release` is the server's
+/// policy for all of them.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CustodySection {
+    /// `open`: release to any signed request this server admits, within the
+    /// limits below. `closed`: release to none, so only this server's own
+    /// channels can add its users.
+    pub release: ReleasePolicy,
+    /// Most packages released for one DID per hour, across requesters.
+    pub per_member_per_hour: u64,
+    /// Most packages released to one requester per hour, across DIDs.
+    pub per_requester_per_hour: u64,
+    /// How far a request's `issued_at` may be from this server's clock, in
+    /// seconds, either way.
+    pub request_window_secs: u64,
+}
+
+impl Default for CustodySection {
+    fn default() -> Self {
+        Self {
+            release: ReleasePolicy::Open,
+            per_member_per_hour: 10,
+            per_requester_per_hour: 20,
+            request_window_secs: 300,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReleasePolicy {
+    #[default]
+    Open,
+    Closed,
 }
 
 /// `[limits]`: the most bytes one HTTP request body or one WebSocket message
@@ -155,10 +199,23 @@ pub struct ServerSection {
     /// carry the client's address in a PROXY protocol v2 header. Off unless
     /// `trusted` names one.
     pub proxy_protocol: ProxyProtocolSection,
+    /// How long a stopping server waits for in-flight work, in milliseconds
+    /// (#424). On SIGTERM or SIGINT it stops accepting connections, sends each
+    /// WebSocket client a close frame with code 1001 (going away), and lets
+    /// requests already in flight finish. Whatever is still open when this runs
+    /// out is cut. `0` cuts at once. At most [`MAX_SHUTDOWN_DRAIN_MS`].
+    pub shutdown_drain_ms: u64,
 }
 
 /// The default `[server] max_future_skew_ms`: five minutes.
 pub const DEFAULT_MAX_FUTURE_SKEW_MS: u64 = 300_000;
+
+/// The default `[server] shutdown_drain_ms`: five seconds. That is half the
+/// time `install.sh` waits for a server it replaces to exit.
+pub const DEFAULT_SHUTDOWN_DRAIN_MS: u64 = 5_000;
+
+/// The largest `[server] shutdown_drain_ms` a server boots with: five minutes.
+pub const MAX_SHUTDOWN_DRAIN_MS: u64 = 300_000;
 
 /// `[server.proxy_protocol]` (#399). A TLS-passthrough proxy cannot add an
 /// HTTP header, so without this every client behind it has the proxy's
@@ -224,6 +281,7 @@ impl Default for ServerSection {
             ],
             max_future_skew_ms: DEFAULT_MAX_FUTURE_SKEW_MS,
             proxy_protocol: ProxyProtocolSection::default(),
+            shutdown_drain_ms: DEFAULT_SHUTDOWN_DRAIN_MS,
         }
     }
 }
@@ -1516,6 +1574,15 @@ mod tests {
         let set: JigServerConfig =
             toml::from_str("[server]\nmax_future_skew_ms = 60000\n").unwrap();
         assert_eq!(set.server.max_future_skew_ms, 60_000);
+    }
+
+    #[test]
+    fn the_shutdown_drain_defaults_when_omitted_and_parses_when_set() {
+        let omitted: JigServerConfig =
+            toml::from_str("[server]\nlisten = \"0.0.0.0:443\"\n").unwrap();
+        assert_eq!(omitted.server.shutdown_drain_ms, DEFAULT_SHUTDOWN_DRAIN_MS);
+        let set: JigServerConfig = toml::from_str("[server]\nshutdown_drain_ms = 0\n").unwrap();
+        assert_eq!(set.server.shutdown_drain_ms, 0);
     }
 
     #[test]

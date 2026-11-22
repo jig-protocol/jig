@@ -212,17 +212,6 @@ impl Fanout {
         Ok(())
     }
 
-    /// Public wrapper so ingest can dispatch to bridge sinks on the
-    /// federated-source path (which must skip peer re-broadcast).
-    pub async fn dispatch_to_bridges_public(
-        &self,
-        block: &StoredBlock,
-        receipt: &StoredReceipt,
-        policy: Option<&DeliveryPolicy>,
-    ) {
-        self.dispatch_to_bridges(block, receipt, policy);
-    }
-
     fn dispatch_to_bridges(
         &self,
         block: &StoredBlock,

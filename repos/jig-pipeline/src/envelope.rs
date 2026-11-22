@@ -333,23 +333,20 @@ pub struct SubscribeAuth {
     pub sig_b64: String,
 }
 
-/// Subscription scope: a single channel, by id or by slug, or a
-/// federation-wide subscription filtered to specified block kinds.
+/// Subscription scope: a single channel, by id or by slug.
+///
+/// There was a `federation` scope, a peer's subscription to every block of
+/// this server's open channels: the legacy relay. A channel now crosses
+/// servers only by a share (JEP-0005), so a `federation` subscribe from a
+/// release before this one does not parse.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Scope {
     /// A channel by slug, which names only a channel the server sequences.
-    Channel {
-        slug: String,
-    },
+    Channel { slug: String },
     /// A channel by its id: the canonical CID text of its channel-create
     /// block, which names one channel on any server.
-    ChannelId {
-        channel_id: String,
-    },
-    Federation {
-        block_kinds: Vec<String>,
-    },
+    ChannelId { channel_id: String },
 }
 
 impl Scope {
@@ -361,18 +358,10 @@ impl Scope {
     /// "every subscribe signature is invalid" with no indication which side is
     /// wrong.
     ///
-    /// Block kinds are sorted so a client that lists them in a different order
-    /// still produces the same string. Without that, a signature would depend
-    /// on incidental ordering the wire format does not otherwise care about.
     pub fn canonical_string(&self) -> String {
         match self {
             Scope::Channel { slug } => format!("channel:{slug}"),
             Scope::ChannelId { channel_id } => format!("channel_id:{channel_id}"),
-            Scope::Federation { block_kinds } => {
-                let mut kinds = block_kinds.clone();
-                kinds.sort();
-                format!("federation:{}", kinds.join(","))
-            }
         }
     }
 }
@@ -598,15 +587,6 @@ mod tests {
         };
         assert_ne!(a.canonical_string(), b.canonical_string());
 
-        let fed = Scope::Federation {
-            block_kinds: vec!["text-render".into()],
-        };
-        assert_ne!(
-            a.canonical_string(),
-            fed.canonical_string(),
-            "a channel named like a federation filter must not collide"
-        );
-
         // The same text as a slug and as an id is two scopes, signed apart.
         let by_slug = Scope::Channel { slug: "x".into() };
         let by_id = Scope::ChannelId {
@@ -616,18 +596,16 @@ mod tests {
         assert_ne!(by_slug.canonical_string(), by_id.canonical_string());
     }
 
-    /// Block-kind order is incidental on the wire, so it must not change the
-    /// signed string — otherwise a client that reorders its filter list would
-    /// produce a signature the server rejects for no meaningful reason.
+    /// A release before this one subscribes a peer to the federation scope.
+    /// That scope is gone, so the frame does not parse: the connection
+    /// answers it as malformed, and the dialer's link, which carries its
+    /// shares too, goes on ([`Scope`]).
     #[test]
-    fn federation_scope_is_order_independent() {
-        let a = Scope::Federation {
-            block_kinds: vec!["b".into(), "a".into()],
-        };
-        let b = Scope::Federation {
-            block_kinds: vec!["a".into(), "b".into()],
-        };
-        assert_eq!(a.canonical_string(), b.canonical_string());
+    fn a_federation_subscribe_from_an_older_release_does_not_parse() {
+        let older = r#"{"v":1,"op":"subscribe","scope":{"kind":"federation","block_kinds":[]}}"#;
+        assert!(serde_json::from_str::<Envelope>(older).is_err());
+        let channel = r##"{"v":1,"op":"subscribe","scope":{"kind":"channel","slug":"#hello"}}"##;
+        assert!(serde_json::from_str::<Envelope>(channel).is_ok());
     }
 
     #[test]
