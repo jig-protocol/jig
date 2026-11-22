@@ -51,6 +51,13 @@ fn boot_checks(config: &ServerConfig) -> Result<()> {
     )
     .map_err(|e| ServerError::Runtime(format!("failed to create jig-runtime: {e}")))?;
     crate::v0_0_2_limits::Limits::validate(&config.limits).map_err(ServerError::Config)?;
+    let drain = config.server.shutdown_drain_ms;
+    if drain > jig_config::v0_0_2_server::MAX_SHUTDOWN_DRAIN_MS {
+        return Err(ServerError::Config(format!(
+            "[server] shutdown_drain_ms = {drain} is over the {} ms maximum",
+            jig_config::v0_0_2_server::MAX_SHUTDOWN_DRAIN_MS
+        )));
+    }
     Ok(())
 }
 
@@ -72,7 +79,25 @@ impl JigServer {
         Ok(Self { config, v0_0_2 })
     }
 
+    /// Serve until SIGTERM or SIGINT, then shut down gracefully (#424): stop
+    /// accepting, drain in-flight requests and WebSocket sessions within
+    /// `[server] shutdown_drain_ms`, and return. A second signal cuts the
+    /// drain short.
     pub async fn start(&self) -> Result<()> {
+        // Registered before anything is bound: from here a SIGTERM stops the
+        // server gracefully rather than killing it.
+        let stop = crate::shutdown::signal();
+        self.serve_until(stop, crate::shutdown::signal).await
+    }
+
+    /// [`JigServer::start`] with the signals as futures: `stop` starts the
+    /// shutdown, and `cut`, called once it has, ends the drain early.
+    pub async fn serve_until<S, C, CF>(&self, stop: S, cut: C) -> Result<()>
+    where
+        S: std::future::Future<Output = ()>,
+        C: FnOnce() -> CF,
+        CF: std::future::Future<Output = ()>,
+    {
         tracing::info!(
             "Starting Jig server on {}:{}",
             self.config.bind_address,
@@ -98,6 +123,7 @@ impl JigServer {
         let router = router.layer(axum::extract::DefaultBodyLimit::max(
             crate::v0_0_2_limits::Limits::resolve(&self.config.limits).request_body,
         ));
+        let drain = std::time::Duration::from_millis(self.config.server.shutdown_drain_ms);
 
         let addr: SocketAddr = format!("{}:{}", self.config.bind_address, self.config.port)
             .parse()
@@ -120,7 +146,7 @@ impl JigServer {
             .await
             .map_err(|e| ServerError::Server(format!("binding {addr}: {e}")))?;
 
-        if self.config.tls.enabled {
+        let tls = if self.config.tls.enabled {
             let data_dir = self
                 .config
                 .database_path
@@ -145,22 +171,123 @@ impl JigServer {
                 "HTTPS (rustls) listening on https://{}",
                 listener.local_addr()?
             );
-            serve_tls(listener, router, rustls_config, proxy).await?;
+            Some(rustls_config)
         } else {
             tracing::info!("HTTP API listening on http://{}", listener.local_addr()?);
-            match proxy {
-                // Without PROXY protocol, axum's own server, exactly as before.
-                None => axum::serve(
+            None
+        };
+
+        serve_listener(listener, router, tls, proxy, drain, stop, cut).await
+    }
+}
+
+/// Serve `router` on `listener` until `stop`, then shut down gracefully
+/// (#424): stop accepting, drain in-flight requests and WebSocket sessions
+/// within `drain` (or until `cut`), and return.
+///
+/// Over TLS when `tls` is set ([`serve_tls`]). Plain HTTP goes through
+/// `axum::serve` and its own graceful shutdown, or through [`serve_plain`]
+/// when PROXY protocol is on.
+pub(crate) async fn serve_listener<S, C, CF>(
+    listener: TcpListener,
+    router: Router,
+    tls: Option<RustlsServerConfig>,
+    proxy: Option<Arc<crate::proxy_protocol::ProxyProtocol>>,
+    drain: std::time::Duration,
+    stop: S,
+    cut: C,
+) -> Result<()>
+where
+    S: std::future::Future<Output = ()>,
+    C: FnOnce() -> CF,
+    CF: std::future::Future<Output = ()>,
+{
+    // The WebSocket handler finds the shutdown signal here, on every path a
+    // request can come in by.
+    let shutdown = crate::shutdown::Shutdown::new();
+    let router = router.layer(axum::Extension(shutdown.clone()));
+
+    let mut listening: tokio::task::JoinHandle<Result<()>> = match (tls, proxy) {
+        (Some(rustls_config), proxy) => shutdown.spawn(serve_tls(
+            listener,
+            router,
+            rustls_config,
+            proxy,
+            shutdown.clone(),
+        )),
+        // Without PROXY protocol, axum's own server, exactly as before, with
+        // its own graceful shutdown.
+        (None, None) => {
+            let stop = shutdown.cancelled_owned();
+            shutdown.spawn(async move {
+                axum::serve(
                     listener,
                     router.into_make_service_with_connect_info::<SocketAddr>(),
                 )
+                .with_graceful_shutdown(stop)
                 .await
-                .map_err(|e| ServerError::Server(format!("HTTP server error: {e}")))?,
-                Some(proxy) => serve_plain(listener, router, proxy).await,
+                .map_err(|e| ServerError::Server(format!("HTTP server error: {e}")))
+            })
+        }
+        (None, Some(proxy)) => {
+            let watched = shutdown.clone();
+            shutdown.spawn(async move {
+                serve_plain(listener, router, proxy, watched).await;
+                Ok(())
+            })
+        }
+    };
+
+    // The listener lives no longer than this future: dropped early (a caller
+    // aborting it), or returning once the drain has run out or been cut, it
+    // stops accepting and frees the port rather than serving on detached.
+    let _listener_lifetime = AbortOnDrop(listening.abort_handle());
+
+    // Serve until the signal, or until the listener fails.
+    tokio::pin!(stop);
+    tokio::select! {
+        served = &mut listening => {
+            return match served {
+                Ok(result) => result,
+                Err(e) => Err(ServerError::Server(format!("listener task failed: {e}"))),
+            };
+        }
+        () = &mut stop => {}
+    }
+    shutdown.begin();
+    tracing::info!(
+        in_flight = shutdown.in_flight(),
+        drain_ms = drain.as_millis() as u64,
+        "shutting down: no new connections; draining in-flight requests and closing \
+         WebSocket sessions (1001)"
+    );
+    tokio::select! {
+        drained = shutdown.drain(drain) => {
+            if drained {
+                tracing::info!("shutdown complete: every connection drained");
+            } else {
+                tracing::warn!(
+                    still_open = shutdown.in_flight(),
+                    "shutdown drain ran out; cutting what is still open"
+                );
             }
         }
+        () = cut() => {
+            tracing::warn!(
+                still_open = shutdown.in_flight(),
+                "second signal: cutting the drain short"
+            );
+        }
+    }
+    Ok(())
+}
 
-        Ok(())
+/// Aborts a task when dropped.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -180,34 +307,49 @@ fn load_rustls_config(
 /// With `proxy`, a connection from a trusted proxy first gives up its PROXY
 /// protocol v2 header, in its own task, and is served under the client it
 /// names; without a valid one it is closed.
+///
+/// Once `shutdown` begins this stops accepting and returns, dropping the
+/// listener. Connections still in their PROXY header or TLS handshake are
+/// closed; served ones finish the request in flight ([`serve_connection`]).
 async fn serve_tls(
     listener: TcpListener,
     router: Router,
     rustls_config: RustlsServerConfig,
     proxy: Option<Arc<crate::proxy_protocol::ProxyProtocol>>,
+    shutdown: crate::shutdown::Shutdown,
 ) -> Result<()> {
     let acceptor = TlsAcceptor::from(std::sync::Arc::new(rustls_config));
     loop {
-        let (mut tcp, peer) = listener
-            .accept()
-            .await
-            .map_err(|e| ServerError::Server(format!("accept error: {e}")))?;
+        let (mut tcp, peer) = tokio::select! {
+            accepted = listener.accept() => {
+                accepted.map_err(|e| ServerError::Server(format!("accept error: {e}")))?
+            }
+            () = shutdown.cancelled() => return Ok(()),
+        };
         let acceptor = acceptor.clone();
         let router = router.clone();
         let proxy = proxy.clone();
-        tokio::spawn(async move {
-            let Some(peer) = client_addr(proxy.as_deref(), &mut tcp, peer).await else {
-                return;
-            };
-            let tls = match acceptor.accept(tcp).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::debug!("TLS handshake failed: {e}");
-                    return;
+        let watched = shutdown.clone();
+        shutdown.spawn(async move {
+            let shutdown = watched;
+            let handshake = async {
+                let peer = client_addr(proxy.as_deref(), &mut tcp, peer).await?;
+                match acceptor.accept(tcp).await {
+                    Ok(tls) => Some((peer, tls)),
+                    Err(e) => {
+                        tracing::debug!("TLS handshake failed: {e}");
+                        None
+                    }
                 }
             };
+            let accepted = tokio::select! {
+                done = handshake => done,
+                () = shutdown.cancelled() => None,
+            };
+            let Some((peer, tls)) = accepted else {
+                return;
+            };
             let exporter = TlsExporter::of(tls.get_ref().1);
-            let io = TokioIo::new(tls);
             let service = hyper::service::service_fn(
                 move |mut req: hyper::Request<hyper::body::Incoming>| {
                     // What `into_make_service_with_connect_info` gives the
@@ -220,13 +362,43 @@ async fn serve_tls(
                     router.clone().oneshot(req)
                 },
             );
-            if let Err(e) = AutoBuilder::new(TokioExecutor::new())
-                .serve_connection_with_upgrades(io, service)
-                .await
-            {
-                tracing::debug!("connection error: {e}");
-            }
+            serve_connection(TokioIo::new(tls), service, &shutdown).await;
         });
+    }
+}
+
+/// Serve one connection until it ends. Once `shutdown` begins, hyper's own
+/// graceful shutdown lets the request in flight finish and then closes:
+/// HTTP/1 stops keeping the connection alive, HTTP/2 sends GOAWAY. A
+/// connection upgraded to a WebSocket is the session's from then on; the
+/// session closes itself with 1001 (`v0_0_2_ws::handle_socket`).
+async fn serve_connection<I, S, B>(io: I, service: S, shutdown: &crate::shutdown::Shutdown)
+where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    S: hyper::service::Service<
+            hyper::Request<hyper::body::Incoming>,
+            Response = hyper::Response<B>,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    B: hyper::body::Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let builder = AutoBuilder::new(TokioExecutor::new());
+    let conn = builder.serve_connection_with_upgrades(io, service);
+    tokio::pin!(conn);
+    let served = tokio::select! {
+        served = conn.as_mut() => served,
+        () = shutdown.cancelled() => {
+            conn.as_mut().graceful_shutdown();
+            conn.await
+        }
+    };
+    if let Err(e) = served {
+        tracing::debug!("connection error: {e}");
     }
 }
 
@@ -253,24 +425,38 @@ async fn client_addr(
 /// TLS step. Accept errors are handled as `axum::serve` handles them, by
 /// waiting a second, so running out of file descriptors does not end the
 /// server. Without PROXY protocol the plain listener stays on `axum::serve`.
+/// Returns once `shutdown` begins, as [`serve_tls`] does.
 async fn serve_plain(
     listener: TcpListener,
     router: Router,
     proxy: Arc<crate::proxy_protocol::ProxyProtocol>,
-) -> ! {
+    shutdown: crate::shutdown::Shutdown,
+) {
     loop {
-        let (mut tcp, peer) = match listener.accept().await {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            () = shutdown.cancelled() => return,
+        };
+        let (mut tcp, peer) = match accepted {
             Ok(accepted) => accepted,
             Err(e) => {
                 tracing::error!("accept error: {e}");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                continue;
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_secs(1)) => continue,
+                    () = shutdown.cancelled() => return,
+                }
             }
         };
         let router = router.clone();
         let proxy = proxy.clone();
-        tokio::spawn(async move {
-            let Some(peer) = client_addr(Some(&proxy), &mut tcp, peer).await else {
+        let watched = shutdown.clone();
+        shutdown.spawn(async move {
+            let shutdown = watched;
+            let peer = tokio::select! {
+                peer = client_addr(Some(&proxy), &mut tcp, peer) => peer,
+                () = shutdown.cancelled() => None,
+            };
+            let Some(peer) = peer else {
                 return;
             };
             let service = hyper::service::service_fn(
@@ -280,12 +466,7 @@ async fn serve_plain(
                     router.clone().oneshot(req)
                 },
             );
-            if let Err(e) = AutoBuilder::new(TokioExecutor::new())
-                .serve_connection_with_upgrades(TokioIo::new(tcp), service)
-                .await
-            {
-                tracing::debug!("connection error: {e}");
-            }
+            serve_connection(TokioIo::new(tcp), service, &shutdown).await;
         });
     }
 }
@@ -351,7 +532,14 @@ mod tests {
         let bound = listener.local_addr().unwrap();
 
         let task = tokio::spawn(async move {
-            let _ = serve_tls(listener, router, rustls_config, None).await;
+            let _ = serve_tls(
+                listener,
+                router,
+                rustls_config,
+                None,
+                crate::shutdown::Shutdown::new(),
+            )
+            .await;
         });
 
         // use_rustls_tls: force the reqwest 0.11 client onto the rustls backend
@@ -395,7 +583,14 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bound = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
-            let _ = serve_tls(listener, router, rustls_config, None).await;
+            let _ = serve_tls(
+                listener,
+                router,
+                rustls_config,
+                None,
+                crate::shutdown::Shutdown::new(),
+            )
+            .await;
         });
 
         let mut roots = rustls::RootCertStore::empty();
@@ -481,7 +676,14 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bound = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
-            let _ = serve_tls(listener, router, rustls_config, None).await;
+            let _ = serve_tls(
+                listener,
+                router,
+                rustls_config,
+                None,
+                crate::shutdown::Shutdown::new(),
+            )
+            .await;
         });
 
         // Trust exactly the server's own certificate, by name, so the check
@@ -573,6 +775,7 @@ mod tests {
             listener,
             addr_router(),
             trusting(&["127.0.0.1"]),
+            crate::shutdown::Shutdown::new(),
         ));
 
         let mut request = client_header(bound);
@@ -599,6 +802,7 @@ mod tests {
             listener,
             addr_router(),
             trusting(&["10.0.0.5"]),
+            crate::shutdown::Shutdown::new(),
         ));
 
         // Not a trusted proxy: served as itself.
@@ -652,7 +856,14 @@ mod tests {
             let router = addr_router();
             let proxy = trusting(&[trusted]);
             let task = tokio::spawn(async move {
-                let _ = serve_tls(listener, router, rustls_config, Some(proxy)).await;
+                let _ = serve_tls(
+                    listener,
+                    router,
+                    rustls_config,
+                    Some(proxy),
+                    crate::shutdown::Shutdown::new(),
+                )
+                .await;
             });
 
             let mut tcp = tokio::net::TcpStream::connect(bound).await.unwrap();
@@ -673,6 +884,280 @@ mod tests {
                 "{answer}"
             );
             task.abort();
+        }
+    }
+
+    // ---- graceful shutdown (#424) ------------------------------------------
+
+    #[test]
+    fn a_drain_over_the_maximum_refuses_the_boot() {
+        let dir = tempdir().unwrap();
+        let mut config = ServerConfig {
+            database_path: dir.path().join("test.db"),
+            ..Default::default()
+        };
+        config.server.shutdown_drain_ms = jig_config::v0_0_2_server::MAX_SHUTDOWN_DRAIN_MS;
+        assert!(JigServer::new(config.clone()).is_ok());
+        config.server.shutdown_drain_ms += 1;
+        let err = JigServer::new(config).err().expect("refused");
+        assert!(err.to_string().contains("shutdown_drain_ms"), "{err}");
+    }
+
+    /// The three ways a request reaches the router.
+    #[derive(Clone, Copy, Debug)]
+    enum Listening {
+        /// Plain HTTP on `axum::serve`.
+        Axum,
+        /// Plain HTTP behind a trusted PROXY protocol proxy (`serve_plain`).
+        Proxied,
+        /// TLS (`serve_tls`).
+        Tls,
+    }
+
+    trait Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+    impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Io for T {}
+
+    struct Harness {
+        bound: SocketAddr,
+        tls: Option<(tokio_rustls::TlsConnector, tempfile::TempDir)>,
+        mode: Listening,
+    }
+
+    impl Harness {
+        /// Start `router` in `mode`, stopping on `stop`; `cut` ends the drain.
+        async fn start<C, CF>(
+            mode: Listening,
+            router: Router,
+            drain: Duration,
+            stop: tokio::sync::oneshot::Receiver<()>,
+            cut: C,
+        ) -> (Self, tokio::task::JoinHandle<Result<()>>)
+        where
+            C: FnOnce() -> CF + Send + 'static,
+            CF: std::future::Future<Output = ()> + Send + 'static,
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let bound = listener.local_addr().unwrap();
+            let (tls, rustls_config) = match mode {
+                Listening::Tls => {
+                    let ck =
+                        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+                    let dir = tempdir().unwrap();
+                    let cert = dir.path().join("cert.pem");
+                    let key = dir.path().join("key.pem");
+                    std::fs::write(&cert, ck.cert.pem()).unwrap();
+                    std::fs::write(&key, ck.signing_key.serialize_pem()).unwrap();
+                    let (server, _) = load_rustls_config(&cert, &key).unwrap();
+                    let mut roots = rustls::RootCertStore::empty();
+                    roots.add(ck.cert.der().clone()).unwrap();
+                    let client = rustls::ClientConfig::builder_with_provider(Arc::new(
+                        rustls::crypto::ring::default_provider(),
+                    ))
+                    .with_safe_default_protocol_versions()
+                    .unwrap()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth();
+                    (
+                        Some((tokio_rustls::TlsConnector::from(Arc::new(client)), dir)),
+                        Some(server),
+                    )
+                }
+                _ => (None, None),
+            };
+            let proxy = matches!(mode, Listening::Proxied).then(|| trusting(&["127.0.0.1"]));
+            let task = tokio::spawn(serve_listener(
+                listener,
+                router,
+                rustls_config,
+                proxy,
+                drain,
+                async move {
+                    let _ = stop.await;
+                },
+                cut,
+            ));
+            (Self { bound, tls, mode }, task)
+        }
+
+        /// A connection to the server, past the PROXY header and TLS as needed.
+        async fn connect(&self) -> std::io::Result<Box<dyn Io>> {
+            use tokio::io::AsyncWriteExt;
+            let mut tcp = tokio::net::TcpStream::connect(self.bound).await?;
+            if let Listening::Proxied = self.mode {
+                tcp.write_all(&client_header(self.bound)).await?;
+            }
+            match &self.tls {
+                Some((connector, _)) => {
+                    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+                    Ok(Box::new(connector.connect(name, tcp).await?))
+                }
+                None => Ok(Box::new(tcp)),
+            }
+        }
+
+        /// Whether a new connection is still accepted. A closed listener
+        /// refuses the TCP connect itself.
+        async fn accepts(&self) -> bool {
+            tokio::net::TcpStream::connect(self.bound).await.is_ok()
+        }
+    }
+
+    /// `/slow` reports that it started, then answers once released; `/hang`
+    /// never answers.
+    fn slow_router(
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> Router {
+        use axum::routing::get;
+        Router::new()
+            .route(
+                "/slow",
+                get(move || async move {
+                    let _ = started.send(());
+                    release.notified().await;
+                    "done"
+                }),
+            )
+            .route("/hang", get(std::future::pending::<&'static str>))
+    }
+
+    /// The request is keep-alive (no `Connection: close`), so the server
+    /// closing the connection after it is the graceful shutdown's doing.
+    const GET_SLOW: &[u8] = b"GET /slow HTTP/1.1\r\nHost: x\r\n\r\n";
+    const GET_HANG: &[u8] = b"GET /hang HTTP/1.1\r\nHost: x\r\n\r\n";
+
+    /// On every listener: a request in flight when the signal arrives is
+    /// answered, its keep-alive connection is then closed, a new connection
+    /// is refused, and the server returns as soon as the drain is done.
+    #[tokio::test]
+    async fn shutdown_finishes_the_request_in_flight_and_refuses_new_connections() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for mode in [Listening::Axum, Listening::Proxied, Listening::Tls] {
+            let (started_tx, mut started) = tokio::sync::mpsc::unbounded_channel();
+            let release = Arc::new(tokio::sync::Notify::new());
+            let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+            let (harness, served) = Harness::start(
+                mode,
+                slow_router(started_tx, release.clone()),
+                Duration::from_secs(10),
+                stop_rx,
+                std::future::pending,
+            )
+            .await;
+
+            let mut conn = harness.connect().await.unwrap();
+            conn.write_all(GET_SLOW).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), started.recv())
+                .await
+                .expect("the request reached the handler");
+
+            stop_tx.send(()).unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while harness.accepts().await {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{mode:?}: still accepting after the signal"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                !served.is_finished(),
+                "{mode:?}: returned with a request in flight"
+            );
+
+            release.notify_one();
+            let mut out = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), conn.read_to_end(&mut out))
+                .await
+                .unwrap_or_else(|_| panic!("{mode:?}: the connection is closed after its answer"))
+                .ok();
+            let answer = String::from_utf8_lossy(&out);
+            assert!(answer.starts_with("HTTP/1.1 200"), "{mode:?}: {answer}");
+            assert!(answer.ends_with("done"), "{mode:?}: {answer}");
+
+            tokio::time::timeout(Duration::from_secs(5), served)
+                .await
+                .unwrap_or_else(|_| panic!("{mode:?}: the drain finished"))
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    /// A server future dropped before its signal (a caller aborting it) takes
+    /// its listener with it: the port stops accepting at once.
+    #[tokio::test]
+    async fn dropping_the_server_stops_its_listener() {
+        for mode in [Listening::Axum, Listening::Proxied, Listening::Tls] {
+            let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+            let (harness, served) = Harness::start(
+                mode,
+                Router::new(),
+                Duration::from_secs(5),
+                stop_rx,
+                std::future::pending,
+            )
+            .await;
+            assert!(harness.accepts().await, "{mode:?}: serving");
+            served.abort();
+            let _ = served.await;
+            assert!(
+                !harness.accepts().await,
+                "{mode:?}: still accepting once dropped"
+            );
+        }
+    }
+
+    /// A request that never finishes holds the server only until the drain
+    /// runs out, or until a second signal cuts it short.
+    #[tokio::test]
+    async fn shutdown_is_bounded_by_the_drain_and_cut_by_a_second_signal() {
+        use tokio::io::AsyncWriteExt;
+        for mode in [Listening::Axum, Listening::Proxied, Listening::Tls] {
+            for cut_short in [false, true] {
+                let (started_tx, _started) = tokio::sync::mpsc::unbounded_channel();
+                let router = slow_router(started_tx, Arc::new(tokio::sync::Notify::new()));
+                let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+                let (cut_tx, cut_rx) = tokio::sync::oneshot::channel::<()>();
+                // Cut short: a drain that would outlast the test, ended by the
+                // second signal. Otherwise a short drain and no second signal.
+                let drain = if cut_short {
+                    Duration::from_secs(600)
+                } else {
+                    Duration::from_millis(300)
+                };
+                let (harness, served) =
+                    Harness::start(mode, router, drain, stop_rx, move || async {
+                        let _ = cut_rx.await;
+                    })
+                    .await;
+
+                let mut conn = harness.connect().await.unwrap();
+                conn.write_all(GET_HANG).await.unwrap();
+                // Let the request reach the router before stopping.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                stop_tx.send(()).unwrap();
+                let stopped = tokio::time::Instant::now();
+                // Held to the end of the iteration: a dropped sender would
+                // resolve the cut and end every drain at once.
+                let mut cut_tx = Some(cut_tx);
+                if cut_short {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    assert!(!served.is_finished(), "{mode:?}: the drain waits for /hang");
+                    cut_tx.take().unwrap().send(()).unwrap();
+                }
+                tokio::time::timeout(Duration::from_secs(5), served)
+                    .await
+                    .unwrap_or_else(|_| panic!("{mode:?} cut={cut_short}: not bounded"))
+                    .unwrap()
+                    .unwrap();
+                if !cut_short {
+                    assert!(
+                        stopped.elapsed() >= Duration::from_millis(250),
+                        "{mode:?}: returned before the drain ran out"
+                    );
+                }
+                drop((conn, cut_tx));
+            }
         }
     }
 }

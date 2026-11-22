@@ -153,10 +153,14 @@ private network:
   proofs that ages in together cannot crowd out the recorded members. An
   aged proof buys capacity only: such a DID self-joins channels as a
   `guest`, so a `join = member` channel takes recorded members alone.
-- **Federated peers vouch for their authors.** Blocks relayed from a peer run
-  the same admission, write and suite gates as local ones, except that their
-  authors are not asked for proof-of-work: they never spoke to this server.
-  Only federate with servers you would let post on your behalf.
+- **A follower vouches for its users.** Under a `write` or `member` share, the
+  server that follows a channel relays its users' posts to this one. They run
+  the same admission, write and suite gates as local posts, and the share's
+  grant, with two exceptions. Their authors are not asked for proof-of-work:
+  they never spoke to this server. And they do not draw on `[auth.pools]`, so
+  the pool guarantee above does not bound them: what bounds them is the
+  per-DID rate limit and `[federation.relayed_writes]`, per peer and channel.
+  Only share with servers you would let post on your behalf.
 - **Channel ops are on by default.** `POST /api/v1/channels*` is always
   mounted and runs the same gates as every other write: anyone who can reach
   the port can create an open channel.
@@ -356,6 +360,22 @@ Three landmines:
   `dangerously_enable_v0_0_1_rest` flag is a removed key: a config that sets it
   refuses to boot. `jig read` uses the
   signed history endpoint, `GET /api/v1/channels/<slug>/blocks`.
+
+### Stopping and restarting
+
+On SIGTERM (`systemctl stop` or `restart`, or `install.sh` replacing a running
+server) or SIGINT, jig-server shuts down gracefully:
+- it stops accepting connections;
+- it closes each WebSocket session with code 1001 (going away), so clients
+  reconnect promptly;
+- it gives the requests in flight up to `[server] shutdown_drain_ms` (default
+  5000) to finish, then exits 0.
+
+What is still open when the drain runs out is cut, and a second signal cuts the
+drain short. A block being ingested at that moment is stored whole or not at
+all. `install.sh` waits 10 s for the server it replaces, and the unit's
+`TimeoutStopSec` defaults to 90 s, so keep the drain under both. A client that
+resubmits a block it got no answer for is told the block's CID (#396).
 
 ### Size limits
 
@@ -743,24 +763,23 @@ this server.
 A channel reaches another server only once it is shared. Its creation block
 names the server that orders it, so a peer no longer takes a channel this
 server creates as one of its own. `naively_accept_peer_relayed_creates` (see
-`config.example.toml`) is for tests only: a server with it stores a copy of a
-peer's new channel, but clients refuse to read the copy, because its creation
-block names another server. Servers that trust each other set
-`offers = "accept"` and use `jig channel share`.
+`config.example.toml`) has no effect: this server takes no relayed blocks.
+Servers that trust each other set `offers = "accept"` and use `jig channel
+share`.
 
-The older peer relay no longer posts into channels: a server refuses any post
-a peer relays into a channel the server orders itself, whether the post names
-the channel or its id. The first refusal per peer and channel is logged at WARN
-with the reason `relayed-into-sequenced-channel`, the rest at DEBUG, and each is
-counted in `jig_federation_relayed_refused_total`. **Share any channel that
-reaches peers only through the relay**; until it is shared, peers' posts to it
-are refused and logged, and their users post on this server.
+This server neither sends nor takes relayed posts. Its posts reach another
+server only through a channel it shares, and another server's posts reach it
+the same way. **Share any channel that reached peers only through the older
+relay**: a peer on an earlier release no longer sees this server's posts in its
+own channel of the same name, and its posts no longer land here. Such a peer
+still subscribes to the relay's stream and asks for its catch-up on each
+connection. This server answers the subscription as malformed (`BAD_JSON`) and
+logs the catch-up request at DEBUG. The connection, which also carries shares,
+stays up.
 
-This server relays nothing to its peers either. Its posts reach another server
-only through a channel it shares, so a peer on an earlier release no longer sees
-them in its own channel of the same name. A peer's federation subscription is
-answered with `FEDERATION_STREAM_RETIRED` and sends nothing; the connection,
-which also carries shares, stays up.
+The relay's refusal metric, `jig_federation_relayed_refused_total`, is gone
+with it: remove it from dashboards and alerts. So is the
+`relayed-into-sequenced-channel` WARN.
 
 ---
 

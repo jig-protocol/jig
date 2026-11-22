@@ -31,7 +31,8 @@ shellexpand  = "3"
 
 # Async runtime
 tokio = { workspace = true }
-tokio-util = "0.7"
+# `rt` for `TaskTracker`: graceful shutdown waits on the connections it tracks.
+tokio-util = { version = "0.7", features = ["rt"] }
 futures = "0.3"
 
 # Web framework
@@ -106,7 +107,6 @@ rustls = { version = "0.23", default-features = false, features = [
 ] }
 rustls-pki-types = "1.0"
 dashmap = "6"
-jsonwebtoken = "11"
 # Defaults off, as in jig-runtime: they would turn wasmtime's `cache` back on.
 wasmtime = { version = "50.0.3", default-features = false, features = ["async"] }
 

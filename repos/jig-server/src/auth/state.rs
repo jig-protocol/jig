@@ -14,7 +14,7 @@
 //! replay defence.
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
 
@@ -60,10 +60,6 @@ pub struct AuthState {
     /// Where admission proofs of work are recorded; `None` in a state built
     /// without a store, where no DID is ever proven.
     proofs: Option<Arc<jig_pipeline::persist::SqliteStore>>,
-    /// The DIDs that may subscribe to this server's federation stream: the
-    /// configured peers' `expected_did`s, canonical. Behind a lock so a peer
-    /// added after boot is trusted without a restart.
-    federation_peers: RwLock<BTreeSet<String>>,
 }
 
 impl AuthState {
@@ -137,30 +133,6 @@ impl AuthState {
             local_member_age_secs: auth.pools.local_member_age_secs,
             aged_share_pct: auth.pools.aged_share_pct,
             proofs: None,
-            federation_peers: RwLock::new(BTreeSet::new()),
-        })
-    }
-
-    /// Trust `did` as a federation peer. Fails on a DID that is not a
-    /// parseable `did:jig:z…`, for the reason [`Self::from_config`] does: an
-    /// entry that can never match is a peer locked out with no message.
-    pub fn trust_federation_peer(&self, did: &str) -> anyhow::Result<()> {
-        let did = canonical_did(did)?;
-        self.federation_peers
-            .write()
-            .expect("federation peer lock poisoned")
-            .insert(did);
-        Ok(())
-    }
-
-    /// Whether `did`, which must be the identity gate 1 VERIFIED, is one of
-    /// this server's federation peers.
-    pub fn is_federation_peer(&self, did: &str) -> bool {
-        canonical_did(did).is_ok_and(|did| {
-            self.federation_peers
-                .read()
-                .expect("federation peer lock poisoned")
-                .contains(&did)
         })
     }
 

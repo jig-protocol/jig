@@ -224,6 +224,11 @@ enum ChannelAction {
         /// A did:jig, a name from `[contacts]`, or a verified `alias@suffix`.
         #[arg()]
         who: String,
+        /// A server the member uses, to ask for their key package when they
+        /// have none on this one. Their verified name usually says where
+        /// they can be found; a bare did:jig does not.
+        #[arg(long, value_name = "SERVER_URL")]
+        via: Option<String>,
     },
 
     /// Remove someone from a channel you own. On an encrypted channel they
@@ -981,7 +986,9 @@ async fn run() -> Result<()> {
                 )
                 .await?;
             }
-            ChannelAction::Add { slug, who } => cmd::channel::add(&ctx, slug, who).await?,
+            ChannelAction::Add { slug, who, via } => {
+                cmd::channel::add(&ctx, slug, who, via).await?
+            }
             ChannelAction::Kick { slug, who } => cmd::channel::kick(&ctx, slug, who).await?,
             ChannelAction::Leave { slug } => cmd::channel::leave(&ctx, slug).await?,
             ChannelAction::Promote { slug } => cmd::channel::promote(&ctx, slug).await?,

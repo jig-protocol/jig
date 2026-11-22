@@ -57,9 +57,13 @@ The v0.0.2 surface, mounted by default:
 | `/api/v1/channels/{slug}/members` | GET | Channel members and roles — signed read, same gate as the timeline |
 | `/api/v1/channels[/{slug}/members\|archive]` | POST | Channel ops as signed blocks (create, add/join, archive). Other ops (`member-remove`, `channel-promote`) go through `POST /api/v1/blocks` |
 | `/api/v1/mls/key-packages` | POST | Publish MLS key packages (`{key_packages_b64: [..]}`); each must be signed by, and name, its DID |
-| `/api/v1/mls/key-packages/{did}` | GET | Take one of a DID's key packages (consumed unless last-resort) — signed read |
+| `/api/v1/mls/key-packages/{did}` | GET | Take one of a DID's key packages (consumed unless last-resort) — signed read, held to the `[custody]` hourly limits and logged like a custodian release |
 | `/api/v1/mls/key-packages/{did}/stock` | GET | How many a DID has left — signed read |
 | `/api/v1/channels/{slug}/mls/group-info` | GET | Newest MLS group info of an encrypted channel, for joining by external commit — signed read, channel-gated |
+| `/api/v1/reach/{did}` | PUT | Keep a DID's reachability record (`{record_b64}`), signed by the DID; kept if it lists this server, or if it withdraws this server from a record kept here |
+| `/api/v1/reach/{did}` | GET | The DID's kept reachability record — signed read |
+| `/api/v1/custody/{did}/requests` | POST | Release one of a DID's key packages to a member of another server (`{request_b64}`, a `jig-kp-request-v1` signed by the requester); limits and policy under `[custody]` |
+| `/api/v1/custody/{did}/releases` | GET | The DID's release log — signed read by that DID |
 
 Reads carry five `x-jig-*` headers with an ed25519 proof over the request
 (`jig_client::ReadProof`); `jig channel list`, `jig chat`, `jig read` and `jig tail` sign
