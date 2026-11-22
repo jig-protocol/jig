@@ -665,11 +665,6 @@ fn rekey_channels_by_id(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// The suffix an `alias_attestations` row is keyed by: the lowercased text
-/// after the last `@` of its alias, or `''` for a bare alias (an ingested
-/// `ns-attestation` block may carry one). Lowercased so `Bob@B.example` and
-/// `bob@b.example` share one key: one name per DID per suffix whatever the
-/// case.
 /// [`SqliteStore::upsert_alias_attestation`] on `conn`, which may be a
 /// transaction.
 fn upsert_alias_attestation_on(conn: &Connection, a: &StoredAliasAttestation) -> Result<()> {
@@ -712,6 +707,11 @@ fn expire_alias_attestation_on(
     Ok(())
 }
 
+/// The suffix an `alias_attestations` row is keyed by: the lowercased text
+/// after the last `@` of its alias, or `''` for a bare alias (an ingested
+/// `ns-attestation` block may carry one). Lowercased so `Bob@B.example` and
+/// `bob@b.example` share one key: one name per DID per suffix whatever the
+/// case.
 fn alias_suffix_of(alias: &str) -> String {
     alias
         .rsplit_once('@')
