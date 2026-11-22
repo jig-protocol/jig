@@ -32,7 +32,7 @@ pub const MAX_BATCH: usize = 100;
 /// self-minted identity can make this server store.
 pub const MAX_STOCK: u64 = 200;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct PublishBody {
     pub key_packages_b64: Vec<String>,
 }
@@ -71,15 +71,32 @@ fn bad(code: &'static str, msg: impl Into<String>) -> (StatusCode, Json<ErrorBod
 
 /// POST /api/v1/mls/key-packages
 ///
-/// No request signature: every key package is signed by its DID's own key and
-/// names that DID in its credential (`jig_mls::credential`), which is a
-/// stronger proof than a request header — nobody can publish for a DID whose
-/// key they do not hold. The publisher still passes admission.
+/// No request signature is needed to stock: every key package is signed by
+/// its DID's own key and names that DID in its credential
+/// (`jig_mls::credential`), so nobody can make a package for a DID whose key
+/// they do not hold. The publisher still passes admission.
+///
+/// Replacing the DID's last-resort package needs more, because a package
+/// signature is not fresh: whoever was released an old last-resort package
+/// could upload it here and replace a usable one with one whose key its owner
+/// deleted. So a replacement needs the request itself signed by the DID, over
+/// the exact body bytes, so the proof cannot be replayed with other packages.
+/// An upload without such a proof while one is held is skipped, as before.
 pub async fn publish_key_packages(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<PublishBody>,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+    raw: axum::body::Bytes,
 ) -> Result<Json<PublishResult>, (StatusCode, Json<ErrorBody>)> {
     let started = std::time::Instant::now();
+    // A proof that does not verify over these bytes is no owner's, but the
+    // upload may still stock: package signatures carry that.
+    let signer =
+        crate::v0_0_2_blocks::verify_proof(&state, &headers, "POST", uri.path(), &raw, started)
+            .ok()
+            .flatten();
+    let body: PublishBody =
+        serde_json::from_slice(&raw).map_err(|e| bad("BAD_BATCH", format!("request body: {e}")))?;
     if body.key_packages_b64.is_empty() || body.key_packages_b64.len() > MAX_BATCH {
         return Err(bad(
             "BAD_BATCH",
@@ -102,6 +119,7 @@ pub async fn publish_key_packages(
             "every key package in a batch must belong to one DID",
         ));
     }
+    let owner_signed = signer.is_some_and(|caller| caller.to_did_jig_string() == did);
     state
         .auth
         .admit_and_charge(&did)
@@ -112,12 +130,27 @@ pub async fn publish_key_packages(
         store.key_package_stock(&did).map_err(persist_err)?;
     let now = chrono::Utc::now().timestamp();
     let mut accepted = 0;
+    let mut last_resort_seen = false;
     for (bytes, info) in validated {
-        // One last-resort package per DID is all it needs, and each carries a
-        // fresh reference, so without this a DID could store unboundedly
-        // many of them past `MAX_STOCK`.
+        // One last-resort package per DID is in use at a time. A new one
+        // replaces the old, which its owner rotates out after withdrawing
+        // custody (JEP-0017 rule 32); only the DID can sign a new one, and a
+        // batch replaces it at most once.
         if info.last_resort {
+            if last_resort_seen {
+                continue;
+            }
+            last_resort_seen = true;
+            if has_last_resort && !owner_signed {
+                continue;
+            }
             if has_last_resort {
+                if store
+                    .replace_last_resort(&info.reference, &did, &bytes, now)
+                    .map_err(persist_err)?
+                {
+                    accepted += 1;
+                }
                 continue;
             }
         } else if available >= MAX_STOCK {
@@ -300,11 +333,50 @@ mod tests {
     }
 
     async fn publish(state: &Arc<AppState>, packages: &[Vec<u8>]) -> PublishResult {
+        publish_as(state, packages, None).await
+    }
+
+    fn body_of(packages: &[Vec<u8>]) -> Vec<u8> {
+        serde_json::to_vec(&PublishBody {
+            key_packages_b64: packages.iter().map(|p| STANDARD.encode(p)).collect(),
+        })
+        .unwrap()
+    }
+
+    /// Publish `packages`, with the request signed by `signer` if given.
+    async fn publish_as(
+        state: &Arc<AppState>,
+        packages: &[Vec<u8>],
+        signer: Option<u8>,
+    ) -> PublishResult {
+        let body = body_of(packages);
+        publish_signed_over(state, &body, signer.map(|s| (s, body.clone()))).await
+    }
+
+    /// Send `body`, with a proof by `signer` over `signed` (which may differ).
+    async fn publish_signed_over(
+        state: &Arc<AppState>,
+        body: &[u8],
+        signer: Option<(u8, Vec<u8>)>,
+    ) -> PublishResult {
+        let path = "/api/v1/mls/key-packages";
+        let mut headers = axum::http::HeaderMap::new();
+        if let Some((seed, signed)) = signer {
+            let identity = jig_client::identity::Identity::from_signing_key(
+                ed25519_dalek::SigningKey::from_bytes(&[seed; 32]),
+            );
+            for (name, value) in
+                jig_client::read_auth::ReadProof::sign_body(&identity, "POST", path, &signed)
+                    .headers()
+            {
+                headers.insert(name, value.parse().unwrap());
+            }
+        }
         let Json(result) = publish_key_packages(
             State(state.clone()),
-            Json(PublishBody {
-                key_packages_b64: packages.iter().map(|p| STANDARD.encode(p)).collect(),
-            }),
+            path.parse().unwrap(),
+            headers,
+            body.to_vec().into(),
         )
         .await
         .unwrap();
@@ -312,7 +384,8 @@ mod tests {
     }
 
     /// Each last-resort package has a fresh reference, so without a cap one
-    /// DID could store as many as it liked.
+    /// DID could store as many as it liked. A new one replaces the old
+    /// (JEP-0017 rule 32), and one batch replaces it at most once.
     #[tokio::test]
     async fn a_did_keeps_one_last_resort_package() {
         let state = Arc::new(AppState::for_test().unwrap());
@@ -326,10 +399,30 @@ mod tests {
             (3, 2, true)
         );
 
-        let again = publish(&state, &m.key_packages(2, true).unwrap()).await;
+        let unsigned = publish(&state, &m.key_packages(1, true).unwrap()).await;
         assert_eq!(
-            again.accepted, 0,
-            "a second last-resort package is not stored"
+            unsigned.accepted, 0,
+            "an unsigned upload does not replace the held last-resort package"
+        );
+        let again = publish_as(&state, &m.key_packages(2, true).unwrap(), Some(7)).await;
+        assert_eq!(
+            (again.accepted, again.available, again.last_resort),
+            (1, 2, true),
+            "a new last-resort package replaces the old, once per batch"
+        );
+        let stranger = publish_as(&state, &m.key_packages(1, true).unwrap(), Some(8)).await;
+        assert_eq!(
+            stranger.accepted, 0,
+            "a request signed by another DID does not replace it"
+        );
+        // The owner's proof for one body, replayed with another: the
+        // packages it brings do not replace the held one.
+        let signed_for = body_of(&m.key_packages(1, true).unwrap());
+        let replayed = body_of(&m.key_packages(1, true).unwrap());
+        let r = publish_signed_over(&state, &replayed, Some((7, signed_for))).await;
+        assert_eq!(
+            r.accepted, 0,
+            "a proof over another body does not replace it"
         );
     }
 
@@ -382,9 +475,9 @@ mod tests {
         batch.extend(b.key_packages(1, false).unwrap());
         let refused = publish_key_packages(
             State(state),
-            Json(PublishBody {
-                key_packages_b64: batch.iter().map(|p| STANDARD.encode(p)).collect(),
-            }),
+            "/api/v1/mls/key-packages".parse().unwrap(),
+            axum::http::HeaderMap::new(),
+            body_of(&batch).into(),
         )
         .await;
         assert!(matches!(refused, Err((StatusCode::BAD_REQUEST, _))));

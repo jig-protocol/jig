@@ -414,6 +414,35 @@ impl Member {
         }
     }
 
+    /// Delete the private halves of this member's key packages named by
+    /// `references` (each a package's hash reference, as
+    /// [`crate::delivery::validate_key_package`] gives it), last-resort ones
+    /// included. A welcome naming one of them can no longer be joined. A
+    /// reference this member holds no package for is skipped, so the call
+    /// can be repeated. Returns how many were deleted.
+    pub fn forget_key_packages(&self, references: &[Vec<u8>]) -> Result<usize> {
+        use openmls::prelude::tls_codec;
+        use openmls::prelude::{KeyPackageBundle, KeyPackageRef};
+        use openmls_traits::storage::StorageProvider as _;
+        let storage = self.provider.storage();
+        let mut deleted = 0;
+        for reference in references {
+            // openmls builds a reference from bytes only in its tests, so
+            // decode it from its wire form, a variable-length vector.
+            let reference = tls_codec::VLBytes::new(reference.clone())
+                .tls_serialize_detached()
+                .map_err(internal)
+                .and_then(|wire| KeyPackageRef::tls_deserialize_exact(wire).map_err(malformed))?;
+            let held: Option<KeyPackageBundle> =
+                storage.key_package(&reference).map_err(internal)?;
+            if held.is_some() {
+                storage.delete_key_package(&reference).map_err(internal)?;
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
+    }
+
     /// Drop all local state for a group.
     pub fn forget(&self, group_id: &[u8]) -> Result<()> {
         if let Ok(mut group) = self.load(group_id) {
