@@ -281,8 +281,9 @@ pub async fn serve_app(
 /// [`serve_app`] until `stop`, then shut down gracefully (#438): stop
 /// accepting, let the requests in flight finish within `[network]
 /// shutdown_drain_ms` (or until `cut`), end whatever is still open, and
-/// return. No connection outlives the return, whether or not the caller's
-/// runtime keeps running.
+/// return. Each connection still open is ended by then (an HTTP/2 stream's
+/// handler, which hyper runs on a task of its own, ends once its connection
+/// is cut), whether or not the caller's runtime keeps running.
 pub async fn serve_app_until<S, C, CF>(
     cfg: &NameServerConfig,
     app: NameServerApp,
@@ -436,8 +437,19 @@ async fn serve_connections(
             accepted = listener.accept() => accepted,
             () = shutdown.cancelled() => return Ok(()),
         };
-        let (tcp, peer) =
-            accepted.map_err(|e| NameServerError::Other(anyhow::anyhow!("accept error: {e}")))?;
+        // As `axum::serve` does, and jig-server's `serve_plain`: an accept
+        // error (out of file descriptors, a connection aborted before it was
+        // accepted) is logged and waited out, so it does not stop the server.
+        let (tcp, peer) = match accepted {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                tracing::error!("accept error: {e}");
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_secs(1)) => continue,
+                    () = shutdown.cancelled() => return Ok(()),
+                }
+            }
+        };
         let (tls, router, watched) = (tls.clone(), router.clone(), shutdown.clone());
         shutdown.spawn_cut(async move {
             let shutdown = watched;

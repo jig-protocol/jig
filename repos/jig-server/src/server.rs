@@ -189,7 +189,9 @@ impl JigServer {
 /// ([`serve_plain`]); both with PROXY protocol when `proxy` is set. Each
 /// connection is served by hyper-util's auto builder (HTTP/1, or HTTP/2,
 /// over plain HTTP by prior knowledge) and runs as a task that a drain which
-/// runs out, or is cut, ends: none outlives this future's return.
+/// runs out, or is cut, ends before this future returns. An HTTP/2 stream's
+/// handler, which hyper runs on a task of its own, ends once its connection
+/// is cut.
 pub(crate) async fn serve_listener<S, C, CF>(
     listener: TcpListener,
     router: Router,
