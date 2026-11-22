@@ -79,10 +79,17 @@ impl RulesetSection {
                 "[ruleset] url is set without a path: there is nothing to serve".to_string(),
             );
         }
+        // An absolute https:// URL naming a host: the authority is what
+        // follows the scheme, up to the first path, query or fragment.
         if let Some(url) = &self.url
-            && !url.starts_with("https://")
+            && !url.strip_prefix("https://").is_some_and(|rest| {
+                let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+                !host.is_empty() && !host.contains(char::is_whitespace) && !host.contains('@')
+            })
         {
-            return Err(format!("[ruleset] url {url:?} is not an https:// URL"));
+            return Err(format!(
+                "[ruleset] url {url:?} is not an absolute https:// URL with a host"
+            ));
         }
         Ok(())
     }

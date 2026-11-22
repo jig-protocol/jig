@@ -69,8 +69,9 @@ pub fn load(section: &RulesetSection, pools: &PoolsSection) -> anyhow::Result<Op
 }
 
 /// Refuse to declare a ruleset whose pool shares (stranger, invited and
-/// aged) this server does not enforce: declaring is signing a claim (JEP-0009 rule 4), and a server
-/// that enforces other shares signs evidence against itself. The pools are
+/// aged) this server does not enforce: declaring is signing a claim
+/// (JEP-0009 rule 4), and a server that enforces other shares signs evidence
+/// against itself. The pools are
 /// the one part of a ruleset enforced today; standing and the rest have no
 /// enforcement until R2.4, so they are not checked here.
 pub fn check_enforced(signed: &SignedRuleset, pools: &PoolsSection) -> Result<(), String> {
@@ -359,6 +360,25 @@ pub(crate) mod tests {
             format!("{err:#}").contains("not a signed ruleset"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn a_mirror_url_without_a_host_refuses_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(&dir, signed_ruleset().envelope());
+        for url in [
+            "https://",
+            "https:///r.cose",
+            "https://?x",
+            "https://a b/r",
+            "https://u@h/r",
+        ] {
+            let section = RulesetSection {
+                path: Some(path.clone()),
+                url: Some(url.into()),
+            };
+            assert!(load(&section, &enforced()).is_err(), "{url}");
+        }
     }
 
     #[test]

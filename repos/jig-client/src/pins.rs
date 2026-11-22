@@ -173,9 +173,15 @@ pub struct ServerPin {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub welcome: Option<String>,
     /// The `server-manifest` this device last checked a welcome against
-    /// ([`crate::manifest`]); a welcome citing it needs no second check.
+    /// ([`crate::manifest`]); a welcome citing it, and naming
+    /// [`Self::ruleset`], needs no second check. The manifest reference does
+    /// not cover the ruleset a welcome names, so the cache holds both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest: Option<jig_pipeline::handshake::ManifestRef>,
+    /// The ruleset the welcome checked against [`Self::manifest`] named, when
+    /// it granted the ruleset capability (JEP-0009 rule 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ruleset: Option<jig_pipeline::handshake::RulesetRef>,
     /// The public key links this pin moved along, and those the server
     /// served leading to its pinned DID, base64 as served: a later link out
     /// of one of their DIDs to another is a fork
@@ -673,11 +679,14 @@ impl Pins {
         &mut self,
         server: &str,
         manifest: &jig_pipeline::handshake::ManifestRef,
+        ruleset: Option<&jig_pipeline::handshake::RulesetRef>,
     ) -> Result<(), PinError> {
         self.update(|file| {
             let pin = file.servers.entry(server_key(server)).or_default();
-            let changed = pin.manifest.as_ref() != Some(manifest);
+            let changed =
+                pin.manifest.as_ref() != Some(manifest) || pin.ruleset.as_ref() != ruleset;
             pin.manifest = Some(manifest.clone());
+            pin.ruleset = ruleset.cloned();
             Ok(((), changed))
         })
     }

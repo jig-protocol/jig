@@ -16,6 +16,8 @@ pub const MAX_RULESET_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RulesetMismatch {
+    #[error("the document fetched is {0} bytes, over the {MAX_RULESET_BYTES}-byte limit")]
+    TooLarge(usize),
     #[error("the document fetched is {actual}, not the {declared} the server declared")]
     Hash { declared: String, actual: String },
     #[error("the document fetched does not open as a signed ruleset: {0}")]
@@ -40,6 +42,11 @@ pub fn check_fetched(
     declared: &RulesetRef,
     bytes: &[u8],
 ) -> Result<SignedRuleset, RulesetMismatch> {
+    // Bound the work before hashing or parsing. A fetcher bounds the read
+    // itself (`crate::limits::read_capped` with this limit).
+    if bytes.len() > MAX_RULESET_BYTES {
+        return Err(RulesetMismatch::TooLarge(bytes.len()));
+    }
     let actual = hash_of(bytes).to_string();
     if actual != declared.hash {
         return Err(RulesetMismatch::Hash {
@@ -127,6 +134,14 @@ mod tests {
             let err = check_fetched(&declared, signed.envelope()).unwrap_err();
             assert!(matches!(err, RulesetMismatch::Names { .. }), "{err}");
         }
+    }
+
+    #[test]
+    fn a_document_over_the_limit_is_refused_before_it_is_hashed() {
+        let big = vec![0u8; MAX_RULESET_BYTES + 1];
+        let declared = declared_for(&big, "jig-reference", 1);
+        let err = check_fetched(&declared, &big).unwrap_err();
+        assert_eq!(err, RulesetMismatch::TooLarge(MAX_RULESET_BYTES + 1));
     }
 
     #[test]

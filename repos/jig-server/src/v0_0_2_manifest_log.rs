@@ -134,6 +134,7 @@ pub async fn publish(state: &Arc<AppState>) -> anyhow::Result<ManifestRef> {
         .pop()
         .filter(|b| b.block_kind == BlockKind::ServerManifest.as_str());
     let ruleset = state.ruleset.as_ref().map(|r| r.reference.clone());
+    let supersedes = newest.as_ref().map(|block| block.cid.clone());
     // The newest says what this server advertises now, and declares the
     // ruleset it declares now, and was written by the DID it signs as now: a
     // welcome cites only its own DID's entry, so after a key change the same
@@ -154,6 +155,15 @@ pub async fn publish(state: &Arc<AppState>) -> anyhow::Result<ManifestRef> {
                 state,
                 block(state, BlockKind::ServerManifest, |m| {
                     let m = m.metadata_entry(METADATA_KEY, serde_json::json!(encoded));
+                    // The entry it replaces, so going back to an earlier
+                    // advertisement (ruleset A, then none, then A) is a new
+                    // block, not the earlier one again: identical bytes would
+                    // ingest as the block already held, and leave the log's
+                    // newest entry saying something this server no longer does.
+                    let m = match &supersedes {
+                        Some(cid) => m.metadata_entry(SUPERSEDES_KEY, serde_json::json!(cid)),
+                        None => m,
+                    };
                     // Only when it declares one, so a server that declares
                     // none publishes the block it always did.
                     match &ruleset {
@@ -264,6 +274,10 @@ fn author_of(bundle_bytes: &[u8]) -> Option<String> {
     let manifest: BlockManifest = serde_json::from_slice(&manifest_bytes).ok()?;
     Some(manifest.authors.first()?.did.to_did_jig_string())
 }
+
+/// The block metadata key naming the manifest-log entry a `server-manifest`
+/// replaces. Clients read only [`METADATA_KEY`] and [`RULESET_METADATA_KEY`].
+const SUPERSEDES_KEY: &str = "supersedes";
 
 /// The ruleset a stored `server-manifest` block declares: `Some(None)` for
 /// none, `None` when the block does not parse or declares something that is
@@ -574,6 +588,39 @@ pub(crate) mod tests {
         assert_ne!(second.cid, first.cid);
         let block = store.get_block(&second.cid).unwrap().unwrap();
         assert_eq!(ruleset_of(&block.bundle_bytes), Some(None));
+    }
+
+    /// Declaring A, then none, then A again ends with an entry that declares
+    /// A: going back is a new entry, not the first A entry again.
+    #[tokio::test]
+    async fn going_back_to_an_earlier_ruleset_publishes_a_new_entry() {
+        let signed = crate::v0_0_2_ruleset::tests::signed_ruleset();
+        let (_dir, declaring) = crate::v0_0_2_ruleset::tests::declaring_state(&signed);
+        let declaring = Arc::new(declaring);
+        let first = publish(&declaring).await.unwrap();
+
+        let mut plain = AppState::for_test().unwrap();
+        plain.ingest_ctx = declaring.ingest_ctx.clone();
+        plain.server_did = declaring.server_did.clone();
+        let second = publish(&Arc::new(plain)).await.unwrap();
+
+        let third = publish(&declaring).await.unwrap();
+        assert!(
+            first.seq < second.seq && second.seq < third.seq,
+            "{first:?} {second:?} {third:?}"
+        );
+        assert_ne!(third.cid, first.cid);
+        let store = &declaring.ingest_ctx.store;
+        let newest = store
+            .list_blocks_by_channel(LOG_SLUG, 1, None)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(newest.cid, third.cid);
+        assert_eq!(
+            ruleset_of(&newest.bundle_bytes),
+            Some(Some(declaring.ruleset.as_ref().unwrap().reference.clone()))
+        );
     }
 
     /// A welcome to a client that asks names the declared ruleset; the

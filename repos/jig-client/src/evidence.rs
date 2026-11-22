@@ -216,7 +216,8 @@ pub fn verify(bundle: &Bundle) -> Result<Checked, BundleError> {
                     "{} signed a welcome that contradicts entry {} of its manifest log: {reason}",
                     bundle.server_did, cited.seq
                 )),
-                Err(ManifestCheck::Unproven(reason)) => {
+                // `check_cited` never withholds: only a client that asked can.
+                Err(ManifestCheck::Unproven(reason) | ManifestCheck::Withheld(reason)) => {
                     return Err(BundleError::Proof(format!(
                         "the manifest is not shown to be the server's: {reason}"
                     )));

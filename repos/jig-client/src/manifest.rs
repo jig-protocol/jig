@@ -39,16 +39,51 @@ pub enum ManifestCheck {
     Unproven(String),
     #[error("the server's welcome contradicts the manifest it cites: {0}")]
     Contradicts(String),
+    /// A client that asked for the server's ruleset was answered by a
+    /// welcome that does not grant it, while the manifest the welcome cites
+    /// declares one ([`check_cited_asked`]). Only the client knows it asked,
+    /// so this is a refusal, not evidence anyone else can check.
+    #[error("the server's welcome withholds the ruleset its manifest declares: {0}")]
+    Withheld(String),
 }
 
 /// Check `cited`, the block and record `welcome` cites, as served. Returns
 /// the document on success.
+///
+/// It checks only what the welcome signs, so it holds for evidence: a
+/// welcome that does not grant the ruleset capability makes no claim about
+/// the ruleset, whatever the manifest declares. A client that asked uses
+/// [`check_cited_asked`].
 pub fn check_cited(
     welcome: &VerifiedWelcome,
     cited: &ManifestRef,
     bundle_b64: &str,
     sig_b64: &str,
     record: &IngestRecord,
+) -> Result<ServerManifest, ManifestCheck> {
+    check_cited_as(welcome, cited, bundle_b64, sig_b64, record, false)
+}
+
+/// [`check_cited`] for a client whose hello asked for the ruleset: a welcome
+/// that does not grant it, citing a manifest that declares one, is refused
+/// as [`ManifestCheck::Withheld`].
+pub fn check_cited_asked(
+    welcome: &VerifiedWelcome,
+    cited: &ManifestRef,
+    bundle_b64: &str,
+    sig_b64: &str,
+    record: &IngestRecord,
+) -> Result<ServerManifest, ManifestCheck> {
+    check_cited_as(welcome, cited, bundle_b64, sig_b64, record, true)
+}
+
+fn check_cited_as(
+    welcome: &VerifiedWelcome,
+    cited: &ManifestRef,
+    bundle_b64: &str,
+    sig_b64: &str,
+    record: &IngestRecord,
+    asked_ruleset: bool,
 ) -> Result<ServerManifest, ManifestCheck> {
     let unproven = |reason: &str| ManifestCheck::Unproven(reason.to_string());
     let manifest = served_block(&cited.cid, bundle_b64, sig_b64).map_err(|r| unproven(&r))?;
@@ -109,16 +144,22 @@ pub fn check_cited(
             "the manifest it signed declares no valid ruleset: {e}"
         ))
     })?;
-    // A welcome to a hello that asked signs the ruleset, or its absence
-    // (`Capabilities::ruleset`). One that does not grant the capability is
-    // from a server that does not declare: this build always asks, so a
-    // block that declares one anyway is a server answering it as if it did
-    // not, which hides the ruleset it applies.
-    let named = welcome
-        .capabilities
-        .ruleset
-        .then_some(welcome.ruleset.as_deref())
-        .flatten();
+    // A welcome that grants the capability signs the ruleset, or its
+    // absence (`Capabilities::ruleset`): that claim must be the manifest's.
+    // One that does not grant it claims nothing about the ruleset (a server
+    // answers a hello that did not ask that way), so only a client that
+    // asked can hold its silence against the manifest.
+    if !welcome.capabilities.ruleset {
+        if asked_ruleset && let Some(declared) = &declared {
+            return Err(ManifestCheck::Withheld(format!(
+                "this client asked for the ruleset; the welcome does not grant it, and the \
+                 manifest declares {}",
+                ruleset_name(Some(declared))
+            )));
+        }
+        return Ok(doc);
+    }
+    let named = welcome.ruleset.as_deref();
     if named != declared.as_ref() {
         return Err(contradicts(format!(
             "the welcome names ruleset {}, the manifest declares {}",
@@ -419,9 +460,26 @@ mod tests {
         contradicts(check_cited(
             &hidden, &declared, &d_bundle, &d_sig, &d_record,
         ));
-        // A welcome that does not grant the capability is from a server that
-        // declares nothing; its manifest saying otherwise is a contradiction.
-        contradicts(check_cited(&base, &declared, &d_bundle, &d_sig, &d_record));
+    }
+
+    /// A welcome that does not grant the capability says nothing about the
+    /// ruleset, so it is no evidence against a manifest that declares one:
+    /// a server answers a hello that did not ask that way. A client that
+    /// asked refuses it, without evidence.
+    #[test]
+    fn a_welcome_without_the_capability_is_refused_only_by_a_client_that_asked() {
+        let server = Server::new();
+        let base = server.welcome(&["none", "mls"], &["text-render", "member-add"]);
+        let (cited, bundle, sig, record) = server.publish_declaring(&doc(), &ruleset(1), 1);
+        check_cited(&base, &cited, &bundle, &sig, &record).unwrap();
+        let asked = check_cited_asked(&base, &cited, &bundle, &sig, &record);
+        assert!(
+            matches!(asked, Err(ManifestCheck::Withheld(_))),
+            "{asked:?}"
+        );
+        // Nothing declared: nothing withheld.
+        let (cited, bundle, sig, record) = server.publish(&doc(), 1);
+        check_cited_asked(&base, &cited, &bundle, &sig, &record).unwrap();
     }
 
     #[test]
