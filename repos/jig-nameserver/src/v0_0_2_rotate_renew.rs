@@ -13,8 +13,9 @@ use serde::Deserialize;
 use crate::v0_0_2::AppState;
 use crate::v0_0_2_policy::SuffixPolicy;
 use crate::v0_0_2_register::{
-    ApiError, PowClaim, check_pow, consume_challenge, current_binding, err, issue_and_persist,
-    refuse_second_name, served_name, verify_action_proof, verify_bare_challenge_sig,
+    ApiError, PowClaim, check_pow, consume_challenge, current_binding, err, issue,
+    issue_and_persist, refuse_second_name, served_name, verify_action_proof,
+    verify_bare_challenge_sig,
 };
 
 /// The policy of `name`'s suffix, which `served_name` checked is served.
@@ -140,39 +141,34 @@ pub async fn rotate(
     )
     .await?;
 
-    // 4. Expire the old-DID row so it no longer matches alias queries.
-    //    Without this, both the old and new rows would be valid for the same
-    //    alias and the result would be non-deterministic when their valid_from
-    //    timestamps are equal (common in tests). Setting valid_until = now on
-    //    the old row is the cleanest fix within the (did, ns_did, suffix) PK
-    //    model; a later refactor can add a proper `alias → did` unique index.
+    // 4. Expire the old-DID row and store a new attestation under new_did,
+    //    in one transaction: a rotation cut between the two (a crash, or a
+    //    shutdown drain that runs out, #438) leaves the old binding or the
+    //    new one, never neither. Expiring the old row (valid_until = now)
+    //    keeps both rows from matching the alias when their valid_from are
+    //    equal; a later refactor can add a proper `alias → did` unique index.
+    //    The old DID's reachability record does not carry over.
     let now = chrono::Utc::now().timestamp();
-    let store_expire = state.ingest_ctx.store.clone();
-    let old_did_clone = req.old_did.clone();
-    let ns_did_clone = state.ns_did_string();
-    let alias_clone = alias.clone();
-    tokio::task::spawn_blocking(move || {
-        store_expire.expire_alias_attestation(&old_did_clone, &ns_did_clone, &alias_clone, now)
-    })
-    .await
-    .map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "JOIN_ERROR",
-            e.to_string(),
-        )
-    })?
-    .map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "PERSIST_ERROR",
-            e.to_string(),
-        )
-    })?;
-
-    // 5. Issue + sign new attestation under new_did. The old DID's
-    //    reachability record does not carry over.
-    issue_and_persist(&state, &req.new_did, &alias, None).await
+    let (binding, stored) = issue(&state, &req.new_did, &alias, None);
+    let store = state.ingest_ctx.store.clone();
+    let old_did = req.old_did.clone();
+    tokio::task::spawn_blocking(move || store.rotate_alias_attestation(&old_did, now, &stored))
+        .await
+        .map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "JOIN_ERROR",
+                e.to_string(),
+            )
+        })?
+        .map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "PERSIST_ERROR",
+                e.to_string(),
+            )
+        })?;
+    Ok(Json(binding.response()))
 }
 
 /// POST /v1/renew — refresh the validity window of an existing

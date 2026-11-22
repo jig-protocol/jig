@@ -145,6 +145,8 @@ jig-mls = { workspace = true, features = ["conformance"] }
 jig-pipeline = { path = "../jig-pipeline", features = ["test-support"] }
 # Paused time (`start_paused`, `time::advance`) for the stream's limits.
 tokio = { workspace = true, features = ["test-util"] }
+# An HTTP/2 client for the h2c-by-prior-knowledge tests.
+hyper = { workspace = true, features = ["client", "http2"] }
 
 [features]
 default = ["sqlite"]

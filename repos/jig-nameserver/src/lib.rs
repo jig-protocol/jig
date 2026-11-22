@@ -3,6 +3,7 @@
 pub mod config;
 pub mod error;
 pub mod server;
+pub mod shutdown;
 pub mod v0_0_2;
 pub mod v0_0_2_handles;
 pub mod v0_0_2_metrics;

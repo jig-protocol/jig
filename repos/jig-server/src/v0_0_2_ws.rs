@@ -342,179 +342,191 @@ async fn handle_socket(
     };
 
     let mut peer_rx: Option<mpsc::Receiver<Envelope>> = None;
-    loop {
-        // A dialer that named a peer DID has until here to prove it.
-        let proof_deadline = session.awaiting_peer.as_ref().map(|p| p.deadline);
-        if peer_rx.is_none() {
-            peer_rx = session.peer_rx.take();
-        }
-        tokio::select! {
-            // --- Peer frames this server sends unprompted → Peer ---
-            Some(env) = async {
-                match peer_rx.as_mut() {
-                    Some(rx) => rx.recv().await,
-                    None => std::future::pending().await,
+    // A drain that runs out, or is cut, ends the session where it stands,
+    // as it ends every other connection; the cleanup below still runs.
+    let cut = shutdown.clone();
+    let run = async {
+        loop {
+            // A dialer that named a peer DID has until here to prove it.
+            let proof_deadline = session.awaiting_peer.as_ref().map(|p| p.deadline);
+            if peer_rx.is_none() {
+                peer_rx = session.peer_rx.take();
+            }
+            tokio::select! {
+                // --- Peer frames this server sends unprompted → Peer ---
+                Some(env) = async {
+                    match peer_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let Ok(json) = serde_json::to_string(&env) else {
+                        continue;
+                    };
+                    if socket.send(Message::Text(json.into())).await.is_err() {
+                        break;
+                    }
                 }
-            } => {
-                let Ok(json) = serde_json::to_string(&env) else {
-                    continue;
-                };
-                if socket.send(Message::Text(json.into())).await.is_err() {
+                () = async {
+                    match proof_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    tracing::info!(conn_id, "closing: no peer_proof within the handshake wait");
+                    let _ = socket
+                        .send(Message::Close(Some(CloseFrame {
+                            code: close::HANDSHAKE_FAILED,
+                            reason: "no peer_proof".into(),
+                        })))
+                        .await;
                     break;
                 }
-            }
-            () = async {
-                match proof_deadline {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending().await,
+                // --- The server is stopping (#424) ---
+                // Checked between frames, so a frame already being handled
+                // (an ingest included) finishes first.
+                () = async {
+                    match &shutdown {
+                        Some(shutdown) => shutdown.cancelled().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    tracing::debug!(conn_id, "closing: server shutting down");
+                    let sent = socket
+                        .send(Message::Close(Some(CloseFrame {
+                            code: axum::extract::ws::close_code::AWAY,
+                            reason: "server shutting down".into(),
+                        })))
+                        .await;
+                    // Finish the closing handshake (RFC 6455 §7.1.1): read until
+                    // the client's Close, discarding anything else, so the 1001
+                    // isn't lost to a reset from closing on unread data. A client
+                    // that never answers is given CLOSE_REPLY_WAIT.
+                    if sent.is_ok() {
+                        let _ = tokio::time::timeout(CLOSE_REPLY_WAIT, async {
+                            while let Some(Ok(msg)) = socket.recv().await {
+                                if matches!(msg, Message::Close(_)) {
+                                    break;
+                                }
+                            }
+                        })
+                        .await;
+                    }
+                    break;
                 }
-            } => {
-                tracing::info!(conn_id, "closing: no peer_proof within the handshake wait");
-                let _ = socket
-                    .send(Message::Close(Some(CloseFrame {
-                        code: close::HANDSHAKE_FAILED,
-                        reason: "no peer_proof".into(),
-                    })))
-                    .await;
-                break;
-            }
-            // --- The server is stopping (#424) ---
-            // Checked between frames, so a frame already being handled
-            // (an ingest included) finishes first.
-            () = async {
-                match &shutdown {
-                    Some(shutdown) => shutdown.cancelled().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                tracing::debug!(conn_id, "closing: server shutting down");
-                let sent = socket
-                    .send(Message::Close(Some(CloseFrame {
-                        code: axum::extract::ws::close_code::AWAY,
-                        reason: "server shutting down".into(),
-                    })))
-                    .await;
-                // Finish the closing handshake (RFC 6455 §7.1.1): read until
-                // the client's Close, discarding anything else, so the 1001
-                // isn't lost to a reset from closing on unread data. A client
-                // that never answers is given CLOSE_REPLY_WAIT.
-                if sent.is_ok() {
-                    let _ = tokio::time::timeout(CLOSE_REPLY_WAIT, async {
-                        while let Some(Ok(msg)) = socket.recv().await {
-                            if matches!(msg, Message::Close(_)) {
+                // --- Client → Server ---
+                client_msg = socket.recv() => {
+                    let Some(Ok(msg)) = client_msg else {
+                        // Stream ended or error — clean disconnect.
+                        break;
+                    };
+                    match msg {
+                        // Every frame costs its sender's address, signed or not:
+                        // one upgraded connection is not a licence to flood.
+                        Message::Text(_) if ip.is_some_and(|ip| !state.auth.charge_ip(ip)) => {
+                            let outcome = crate::auth::GateOutcome::RateLimited;
+                            let (status, code, message) = state.auth.disclosure.disclose(&outcome);
+                            let wait = (code == "RATE_LIMITED")
+                                .then(|| state.auth.ip_retry_after_ms())
+                                .flatten();
+                            let _ = send_error_after(
+                                &mut socket,
+                                Some(status),
+                                code,
+                                None,
+                                &message,
+                                wait,
+                            )
+                            .await;
+                        }
+                        Message::Text(text) => {
+                            if let Err(e) = handle_client_frame(
+                                &text,
+                                &state,
+                                &sub_tx,
+                                &mut session,
+                                conn_id,
+                                &mut socket,
+                            )
+                            .await
+                            {
+                                tracing::warn!(conn_id, "ws frame error: {e}");
+                            }
+                            if let Some((code, reason)) = session.close.take() {
+                                let _ = socket
+                                    .send(Message::Close(Some(CloseFrame {
+                                        code,
+                                        reason: reason.into(),
+                                    })))
+                                    .await;
                                 break;
                             }
                         }
-                    })
-                    .await;
-                }
-                break;
-            }
-            // --- Client → Server ---
-            client_msg = socket.recv() => {
-                let Some(Ok(msg)) = client_msg else {
-                    // Stream ended or error — clean disconnect.
-                    break;
-                };
-                match msg {
-                    // Every frame costs its sender's address, signed or not:
-                    // one upgraded connection is not a licence to flood.
-                    Message::Text(_) if ip.is_some_and(|ip| !state.auth.charge_ip(ip)) => {
-                        let outcome = crate::auth::GateOutcome::RateLimited;
-                        let (status, code, message) = state.auth.disclosure.disclose(&outcome);
-                        let wait = (code == "RATE_LIMITED")
-                            .then(|| state.auth.ip_retry_after_ms())
-                            .flatten();
-                        let _ = send_error_after(
-                            &mut socket,
-                            Some(status),
-                            code,
-                            None,
-                            &message,
-                            wait,
-                        )
-                        .await;
+                        Message::Close(_) => break,
+                        // Ignore Ping/Pong/Binary; axum handles Ping→Pong automatically.
+                        _ => {}
                     }
-                    Message::Text(text) => {
-                        if let Err(e) = handle_client_frame(
-                            &text,
-                            &state,
-                            &sub_tx,
-                            &mut session,
-                            conn_id,
-                            &mut socket,
-                        )
-                        .await
-                        {
-                            tracing::warn!(conn_id, "ws frame error: {e}");
-                        }
-                        if let Some((code, reason)) = session.close.take() {
-                            let _ = socket
-                                .send(Message::Close(Some(CloseFrame {
-                                    code,
-                                    reason: reason.into(),
-                                })))
-                                .await;
-                            break;
-                        }
-                    }
-                    Message::Close(_) => break,
-                    // Ignore Ping/Pong/Binary; axum handles Ping→Pong automatically.
-                    _ => {}
                 }
-            }
 
-            // --- Fanout delivery → Client ---
-            delivery = sub_rx.recv() => {
-                let Some((block, receipt)) = delivery else {
-                    // Sub channel closed (server shutdown path).
-                    break;
-                };
-                let receipts = vec![ReceiptRef {
-                    server_did: receipt.server_id.clone(),
-                    render_hash: receipt.render_hash.clone(),
-                    receipt_bytes_b64: base64::engine::general_purpose::STANDARD
-                        .encode(&receipt.receipt_bytes),
-                }];
-                let frame = Envelope::new(Frame::Block {
-                    bundle_b64: base64::engine::general_purpose::STANDARD
-                        .encode(&block.bundle_bytes),
-                    sig_b64: if block.sender_sig.is_empty() {
-                        None
-                    } else {
-                        Some(
-                            base64::engine::general_purpose::STANDARD
-                                .encode(&block.sender_sig),
-                        )
-                    },
-                    receipts,
-                    delivery_cid: format!("delivery:{}", block.cid),
-                    // Stored in the same transaction as the block, so it is
-                    // there by the time fanout delivers it. A store error
-                    // sends the block without one, which the client sees as
-                    // a block it cannot place, not as a forged record. The
-                    // record is the delivery channel's: a block a carried
-                    // channel shares with another holds one in each.
-                    ingest: match &block.channel_id {
-                        Some(channel_id) => state
-                            .ingest_ctx
-                            .store
-                            .get_chain_record(channel_id, &block.cid),
-                        None => state.ingest_ctx.store.get_ingest_record(&block.cid),
-                    }
-                    .unwrap_or_else(|e| {
-                            tracing::warn!(cid = %block.cid, "ingest record lookup failed: {e}");
+                // --- Fanout delivery → Client ---
+                delivery = sub_rx.recv() => {
+                    let Some((block, receipt)) = delivery else {
+                        // Sub channel closed (server shutdown path).
+                        break;
+                    };
+                    let receipts = vec![ReceiptRef {
+                        server_did: receipt.server_id.clone(),
+                        render_hash: receipt.render_hash.clone(),
+                        receipt_bytes_b64: base64::engine::general_purpose::STANDARD
+                            .encode(&receipt.receipt_bytes),
+                    }];
+                    let frame = Envelope::new(Frame::Block {
+                        bundle_b64: base64::engine::general_purpose::STANDARD
+                            .encode(&block.bundle_bytes),
+                        sig_b64: if block.sender_sig.is_empty() {
                             None
-                        }),
-                });
-                let Ok(json) = serde_json::to_string(&frame) else {
-                    continue;
-                };
-                if socket.send(Message::Text(json.into())).await.is_err() {
-                    break;
+                        } else {
+                            Some(
+                                base64::engine::general_purpose::STANDARD
+                                    .encode(&block.sender_sig),
+                            )
+                        },
+                        receipts,
+                        delivery_cid: format!("delivery:{}", block.cid),
+                        // Stored in the same transaction as the block, so it is
+                        // there by the time fanout delivers it. A store error
+                        // sends the block without one, which the client sees as
+                        // a block it cannot place, not as a forged record. The
+                        // record is the delivery channel's: a block a carried
+                        // channel shares with another holds one in each.
+                        ingest: match &block.channel_id {
+                            Some(channel_id) => state
+                                .ingest_ctx
+                                .store
+                                .get_chain_record(channel_id, &block.cid),
+                            None => state.ingest_ctx.store.get_ingest_record(&block.cid),
+                        }
+                        .unwrap_or_else(|e| {
+                                tracing::warn!(cid = %block.cid, "ingest record lookup failed: {e}");
+                                None
+                            }),
+                    });
+                    let Ok(json) = serde_json::to_string(&frame) else {
+                        continue;
+                    };
+                    if socket.send(Message::Text(json.into())).await.is_err() {
+                        break;
+                    }
                 }
             }
         }
+    };
+    match &cut {
+        Some(cut) => tokio::select! {
+            () = run => {}
+            () = cut.cut_off() => {}
+        },
+        None => run.await,
     }
 
     // Clean up the subscription so the Fanout map doesn't grow without bound.
@@ -2237,6 +2249,49 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(stopped.elapsed() < CLOSE_REPLY_WAIT + Duration::from_secs(2));
+        drop(silent);
+    }
+
+    /// A drain that runs out cuts a session that is still open (here, one
+    /// waiting for a Close reply that never comes), and the session's cleanup
+    /// still runs before the server returns: the connection gauge is back
+    /// where it started.
+    #[tokio::test]
+    async fn a_cut_session_still_cleans_up() {
+        let state = Arc::new(AppState::for_test().unwrap());
+        let app = Router::new()
+            .route("/api/v1/ws", get(ws_handler))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/api/v1/ws", listener.local_addr().unwrap());
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let served = tokio::spawn(crate::server::serve_listener(
+            listener,
+            app,
+            None,
+            None,
+            Duration::ZERO,
+            async move {
+                let _ = stop_rx.await;
+            },
+            std::future::pending,
+        ));
+
+        let before = metrics::snapshot().connections_active;
+        // Never read: the session waits for a Close reply until it is cut.
+        let silent = established(&url).await;
+        assert_eq!(metrics::snapshot().connections_active, before + 1);
+        stop_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), served)
+            .await
+            .expect("bounded")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            metrics::snapshot().connections_active,
+            before,
+            "the cut session ran its cleanup"
+        );
         drop(silent);
     }
 

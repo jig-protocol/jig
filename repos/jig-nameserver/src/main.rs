@@ -146,8 +146,14 @@ fn run_keys(keys: KeysCommand, config: Option<&std::path::Path>) -> Result<Strin
     .map_err(|e| e.to_string())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Not `#[tokio::main]`: its runtime waits, without a bound, for blocking
+    // work still running at exit, which would outlast the shutdown drain
+    // (#438).
+    jig_nameserver::shutdown::run(run())?
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     // Before any logging is set up, so stdout carries the DID and nothing else.
