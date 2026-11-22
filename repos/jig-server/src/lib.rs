@@ -25,6 +25,7 @@ pub mod v0_0_2_mls;
 pub mod v0_0_2_nameserver_tls;
 pub mod v0_0_2_peer;
 pub mod v0_0_2_relay;
+pub mod v0_0_2_ruleset;
 pub mod v0_0_2_stream;
 pub mod v0_0_2_ws;
 

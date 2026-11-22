@@ -16,8 +16,12 @@
 # reader, every channel listed, carol's alias still resolving to her DID and
 # vouched for by the same nameserver DID. Each step adds its own messages and
 # an encrypted channel of its own, so later steps read what earlier releases
-# wrote. After the last step jig-server rotates its key, and every client,
-# pinned on the old DID, must follow the key link and keep working.
+# wrote. After the last step jig-server declares a ruleset (JEP-0009 rule 4):
+# every client still reads everything, and so does a new user on the previous
+# step's `jig`, which predates declarations and must still verify the welcome
+# and the manifest of a server that makes one. Then jig-server rotates its key,
+# and every client, pinned on the old DID, must follow the key link and keep
+# working.
 #
 # STEP is one of:
 #   vX.Y.Z...       a published release: install.sh and the tarball from its
@@ -90,8 +94,9 @@ rand_hex() { od -An -tx1 -N32 /dev/urandom | tr -d ' \n'; }
 UPGRADE_KEY_ALICE="$(rand_hex)"
 UPGRADE_KEY_BOB="$(rand_hex)"
 UPGRADE_KEY_CAROL="$(rand_hex)"
+UPGRADE_KEY_DAVE="$(rand_hex)"
 UPGRADE_NS_KEY="$(rand_hex)"
-export UPGRADE_KEY_ALICE UPGRADE_KEY_BOB UPGRADE_KEY_CAROL UPGRADE_NS_KEY
+export UPGRADE_KEY_ALICE UPGRADE_KEY_BOB UPGRADE_KEY_CAROL UPGRADE_KEY_DAVE UPGRADE_NS_KEY
 
 export JIG_NONINTERACTIVE=1 JIG_KEYCHAIN=none RUST_BACKTRACE=0
 export USER="${USER:-upgrade}"
@@ -167,6 +172,12 @@ as() {
 }
 
 did_of() { sed -n 's/^did = "\(.*\)"$/\1/p' "$(home_of "$1")/.jig/cli.toml"; }
+
+# jig as dave, on the previous step's `jig` (kept before each install).
+as_prev() {
+  env HOME="$(home_of dave)" JIG_HOME="$(home_of dave)/.jig" \
+    JIG_KEY_UNLOCK="env:UPGRADE_KEY_DAVE" "$sandbox/jig.prev" "$@"
+}
 
 # Post TEXT to CHANNEL as WHO, and record who must be able to read it.
 post() {
@@ -471,6 +482,9 @@ for step in "$@"; do
     kind=release
     case "$step" in mirror=*) kind=mirror ;; esac
     old_pid="$(cat "$ALICE_JIG_HOME/jig-server.pid")"
+    # The client a user who has not upgraded yet still runs.
+    cp "$BIN/jig" "$sandbox/jig.prev"
+    prev_step="${prev_step_next:-}"
     stop_ns
     installed=1
     install_step "$step" > "$sandbox/install-running.out" 2>&1 || installed=0
@@ -499,8 +513,47 @@ for step in "$@"; do
   fi
   write_step "$n"
   check_all
+  prev_step_next="$step"
   n=$((n + 1))
 done
+
+# A ruleset declared by the last step's server (JEP-0009 rule 4), when it can
+# declare one: this build's clients verify it in the welcome and the manifest
+# log, and the previous step's `jig`, which never asks for it, is answered as
+# before. The document is a public test signature of `jig-reference`.
+RULESET_FIXTURE="$(cd "$(dirname "$0")/.." && pwd)/repos/jig-spec/jep/vectors/0009/rulesets/jig-reference.test-signed.cose"
+config="$ALICE_JIG_HOME/config.toml"
+if "$BIN/jig-server" --init-config "$sandbox/template.toml" >/dev/null 2>&1 &&
+   grep -q '^\[ruleset\]' "$sandbox/template.toml"; then
+  log "declaring a ruleset"
+  cp "$RULESET_FIXTURE" "$sandbox/ruleset.cose"
+  stop_server
+  if grep -q '^\[ruleset\]' "$config"; then
+    sed -i.bak "/^\[ruleset\]/a path = \"$sandbox/ruleset.cose\"" "$config"
+  else
+    printf '\n[ruleset]\npath = "%s"\n' "$sandbox/ruleset.cose" >> "$config"
+  fi
+  start_server
+  check_all
+  served="$sandbox/ruleset.served"
+  # Boot logs the declaration; the URL is the server's own path for it.
+  url="$(grep -o '/api/v1/ruleset/b[a-z2-7]*' "$ALICE_JIG_HOME/logs/jig-server.log" | tail -1)"
+  [ -n "$url" ] || fail "jig-server did not log the ruleset it declares"
+  curl -fsSk "https://127.0.0.1:$server_port$url" -o "$served" || fail "jig-server does not serve the ruleset it declares at $url"
+  cmp -s "$served" "$sandbox/ruleset.cose" || fail "jig-server serves another document at $url than the one it declares"
+  note "jig-server declares jig-reference (test-signed); this build's clients read everything"
+  if [ -x "$sandbox/jig.prev" ]; then
+    as_prev init dave >/dev/null || fail "dave could not create an identity on the previous step's jig"
+    as_prev server set "https://127.0.0.1:$server_port" >/dev/null
+    out="$sandbox/prev-read.out"
+    as_prev read '#open' --limit 500 > "$out" 2>&1 || {
+      cat "$out" >&2; fail "the previous step's jig (${prev_step:-?}) cannot read from a server that declares a ruleset"; }
+    grep -qF -- "open from step 0" "$out" || { cat "$out" >&2; fail "the previous step's jig does not see #open's history"; }
+    note "the previous step's jig (${prev_step:-?}) verifies the welcome and manifest of a server that declares a ruleset"
+  fi
+else
+  note "the last step's jig-server cannot declare a ruleset; skipped"
+fi
 
 # Key rotation on the last release: every client pinned on the old DID must
 # follow the key link.

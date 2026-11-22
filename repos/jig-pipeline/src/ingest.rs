@@ -1599,6 +1599,9 @@ fn manifest_log_write(
                 .get(METADATA_KEY)
                 .and_then(|v| v.as_str())
                 .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok());
+            if let Err(e) = crate::server_manifest::declared_ruleset(&manifest.metadata) {
+                return refuse(&e);
+            }
             match decoded.map(|bytes: Vec<u8>| ServerManifest::decode(&bytes)) {
                 Some(Ok(_)) => Ok(true),
                 Some(Err(e)) => refuse(&format!("the server-manifest does not decode: {e}")),

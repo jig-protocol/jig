@@ -299,7 +299,8 @@ pub fn build_v0_0_2_router(state: Arc<AppState>) -> Router {
         .merge(crate::v0_0_2_custody::build_custody_router(state.clone()))
         .merge(crate::v0_0_2_admission::build_admission_router(
             state.clone(),
-        ));
+        ))
+        .merge(crate::v0_0_2_ruleset::build_ruleset_router(state.clone()));
 
     // Merge bridge-contributed routes under `/_bridge/<name>/`. Each drained
     // sub-router is a `Router<()>` carrying its own state, so it nests cleanly
@@ -1129,6 +1130,9 @@ pub(crate) fn handshake_capabilities(state: &AppState) -> jig_pipeline::handshak
         // Implemented; `negotiate` signs it only into a welcome whose hello
         // asked for it.
         tiers: true,
+        // Likewise: declarations are implemented whether or not this server
+        // declares one, so a client that asked learns which.
+        ruleset: true,
     }
 }
 
@@ -1184,6 +1188,7 @@ async fn complete_hello(
         key_link: state.key_link.clone(),
         admit: admit_offer(state.auth.pow_bits(), unix_now()),
         prior_key_links: state.prior_key_links.clone(),
+        ruleset: state.ruleset.as_ref().map(|r| r.reference.clone()),
     };
     match jig_pipeline::handshake::negotiate(&hello, &offer) {
         Ok(statement) => {
