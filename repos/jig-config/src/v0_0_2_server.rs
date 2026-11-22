@@ -753,12 +753,12 @@ impl FederationSection {
                 ));
             }
         }
-        let mut quotas: BTreeMap<&str, Option<PeerQuotaConfig>> = BTreeMap::new();
+        let mut quotas: BTreeMap<String, Option<PeerQuotaConfig>> = BTreeMap::new();
         for (i, peer) in self.peers.iter().enumerate() {
             if let Some(q) = &peer.quota {
                 check_quota(q, &format!("peers[{i}].quota"))?;
             }
-            if let Some(earlier) = quotas.insert(&peer.expected_did, peer.quota)
+            if let Some(earlier) = quotas.insert(did_spelling_key(&peer.expected_did), peer.quota)
                 && earlier != peer.quota
             {
                 return Err(format!(
@@ -1291,6 +1291,19 @@ impl JigServerConfig {
         // Step 3: per-bridge enabled check (also acts as deny-by-default
         // for bridges with no per_bridge entry at all)
         matches!(self.bridges.per_bridge.get(name), Some(b) if b.enabled)
+    }
+}
+
+/// One key for every spelling of a DID an operator may type: the server reads
+/// `expected_did` with `Did::canonicalize`, which trims it and decodes the
+/// body after `did:jig:z` in any letter case, so two entries that differ only
+/// there name one peer (#460). A string that is not a DID keys as itself;
+/// boot refuses it later.
+fn did_spelling_key(did: &str) -> String {
+    let did = did.trim();
+    match did.strip_prefix("did:jig:z") {
+        Some(body) => format!("did:jig:z{}", body.to_uppercase()),
+        None => did.to_string(),
     }
 }
 
@@ -1894,6 +1907,31 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    /// Two entries for one peer, spelled in different letter case, are one
+    /// peer: given different quotas they are refused as a duplicate, as the
+    /// same spelling twice is (#460).
+    #[test]
+    fn one_peer_in_two_letter_cases_with_two_quotas_is_refused() {
+        let config = |second: &str| {
+            format!(
+                "[[federation.peers]]\nurl = \"wss://a.example\"\nexpected_did = \"did:jig:zabcd\"\n\
+                 quota = {{ blocks_per_min = 10, bytes_per_min = 1000 }}\n\
+                 [[federation.peers]]\nurl = \"wss://a.example\"\nexpected_did = \"{second}\"\n\
+                 quota = {{ blocks_per_min = 20, bytes_per_min = 1000 }}\n"
+            )
+        };
+        for second in ["did:jig:zabcd", "did:jig:zABCD", " did:jig:zAbCd "] {
+            let cfg: JigServerConfig = toml::from_str(&config(second)).unwrap();
+            let err = cfg.federation.validate().expect_err(second);
+            assert!(
+                err.contains("more than once with different quotas"),
+                "{err}"
+            );
+        }
+        let cfg: JigServerConfig = toml::from_str(&config("did:jig:zwxyz")).unwrap();
+        assert!(cfg.federation.validate().is_ok());
     }
 
     #[test]
