@@ -1253,9 +1253,9 @@ impl SqliteStore {
             DROP INDEX IF EXISTS blocks_channel_hlc;
             CREATE INDEX IF NOT EXISTS blocks_channel_hlc_cid
                 ON blocks(channel_id, hlc_wall_ms, hlc_logical, hlc_origin, cid);
-            -- The newest block from a peer, where a catch-up starts.
-            CREATE INDEX IF NOT EXISTS blocks_federated_from
-                ON blocks(federated_from);
+            -- The legacy relay's catch-up started from the newest block a peer
+            -- relayed; nothing asks that now.
+            DROP INDEX IF EXISTS blocks_federated_from;
 
             CREATE TABLE IF NOT EXISTS receipts (
                 cid            TEXT PRIMARY KEY,
@@ -1424,16 +1424,14 @@ impl SqliteStore {
                 PRIMARY KEY (bridge_name, ns, key)
             );
 
-            -- A federation catch-up this server has not finished: the peer's
-            -- block it resumes after. Removed when a catch-up reaches the end.
-            CREATE TABLE IF NOT EXISTS catch_up_cursors (
-                peer_server_url  TEXT PRIMARY KEY,
-                after_cid        TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS catch_up_seen (
-                peer_server_url  TEXT PRIMARY KEY,
-                last_cid         TEXT NOT NULL
-            );
+            -- The legacy relay's catch-up kept, per peer, where it resumed
+            -- (`catch_up_cursors`) and the last block it dealt with
+            -- (`catch_up_seen`). This server takes no relayed blocks, so both
+            -- go. They held peer URLs and block CIDs, nothing a user wrote; a
+            -- release before this one creates them again, empty, and resumes
+            -- from its newest held block.
+            DROP TABLE IF EXISTS catch_up_cursors;
+            DROP TABLE IF EXISTS catch_up_seen;
             "#,
         )?;
 
@@ -1781,19 +1779,6 @@ impl SqliteStore {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
-    }
-
-    /// The newest block this store took from `federated_from` (a peer's URL),
-    /// in its own order.
-    pub fn newest_block_from(&self, federated_from: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().expect("poisoned");
-        Ok(conn
-            .query_row(
-                "SELECT cid FROM blocks WHERE federated_from = ?1 ORDER BY rowid DESC LIMIT 1",
-                [federated_from],
-                |r| r.get(0),
-            )
-            .optional()?)
     }
 
     pub fn get_block(&self, cid: &str) -> Result<Option<StoredBlock>> {
@@ -3350,65 +3335,6 @@ impl SqliteStore {
         Ok(rows)
     }
 
-    // --- catch-up cursors ---
-
-    /// Where an unfinished catch-up from `peer_server_url` resumes: the
-    /// peer's block it got to, or `""` for its start.
-    pub fn catch_up_cursor(&self, peer_server_url: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().expect("poisoned");
-        Ok(conn
-            .query_row(
-                "SELECT after_cid FROM catch_up_cursors WHERE peer_server_url = ?1",
-                [peer_server_url],
-                |r| r.get(0),
-            )
-            .optional()?)
-    }
-
-    /// Record how far the catch-up from `peer_server_url` got.
-    pub fn set_catch_up_cursor(&self, peer_server_url: &str, after_cid: &str) -> Result<()> {
-        self.conn.lock().expect("poisoned").execute(
-            "INSERT INTO catch_up_cursors (peer_server_url, after_cid) VALUES (?1, ?2)
-             ON CONFLICT(peer_server_url) DO UPDATE SET after_cid = excluded.after_cid",
-            params![peer_server_url, after_cid],
-        )?;
-        Ok(())
-    }
-
-    /// The catch-up from `peer_server_url` reached the end.
-    pub fn clear_catch_up_cursor(&self, peer_server_url: &str) -> Result<()> {
-        self.conn.lock().expect("poisoned").execute(
-            "DELETE FROM catch_up_cursors WHERE peer_server_url = ?1",
-            [peer_server_url],
-        )?;
-        Ok(())
-    }
-
-    /// The last block `peer_server_url` relayed that this server dealt with,
-    /// whether it landed or was refused. A catch-up resumes from it: a refused
-    /// block is never held, so the newest held block would ask for it again
-    /// on every reconnect (#357).
-    pub fn catch_up_seen(&self, peer_server_url: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().expect("poisoned");
-        Ok(conn
-            .query_row(
-                "SELECT last_cid FROM catch_up_seen WHERE peer_server_url = ?1",
-                [peer_server_url],
-                |r| r.get(0),
-            )
-            .optional()?)
-    }
-
-    /// Record `cid` as the last block from `peer_server_url` dealt with.
-    pub fn set_catch_up_seen(&self, peer_server_url: &str, cid: &str) -> Result<()> {
-        self.conn.lock().expect("poisoned").execute(
-            "INSERT INTO catch_up_seen (peer_server_url, last_cid) VALUES (?1, ?2)
-             ON CONFLICT(peer_server_url) DO UPDATE SET last_cid = excluded.last_cid",
-            params![peer_server_url, cid],
-        )?;
-        Ok(())
-    }
-
     // --- subscription cursors ---
 
     pub fn upsert_cursor(&self, c: &StoredCursor) -> Result<()> {
@@ -3982,33 +3908,6 @@ mod tests {
         }
     }
 
-    /// Where a catch-up starts is found by index, not by walking `blocks`
-    /// back from the newest row.
-    #[test]
-    fn the_newest_block_from_a_peer_is_found_by_index() {
-        let store = SqliteStore::open_in_memory().unwrap();
-        let conn = store.conn.lock().unwrap();
-        let plan: Vec<String> = conn
-            .prepare(
-                "EXPLAIN QUERY PLAN \
-                 SELECT cid FROM blocks WHERE federated_from = ?1 ORDER BY rowid DESC LIMIT 1",
-            )
-            .unwrap()
-            .query_map(["wss://peer"], |r| r.get::<_, String>(3))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert!(
-            plan.iter()
-                .any(|step| step.contains("blocks_federated_from")),
-            "{plan:?}"
-        );
-        assert!(
-            !plan.iter().any(|step| step.contains("TEMP B-TREE")),
-            "{plan:?}"
-        );
-    }
-
     #[test]
     fn schema_creates_all_v002_tables() {
         let store = SqliteStore::open_in_memory().unwrap();
@@ -4016,8 +3915,6 @@ mod tests {
         for required in [
             "alias_attestations",
             "blocks",
-            "catch_up_cursors",
-            "catch_up_seen",
             "channels",
             "memberships",
             "peers",
@@ -4030,6 +3927,42 @@ mod tests {
                 "missing table: {required}"
             );
         }
+    }
+
+    /// A store from a release that ran the legacy relay's catch-up opens
+    /// without its two tables and its index on `blocks.federated_from`:
+    /// nothing reads them, and what they held was only where that catch-up
+    /// resumed.
+    #[test]
+    fn migrate_drops_the_legacy_relays_catch_up_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jig.db");
+        drop(SqliteStore::open(&path).unwrap());
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE catch_up_cursors (peer_server_url TEXT PRIMARY KEY, after_cid TEXT NOT NULL);
+                 CREATE TABLE catch_up_seen (peer_server_url TEXT PRIMARY KEY, last_cid TEXT NOT NULL);
+                 INSERT INTO catch_up_cursors VALUES ('wss://peer', 'bafy-a');
+                 INSERT INTO catch_up_seen VALUES ('wss://peer', 'bafy-b');
+                 CREATE INDEX blocks_federated_from ON blocks(federated_from);",
+            )
+            .unwrap();
+        }
+        let store = SqliteStore::open(&path).unwrap();
+        let tables = store.list_tables().unwrap();
+        for gone in ["catch_up_cursors", "catch_up_seen"] {
+            assert!(!tables.contains(&gone.to_string()), "{gone} is still there");
+        }
+        let index: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'blocks_federated_from'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 0, "blocks_federated_from is still there");
     }
 
     /// `CREATE TABLE IF NOT EXISTS` never adds columns to a table that already
