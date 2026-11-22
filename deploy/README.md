@@ -372,7 +372,8 @@ server) or SIGINT, jig-server shuts down gracefully:
 What is still open when the drain runs out is cut, and a second signal cuts the
 drain short. A block being ingested at that moment is stored whole or not at
 all. `install.sh` waits 10 s for the server it replaces, and the unit's
-`TimeoutStopSec` defaults to 90 s, so keep the drain under both. A client that
+`TimeoutStopSec` defaults to 90 s. After the drain, blocking work still
+running gets up to 1 s more, so keep the drain a few seconds under both. A client that
 resubmits a block it got no answer for is told the block's CID (#396).
 
 The nameserver stops the same way, with its own `[network] shutdown_drain_ms`

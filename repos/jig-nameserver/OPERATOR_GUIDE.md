@@ -163,7 +163,7 @@ unlock = "credential:/run/credentials/jig-nameserver.service/jig-nameserver-key"
 
 ## Stopping and restarting
 
-On SIGTERM (`systemctl stop` or `restart`) or SIGINT, the nameserver shuts down gracefully: it stops accepting connections, gives the requests in flight up to `[network] shutdown_drain_ms` (default `5000`) to finish, then exits 0. What is still open when the drain runs out is cut, and a second signal cuts the drain short. `0` cuts at once; over `300000` (five minutes) refuses to boot. A registration, rotation or renewal being written when the drain is cut is stored whole or not at all. The unit's `TimeoutStopSec` defaults to 90 s, so keep the drain under it.
+On SIGTERM (`systemctl stop` or `restart`) or SIGINT, the nameserver shuts down gracefully: it stops accepting connections, gives the requests in flight up to `[network] shutdown_drain_ms` (default `5000`) to finish, then exits 0. What is still open when the drain runs out is cut, and a second signal cuts the drain short. `0` cuts at once; over `300000` (five minutes) refuses to boot. A registration, rotation or renewal being written when the drain is cut is stored whole or not at all. Once the drain ends, blocking work still running (a SQLite call) gets up to 1 s more before the process exits, so keep the drain at least a few seconds under the unit's `TimeoutStopSec` (90 s by default), or systemd kills the process first.
 
 ## Security notes
 
