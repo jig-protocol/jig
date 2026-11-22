@@ -688,6 +688,24 @@ impl Secure {
         Ok(pinned)
     }
 
+    /// The id of the MLS group `info`'s creation block starts (#455): the
+    /// block is fetched and held to the channel's id, which it must hash to.
+    pub async fn created_group_id(&self, info: &ChannelInfo) -> Result<Option<Vec<u8>>> {
+        #[derive(Deserialize)]
+        struct Served {
+            bundle_b64: String,
+        }
+        let served: Served = self
+            .get_json_capped(
+                &format!("/api/v1/blocks/{}", info.id),
+                limits::history_page_bytes(1),
+            )
+            .await
+            .with_context(|| format!("fetching the block that created {}", info.slug))?;
+        creation_group_id(&info.id, &served.bundle_b64)
+            .with_context(|| format!("reading the block that created {}", info.slug))
+    }
+
     /// Whether what is sent to `slug` must be encrypted. This device's own
     /// MLS state outranks the server's listing ([`must_encrypt`]), and the
     /// listing's suite is the owner's signed one ([`Self::channel`]). A
@@ -1653,6 +1671,38 @@ fn pick(
     }
 }
 
+/// The MLS group the channel-create in `bundle_b64` starts, once the bundle
+/// is shown to be the block `channel_id` names: the server serving it is not
+/// taken at its word.
+fn creation_group_id(channel_id: &str, bundle_b64: &str) -> Result<Option<Vec<u8>>> {
+    let bytes = STANDARD
+        .decode(bundle_b64)
+        .context("the bundle is not base64")?;
+    let (manifest_bytes, code_bytes): (Vec<u8>, Vec<u8>) =
+        serde_json::from_slice(&bytes).context("the bundle is malformed")?;
+    let bundle = jig_core::BlockBundle {
+        manifest_bytes: &manifest_bytes,
+        code_bytes: &code_bytes,
+        resources: vec![],
+    };
+    let cid = bundle.block_cid().context("its CID cannot be derived")?;
+    anyhow::ensure!(
+        cid.to_string() == channel_id,
+        "the block served is not the one the channel names"
+    );
+    let manifest: jig_core::BlockManifest =
+        serde_json::from_slice(&manifest_bytes).context("the manifest is malformed")?;
+    // The block is the channel's own, by its hash: without a group info it
+    // was created unencrypted, and no group is anyone's to adopt.
+    let Some(info) = manifest.metadata.get("mls_group_info") else {
+        return Ok(None);
+    };
+    let info = info
+        .as_str()
+        .context("its `mls_group_info` is not a string")?;
+    Ok(Some(jig_client::secure::created_group_id(info)?))
+}
+
 /// The channels in a listing that this server orders itself, leaving out
 /// those it carries for another server.
 fn ordered_here(channels: Vec<ChannelInfo>, ours: &[String]) -> Vec<ChannelInfo> {
@@ -1676,8 +1726,8 @@ fn shadow_note(reference: &str, own: &ChannelInfo, carried: &ChannelInfo) -> Str
 #[cfg(test)]
 mod tests {
     use super::{
-        ChannelInfo, group_name, must_encrypt, ordered_here, own_group_name, pick, sequencers_for,
-        shadow_note,
+        ChannelInfo, creation_group_id, group_name, must_encrypt, ordered_here, own_group_name,
+        pick, sequencers_for, shadow_note,
     };
     use jig_client::pins::{ChannelPin, Pins};
 
@@ -1766,6 +1816,51 @@ mod tests {
             "bafylegacy"
         );
         assert!(pick(vec![], "#none", &ours).unwrap().is_none());
+    }
+
+    /// A `channel create` retry reads the group the listed channel was
+    /// created with from its creation block, held to the channel's id (#455).
+    #[test]
+    fn a_creation_block_names_the_group_it_started() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let keys = tempfile::tempdir().unwrap();
+        let id = jig_client::Identity::generate_for_tests(keys.path());
+        let state = tempfile::tempdir().unwrap();
+        let session = jig_client::secure::Session::open(
+            state.path(),
+            jig_client::Identity::generate_for_tests(keys.path()),
+        )
+        .unwrap();
+        let created = session.create_group("wss://host", "creating:#x").unwrap();
+        let create = |meta| {
+            jig_client::blocks::build_with_metadata(
+                &id,
+                jig_core::BlockKind::ChannelCreate,
+                jig_core::HlcTimestamp::now_wall(id.did().clone()),
+                meta,
+            )
+        };
+        let block = create(serde_json::json!({
+            "slug": "#x",
+            "suite": "mls",
+            "mls_group_info": STANDARD.encode(&created.group_info),
+        }));
+        let bundle = STANDARD.encode(block.canonical_bytes());
+        assert_eq!(
+            creation_group_id(&block.cid(), &bundle).unwrap(),
+            Some(created.group_id)
+        );
+
+        // Served under another channel's id: not taken.
+        let other = create(serde_json::json!({ "slug": "#y" }));
+        assert!(creation_group_id(&other.cid(), &bundle).is_err());
+        // A channel created with no group: none to adopt.
+        let plain = STANDARD.encode(other.canonical_bytes());
+        assert_eq!(creation_group_id(&other.cid(), &plain).unwrap(), None);
+        // A group info that is no string is an error, not "no group".
+        let odd = create(serde_json::json!({ "slug": "#z", "mls_group_info": 7 }));
+        let odd_bundle = STANDARD.encode(odd.canonical_bytes());
+        assert!(creation_group_id(&odd.cid(), &odd_bundle).is_err());
     }
 
     /// A `channel create` retry asks whether this server took the create it
