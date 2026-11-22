@@ -18,14 +18,28 @@ use axum::http::StatusCode;
 use jig_pipeline::ingest::{IngestError, RenderCause};
 use std::time::Duration;
 
-/// How long a client refused for a render deadline is told to wait. The
-/// deadline (250 ms by default) passed because this host was loaded; one
-/// second lets a burst drain without the client giving up.
+/// How long a client refused for a render deadline is told to wait, before
+/// [`jitter`]. The deadline (250 ms by default) passed because this host was
+/// loaded; about a second lets a burst drain without the client giving up.
 pub const RENDER_DEADLINE_RETRY: Duration = Duration::from_secs(1);
 
+/// `nominal` scaled by a factor drawn uniformly from 0.5 to 1.5: a fixed
+/// wait, spread so that clients refused in one burst do not all come back
+/// in the next one (JEP-0002 rule 7). Only for waits this server picks; a
+/// rate limit's wait is when a token is back, and is sent as it is.
+pub fn jitter(nominal: Duration) -> Duration {
+    nominal.mul_f64(0.5 + rand::random::<f64>())
+}
+
+/// A wait in whole milliseconds, as `retry_after_ms` carries it: never 0.
+pub fn millis(wait: Duration) -> u64 {
+    u64::try_from(wait.as_millis()).unwrap_or(u64::MAX).max(1)
+}
+
 /// How long the client should wait before posting again, for the ingest
-/// failures that waiting changes. Every surface carries it as
-/// `retry_after_ms`; the classifier's message says it too.
+/// failures that waiting changes, before [`jitter`]. Every surface carries a
+/// jittered draw of it as `retry_after_ms`; the classifier's message says the
+/// same draw ([`classify_with_wait`]).
 pub fn retry_after(e: &IngestError) -> Option<Duration> {
     match e {
         IngestError::RenderFailed {
@@ -39,6 +53,16 @@ pub fn retry_after(e: &IngestError) -> Option<Duration> {
 /// Classify an ingest failure into `(status, error_code, message)`. Callers
 /// wrap this triple in whatever JSON body type their endpoint uses.
 pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, String) {
+    classify_with_wait(e, retry_after(e).map(jitter))
+}
+
+/// [`classify_ingest_error`], its message naming `wait` for a failure that
+/// waiting changes: for a caller that sends the same wait in
+/// `retry_after_ms`, so the message and the field agree.
+pub fn classify_with_wait(
+    e: &IngestError,
+    wait: Option<Duration>,
+) -> (StatusCode, &'static str, String) {
     match e {
         IngestError::InvalidSignature => (
             StatusCode::UNAUTHORIZED,
@@ -102,7 +126,7 @@ pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, Stri
             cause: RenderCause::DeadlineExceeded,
             ..
         } => {
-            let ms = RENDER_DEADLINE_RETRY.as_millis();
+            let ms = millis(wait.unwrap_or(RENDER_DEADLINE_RETRY));
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "RENDER_FAILED",
@@ -481,7 +505,12 @@ mod tests {
             classify_ingest_error(&render_failed(RenderCause::DeadlineExceeded));
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(code, "RENDER_FAILED");
-        assert!(message.ends_with("(retry_after_ms=1000)"), "{message}");
+        let said = message
+            .rsplit_once("(retry_after_ms=")
+            .and_then(|(_, ms)| ms.strip_suffix(')'))
+            .and_then(|ms| ms.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("{message}"));
+        assert!((500..=1500).contains(&said), "{message}");
         assert_eq!(
             retry_after(&render_failed(RenderCause::DeadlineExceeded)),
             Some(RENDER_DEADLINE_RETRY)
@@ -495,7 +524,15 @@ mod tests {
         }
         // REST carries the wait in its body, as WS does in its Error frame.
         let (_, body) = blocks_map_ingest_error(render_failed(RenderCause::DeadlineExceeded));
-        assert_eq!(body.0.retry_after_ms, Some(1000));
+        let wait = body.0.retry_after_ms.expect("a wait");
+        assert!((500..=1500).contains(&wait), "{wait}");
+        assert!(
+            body.0
+                .message
+                .ends_with(&format!("(retry_after_ms={wait})")),
+            "the message names the wait the field carries: {}",
+            body.0.message
+        );
         let (_, body) = blocks_map_ingest_error(render_failed(RenderCause::FuelExhausted));
         assert_eq!(body.0.retry_after_ms, None);
 
@@ -537,5 +574,27 @@ mod tests {
                 "code mismatch classifying: {label}"
             );
         }
+    }
+
+    /// A fixed wait is spread over half to one and a half times itself, so
+    /// that clients refused together come back apart.
+    #[test]
+    fn a_fixed_wait_is_spread_around_its_nominal_value() {
+        let nominal = Duration::from_millis(1000);
+        let draws: Vec<u64> = (0..2000).map(|_| millis(jitter(nominal))).collect();
+        assert!(
+            draws.iter().all(|ms| (500..=1500).contains(ms)),
+            "{draws:?}"
+        );
+        // Both halves are used: not a constant, not one-sided.
+        assert!(draws.iter().any(|&ms| ms < 750), "{draws:?}");
+        assert!(draws.iter().any(|&ms| ms > 1250), "{draws:?}");
+        // A burst of 16 refusals lands on more than a handful of distinct
+        // milliseconds, where the fixed wait put them all on one.
+        let mut first: Vec<u64> = draws[..16].to_vec();
+        first.sort_unstable();
+        first.dedup();
+        assert!(first.len() > 8, "{first:?}");
+        assert_eq!(millis(Duration::ZERO), 1);
     }
 }

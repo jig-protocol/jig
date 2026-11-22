@@ -58,8 +58,9 @@ pub async fn run(ctx: &CliContext, who: String, message: String) -> Result<()> {
     // A DM the other side opened reaches this device as a welcome in its
     // history, so catch up before asking who is in it.
     secure.sync(&slug).await?;
-    let roster = if secure.session.has_group(secure.server(), &slug)? {
-        secure.session.group_members(secure.server(), &slug)?
+    let key = secure.key(&slug);
+    let roster = if secure.session.has_group(secure.server(), &key)? {
+        secure.session.group_members(secure.server(), &key)?
     } else {
         Vec::new()
     };

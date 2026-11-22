@@ -3,7 +3,10 @@
 //! The link carries peer frames only ([`crate::v0_0_2_peer`]): the federation
 //! contract's offers, answers and ends, and the streams of the channels a
 //! share carries. A channel reaches another server only by a share
-//! (JEP-0005); this server neither sends nor takes relayed blocks.
+//! (JEP-0005). The legacy relay, which pushed every post of a server's open
+//! channels to its peers, is gone: this server neither sends nor takes its
+//! blocks. A follower's users' writes still reach the owner, relayed under
+//! the share's grant (`relay-submit`, [`crate::v0_0_2_relay`]).
 //!
 //! Trust model: listing a peer in `[federation] peers` is what trusts it.
 //! This server dials the peer's `url` and refuses a welcome signed by any
@@ -359,9 +362,9 @@ pub(crate) async fn connect_and_relay(
     let registration = state.peers.register(peer_sender.clone());
     info!(peer_url = %peer.url, "federation peer connected");
 
-    // This server subscribes to nothing on the link and sends the peer no
-    // blocks: a channel reaches another server only by a share, whose
-    // stream goes out and comes in as peer frames.
+    // This server subscribes to nothing on the link and pushes the peer no
+    // blocks outside a share: a share's record stream and the writes a
+    // follower relays under it go out and come in as peer frames.
     let result = loop {
         tokio::select! {
             // Inbound from peer

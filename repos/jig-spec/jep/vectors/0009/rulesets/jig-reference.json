@@ -1,0 +1,104 @@
+{
+  "authors": [],
+  "binding": [],
+  "consequences": [
+    {
+      "band": "negative",
+      "effort": "m_standing above 1, up to max_penalty_multiplier",
+      "join": "guest",
+      "pool": "stranger",
+      "score_ppm": [
+        -999999,
+        -1
+      ]
+    },
+    {
+      "band": "unknown",
+      "effort": "m_standing = 1",
+      "join": "guest",
+      "note": "member only by aged proof (rule 49)",
+      "pool": "member",
+      "score_ppm": null
+    },
+    {
+      "band": "below-established",
+      "effort": "m_standing = 1",
+      "join": "guest",
+      "note": "member only by aged proof (rule 49)",
+      "pool": "member",
+      "score_ppm": [
+        0,
+        299999
+      ]
+    },
+    {
+      "band": "established",
+      "effort": "m_standing falls linearly to 1 / max_standing_discount",
+      "join": "member",
+      "pool": "member",
+      "score_ppm": [
+        300000,
+        999999
+      ]
+    }
+  ],
+  "epoch": {
+    "epoch_secs": 86400,
+    "witness_threshold": 0
+  },
+  "events": {
+    "good-standing-interval": 1000000,
+    "invalid-proof": -1000000,
+    "invite-redeemed": 0,
+    "quota-breach": -1000000,
+    "signed-contradiction": -25000000,
+    "spam-confirmed": -10000000,
+    "standing-fraud": -25000000,
+    "verdict-applied": 0
+  },
+  "id": "jig-reference",
+  "invites": false,
+  "maths": {
+    "id": "jig-beta-v1",
+    "version": 1
+  },
+  "parameters": {
+    "invites": {
+      "invite_start": 0,
+      "invite_window_epochs": 30,
+      "invites_per_window": 0
+    },
+    "pools": {
+      "aged_share": 25,
+      "invited_share": 10,
+      "stranger_share": 20
+    },
+    "pow": {
+      "admit": {
+        "max_effort": 16777216,
+        "max_solve_secs": 13,
+        "min_effort": 1048576
+      },
+      "max_penalty_multiplier": 16,
+      "max_standing_discount": 4
+    },
+    "standing": {
+      "accrual_per_period": 1000000,
+      "admit_age_epochs": 7,
+      "established": 300000,
+      "lambda_neg": 22840,
+      "lambda_pos": 7672,
+      "max_idle_epochs": 14,
+      "min_age_epochs": 30,
+      "minor": 1000000,
+      "per_reporter_cap": 4000000,
+      "per_reporter_neg_cap": 25000000,
+      "receipt_positions": 4096,
+      "unknown_reporter_weight": 0
+    }
+  },
+  "tribunal": null,
+  "useful_work": null,
+  "v": 1,
+  "version": 1
+}
