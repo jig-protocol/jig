@@ -259,10 +259,7 @@ impl Contracts {
 
     /// The configured peer whose DID is `did`.
     fn peer(&self, did: &str) -> Option<&FederationPeer> {
-        self.federation
-            .peers
-            .iter()
-            .find(|p| jig_pipeline::effect::canonical_did_string(&p.expected_did) == did)
+        crate::v0_0_2_federation::configured_peer(&self.federation, did)
     }
 
     /// This server's current `server-manifest`, as contract messages cite it.

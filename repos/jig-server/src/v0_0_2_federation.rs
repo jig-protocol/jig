@@ -101,6 +101,18 @@ fn warn_plaintext_peer(peer_url: &str) {
     );
 }
 
+/// The configured peer whose DID is `did`, a DID this server verified and so
+/// spells canonically. An operator typed each `expected_did`, so it may be in
+/// any letter case: it is read the way boot and the dialer read it (#460).
+pub(crate) fn configured_peer<'a>(
+    federation: &'a jig_config::v0_0_2_server::FederationSection,
+    did: &str,
+) -> Option<&'a jig_config::v0_0_2_server::FederationPeer> {
+    federation.peers.iter().find(|p| {
+        jig_core::Did::canonicalize(&p.expected_did).is_ok_and(|d| d.to_did_jig_string() == did)
+    })
+}
+
 /// Spawn one long-running task per configured peer. Each task owns its own
 /// reconnect loop and persists across the server's lifetime.
 pub fn spawn_federation_peers(state: Arc<AppState>) {
@@ -445,6 +457,37 @@ fn handle_inbound_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A peer listed with its DID in another letter case is the same peer:
+    /// the contract and the stream quota find it by the DID its welcome
+    /// proved, as boot and the dialer already did (#460).
+    #[test]
+    fn a_peer_listed_in_another_letter_case_is_found_by_its_did() {
+        use jig_config::v0_0_2_server::{FederationPeer, FederationSection, OfferPolicy};
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let did =
+            jig_core::Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
+        let body = did.strip_prefix("did:jig:z").unwrap();
+        let federation = FederationSection {
+            peers: vec![FederationPeer {
+                url: "wss://peer.example".into(),
+                expected_did: format!("did:jig:z{}", body.to_uppercase()),
+                alias: None,
+                publish: false,
+                quota: None,
+                offers: OfferPolicy::Hold,
+            }],
+            ..Default::default()
+        };
+        assert!(configured_peer(&federation, &did).is_some());
+        let other = jig_core::Did::from_ed25519_pubkey(
+            ed25519_dalek::SigningKey::from_bytes(&[8; 32])
+                .verifying_key()
+                .as_bytes(),
+        )
+        .to_did_jig_string();
+        assert!(configured_peer(&federation, &other).is_none());
+    }
 
     /// A peer that sends one text message of each length in `lens`, in order.
     async fn peer_sending(lens: Vec<usize>) -> String {
