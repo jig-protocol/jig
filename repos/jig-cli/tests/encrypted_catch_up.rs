@@ -731,3 +731,209 @@ async fn an_encrypted_channel_is_created_added_to_and_read_through_jig() {
     let again = ok(alice.path(), &["channel", "create", "#sec", "--exist-ok"]);
     assert!(again.contains("already exists"), "{again}");
 }
+
+/// What [`losing_proxy`] does with the next channel-create it sees.
+#[derive(Clone, Copy, PartialEq)]
+enum Lose {
+    /// Passes it to the server and drops the answer: the server took it.
+    Answer,
+    /// Drops it before the server sees it: the server never took it.
+    Create,
+}
+
+/// What a [`losing_proxy`] is set to.
+#[derive(Default)]
+struct Losing {
+    /// What to do with the next channel-create; passed through once used.
+    next: std::sync::Mutex<Option<Lose>>,
+    /// Set once a create is lost: every connection is refused, so nothing
+    /// tells the device how its create went, until the test clears it.
+    gone: std::sync::atomic::AtomicBool,
+}
+
+/// A proxy in front of `server` that loses one channel-create as
+/// [`Losing::next`] says, and then refuses every connection while
+/// [`Losing::gone`] is set: a create whose answer never came, as a device
+/// sees one over a link that dropped. Everything else passes through, one
+/// request per connection; a WebSocket upgrade is relayed both ways.
+async fn losing_proxy(server: &TestJigServer) -> (String, Arc<Losing>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let upstream = server.http_url().trim_start_matches("http://").to_string();
+    let losing = Arc::new(Losing::default());
+    let state = losing.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((mut client, _)) = listener.accept().await {
+            let (upstream, state) = (upstream.clone(), state.clone());
+            tokio::spawn(async move {
+                if state.gone.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 16 * 1024];
+                let head_end = loop {
+                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break i + 4;
+                    }
+                    let n = client.read(&mut chunk).await?;
+                    if n == 0 {
+                        return Ok(());
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                };
+                let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+                let lower = head.to_ascii_lowercase();
+                let body_len = lower
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                while buf.len() < head_end + body_len {
+                    let n = client.read(&mut chunk).await?;
+                    if n == 0 {
+                        return Ok(());
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let mut up = tokio::net::TcpStream::connect(&upstream).await?;
+                if lower.contains("upgrade: websocket") {
+                    up.write_all(&buf).await?;
+                    tokio::io::copy_bidirectional(&mut client, &mut up).await?;
+                    return Ok(());
+                }
+                let line = head.lines().next().unwrap_or_default();
+                let create = line.starts_with("POST /api/v1/channels ");
+                let lose = if create {
+                    state.next.lock().unwrap().take()
+                } else {
+                    None
+                };
+                // One request per connection, so each is seen here.
+                let rest: String = head
+                    .split("\r\n")
+                    .skip(1)
+                    .filter(|l| !l.to_ascii_lowercase().starts_with("connection:"))
+                    .collect::<Vec<_>>()
+                    .join("\r\n");
+                let request = [
+                    format!("{line}\r\nconnection: close\r\n{rest}").as_bytes(),
+                    &buf[head_end..],
+                ]
+                .concat();
+                if lose == Some(Lose::Create) {
+                    state.gone.store(true, Ordering::SeqCst);
+                    return Ok(());
+                }
+                up.write_all(&request).await?;
+                let mut answer = Vec::new();
+                up.read_to_end(&mut answer).await?;
+                if lose == Some(Lose::Answer) {
+                    state.gone.store(true, Ordering::SeqCst);
+                    return Ok(());
+                }
+                client.write_all(&answer).await?;
+                Ok::<_, std::io::Error>(())
+            });
+        }
+    });
+    (url, losing)
+}
+
+/// `jig` with `args`, expected to fail: what it printed, out and err.
+fn fails(home: &Path, args: &[&str]) -> (String, String) {
+    let out = jig(home).args(args).output().unwrap();
+    assert!(!out.status.success(), "jig {args:?} succeeded: {out:?}");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// A second device under the same identity: `home` copied as it stands,
+/// then pointed at `url` directly.
+fn same_identity(home: &Path, url: &str) -> tempfile::TempDir {
+    fn copy(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+    let other = tempfile::tempdir().unwrap();
+    copy(home, other.path());
+    ok(other.path(), &["server", "set", url]);
+    other
+}
+
+/// #455: a create whose answer was lost, that the server took. The device
+/// kept its group, and creating again finds the channel was created with
+/// that group and files it under the channel's id.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_retry_adopts_the_group_the_channel_was_created_with() {
+    let server = TestJigServer::start().await.expect("start");
+    let (url, losing) = losing_proxy(&server).await;
+    let (alice, _) = device(&url, "alice");
+
+    *losing.next.lock().unwrap() = Some(Lose::Answer);
+    fails(alice.path(), &["channel", "create", "#x"]);
+    losing.gone.store(false, Ordering::SeqCst);
+
+    let again = ok(alice.path(), &["channel", "create", "#x", "--exist-ok"]);
+    assert!(again.contains("already exists"), "{again}");
+    ok(alice.path(), &["send", "--channel", "#x", "kept"]);
+}
+
+/// #455: a create whose answer was lost, that the server never took, while
+/// another device under the same identity created the slug with its own
+/// group. Creating again does not take this device's group for that
+/// channel: it says the channel exists and how to join it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_retry_does_not_adopt_another_devices_channel() {
+    let server = TestJigServer::start().await.expect("start");
+    let (url, losing) = losing_proxy(&server).await;
+    let (alice, _) = device(&url, "alice");
+    let laptop = same_identity(alice.path(), &server.http_url());
+
+    *losing.next.lock().unwrap() = Some(Lose::Create);
+    fails(alice.path(), &["channel", "create", "#x"]);
+    ok(laptop.path(), &["channel", "create", "#x"]);
+    losing.gone.store(false, Ordering::SeqCst);
+
+    let (_, said) = fails(alice.path(), &["channel", "create", "#x"]);
+    assert!(said.contains("#x already exists"), "{said}");
+    assert!(said.contains("jig channel join #x"), "{said}");
+    assert!(!said.contains("MLS"), "{said}");
+    let (_, said) = fails(alice.path(), &["send", "--channel", "#x", "lost"]);
+    assert!(said.contains("no MLS group"), "{said}");
+}
+
+/// The same, where the other device created the slug unencrypted: its
+/// creation block names no group, so the pending one is discarded rather
+/// than failing every retry.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_retry_does_not_adopt_another_devices_public_channel() {
+    let server = TestJigServer::start().await.expect("start");
+    let (url, losing) = losing_proxy(&server).await;
+    let (alice, _) = device(&url, "alice");
+    let laptop = same_identity(alice.path(), &server.http_url());
+
+    *losing.next.lock().unwrap() = Some(Lose::Create);
+    fails(alice.path(), &["channel", "create", "#x"]);
+    ok(
+        laptop.path(),
+        &["channel", "create", "#x", "--tier", "public", "--yes"],
+    );
+    losing.gone.store(false, Ordering::SeqCst);
+
+    let (_, said) = fails(alice.path(), &["channel", "create", "#x"]);
+    assert!(said.contains("#x already exists"), "{said}");
+    assert!(!said.contains("MLS"), "{said}");
+    let out = ok(alice.path(), &["channel", "create", "#x", "--exist-ok"]);
+    assert!(out.contains("channel already exists: #x"), "{out}");
+}

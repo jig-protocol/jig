@@ -30,23 +30,8 @@ pub async fn apply_effect(
     receipt_bytes: &[u8],
     block_cid: &str,
 ) -> anyhow::Result<()> {
-    apply_effect_as(store, bundle, receipt_bytes, block_cid, false).await
-}
-
-/// [`apply_effect`], with a `channel-create` stored as a relayed copy this
-/// server sequences when `relayed_copy` is set
-/// ([`crate::ingest::copies_relayed_create`]).
-pub async fn apply_effect_as(
-    store: &Arc<SqliteStore>,
-    bundle: &BlockBundle<'_>,
-    _receipt_bytes: &[u8],
-    block_cid: &str,
-    relayed_copy: bool,
-) -> anyhow::Result<()> {
-    let mut manifest: BlockManifest = serde_json::from_slice(bundle.manifest_bytes)?;
-    if relayed_copy {
-        manifest = crate::ingest::as_relayed_copy(&manifest);
-    }
+    let _ = receipt_bytes;
+    let manifest: BlockManifest = serde_json::from_slice(bundle.manifest_bytes)?;
     let Some(kind) = manifest.kind else {
         // No kind field — pre-v0.0.2 fixture or malformed; no effect.
         return Ok(());

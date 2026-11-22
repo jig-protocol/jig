@@ -45,6 +45,10 @@ use crate::v0_0_2::AppState;
 /// disambiguation. Not auth-significant.
 static CONN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// How long a session closed for shutdown (#424) waits for the client's
+/// Close reply before it drops the socket anyway.
+const CLOSE_REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Process-lifetime counters behind `GET /metrics` (served from
 /// [`crate::handler::build_router`]).
 ///
@@ -64,7 +68,6 @@ pub mod metrics {
     static CONNECTIONS_ACTIVE: AtomicU64 = AtomicU64::new(0);
     static SUBSCRIBERS_ACTIVE: AtomicU64 = AtomicU64::new(0);
     static BLOCKS_INGESTED: AtomicU64 = AtomicU64::new(0);
-    static RELAYED_INTO_SEQUENCED: AtomicU64 = AtomicU64::new(0);
     /// Cardinality is bounded by the channels this server actually serves,
     /// which is the same bound the block store already carries.
     static CHANNEL_MESSAGES: RwLock<BTreeMap<String, u64>> = RwLock::new(BTreeMap::new());
@@ -107,17 +110,6 @@ pub mod metrics {
         }
     }
 
-    /// Record one post a peer relayed into a channel this server sequences,
-    /// refused (JEP-0014 rule 37, #357).
-    pub fn relayed_into_sequenced() {
-        RELAYED_INTO_SEQUENCED.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// How many [`relayed_into_sequenced`] refusals since start.
-    pub fn relayed_into_sequenced_total() -> u64 {
-        RELAYED_INTO_SEQUENCED.load(Ordering::Relaxed)
-    }
-
     /// Saturating decrement — a gauge that underflows to u64::MAX is worse
     /// than one that is briefly wrong.
     ///
@@ -149,22 +141,13 @@ pub mod metrics {
     /// Prometheus text exposition (format version 0.0.4) of the live counters.
     pub fn render_prometheus() -> String {
         let snap = snapshot();
-        let mut out = render(
+        render(
             snap.connections_active,
             snap.subscribers_active,
             snap.blocks_ingested,
             &snap.channels,
             &jig_pipeline::metrics::ingested_by_source(),
-        );
-        out.push_str(&format!(
-            "# HELP jig_federation_relayed_refused_total Blocks a peer relayed and this server \
-             refused, by reason.\n\
-             # TYPE jig_federation_relayed_refused_total counter\n\
-             jig_federation_relayed_refused_total{{reason=\"{}\"}} {}\n",
-            jig_pipeline::ingest::RELAYED_INTO_SEQUENCED,
-            relayed_into_sequenced_total()
-        ));
-        out
+        )
     }
 
     /// Pure renderer — separated from the globals so its output format is
@@ -235,6 +218,7 @@ pub async fn ws_handler(
     State(state): State<Arc<AppState>>,
     peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     exporter: Option<axum::Extension<crate::server::TlsExporter>>,
+    shutdown: Option<axum::Extension<crate::shutdown::Shutdown>>,
 ) -> Response {
     let conn_id = CONN_COUNTER.fetch_add(1, Ordering::SeqCst);
     let ip = peer.map(|p| p.0.0.ip());
@@ -243,9 +227,19 @@ pub async fn ws_handler(
     let tls_exporter = exporter.map(|e| e.0.0.to_vec()).unwrap_or_default();
     // `[limits]`: a message or frame over these closes the connection.
     let limits = state.limits();
+    // A stopping server waits for the session to send its close frame
+    // (#424). The hold is taken here, before the upgrade completes, so a
+    // drain that starts in between still waits for the session; a failed
+    // upgrade drops it. A router served without the listener's `Shutdown`
+    // (tests driving it directly) has none to watch.
+    let shutdown = shutdown.map(|axum::Extension(shutdown)| shutdown);
+    let held = shutdown.as_ref().map(crate::shutdown::Shutdown::hold);
     ws.max_message_size(limits.ws_message)
         .max_frame_size(limits.ws_frame)
-        .on_upgrade(move |socket| handle_socket(socket, state, conn_id, ip, tls_exporter))
+        .on_upgrade(move |socket| async move {
+            handle_socket(socket, state, conn_id, ip, tls_exporter, shutdown).await;
+            drop(held);
+        })
 }
 
 /// The address a request came from: its TCP peer, as the listener recorded
@@ -302,6 +296,7 @@ pub fn build_v0_0_2_router(state: Arc<AppState>) -> Router {
         .merge(crate::v0_0_2_blocks::build_blocks_router(state.clone()))
         .merge(crate::v0_0_2_admin::build_channel_ops_router(state.clone()))
         .merge(crate::v0_0_2_mls::build_mls_router(state.clone()))
+        .merge(crate::v0_0_2_custody::build_custody_router(state.clone()))
         .merge(crate::v0_0_2_admission::build_admission_router(
             state.clone(),
         ));
@@ -335,6 +330,7 @@ async fn handle_socket(
     conn_id: u64,
     ip: Option<std::net::IpAddr>,
     tls_exporter: Vec<u8>,
+    shutdown: Option<crate::shutdown::Shutdown>,
 ) {
     metrics::connection_opened();
     // Per-connection channel: fanout delivers (StoredBlock, StoredReceipt) here.
@@ -379,6 +375,38 @@ async fn handle_socket(
                         reason: "no peer_proof".into(),
                     })))
                     .await;
+                break;
+            }
+            // --- The server is stopping (#424) ---
+            // Checked between frames, so a frame already being handled
+            // (an ingest included) finishes first.
+            () = async {
+                match &shutdown {
+                    Some(shutdown) => shutdown.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                tracing::debug!(conn_id, "closing: server shutting down");
+                let sent = socket
+                    .send(Message::Close(Some(CloseFrame {
+                        code: axum::extract::ws::close_code::AWAY,
+                        reason: "server shutting down".into(),
+                    })))
+                    .await;
+                // Finish the closing handshake (RFC 6455 §7.1.1): read until
+                // the client's Close, discarding anything else, so the 1001
+                // isn't lost to a reset from closing on unread data. A client
+                // that never answers is given CLOSE_REPLY_WAIT.
+                if sent.is_ok() {
+                    let _ = tokio::time::timeout(CLOSE_REPLY_WAIT, async {
+                        while let Some(Ok(msg)) = socket.recv().await {
+                            if matches!(msg, Message::Close(_)) {
+                                break;
+                            }
+                        }
+                    })
+                    .await;
+                }
                 break;
             }
             // --- Client → Server ---
@@ -563,7 +591,6 @@ fn subscribed_channel(
     match scope {
         Scope::Channel { slug } => store.get_channel_by_slug_including_archived(slug),
         Scope::ChannelId { channel_id } => store.get_channel_by_id_including_archived(channel_id),
-        Scope::Federation { .. } => Ok(None),
     }
     .map_err(|e| e.to_string())
 }
@@ -763,10 +790,7 @@ async fn handle_client_frame(
 
             // Gate 1 on the WSS path. The scope's canonical string is what was
             // signed, so a proof for one channel cannot subscribe to another.
-            // The federation stream is for configured peers only, so it is
-            // authenticated whatever `require_authenticated_reads` says.
-            let federation = matches!(scope, Scope::Federation { .. });
-            if state.config.auth.require_authenticated_reads || federation {
+            if state.config.auth.require_authenticated_reads {
                 let scope_str = scope.canonical_string();
 
                 let outcome = match auth {
@@ -811,14 +835,6 @@ async fn handle_client_frame(
                     }
                 };
 
-                let outcome = outcome.or_else(|| {
-                    let peer = session
-                        .did
-                        .as_ref()
-                        .is_some_and(|did| state.auth.is_federation_peer(did.as_str()));
-                    (federation && !peer)
-                        .then_some(crate::auth::GateOutcome::AuthzNotFederationPeer)
-                });
                 if let Some(outcome) = outcome {
                     tracing::info!(
                         conn_id,
@@ -831,23 +847,6 @@ async fn handle_client_frame(
                         send_error_after(socket, Some(status), code, None, &message, wait).await;
                     return Ok(());
                 }
-            }
-
-            // The federation stream is retired: a channel reaches another
-            // server only by a share, whose records go out as peer frames. A
-            // listed peer on an older release gets an error it logs and lives
-            // with (only `NOT_A_PEER`, which an unlisted one still gets above,
-            // ends its connection, and that connection carries its shares).
-            if federation {
-                let _ = send_error(
-                    socket,
-                    Some(410),
-                    FEDERATION_STREAM_RETIRED,
-                    None,
-                    "this server relays no blocks; a channel reaches it only by a share",
-                )
-                .await;
-                return Ok(());
             }
 
             // Who this subscription belongs to, for the per-delivery check.
@@ -939,8 +938,6 @@ async fn handle_client_frame(
                     SubscriptionScope::Channel(channel.map(|c| c.id).unwrap_or(slug))
                 }
                 Scope::ChannelId { channel_id } => SubscriptionScope::Channel(channel_id),
-                // Refused above.
-                Scope::Federation { .. } => return Ok(()),
             };
             // A connection holds ONE subscription. A re-Subscribe replaces it,
             // and the old one must actually go: left in the fanout map it
@@ -1305,10 +1302,6 @@ fn channel_label(state: &AppState, manifest_bytes: &[u8]) -> Option<String> {
 
 /// The shared metrics label for channels whose slug is not disclosed.
 pub const RESTRICTED_LABEL: &str = "(restricted)";
-
-/// The error code a federation-scope subscribe gets: the legacy relay's
-/// stream is retired, and a channel reaches another server only by a share.
-pub const FEDERATION_STREAM_RETIRED: &str = "FEDERATION_STREAM_RETIRED";
 
 /// Invariant: every Error answers exactly one client frame (Subscribe or
 /// Submit), and names it by `ref_cid` where it can. The client matches
@@ -1746,8 +1739,8 @@ mod tests {
         let mut ws = established(&url).await;
 
         let sub = Envelope::new(Frame::Subscribe {
-            scope: Scope::Federation {
-                block_kinds: vec![],
+            scope: Scope::Channel {
+                slug: "#hello".into(),
             },
             auth: None,
         });
@@ -1779,8 +1772,8 @@ mod tests {
         let attacker = test_identity();
         let victim = test_identity();
 
-        let scope = Scope::Federation {
-            block_kinds: vec![],
+        let scope = Scope::Channel {
+            slug: "#hello".into(),
         };
         let mut frame = signed_subscribe_frame(&attacker, scope);
         if let Frame::Subscribe { auth: Some(a), .. } = &mut frame.frame {
@@ -1807,91 +1800,58 @@ mod tests {
         }
     }
 
-    /// The federation stream is retired, and still answers only listed
-    /// peers as such: a stranger with a valid proof is refused as not a peer
-    /// (so an older dialer not yet listed reconnects and asks again), a listed
-    /// peer is told the stream is retired and is sent nothing, and on a server
-    /// that does not authenticate reads an unsigned federation subscribe is
-    /// still refused.
+    /// A peer on a release before this one still subscribes to the
+    /// federation scope on its link, which is gone: the frame is answered as
+    /// malformed, nothing is registered, and the link goes on, since it
+    /// carries that peer's shares too. A peer frame sent after it still
+    /// reaches the federation contract.
     #[tokio::test]
-    async fn the_federation_stream_is_retired_and_refuses_strangers_as_before() {
-        let federation = || Scope::Federation {
-            block_kinds: vec![],
-        };
+    async fn an_older_peers_federation_subscribe_is_malformed_and_the_link_goes_on() {
         let (state, url) = start_test_server().await;
+        let seen = Arc::new(Recorder::default());
+        assert!(state.set_peer_frames(seen.clone()));
+        let key = jig_core::crypto::ed25519::generate_signing_key();
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+        crate::v0_0_2_federation::complete_peer_handshake(
+            &mut ws,
+            &state.server_did.to_did_jig_string(),
+            &[],
+            &key,
+        )
+        .await
+        .unwrap();
 
-        let stranger = test_identity();
-        let mut ws = established(&url).await;
-        let sub = signed_subscribe_frame(&stranger, federation());
-        ws.send(TMessage::Text(serde_json::to_string(&sub).unwrap().into()))
-            .await
-            .unwrap();
+        let older = r#"{"v":1,"op":"subscribe","scope":{"kind":"federation","block_kinds":[]}}"#;
+        ws.send(TMessage::Text(older.into())).await.unwrap();
         match next_frame(&mut ws).await.frame {
-            Frame::Error { status, code, .. } => {
-                assert_eq!((status, code.as_str()), (Some(403), "NOT_A_PEER"));
-            }
-            other => panic!("expected NOT_A_PEER, got {other:?}"),
+            Frame::Error { code, .. } => assert_eq!(code, "BAD_JSON"),
+            other => panic!("expected BAD_JSON, got {other:?}"),
         }
+        assert_eq!(state.ingest_ctx.fanout.local_subscription_count().await, 0);
 
-        // Listed, the same caller is told the stream is retired: this server
-        // relays no blocks, and a block landing here is not sent to it.
-        state
-            .auth
-            .trust_federation_peer(&stranger.did_string())
-            .unwrap();
-        seed_channel(&state, "#hello");
-        let sub = signed_subscribe_frame(&stranger, federation());
-        ws.send(TMessage::Text(serde_json::to_string(&sub).unwrap().into()))
-            .await
-            .unwrap();
-        match next_frame(&mut ws).await.frame {
-            Frame::Error { status, code, .. } => {
-                assert_eq!(
-                    (status, code.as_str()),
-                    (Some(410), FEDERATION_STREAM_RETIRED)
-                );
-            }
-            other => panic!("expected FEDERATION_STREAM_RETIRED, got {other:?}"),
-        }
-        let author = test_identity();
-        let block = build_text_render(&author, "#hello", "hi", test_hlc(&author));
-        let submit = Envelope::new(Frame::Submit {
-            bundle_b64: base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
-            sig_b64: base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
+        let offer = Envelope::new(Frame::Peer {
+            kind: "contract-offer".into(),
+            body: b"after".to_vec(),
         });
         ws.send(TMessage::Text(
-            serde_json::to_string(&submit).unwrap().into(),
+            serde_json::to_string(&offer).unwrap().into(),
         ))
         .await
         .unwrap();
-        match next_frame(&mut ws).await.frame {
-            Frame::Ack { .. } => {}
-            other => panic!("expected the submit's ack, got {other:?}"),
-        }
-        assert!(
-            tokio::time::timeout(Duration::from_millis(300), next_frame(&mut ws))
-                .await
-                .is_err(),
-            "nothing is relayed to a peer"
+        let peer_did =
+            jig_core::Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
+        assert_eq!(
+            seen.wait_for(1).await[0],
+            (peer_did, "contract-offer".into(), b"after".to_vec())
         );
-
-        let mut open_reads = jig_config::v0_0_2_server::JigServerConfig::default();
-        open_reads.auth.require_authenticated_reads = false;
-        let (_state, url) =
-            start_test_server_with(AppState::for_test_with_config(open_reads).unwrap()).await;
-        let mut ws = established(&url).await;
-        let unsigned = Envelope::new(Frame::Subscribe {
-            scope: federation(),
-            auth: None,
-        });
-        ws.send(TMessage::Text(
-            serde_json::to_string(&unsigned).unwrap().into(),
-        ))
-        .await
-        .unwrap();
         match next_frame(&mut ws).await.frame {
-            Frame::Error { code, .. } => assert_eq!(code, "AUTH_REQUIRED"),
-            other => panic!("expected AUTH_REQUIRED, got {other:?}"),
+            Frame::Peer { kind, body } => {
+                assert_eq!(
+                    (kind.as_str(), body.as_slice()),
+                    ("contract-answer", &b"after"[..])
+                )
+            }
+            other => panic!("expected the handler's answer, got {other:?}"),
         }
     }
 
@@ -2187,6 +2147,94 @@ mod tests {
         );
     }
 
+    // --- graceful shutdown (#424) ---------------------------------------------
+
+    /// A stopping server closes every WebSocket session with 1001 (going
+    /// away), so clients reconnect promptly, and waits for that before it
+    /// returns. A session that is not yet past `hello` is closed the same way.
+    #[tokio::test]
+    async fn shutdown_closes_each_session_with_going_away() {
+        let state = Arc::new(AppState::for_test().unwrap());
+        let app = Router::new()
+            .route("/api/v1/ws", get(ws_handler))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/api/v1/ws", listener.local_addr().unwrap());
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let served = tokio::spawn(crate::server::serve_listener(
+            listener,
+            app,
+            None,
+            None,
+            Duration::from_secs(10),
+            async move {
+                let _ = stop_rx.await;
+            },
+            std::future::pending,
+        ));
+
+        let mut established = established(&url).await;
+        let (mut fresh, _) = connect_async(&url).await.unwrap();
+        stop_tx.send(()).unwrap();
+
+        assert_eq!(
+            close_code(&mut established).await,
+            Some(axum::extract::ws::close_code::AWAY)
+        );
+        assert_eq!(
+            close_code(&mut fresh).await,
+            Some(axum::extract::ws::close_code::AWAY)
+        );
+        tokio::time::timeout(Duration::from_secs(5), served)
+            .await
+            .expect("the server returns once both sessions closed")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// After its 1001 a session waits for the client's Close, so the close
+    /// frame is not lost to a reset, but not for long: a client that never
+    /// answers holds a ten-second drain for about CLOSE_REPLY_WAIT.
+    #[tokio::test]
+    async fn shutdown_waits_briefly_for_the_close_reply() {
+        let state = Arc::new(AppState::for_test().unwrap());
+        let app = Router::new()
+            .route("/api/v1/ws", get(ws_handler))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/api/v1/ws", listener.local_addr().unwrap());
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let served = tokio::spawn(crate::server::serve_listener(
+            listener,
+            app,
+            None,
+            None,
+            Duration::from_secs(10),
+            async move {
+                let _ = stop_rx.await;
+            },
+            std::future::pending,
+        ));
+
+        // Never read: the client neither sees the 1001 nor answers it.
+        let (silent, _) = connect_async(&url).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stop_tx.send(()).unwrap();
+        let stopped = std::time::Instant::now();
+        tokio::time::sleep(CLOSE_REPLY_WAIT / 2).await;
+        assert!(
+            !served.is_finished(),
+            "the session waits for the Close reply"
+        );
+        tokio::time::timeout(Duration::from_secs(5), served)
+            .await
+            .expect("bounded by CLOSE_REPLY_WAIT, not the drain")
+            .unwrap()
+            .unwrap();
+        assert!(stopped.elapsed() < CLOSE_REPLY_WAIT + Duration::from_secs(2));
+        drop(silent);
+    }
+
     // --- bad JSON → connection stays alive ----------------------------------
 
     #[tokio::test]
@@ -2311,16 +2359,12 @@ mod tests {
     }
 
     /// A dialing server that proves its DID in the handshake (JEP-0002 rule
-    /// 12) is that DID on the connection: a listed peer's federation
-    /// subscribe needs no second proof, and passes the gate to be told the
-    /// stream is retired rather than that it is not authenticated.
+    /// 12) is that DID on the connection: its subscribe needs no second
+    /// proof, and is registered rather than refused as not authenticated.
     #[tokio::test]
     async fn a_peer_that_proves_its_did_needs_no_second_proof() {
         let (state, url) = start_test_server().await;
         let key = jig_core::crypto::ed25519::generate_signing_key();
-        let peer_did =
-            jig_core::Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
-        state.auth.trust_federation_peer(&peer_did).unwrap();
 
         let (mut ws, _) = connect_async(&url).await.unwrap();
         crate::v0_0_2_federation::complete_peer_handshake(
@@ -2331,30 +2375,41 @@ mod tests {
         )
         .await
         .unwrap();
+        seed_channel(&state, "#hello");
         let sub = Envelope::new(Frame::Subscribe {
-            scope: Scope::Federation {
-                block_kinds: vec![],
+            scope: Scope::Channel {
+                slug: "#hello".into(),
             },
             auth: None,
         });
         ws.send(TMessage::Text(serde_json::to_string(&sub).unwrap().into()))
             .await
             .unwrap();
-        match next_frame(&mut ws).await.frame {
-            Frame::Error { code, .. } => assert_eq!(code, FEDERATION_STREAM_RETIRED),
-            other => panic!("expected FEDERATION_STREAM_RETIRED, got {other:?}"),
+        let mut registered = 0;
+        for _ in 0..100 {
+            registered = state.ingest_ctx.fanout.local_subscription_count().await;
+            if registered == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        assert_eq!(registered, 1, "the proven peer's subscribe is registered");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), next_frame(&mut ws))
+                .await
+                .is_err(),
+            "and is not answered with an error"
+        );
     }
 
     /// A hello that names a peer DID ends with that DID's proof over this
     /// connection's transcript, or the connection (class 1, 4001).
     #[tokio::test]
     async fn a_dialer_that_does_not_prove_its_did_is_closed() {
-        let (state, url) = start_test_server().await;
+        let (_state, url) = start_test_server().await;
         let key = jig_core::crypto::ed25519::generate_signing_key();
         let peer_did =
             jig_core::Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
-        state.auth.trust_federation_peer(&peer_did).unwrap();
 
         // Hello and welcome as the server saw them, for the dialer to sign.
         async fn dial(
@@ -2385,8 +2440,8 @@ mod tests {
         // Anything but the proof first.
         let (mut ws, _, _) = dial(&url, Some(&peer_did)).await;
         let sub = Envelope::new(Frame::Subscribe {
-            scope: Scope::Federation {
-                block_kinds: vec![],
+            scope: Scope::Channel {
+                slug: "#hello".into(),
             },
             auth: None,
         });
@@ -2600,8 +2655,7 @@ mod tests {
     #[tokio::test]
     async fn peer_frames_reach_the_dialing_side_too() {
         let dialing = Arc::new(federating(vec![]));
-        // The dialed side lists the dialer as a peer, so it takes its
-        // federation subscription.
+        // The dialed side lists the dialer as a peer.
         let dialed = federating(vec![peer_at(
             "ws://127.0.0.1:1",
             dialing.server_did.to_did_jig_string(),
@@ -2644,11 +2698,11 @@ mod tests {
             ),
             "the dialer's handler sees the DID the welcome proved"
         );
-        // The dialer's catch-up ask comes first ([`crate::v0_0_2_catch_up`]).
-        let seen = dialed_seen.wait_for(2).await;
-        assert_eq!(seen[0].1, crate::v0_0_2_catch_up::CATCH_UP_FRAME);
+        // The dialer asks for nothing first: its answer is the first peer
+        // frame the dialed side sees.
+        let seen = dialed_seen.wait_for(1).await;
         assert_eq!(
-            seen[1],
+            seen[0],
             (
                 dialing_did.clone(),
                 "contract-answer".into(),
@@ -2663,7 +2717,7 @@ mod tests {
             .expect("the dialed peer is live on the dialer too")
             .send("note", b"from-dialing".to_vec())
             .unwrap();
-        assert_eq!(dialed_seen.wait_for(3).await[2].2, b"from-dialing");
+        assert_eq!(dialed_seen.wait_for(2).await[1].2, b"from-dialing");
 
         // The dialer's handler closes; the connection ends as a contract close.
         to_dialing.send("contract-end", vec![]).unwrap();
