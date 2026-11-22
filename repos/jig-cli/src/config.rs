@@ -35,6 +35,20 @@ pub struct ServerSection {
     /// needs it nor grows it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nameserver_url: Option<String>,
+    /// Whether to keep a reachability record on `base_url` listing it
+    /// (JEP-0004 rule 21), so members of other servers can add this identity
+    /// to encrypted channels. Unset means yes. `false` publishes none, and
+    /// only channels on servers holding this identity's key packages can add
+    /// it. A record already published stays until it is replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_reachability: Option<bool>,
+}
+
+impl ServerSection {
+    /// [`Self::publish_reachability`], defaulting to yes.
+    pub fn publishes_reachability(&self) -> bool {
+        self.publish_reachability.unwrap_or(true)
+    }
 }
 
 /// `[naming]`: the suffix delegations this client holds itself.
@@ -199,6 +213,7 @@ impl Default for Config {
                 // TLS, like the server's default (`[tls] enabled = true`).
                 base_url: "https://127.0.0.1:7117".to_string(),
                 nameserver_url: None,
+                publish_reachability: None,
             },
             user: UserSection {
                 did: format!("did:jig:{}", os_username()),
