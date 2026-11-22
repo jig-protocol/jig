@@ -14,10 +14,19 @@ use crate::context::BridgeContext;
 pub struct DeliveredBlock {
     /// Base64-encoded canonical bundle bytes (matches the WSS Block frame format).
     pub bundle_b64: String,
-    /// Receipt references attached to this delivery.
+    /// Receipt references attached to this delivery. Empty when the server
+    /// executed nothing: a block it carries for another server.
     pub receipts: Vec<ReceiptRef>,
     /// Delivery CID assigned by the server's fanout layer.
     pub delivery_cid: String,
+    /// Whether this server sequenced the block. `false` for a block it carries
+    /// for the channel's owner under a share (JEP-0005): that channel's slug
+    /// need not be unique on this server, which may hold a channel of its own
+    /// by the same name. A bridge that routes by slug must decline a carried
+    /// delivery; one that routes by member reaches the member either way.
+    ///
+    /// Added for #454; every earlier delivery was sequenced here.
+    pub sequenced_here: bool,
 }
 
 /// Lightweight receipt reference for bridge consumption. Mirrors

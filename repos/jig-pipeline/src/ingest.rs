@@ -4802,8 +4802,9 @@ mod tests {
             .await
             .expect("bridge sink should receive within timeout")
             .expect("a delivery");
-        assert_eq!(got.0.channel_id.as_deref(), Some(channel_cid.as_str()));
-        assert_eq!(got.0.sender_did, bob_did);
+        assert_eq!(got.block.channel_id.as_deref(), Some(channel_cid.as_str()));
+        assert_eq!(got.block.sender_did, bob_did);
+        assert!(got.sequenced_here, "ingest sequences what it dispatches");
     }
 
     #[tokio::test]
@@ -4873,8 +4874,8 @@ mod tests {
             .await
             .expect("bridge sink should receive within timeout — slug->CID resolution must fire")
             .expect("a delivery");
-        assert_eq!(got.0.channel_id.as_deref(), Some(channel_cid.as_str()));
-        assert_eq!(got.0.sender_did, bob_did);
+        assert_eq!(got.block.channel_id.as_deref(), Some(channel_cid.as_str()));
+        assert_eq!(got.block.sender_did, bob_did);
     }
 
     #[tokio::test]
@@ -4993,6 +4994,60 @@ mod tests {
         assert!(!ctx.store.is_member_by_id(&chan, &guest.did).unwrap());
         join_sealed(&ctx, &member).await.unwrap();
         assert!(ctx.store.is_member_by_id(&chan, &member.did).unwrap());
+    }
+
+    /// The server role is checked when a join is, and never stored (JEP-0014
+    /// rule 9): a DID that joined while it was a `member` keeps that
+    /// membership after it becomes a `guest` (a server that stops counting
+    /// aged proofs as membership), and later joins are held to the new role.
+    #[tokio::test]
+    async fn an_existing_membership_survives_a_role_change() {
+        let mut ctx = all_channel_kinds();
+        let owner = person();
+        let (early, late) = (person(), person());
+        ctx.admission = Arc::new(Recorded {
+            members: vec![early.did.clone(), late.did.clone()],
+        });
+        create_sealed_as(&ctx, &owner, Some("server")).await;
+        let chan = ctx
+            .store
+            .get_channel_by_slug("#sealed")
+            .unwrap()
+            .unwrap()
+            .id;
+        // The join publishes the next epoch's group info, so a later joiner
+        // has one to commit against.
+        let group = ctx.store.get_mls_group("#sealed").unwrap().unwrap();
+        let (_, commit) = early.mls.join_external(&group.group_info.unwrap()).unwrap();
+        plain(
+            &ctx,
+            &early,
+            BlockKind::MemberAdd,
+            serde_json::json!({
+                "channel": "#sealed",
+                "member_did": early.did,
+                "mls_commit": b64(&commit.commit),
+                "mls_group_info": b64(commit.group_info.as_ref().unwrap()),
+                "mls_epoch": commit.epoch,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Both are guests from now on.
+        ctx.admission = Arc::new(Recorded { members: vec![] });
+        assert!(
+            matches!(
+                join_sealed(&ctx, &late).await,
+                Err(IngestError::NotChannelOwner { .. })
+            ),
+            "a join checked after the change is held to the new role"
+        );
+        assert!(!ctx.store.is_member_by_id(&chan, &late.did).unwrap());
+        assert!(
+            ctx.store.is_member_by_id(&chan, &early.did).unwrap(),
+            "the earlier membership stays"
+        );
     }
 
     /// The REST member route is a client of this server too: a self-join

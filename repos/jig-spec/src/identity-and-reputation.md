@@ -496,7 +496,8 @@ lend it, and members keep at least half their burst.
   admission `records` with no negative score, or DIDs whose admission proof is at least
   `local_member_age_secs` (7 days) old. Members by aged proof draw only from `aged_share_pct`
   (25 %) of the member share; recorded members draw from all of it. At 0, an aged proof is no
-  membership.
+  membership. Either way, a member by aged proof joins channels as a `guest` (JEP-0014
+  rule 8).
 - **Invited** stays empty until JEP-0009 defines invites.
 - **Strangers** are everyone else, and every `--anon` key.
 

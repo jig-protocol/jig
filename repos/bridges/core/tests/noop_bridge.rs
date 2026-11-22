@@ -63,6 +63,7 @@ async fn noop_bridge_lifecycle() {
         bundle_b64: "stub".into(),
         receipts: vec![],
         delivery_cid: "stub-cid".into(),
+        sequenced_here: true,
     };
     bridge.outbound(&block).await.unwrap();
     bridge.outbound(&block).await.unwrap();

@@ -54,10 +54,6 @@ pub struct DeliveryPolicy {
     pub open: bool,
     pub owner_did: String,
     pub member_dids: Vec<String>,
-    /// Whether the channel is one the legacy relay carried: open,
-    /// unencrypted, not `#jig/`. The relay no longer sends; this server still
-    /// judges by it what an older peer relays to it.
-    pub federates: bool,
 }
 
 impl DeliveryPolicy {
@@ -67,12 +63,6 @@ impl DeliveryPolicy {
             open,
             owner_did: channel.owner_did.clone(),
             member_dids,
-            // A server's own `#jig/` channels (its manifest log) are its own:
-            // a peer refuses them, and never sequences a copy.
-            federates: open
-                && channel.suite == jig_core::EncryptionSuite::Unencrypted.as_str()
-                && jig_core::slug::classify_slug(&channel.slug)
-                    != Ok(jig_core::slug::SlugClass::Server),
         }
     }
 
@@ -94,6 +84,24 @@ impl DeliveryPolicy {
 type Delivery = (StoredBlock, StoredReceipt);
 type DeliverySender = mpsc::UnboundedSender<Delivery>;
 
+/// What a bridge sink is handed for one managed DID: the block, and whether
+/// this server sequenced it.
+#[derive(Debug, Clone)]
+pub struct BridgeDelivery {
+    pub block: StoredBlock,
+    /// This server's receipt, when it executed the block. `None` for a block
+    /// it carries for another server under a share: it executed nothing.
+    pub receipt: Option<StoredReceipt>,
+    /// Whether this server sequenced the block. `false` for a carried block,
+    /// whose channel's slug need not be unique here (a follower may hold a
+    /// channel of its own by the same name), so a bridge that routes by slug
+    /// must not route it.
+    pub sequenced_here: bool,
+}
+
+/// Where [`Fanout::register_bridge_did`] sends a managed DID's deliveries.
+pub type BridgeSender = mpsc::UnboundedSender<BridgeDelivery>;
+
 struct LocalSubscription {
     scope: SubscriptionScope,
     who: SubscriberIdentity,
@@ -104,7 +112,7 @@ struct LocalSubscription {
 pub struct Fanout {
     next_id: AtomicU64,
     local: RwLock<HashMap<u64, LocalSubscription>>,
-    bridge_dids: StdRwLock<HashMap<String, DeliverySender>>,
+    bridge_dids: StdRwLock<HashMap<String, BridgeSender>>,
     /// The server's own watchers, by block kind ([`Fanout::watch_kinds`]), or
     /// of every block (`None`, [`Fanout::watch_all`]).
     server_watchers: StdRwLock<Vec<(Option<Vec<String>>, DeliverySender)>>,
@@ -163,7 +171,7 @@ impl Fanout {
     /// completes before this returns, so a caller that registers a DID and then
     /// returns can be sure a subsequently-delivered block finds the sink (no
     /// fire-and-forget window). Re-registering the same DID replaces the sender.
-    pub fn register_bridge_did(&self, managed_did: String, tx: DeliverySender) {
+    pub fn register_bridge_did(&self, managed_did: String, tx: BridgeSender) {
         self.bridge_dids
             .write()
             .expect("bridge_dids poisoned")
@@ -200,7 +208,8 @@ impl Fanout {
     }
 
     /// Like `broadcast`, but also dispatches to bridge sinks for any managed
-    /// DID among the policy's members that isn't the block's sender.
+    /// DID among the policy's members that isn't the block's sender. For a
+    /// block this server sequenced.
     pub async fn broadcast_with_members(
         &self,
         block: &StoredBlock,
@@ -208,14 +217,34 @@ impl Fanout {
         policy: Option<&DeliveryPolicy>,
     ) -> anyhow::Result<()> {
         self.broadcast_to_locals(block, receipt, policy).await;
-        self.dispatch_to_bridges(block, receipt, policy);
+        self.dispatch_to_bridges(block, Some(receipt), policy);
         Ok(())
     }
 
-    fn dispatch_to_bridges(
+    /// [`Self::broadcast_with_members`], for a block this server carries for
+    /// the channel's owner under a share (#454). It reaches the same bridge
+    /// sinks, by the same rule: a managed DID among the channel's members, as
+    /// this server mirrors them, that is not the block's sender. It carries no
+    /// receipt, since this server executed nothing, and is marked as not
+    /// sequenced here.
+    ///
+    /// `receipt` is what local subscribers are handed in its place.
+    pub async fn broadcast_carried(
         &self,
         block: &StoredBlock,
         receipt: &StoredReceipt,
+        policy: Option<&DeliveryPolicy>,
+    ) -> anyhow::Result<()> {
+        self.broadcast_to_locals(block, receipt, policy).await;
+        self.dispatch_to_bridges(block, None, policy);
+        Ok(())
+    }
+
+    /// `receipt` is this server's own, or `None` for a carried block.
+    fn dispatch_to_bridges(
+        &self,
+        block: &StoredBlock,
+        receipt: Option<&StoredReceipt>,
         policy: Option<&DeliveryPolicy>,
     ) {
         // No resolved channel means no members to dispatch to.
@@ -224,7 +253,7 @@ impl Fanout {
         };
         // Collect matching sinks under a brief read lock, then send after
         // dropping it (never hold the lock across the send loop).
-        let senders: Vec<DeliverySender> = {
+        let senders: Vec<BridgeSender> = {
             let sinks = self.bridge_dids.read().expect("bridge_dids poisoned");
             policy
                 .member_dids
@@ -234,7 +263,11 @@ impl Fanout {
                 .collect()
         };
         for tx in senders {
-            let _ = tx.send((block.clone(), receipt.clone()));
+            let _ = tx.send(BridgeDelivery {
+                block: block.clone(),
+                receipt: receipt.cloned(),
+                sequenced_here: receipt.is_some(),
+            });
         }
     }
 
@@ -242,17 +275,6 @@ impl Fanout {
     /// `policy`. Blocks reach other servers only by a share, through the
     /// owner's stream ([`Self::watch_all`]), never from here.
     pub async fn broadcast(
-        &self,
-        block: &StoredBlock,
-        receipt: &StoredReceipt,
-        policy: Option<&DeliveryPolicy>,
-    ) -> anyhow::Result<()> {
-        self.broadcast_to_locals(block, receipt, policy).await;
-        Ok(())
-    }
-
-    /// [`Self::broadcast`], for a block that came from another server.
-    pub async fn broadcast_local_only(
         &self,
         block: &StoredBlock,
         receipt: &StoredReceipt,
@@ -343,7 +365,6 @@ mod tests {
             open: true,
             owner_did: "did:jig:zOwner".to_string(),
             member_dids: members.iter().map(|m| m.to_string()).collect(),
-            federates: true,
         }
     }
 
@@ -352,7 +373,6 @@ mod tests {
             open: false,
             owner_did: owner.to_string(),
             member_dids: members.iter().map(|m| m.to_string()).collect(),
-            federates: false,
         }
     }
 
@@ -493,32 +513,6 @@ mod tests {
         assert!(received(&mut rx).await);
     }
 
-    #[test]
-    fn a_channel_federates_only_if_open_and_unencrypted() {
-        let row = |visibility: &str, suite: &str| StoredChannel {
-            id: "c".to_string(),
-            slug: "#c".to_string(),
-            visibility: visibility.to_string(),
-            created_at: 0,
-            owner_did: "did:jig:zOwner".to_string(),
-            suite: suite.to_string(),
-            sequencer_did: String::new(),
-            co_owners: Vec::new(),
-            tiering: crate::persist::ChannelTiering::current(visibility, suite),
-        };
-        assert!(DeliveryPolicy::for_channel(&row("open", "none"), vec![]).federates);
-        assert!(!DeliveryPolicy::for_channel(&row("restricted", "none"), vec![]).federates);
-        assert!(!DeliveryPolicy::for_channel(&row("open", "mls"), vec![]).federates);
-        let manifest_log = StoredChannel {
-            slug: "#jig/manifest".to_string(),
-            ..row("open", "none")
-        };
-        assert!(
-            !DeliveryPolicy::for_channel(&manifest_log, vec![]).federates,
-            "a server's own channels stay home"
-        );
-    }
-
     // ---- scope matching ----------------------------------------------------
 
     #[tokio::test]
@@ -626,7 +620,72 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(got.0.sender_did, "did:jig:zBob");
+        assert_eq!(got.block.sender_did, "did:jig:zBob");
+        assert!(got.sequenced_here);
+        assert!(
+            got.receipt.is_some(),
+            "a block sequenced here carries its receipt"
+        );
+    }
+
+    /// A carried block reaches a bridged member's sink by the same rule as a
+    /// sequenced one, marked as not sequenced here and with no receipt
+    /// (#454).
+    #[tokio::test]
+    async fn a_carried_block_reaches_a_bridged_members_sink_marked_as_carried() {
+        let f = Fanout::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        f.register_bridge_did("did:jig:zShadowAlice".to_string(), tx);
+        let mut blk = sample_block(Some("#general"), "text-render");
+        blk.sender_did = "did:jig:zBob".to_string();
+        f.broadcast_carried(
+            &blk,
+            &sample_receipt(),
+            Some(&open_with_members(&[
+                "did:jig:zBob",
+                "did:jig:zShadowAlice",
+            ])),
+        )
+        .await
+        .unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.block.sender_did, "did:jig:zBob");
+        assert!(!got.sequenced_here);
+        assert!(got.receipt.is_none(), "this server executed nothing");
+    }
+
+    /// A carried block reaches no sink but a member's, open channel or not,
+    /// and never its author's own.
+    #[tokio::test]
+    async fn a_carried_block_reaches_no_sink_of_a_non_member_or_its_author() {
+        let f = Fanout::new();
+        let (stranger_tx, mut stranger) = mpsc::unbounded_channel();
+        let (author_tx, mut author) = mpsc::unbounded_channel();
+        f.register_bridge_did("did:jig:zShadowStranger".to_string(), stranger_tx);
+        f.register_bridge_did("did:jig:zShadowAuthor".to_string(), author_tx);
+        let mut blk = sample_block(Some("#general"), "text-render");
+        blk.sender_did = "did:jig:zShadowAuthor".to_string();
+        f.broadcast_carried(
+            &blk,
+            &sample_receipt(),
+            Some(&open_with_members(&[
+                "did:jig:zShadowAuthor",
+                "did:jig:zBob",
+            ])),
+        )
+        .await
+        .unwrap();
+        // No channel row resolved: nothing to dispatch to.
+        f.broadcast_carried(&blk, &sample_receipt(), None)
+            .await
+            .unwrap();
+        for (who, rx) in [("non-member", &mut stranger), ("author", &mut author)] {
+            let res = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+            assert!(res.is_err(), "the {who}'s sink must get nothing");
+        }
     }
 
     #[tokio::test]
@@ -692,7 +751,7 @@ mod tests {
             .await
             .unwrap();
         assert!(received(&mut rx).await, "a restricted channel's share");
-        f.broadcast_local_only(&share, &sample_receipt(), None)
+        f.broadcast_carried(&share, &sample_receipt(), None)
             .await
             .unwrap();
         assert!(received(&mut rx).await, "a relayed share");

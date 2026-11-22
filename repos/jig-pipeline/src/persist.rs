@@ -665,6 +665,48 @@ fn rekey_channels_by_id(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// [`SqliteStore::upsert_alias_attestation`] on `conn`, which may be a
+/// transaction.
+fn upsert_alias_attestation_on(conn: &Connection, a: &StoredAliasAttestation) -> Result<()> {
+    conn.execute(
+        "INSERT INTO alias_attestations
+             (did, alias, ns_did, valid_from, valid_until, attestation_bytes, suffix)
+         VALUES (?,?,?,?,?,?,?)
+         ON CONFLICT(did, ns_did, suffix) DO UPDATE SET
+            alias = excluded.alias,
+            valid_from = excluded.valid_from,
+            valid_until = excluded.valid_until,
+            attestation_bytes = excluded.attestation_bytes",
+        params![
+            a.did,
+            a.alias,
+            a.ns_did,
+            a.valid_from,
+            a.valid_until,
+            a.attestation_bytes,
+            alias_suffix_of(&a.alias)
+        ],
+    )?;
+    Ok(())
+}
+
+/// [`SqliteStore::expire_alias_attestation`] on `conn`, which may be a
+/// transaction.
+fn expire_alias_attestation_on(
+    conn: &Connection,
+    did: &str,
+    ns_did: &str,
+    alias: &str,
+    as_of: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE alias_attestations SET valid_until = ?
+         WHERE did = ? AND ns_did = ? AND suffix = ?",
+        rusqlite::params![as_of, did, ns_did, alias_suffix_of(alias)],
+    )?;
+    Ok(())
+}
+
 /// The suffix an `alias_attestations` row is keyed by: the lowercased text
 /// after the last `@` of its alias, or `''` for a bare alias (an ingested
 /// `ns-attestation` block may carry one). Lowercased so `Bob@B.example` and
@@ -3348,25 +3390,25 @@ impl SqliteStore {
     /// Insert or replace `a.did`'s binding under `a.alias`'s suffix at
     /// `a.ns_did`. One DID holds at most one name per suffix per nameserver.
     pub fn upsert_alias_attestation(&self, a: &StoredAliasAttestation) -> Result<()> {
-        self.conn.lock().expect("poisoned").execute(
-            "INSERT INTO alias_attestations
-                 (did, alias, ns_did, valid_from, valid_until, attestation_bytes, suffix)
-             VALUES (?,?,?,?,?,?,?)
-             ON CONFLICT(did, ns_did, suffix) DO UPDATE SET
-                alias = excluded.alias,
-                valid_from = excluded.valid_from,
-                valid_until = excluded.valid_until,
-                attestation_bytes = excluded.attestation_bytes",
-            params![
-                a.did,
-                a.alias,
-                a.ns_did,
-                a.valid_from,
-                a.valid_until,
-                a.attestation_bytes,
-                alias_suffix_of(&a.alias)
-            ],
-        )?;
+        upsert_alias_attestation_on(&self.conn.lock().expect("poisoned"), a)
+    }
+
+    /// Move a name from `old_did` to `new.did`: expire `old_did`'s binding
+    /// under `new.alias`'s suffix at `new.ns_did` as of `as_of`, and store
+    /// `new`, in one transaction. A rotation cut between the two (a crash, or
+    /// a shutdown drain that runs out) leaves the old binding or the new one,
+    /// never neither.
+    pub fn rotate_alias_attestation(
+        &self,
+        old_did: &str,
+        as_of: i64,
+        new: &StoredAliasAttestation,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("poisoned");
+        let tx = conn.unchecked_transaction()?;
+        expire_alias_attestation_on(&tx, old_did, &new.ns_did, &new.alias, as_of)?;
+        upsert_alias_attestation_on(&tx, new)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -3419,12 +3461,13 @@ impl SqliteStore {
         alias: &str,
         as_of: i64,
     ) -> Result<()> {
-        self.conn.lock().expect("poisoned").execute(
-            "UPDATE alias_attestations SET valid_until = ?
-             WHERE did = ? AND ns_did = ? AND suffix = ?",
-            rusqlite::params![as_of, did, ns_did, alias_suffix_of(alias)],
-        )?;
-        Ok(())
+        expire_alias_attestation_on(
+            &self.conn.lock().expect("poisoned"),
+            did,
+            ns_did,
+            alias,
+            as_of,
+        )
     }
 
     /// Lowercase `alias` on the rows `is_legacy` selects by their
@@ -7283,6 +7326,45 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// A rotation expires the old binding and stores the new one together:
+    /// when the second write fails, the first is rolled back, and the name
+    /// still resolves to the old DID.
+    #[test]
+    fn rotating_a_name_is_one_transaction() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .upsert_alias_attestation(&att("did:jig:zA", "dj@a.example", b"1"))
+            .unwrap();
+        store
+            .rotate_alias_attestation("did:jig:zA", 500, &att("did:jig:zB", "dj@a.example", b"2"))
+            .unwrap();
+        let held = store.find_alias_attestation("dj@a.example", 1000).unwrap();
+        assert_eq!(held.map(|a| a.did).as_deref(), Some("did:jig:zB"));
+
+        // The new binding's write fails: nothing changes.
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_c BEFORE INSERT ON alias_attestations
+                 WHEN NEW.did = 'did:jig:zC'
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            )
+            .unwrap();
+        assert!(
+            store
+                .rotate_alias_attestation(
+                    "did:jig:zB",
+                    700,
+                    &att("did:jig:zC", "dj@a.example", b"3")
+                )
+                .is_err()
+        );
+        let held = store.find_alias_attestation("dj@a.example", 1000).unwrap();
+        assert_eq!(held.map(|a| a.did).as_deref(), Some("did:jig:zB"));
     }
 
     #[test]

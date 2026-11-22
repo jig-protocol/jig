@@ -283,7 +283,7 @@ async fn a_slug_subscribe_never_reaches_a_carried_channel() {
         };
         server
             .fanout()
-            .broadcast_local_only(
+            .broadcast_carried(
                 &block,
                 &receipt,
                 Some(&DeliveryPolicy::for_channel(&channel, Vec::new())),

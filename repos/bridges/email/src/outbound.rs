@@ -115,6 +115,7 @@ mod tests {
             bundle_b64: base64::engine::general_purpose::STANDARD.encode(blk.canonical_bytes()),
             receipts: vec![],
             delivery_cid: "cid1".into(),
+            sequenced_here: true,
         }
     }
 
@@ -158,6 +159,7 @@ mod tests {
             bundle_b64: "not base64!!!".into(),
             receipts: vec![],
             delivery_cid: "bad".into(),
+            sequenced_here: true,
         };
         assert!(block_to_outbound_email(&delivered, "a@b".into(), "c@d".into()).is_none());
     }

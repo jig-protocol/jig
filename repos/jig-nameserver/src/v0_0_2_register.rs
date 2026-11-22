@@ -531,14 +531,14 @@ pub(crate) async fn current_binding(
     row.map(|r| Binding::from_row(state, &r)).transpose()
 }
 
-/// Sign a fresh 90-day attestation binding `alias` to `did`, store it with
-/// `reachability`, and return the response body.
-pub(crate) async fn issue_and_persist(
+/// Sign a fresh 90-day attestation binding `alias` to `did`, with
+/// `reachability`: the binding and the row that stores it.
+pub(crate) fn issue(
     state: &Arc<AppState>,
     did: &str,
     alias: &str,
     reachability: Option<ReachabilityRecord>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> (Binding, StoredAliasAttestation) {
     let now = chrono::Utc::now().timestamp();
     let binding = Binding {
         attestation: naming::Attestation::sign(
@@ -559,6 +559,17 @@ pub(crate) async fn issue_and_persist(
         valid_until: att.valid_until,
         attestation_bytes: binding.stored_bytes(),
     };
+    (binding, stored)
+}
+
+/// [`issue`] a binding, store it, and return the response body.
+pub(crate) async fn issue_and_persist(
+    state: &Arc<AppState>,
+    did: &str,
+    alias: &str,
+    reachability: Option<ReachabilityRecord>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (binding, stored) = issue(state, did, alias, reachability);
     let store = state.ingest_ctx.store.clone();
     tokio::task::spawn_blocking(move || store.upsert_alias_attestation(&stored))
         .await
