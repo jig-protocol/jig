@@ -1158,6 +1158,32 @@ pub fn hash_of(envelope: &[u8]) -> Cid {
     crate::canonical_cid::of(envelope)
 }
 
+/// The CBOR value a ruleset payload written as JSON denotes, as the R2.1
+/// reference rulesets are (`jig-spec/jep/vectors/0009/rulesets`). JSON has
+/// only integers here: a number that is not one is refused.
+pub fn payload_from_json(json: &serde_json::Value) -> Result<Vec<u8>, RulesetError> {
+    fn value(j: &serde_json::Value) -> Result<Value, RulesetError> {
+        Ok(match j {
+            serde_json::Value::Null => Value::Null,
+            serde_json::Value::Bool(b) => Value::Bool(*b),
+            serde_json::Value::Number(n) => Value::int(
+                n.as_i64()
+                    .ok_or_else(|| field(n.to_string(), "is not an integer"))?,
+            ),
+            serde_json::Value::String(s) => Value::text(s.clone()),
+            serde_json::Value::Array(a) => {
+                Value::Array(a.iter().map(value).collect::<Result<_, _>>()?)
+            }
+            serde_json::Value::Object(o) => Value::Map(
+                o.iter()
+                    .map(|(k, v)| Ok((Value::text(k.clone()), value(v)?)))
+                    .collect::<Result<_, RulesetError>>()?,
+            ),
+        })
+    }
+    Ok(dcbor::encode(&value(json)?)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1168,25 +1194,10 @@ mod tests {
     );
     const NAMES: [&str; 4] = ["jig-reference", "high-sec", "community", "null-sec"];
 
-    /// JSON to the CBOR value it denotes: the vectors are the payloads written as JSON.
-    fn json_to_value(j: &serde_json::Value) -> Value {
-        match j {
-            serde_json::Value::Null => Value::Null,
-            serde_json::Value::Bool(b) => Value::Bool(*b),
-            serde_json::Value::Number(n) => Value::int(n.as_i64().expect("vectors are integers")),
-            serde_json::Value::String(s) => Value::text(s.clone()),
-            serde_json::Value::Array(a) => Value::Array(a.iter().map(json_to_value).collect()),
-            serde_json::Value::Object(o) => Value::Map(
-                o.iter()
-                    .map(|(k, v)| (Value::text(k.clone()), json_to_value(v)))
-                    .collect(),
-            ),
-        }
-    }
-
     fn vector(name: &str) -> Value {
         let text = std::fs::read_to_string(format!("{VECTORS}/{name}.json")).unwrap();
-        json_to_value(&serde_json::from_str(&text).unwrap())
+        let payload = payload_from_json(&serde_json::from_str(&text).unwrap()).unwrap();
+        dcbor::decode(&payload).unwrap()
     }
 
     fn payload(name: &str) -> Vec<u8> {
@@ -1470,6 +1481,29 @@ mod tests {
             authors.sort_by_key(|a| text_key(a));
             doc.authors = authors;
             doc
+        }
+
+        /// `jig-reference.test-signed.cose`: `jig-reference` signed by a public
+        /// test seed that is its one author. The upgrade-path check declares it
+        /// from a server; nobody should apply it, since anyone can sign as that
+        /// seed. `JIG_BLESS_RULESET_FIXTURE=1` rewrites it.
+        #[test]
+        fn the_test_signed_reference_reproduces() {
+            let (key, did) = key(0x5a);
+            let signed = SignedRuleset::sign(authored(vec![did]), &key).unwrap();
+            let path = format!("{VECTORS}/jig-reference.test-signed.cose");
+            if std::env::var_os("JIG_BLESS_RULESET_FIXTURE").is_some() {
+                std::fs::write(&path, signed.envelope()).unwrap();
+            }
+            let fixture = std::fs::read(&path).unwrap();
+            assert!(
+                fixture == signed.envelope(),
+                "{path} is stale: JIG_BLESS_RULESET_FIXTURE=1 rewrites it"
+            );
+            assert_eq!(
+                *SignedRuleset::open(&fixture).unwrap().hash(),
+                hash_of(&fixture)
+            );
         }
 
         #[test]

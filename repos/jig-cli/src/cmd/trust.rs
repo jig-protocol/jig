@@ -597,7 +597,7 @@ async fn check_manifest_in(
     server: &str,
     welcome: &jig_client::manifest::VerifiedWelcome,
 ) -> Result<()> {
-    use jig_client::manifest::{LOG_SLUG, check_cited};
+    use jig_client::manifest::{LOG_SLUG, check_cited_asked};
     let Some(cited) = &welcome.manifest else {
         eprintln!(
             "warning: {server}'s welcome cites no manifest log entry, so its claims are not \
@@ -606,7 +606,14 @@ async fn check_manifest_in(
         return Ok(());
     };
     let mut pins = Pins::load(pins_path)?;
-    if pins.server(server).and_then(|p| p.manifest.as_ref()) == Some(cited) {
+    // The ruleset the welcome names is not in the manifest reference, so a
+    // cache hit needs both to match what was checked.
+    let named = welcome
+        .capabilities
+        .ruleset
+        .then_some(welcome.ruleset.as_deref())
+        .flatten();
+    if pins.manifest_checked(server, cited, named) {
         return Ok(());
     }
     #[derive(serde::Deserialize)]
@@ -648,9 +655,13 @@ async fn check_manifest_in(
             )
         })?;
     let sig_b64 = served.sig_b64.unwrap_or_default();
-    match check_cited(welcome, cited, &served.bundle_b64, &sig_b64, &record) {
+    // This CLI's hello always asks for the ruleset (`ClientOffer::default`).
+    match check_cited_asked(welcome, cited, &served.bundle_b64, &sig_b64, &record) {
         Ok(_) => {}
-        Err(e @ jig_client::manifest::ManifestCheck::Unproven(_)) => {
+        Err(
+            e @ (jig_client::manifest::ManifestCheck::Unproven(_)
+            | jig_client::manifest::ManifestCheck::Withheld(_)),
+        ) => {
             anyhow::bail!("{server}: {e}. Refusing to go on")
         }
         // Two things the server signed disagree: kept, and the server
@@ -708,7 +719,7 @@ async fn check_manifest_in(
              entries in between are not checked."
         );
     }
-    Pins::load(pins_path)?.set_manifest(server, cited)?;
+    Pins::load(pins_path)?.set_manifest(server, cited, named)?;
     Ok(())
 }
 
