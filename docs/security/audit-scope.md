@@ -128,8 +128,19 @@ rest).
 - The `test-aead` suite, which is compiled only for conformance tests. CI checks that no
   release binary enables it.
 
-**Must be code-complete first:** MLS channels across servers (F2 Task 7) and key-package
-custodians (Task 8), if this area is to cover federation. Single-server MLS can be reviewed now.
+**Must be code-complete first,** if this area is to cover federation. Single-server MLS can be
+reviewed now.
+- **MLS channels across servers (F2 Task 7)** are partly done. An encrypted channel federates
+  under a share, and the follower checks each commit against its public copy of the group
+  (JEP-0005 rule 19). Still missing: after a `contract-end`, members are not removed. The
+  client shows a notice and removes no one, though JEP-0005 rule 11 calls for removing leaves
+  reachable only through that follower.
+- **Key-package custodians (Task 8)** are partly done (#440). These shipped: signed custody
+  requests (JEP-0005 rule 21a), hourly limits, the release log, and the operator's interim
+  release policy (rule 21b). Still missing: release policies that DIDs sign, held requests and
+  approvals, the Welcome mailbox, and one package per device (rule 21b).
+- **Leaving a server (JEP-0017)** is specified. Of its three requests, only R1's server side
+  exists (#440).
 
 ### 3.2 The handshake and the TLS DID binding
 

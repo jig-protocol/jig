@@ -53,12 +53,19 @@ impl ReadProof {
     /// included, query string excluded — because that is what the server
     /// hashes on arrival. A mismatch presents as "signature invalid".
     pub fn sign(identity: &Identity, method: &str, path: &str) -> Self {
+        Self::sign_body(identity, method, path, b"")
+    }
+
+    /// [`Self::sign`] over a request with a body: the proof covers `body`'s
+    /// exact bytes, so it cannot be replayed with another body. Send those
+    /// bytes unchanged.
+    pub fn sign_body(identity: &Identity, method: &str, path: &str, body: &[u8]) -> Self {
         let hlc_wall_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         let nonce = fresh_nonce(hlc_wall_ms);
-        let hash = canonical_request_hash(method, path, b"", hlc_wall_ms, 0, &nonce);
+        let hash = canonical_request_hash(method, path, body, hlc_wall_ms, 0, &nonce);
         Self {
             did: identity.did_string(),
             hlc_wall_ms,

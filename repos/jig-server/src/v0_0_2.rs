@@ -414,9 +414,6 @@ impl AppState {
             fanout,
             server_url: server_url.clone(),
             naively_allow_unknown_handles_fallback,
-            naively_accept_peer_relayed_creates: config
-                .federation
-                .naively_accept_peer_relayed_creates,
             executor: Some(executor),
         });
 
@@ -492,9 +489,6 @@ impl AppState {
             fanout,
             server_url: server_url.clone(),
             naively_allow_unknown_handles_fallback,
-            naively_accept_peer_relayed_creates: config
-                .federation
-                .naively_accept_peer_relayed_creates,
             executor: Some(BlockExecutor::shared()),
         });
 
@@ -554,9 +548,6 @@ impl AppState {
             fanout,
             server_url: server_url.clone(),
             naively_allow_unknown_handles_fallback,
-            naively_accept_peer_relayed_creates: config
-                .federation
-                .naively_accept_peer_relayed_creates,
             executor: Some(BlockExecutor::shared()),
         });
 

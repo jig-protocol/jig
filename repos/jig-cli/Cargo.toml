@@ -31,6 +31,7 @@ zeroize = "1"
 # MLS commit type, carried between jig-client's session and the blocks the CLI
 # submits for it.
 jig-mls = { workspace = true }
+hex = { workspace = true }
 rand = { workspace = true }
 
 # CLI

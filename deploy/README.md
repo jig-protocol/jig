@@ -148,7 +148,9 @@ private network:
   `[auth.pools]`: strangers share `stranger_share_pct` (20 %) of the
   server's write capacity, so however many keys a flood brings, members keep
   the rest. Members are the DIDs in `records` with no negative score, plus
-  those whose admission proof is `local_member_age_secs` old.
+  those whose admission proof is `local_member_age_secs` old. The second
+  kind share `aged_share_pct` (25 %) of the member share, so a batch of
+  proofs that ages in together cannot crowd out the recorded members.
 - **A follower vouches for its users.** Under a `write` or `member` share, the
   server that follows a channel relays its users' posts to this one. They run
   the same admission, write and suite gates as local posts, and the share's
@@ -772,10 +774,10 @@ this server.
 
 A channel reaches another server only once it is shared. Its creation block
 names the server that orders it, so a peer no longer takes a channel this
-server creates as one of its own. `naively_accept_peer_relayed_creates` (see
-`config.example.toml`) has no effect: this server takes no relayed blocks.
-Servers that trust each other set `offers = "accept"` and use `jig channel
-share`.
+server creates as one of its own. Servers that trust each other set
+`offers = "accept"` and use `jig channel share`. The test-only key
+`naively_accept_peer_relayed_creates` is removed: a config that still sets it
+does not boot, and the error names the key. Delete the line before upgrading.
 
 This server neither sends nor takes relayed posts. Its posts reach another
 server only through a channel it shares, and another server's posts reach it
