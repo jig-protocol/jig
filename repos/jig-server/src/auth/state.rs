@@ -55,6 +55,8 @@ pub struct AuthState {
     write_pools: Option<WritePools>,
     /// `[auth.pools] local_member_age_secs`.
     local_member_age_secs: u64,
+    /// `[auth.pools] aged_share_pct`: at 0, an aged proof is no membership.
+    aged_share_pct: u8,
     /// Where admission proofs of work are recorded; `None` in a state built
     /// without a store, where no DID is ever proven.
     proofs: Option<Arc<jig_pipeline::persist::SqliteStore>>,
@@ -121,8 +123,15 @@ impl AuthState {
                 limits.max_tracked,
             ),
             effort,
-            write_pools: WritePools::new(&auth.pools, std::time::Instant::now())?,
+            write_pools: {
+                let pools = WritePools::new(&auth.pools, std::time::Instant::now())?;
+                for warning in pools.iter().flat_map(WritePools::warnings) {
+                    tracing::warn!("{warning}");
+                }
+                pools
+            },
             local_member_age_secs: auth.pools.local_member_age_secs,
+            aged_share_pct: auth.pools.aged_share_pct,
             proofs: None,
         })
     }
@@ -220,11 +229,15 @@ impl AuthState {
     /// 21), at `now_unix` on this server's clock. `did` must be the identity
     /// gate 1 VERIFIED.
     ///
-    /// A member is a DID the operator recorded with no negative score, or one
-    /// whose admission proof of work is at least `local_member_age_secs` old.
-    /// No DID is invited until invites exist (JEP-0009). Everyone else is a
-    /// stranger. This server keeps no penalty history yet, so "without a
-    /// penalty" (rule 21) adds nothing to the age test.
+    /// A member is a DID the operator recorded with no negative score: the
+    /// operator's local stand-in for established standing until this server
+    /// computes it (JEP-0009 rule 49). A member by aged proof is one whose
+    /// admission proof of work is at least `local_member_age_secs` old, and
+    /// draws only from the `aged_share_pct` part of the member pool (rule
+    /// 23); at a share of 0 it stays a stranger. No DID is invited until
+    /// invites exist. Everyone else is a stranger. This server keeps no
+    /// penalty history yet, so "without a penalty" (rule 21) adds nothing to
+    /// the age test.
     pub fn pool_of(&self, did: &str, now_unix: i64) -> Pool {
         let view = self.reputation.view(did);
         if !view.is_empty() && view.scores.values().all(|score| *score >= 0) {
@@ -236,7 +249,11 @@ impl AuthState {
             .as_ref()
             .and_then(|store| store.admission_proven_at(did).ok().flatten())
             .is_some_and(|at| now_unix.saturating_sub(at) >= age);
-        if aged { Pool::Member } else { Pool::Stranger }
+        if aged && self.aged_share_pct > 0 {
+            Pool::AgedMember
+        } else {
+            Pool::Stranger
+        }
     }
 
     /// Gate 2, the DID's rate, then its pool's share of the write capacity:
@@ -393,8 +410,8 @@ impl jig_pipeline::ingest::Admission for AuthState {
     fn server_role(&self, sender_did: &str) -> jig_pipeline::ingest::ServerRole {
         use jig_pipeline::ingest::ServerRole;
         match self.pool_of(sender_did, chrono::Utc::now().timestamp()) {
-            Pool::Member => ServerRole::Member,
-            _ => ServerRole::Guest,
+            Pool::Member | Pool::AgedMember => ServerRole::Member,
+            Pool::Invited | Pool::Stranger => ServerRole::Guest,
         }
     }
 }
@@ -623,7 +640,50 @@ mod tests {
         assert_eq!(state.pool_of(&negative, proven_at), Pool::Stranger);
         assert_eq!(state.pool_of(&fresh, proven_at + 1_000), Pool::Stranger);
         assert_eq!(state.pool_of(&proven, proven_at + 99), Pool::Stranger);
-        assert_eq!(state.pool_of(&proven, proven_at + 100), Pool::Member);
+        assert_eq!(state.pool_of(&proven, proven_at + 100), Pool::AgedMember);
+    }
+
+    /// A tiny-burst config that booted before the member split still boots:
+    /// the pools raise the aged allowance to one write and boot logs a
+    /// warning.
+    #[test]
+    fn a_tiny_burst_config_still_boots() {
+        let mut section = AuthSection::default();
+        section.pools.writes_per_second = 3;
+        section.pools.writes_burst = 3;
+        section.pools.stranger_share_pct = 0;
+        section.pools.invited_share_pct = 0;
+        let state = AuthState::from_config(&section).unwrap();
+        let pools = state.write_pools.as_ref().unwrap();
+        assert_eq!(pools.warnings().len(), 1);
+    }
+
+    /// An aged share of 0 (`high-sec`): an aged proof is no membership, so
+    /// that DID stays a stranger and a guest. Recorded members are unchanged.
+    #[test]
+    fn a_zero_aged_share_keeps_aged_proofs_strangers() {
+        use jig_config::v0_0_2_server::ReputationRecord;
+        use jig_pipeline::ingest::{Admission as _, ServerRole};
+        let (recorded, proven) = (did_for(1), did_for(3));
+        let mut section = AuthSection::default();
+        section.pools.local_member_age_secs = 0;
+        section.pools.aged_share_pct = 0;
+        section.admission.records = vec![ReputationRecord {
+            did: recorded.clone(),
+            ruleset_key: "r".to_string(),
+            score: 0,
+        }];
+        let store = Arc::new(jig_pipeline::persist::SqliteStore::open_in_memory().unwrap());
+        let state = AuthState::from_config(&section)
+            .unwrap()
+            .with_proofs(store.clone());
+        state.record_proof(&proven, 20).unwrap();
+        let proven_at = store.admission_proven_at(&proven).unwrap().unwrap();
+
+        assert_eq!(state.pool_of(&recorded, proven_at), Pool::Member);
+        assert_eq!(state.pool_of(&proven, proven_at + 1_000), Pool::Stranger);
+        assert_eq!(state.server_role(&proven), ServerRole::Guest);
+        assert_eq!(state.server_role(&recorded), ServerRole::Member);
     }
 
     /// A writer refused as `RATE_LIMITED` is told the longer of its DID's

@@ -32,7 +32,7 @@ pub const MAX_BATCH: usize = 100;
 /// self-minted identity can make this server store.
 pub const MAX_STOCK: u64 = 200;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct PublishBody {
     pub key_packages_b64: Vec<String>,
 }
@@ -56,6 +56,11 @@ pub struct KeyPackageBody {
 pub struct StockBody {
     pub available: u64,
     pub last_resort: bool,
+    /// `false` once the DID ended both custody and local adds here (JEP-0017
+    /// rule 19): the stock is ended and none of it is handed out again, so
+    /// its owner may delete the keys. An empty stock alone does not say so:
+    /// a released package is handed again to a repeated request.
+    pub stocked: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -71,15 +76,32 @@ fn bad(code: &'static str, msg: impl Into<String>) -> (StatusCode, Json<ErrorBod
 
 /// POST /api/v1/mls/key-packages
 ///
-/// No request signature: every key package is signed by its DID's own key and
-/// names that DID in its credential (`jig_mls::credential`), which is a
-/// stronger proof than a request header — nobody can publish for a DID whose
-/// key they do not hold. The publisher still passes admission.
+/// No request signature is needed to stock: every key package is signed by
+/// its DID's own key and names that DID in its credential
+/// (`jig_mls::credential`), so nobody can make a package for a DID whose key
+/// they do not hold. The publisher still passes admission.
+///
+/// Replacing the DID's last-resort package needs more, because a package
+/// signature is not fresh: whoever was released an old last-resort package
+/// could upload it here and replace a usable one with one whose key its owner
+/// deleted. So a replacement needs the request itself signed by the DID, over
+/// the exact body bytes, so the proof cannot be replayed with other packages.
+/// An upload without such a proof while one is held is skipped, as before.
 pub async fn publish_key_packages(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<PublishBody>,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+    raw: axum::body::Bytes,
 ) -> Result<Json<PublishResult>, (StatusCode, Json<ErrorBody>)> {
     let started = std::time::Instant::now();
+    // A proof that does not verify over these bytes is no owner's, but the
+    // upload may still stock: package signatures carry that.
+    let signer =
+        crate::v0_0_2_blocks::verify_proof(&state, &headers, "POST", uri.path(), &raw, started)
+            .ok()
+            .flatten();
+    let body: PublishBody =
+        serde_json::from_slice(&raw).map_err(|e| bad("BAD_BATCH", format!("request body: {e}")))?;
     if body.key_packages_b64.is_empty() || body.key_packages_b64.len() > MAX_BATCH {
         return Err(bad(
             "BAD_BATCH",
@@ -102,39 +124,36 @@ pub async fn publish_key_packages(
             "every key package in a batch must belong to one DID",
         ));
     }
+    let owner_signed = signer.is_some_and(|caller| caller.to_did_jig_string() == did);
     state
         .auth
         .admit_and_charge(&did)
         .map_err(|outcome| refuse(&state, &outcome, started))?;
 
     let store = &state.ingest_ctx.store;
-    let (mut available, mut has_last_resort) =
-        store.key_package_stock(&did).map_err(persist_err)?;
     let now = chrono::Utc::now().timestamp();
-    let mut accepted = 0;
-    for (bytes, info) in validated {
-        // One last-resort package per DID is all it needs, and each carries a
-        // fresh reference, so without this a DID could store unboundedly
-        // many of them past `MAX_STOCK`.
-        if info.last_resort {
-            if has_last_resort {
-                continue;
-            }
-        } else if available >= MAX_STOCK {
-            continue;
+    let packages: Vec<(Vec<u8>, Vec<u8>, bool)> = validated
+        .into_iter()
+        .map(|(bytes, info)| (info.reference, bytes, info.last_resort))
+        .collect();
+    let ours = state.server_did.to_did_jig_string();
+    let accepted = match store
+        .stock_key_packages(&did, &packages, MAX_STOCK, &ours, owner_signed, now)
+        .map_err(persist_err)?
+    {
+        jig_pipeline::persist::Stocked::Accepted(n) => n as usize,
+        // JEP-0017 rule 19: custody and local adds are both ended here.
+        jig_pipeline::persist::Stocked::NotStockedHere => {
+            return Err(err(
+                StatusCode::FORBIDDEN,
+                "NOT_STOCKED_HERE",
+                format!(
+                    "{did} has ended both custody and local adds at this server, so its key \
+                     packages have no use here"
+                ),
+            ));
         }
-        if store
-            .insert_key_package(&info.reference, &did, &bytes, info.last_resort, now)
-            .map_err(persist_err)?
-        {
-            accepted += 1;
-            if info.last_resort {
-                has_last_resort = true;
-            } else {
-                available += 1;
-            }
-        }
-    }
+    };
     let (available, last_resort) = store.key_package_stock(&did).map_err(persist_err)?;
     Ok(Json(PublishResult {
         did,
@@ -167,6 +186,7 @@ pub async fn take_key_package(
     let requester = caller.map(|c| c.as_str().to_string()).unwrap_or_default();
     let take_id: [u8; 32] = rand::random();
     let custody = &state.config.custody;
+    let ours = state.server_did.to_did_jig_string();
     let ask = jig_pipeline::persist::ReleaseAsk {
         did: &did,
         requester: &requester,
@@ -180,6 +200,7 @@ pub async fn take_key_package(
         per_requester: custody.per_requester_per_hour,
         listing: None,
         kind: jig_pipeline::persist::ReleaseKind::Local,
+        server_did: &ours,
     };
     match state
         .ingest_ctx
@@ -196,6 +217,9 @@ pub async fn take_key_package(
             "RATE_LIMITED",
             format!("{did}'s key packages were taken too often in the last hour; try again later"),
         )),
+        jig_pipeline::persist::Release::LocalAddsEnded => {
+            Err(crate::v0_0_2_custody::local_adds_ended(&did))
+        }
         jig_pipeline::persist::Release::Empty | jig_pipeline::persist::Release::NotListed => {
             Err(err(
                 StatusCode::NOT_FOUND,
@@ -218,14 +242,15 @@ pub async fn key_package_stock(
     let started = std::time::Instant::now();
     admit_caller(&state, &headers, "GET", uri.path(), started)?;
     let did = jig_pipeline::effect::canonical_did_string(&did);
-    let (available, last_resort) = state
-        .ingest_ctx
-        .store
-        .key_package_stock(&did)
+    let store = &state.ingest_ctx.store;
+    let (available, last_resort) = store.key_package_stock(&did).map_err(persist_err)?;
+    let stocked = !store
+        .stock_ended(&did, &state.server_did.to_did_jig_string())
         .map_err(persist_err)?;
     Ok(Json(StockBody {
         available,
         last_resort,
+        stocked,
     }))
 }
 
@@ -300,11 +325,50 @@ mod tests {
     }
 
     async fn publish(state: &Arc<AppState>, packages: &[Vec<u8>]) -> PublishResult {
+        publish_as(state, packages, None).await
+    }
+
+    fn body_of(packages: &[Vec<u8>]) -> Vec<u8> {
+        serde_json::to_vec(&PublishBody {
+            key_packages_b64: packages.iter().map(|p| STANDARD.encode(p)).collect(),
+        })
+        .unwrap()
+    }
+
+    /// Publish `packages`, with the request signed by `signer` if given.
+    async fn publish_as(
+        state: &Arc<AppState>,
+        packages: &[Vec<u8>],
+        signer: Option<u8>,
+    ) -> PublishResult {
+        let body = body_of(packages);
+        publish_signed_over(state, &body, signer.map(|s| (s, body.clone()))).await
+    }
+
+    /// Send `body`, with a proof by `signer` over `signed` (which may differ).
+    async fn publish_signed_over(
+        state: &Arc<AppState>,
+        body: &[u8],
+        signer: Option<(u8, Vec<u8>)>,
+    ) -> PublishResult {
+        let path = "/api/v1/mls/key-packages";
+        let mut headers = axum::http::HeaderMap::new();
+        if let Some((seed, signed)) = signer {
+            let identity = jig_client::identity::Identity::from_signing_key(
+                ed25519_dalek::SigningKey::from_bytes(&[seed; 32]),
+            );
+            for (name, value) in
+                jig_client::read_auth::ReadProof::sign_body(&identity, "POST", path, &signed)
+                    .headers()
+            {
+                headers.insert(name, value.parse().unwrap());
+            }
+        }
         let Json(result) = publish_key_packages(
             State(state.clone()),
-            Json(PublishBody {
-                key_packages_b64: packages.iter().map(|p| STANDARD.encode(p)).collect(),
-            }),
+            path.parse().unwrap(),
+            headers,
+            body.to_vec().into(),
         )
         .await
         .unwrap();
@@ -312,7 +376,8 @@ mod tests {
     }
 
     /// Each last-resort package has a fresh reference, so without a cap one
-    /// DID could store as many as it liked.
+    /// DID could store as many as it liked. A new one replaces the old
+    /// (JEP-0017 rule 32), and one batch replaces it at most once.
     #[tokio::test]
     async fn a_did_keeps_one_last_resort_package() {
         let state = Arc::new(AppState::for_test().unwrap());
@@ -326,10 +391,30 @@ mod tests {
             (3, 2, true)
         );
 
-        let again = publish(&state, &m.key_packages(2, true).unwrap()).await;
+        let unsigned = publish(&state, &m.key_packages(1, true).unwrap()).await;
         assert_eq!(
-            again.accepted, 0,
-            "a second last-resort package is not stored"
+            unsigned.accepted, 0,
+            "an unsigned upload does not replace the held last-resort package"
+        );
+        let again = publish_as(&state, &m.key_packages(2, true).unwrap(), Some(7)).await;
+        assert_eq!(
+            (again.accepted, again.available, again.last_resort),
+            (1, 2, true),
+            "a new last-resort package replaces the old, once per batch"
+        );
+        let stranger = publish_as(&state, &m.key_packages(1, true).unwrap(), Some(8)).await;
+        assert_eq!(
+            stranger.accepted, 0,
+            "a request signed by another DID does not replace it"
+        );
+        // The owner's proof for one body, replayed with another: the
+        // packages it brings do not replace the held one.
+        let signed_for = body_of(&m.key_packages(1, true).unwrap());
+        let replayed = body_of(&m.key_packages(1, true).unwrap());
+        let r = publish_signed_over(&state, &replayed, Some((7, signed_for))).await;
+        assert_eq!(
+            r.accepted, 0,
+            "a proof over another body does not replace it"
         );
     }
 
@@ -382,9 +467,9 @@ mod tests {
         batch.extend(b.key_packages(1, false).unwrap());
         let refused = publish_key_packages(
             State(state),
-            Json(PublishBody {
-                key_packages_b64: batch.iter().map(|p| STANDARD.encode(p)).collect(),
-            }),
+            "/api/v1/mls/key-packages".parse().unwrap(),
+            axum::http::HeaderMap::new(),
+            body_of(&batch).into(),
         )
         .await;
         assert!(matches!(refused, Err((StatusCode::BAD_REQUEST, _))));

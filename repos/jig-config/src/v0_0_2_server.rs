@@ -452,7 +452,8 @@ impl Default for RateLimitSection {
 ///
 /// - **Members** are DIDs with a nonempty `[auth.admission] records` entry
 ///   holding no negative score, and DIDs whose admission proof of work is at
-///   least `local_member_age_secs` old.
+///   least `local_member_age_secs` old. The second kind, members by aged
+///   proof, draw only from `aged_share_pct` of the member share.
 /// - **Invited** is empty until invites exist (JEP-0009).
 /// - **Strangers** are everyone else.
 ///
@@ -476,6 +477,11 @@ pub struct PoolsSection {
     pub stranger_share_pct: u8,
     /// Percent of capacity the invited pool gets (rule 23: 10).
     pub invited_share_pct: u8,
+    /// Percent of the member share that members by aged proof may draw from
+    /// (rule 23, `aged_share`: 25). Recorded members draw from all of it.
+    /// `0` gives aged proofs no membership: those DIDs stay strangers. `100`
+    /// lets them draw from the whole member share.
+    pub aged_share_pct: u8,
     /// How long ago a DID must have done this server's admission proof of
     /// work to count as a member (rule 21's `local_member_age`).
     pub local_member_age_secs: u64,
@@ -488,6 +494,7 @@ impl Default for PoolsSection {
             writes_burst: 2_000,
             stranger_share_pct: 20,
             invited_share_pct: 10,
+            aged_share_pct: 25,
             local_member_age_secs: 7 * 24 * 60 * 60,
         }
     }
@@ -600,15 +607,6 @@ pub struct FederationSection {
     /// still checked by the signed welcome, but nothing after the welcome is
     /// protected on a plaintext link. Surfaces in `unsafe_options_active`.
     pub dangerously_allow_plaintext_federation: bool,
-    /// For tests only: a `channel-create` a configured peer relays, which
-    /// names another server as its sequencer (or none), is stored as a copy
-    /// this server sequences, as the legacy relay did before creates named
-    /// their sequencer. Clients refuse to read such a copy, because its
-    /// creation block names another server. Off, such a create is refused,
-    /// and a channel reaches a peer only once it is shared (JEP-0005):
-    /// servers that trust each other set `offers = "accept"` and use
-    /// `jig channel share`. Surfaces in `unsafe_options_active`.
-    pub naively_accept_peer_relayed_creates: bool,
     /// The quota for every peer without its own `quota`, published in the
     /// server manifest (JEP-0005 rule 16). Defaults to
     /// [`DEFAULT_PEER_BLOCKS_PER_MIN`] blocks and [`DEFAULT_PEER_BYTES_PER_MIN`]
@@ -654,7 +652,6 @@ impl Default for FederationSection {
             peers: Vec::new(),
             dangerously_disable_federation_tls: false,
             dangerously_allow_plaintext_federation: false,
-            naively_accept_peer_relayed_creates: false,
             default_peer_quota: PeerQuotaConfig {
                 blocks_per_min: DEFAULT_PEER_BLOCKS_PER_MIN,
                 bytes_per_min: DEFAULT_PEER_BYTES_PER_MIN,
@@ -763,12 +760,12 @@ impl FederationSection {
                 ));
             }
         }
-        let mut quotas: BTreeMap<&str, Option<PeerQuotaConfig>> = BTreeMap::new();
+        let mut quotas: BTreeMap<String, Option<PeerQuotaConfig>> = BTreeMap::new();
         for (i, peer) in self.peers.iter().enumerate() {
             if let Some(q) = &peer.quota {
                 check_quota(q, &format!("peers[{i}].quota"))?;
             }
-            if let Some(earlier) = quotas.insert(&peer.expected_did, peer.quota)
+            if let Some(earlier) = quotas.insert(did_spelling_key(&peer.expected_did), peer.quota)
                 && earlier != peer.quota
             {
                 return Err(format!(
@@ -1250,9 +1247,6 @@ impl JigServerConfig {
         if self.federation.dangerously_allow_plaintext_federation {
             active.push("federation.dangerously_allow_plaintext_federation".to_string());
         }
-        if self.federation.naively_accept_peer_relayed_creates {
-            active.push("federation.naively_accept_peer_relayed_creates".to_string());
-        }
         if self.identity.naively_allow_unknown_handles_fallback {
             active.push("identity.naively_allow_unknown_handles_fallback".to_string());
         }
@@ -1304,6 +1298,19 @@ impl JigServerConfig {
         // Step 3: per-bridge enabled check (also acts as deny-by-default
         // for bridges with no per_bridge entry at all)
         matches!(self.bridges.per_bridge.get(name), Some(b) if b.enabled)
+    }
+}
+
+/// One key for every spelling of a DID an operator may type: the server reads
+/// `expected_did` with `Did::canonicalize`, which trims it and decodes the
+/// body after `did:jig:z` in any letter case, so two entries that differ only
+/// there name one peer (#460). A string that is not a DID keys as itself;
+/// boot refuses it later.
+fn did_spelling_key(did: &str) -> String {
+    let did = did.trim();
+    match did.strip_prefix("did:jig:z") {
+        Some(body) => format!("did:jig:z{}", body.to_uppercase()),
+        None => did.to_string(),
     }
 }
 
@@ -1494,7 +1501,6 @@ mod tests {
         let cfg = JigServerConfig::default();
         assert!(!cfg.federation.dangerously_disable_federation_tls);
         assert!(!cfg.federation.dangerously_allow_plaintext_federation);
-        assert!(!cfg.federation.naively_accept_peer_relayed_creates);
         assert!(!cfg.identity.naively_allow_unknown_handles_fallback);
         assert!(!cfg.debug.list_handles);
     }
@@ -1550,7 +1556,6 @@ mod tests {
         let mut cfg = JigServerConfig::default();
         cfg.federation.dangerously_disable_federation_tls = true;
         cfg.federation.dangerously_allow_plaintext_federation = true;
-        cfg.federation.naively_accept_peer_relayed_creates = true;
         cfg.identity.naively_allow_unknown_handles_fallback = true;
         cfg.identity.dangerously_allow_plaintext_nameservers = true;
         cfg.debug.list_handles = true;
@@ -1563,7 +1568,6 @@ mod tests {
         assert!(active.contains(&"auth.require_authenticated_reads=false".to_string()));
         assert!(active.contains(&"federation.dangerously_disable_federation_tls".to_string()));
         assert!(active.contains(&"federation.dangerously_allow_plaintext_federation".to_string()));
-        assert!(active.contains(&"federation.naively_accept_peer_relayed_creates".to_string()));
         assert!(active.contains(&"identity.naively_allow_unknown_handles_fallback".to_string()));
         assert!(active.contains(&"identity.dangerously_allow_plaintext_nameservers".to_string()));
         assert!(active.contains(&"debug.list_handles".to_string()));
@@ -1892,6 +1896,49 @@ mod tests {
             .expect_err("a misspelled per-bridge key must be rejected");
         assert!(err.to_string().contains("enabeld"), "got: {err}");
         assert!(toml::from_str::<JigServerConfig>("[sever]\n").is_err());
+    }
+
+    /// `naively_accept_peer_relayed_creates` went with the legacy relay it
+    /// configured. A config that still sets it does not boot, and the error
+    /// names the key, so the operator knows which line to delete.
+    #[test]
+    fn the_removed_relayed_creates_flag_is_refused_by_name() {
+        for value in ["true", "false"] {
+            let err = toml::from_str::<JigServerConfig>(&format!(
+                "[federation]\nnaively_accept_peer_relayed_creates = {value}\n"
+            ))
+            .expect_err("the removed key must not parse");
+            assert!(
+                err.to_string()
+                    .contains("naively_accept_peer_relayed_creates"),
+                "{err}"
+            );
+        }
+    }
+
+    /// Two entries for one peer, spelled in different letter case, are one
+    /// peer: given different quotas they are refused as a duplicate, as the
+    /// same spelling twice is (#460).
+    #[test]
+    fn one_peer_in_two_letter_cases_with_two_quotas_is_refused() {
+        let config = |second: &str| {
+            format!(
+                "[[federation.peers]]\nurl = \"wss://a.example\"\nexpected_did = \"did:jig:zabcd\"\n\
+                 quota = {{ blocks_per_min = 10, bytes_per_min = 1000 }}\n\
+                 [[federation.peers]]\nurl = \"wss://a.example\"\nexpected_did = \"{second}\"\n\
+                 quota = {{ blocks_per_min = 20, bytes_per_min = 1000 }}\n"
+            )
+        };
+        for second in ["did:jig:zabcd", "did:jig:zABCD", " did:jig:zAbCd "] {
+            let cfg: JigServerConfig = toml::from_str(&config(second)).unwrap();
+            let err = cfg.federation.validate().expect_err(second);
+            assert!(
+                err.contains("more than once with different quotas"),
+                "{err}"
+            );
+        }
+        let cfg: JigServerConfig = toml::from_str(&config("did:jig:zwxyz")).unwrap();
+        assert!(cfg.federation.validate().is_ok());
     }
 
     #[test]

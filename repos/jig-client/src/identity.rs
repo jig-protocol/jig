@@ -806,6 +806,18 @@ impl Identity {
         )
     }
 
+    /// This DID's word to the server `server` on whether others may add it
+    /// to the channels that server sequences (JEP-0017 R2): `allow = false`
+    /// ends local adds, `allow = true` at a higher `seq` undoes that.
+    pub fn sign_local_adds(
+        &self,
+        server: &str,
+        allow: bool,
+        seq: u64,
+    ) -> jig_core::contract::LocalAdds {
+        jig_core::contract::LocalAdds::sign(&self.signing, server, allow, seq)
+    }
+
     /// The DID's own key as an MLS group member. The same key signs blocks
     /// and MLS messages — see `jig_mls::credential`. Crate-private so the
     /// seed never leaves this crate.

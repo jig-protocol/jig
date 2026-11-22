@@ -96,6 +96,9 @@ pub struct ReleaseAsk<'a> {
     pub listing: Option<&'a [u8]>,
     /// Which route this release is for, as the log records it.
     pub kind: ReleaseKind,
+    /// This server's DID, which a channel it sequences names, so that a
+    /// release for one can be refused under the DID's local-adds marker.
+    pub server_did: &'a str,
 }
 
 /// Which hourly limit a release hit.
@@ -120,11 +123,40 @@ pub enum Release {
     /// The record `listing` named is no longer the one kept: custody was
     /// withdrawn or replaced since it was checked. Nothing was released.
     NotListed,
+    /// The DID has ended local adds here (JEP-0017 R2), and this release was
+    /// for a channel this server sequences, or by this server's own route.
+    /// Nothing was released.
+    LocalAddsEnded,
+}
+
+/// A DID's newest `jig-local-adds-v1` marker kept here (JEP-0017 R2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalAddsMarker {
+    pub seq: u64,
+    pub allow: bool,
+    /// The DID's own COSE_Sign1, kept as it was sent.
+    pub envelope: Vec<u8>,
+}
+
+/// What [`SqliteStore::stock_key_packages`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stocked {
+    /// This many packages were stored.
+    Accepted(u64),
+    /// The DID has ended both custody and local adds here (JEP-0017 rule
+    /// 19): its stock has no use, so nothing was stored.
+    NotStockedHere,
 }
 
 /// One entry of a custodian's release log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseLogEntry {
+    /// The entry's own identity: the hash of the request it answered, unique
+    /// per row (a local take's is a fresh random one).
+    pub id: Vec<u8>,
+    /// The released package's hash reference, so its owner can delete that
+    /// package's private init key (JEP-0017 rule 32).
+    pub reference: Vec<u8>,
     pub requester: String,
     pub channel_id: String,
     pub last_resort: bool,
@@ -985,6 +1017,39 @@ pub enum Landing {
     /// The guarded right no longer held at the block's seq; nothing was
     /// written.
     Unauthorized,
+    /// A `member-add` of a DID that has ended local adds here (JEP-0017
+    /// R2), read in the landing's transaction; nothing was written.
+    Declined,
+}
+
+/// A `member-add` refused because its member has ended local adds here
+/// (JEP-0017 rule 16). The error the plain landing path returns, so ingest
+/// can tell it from any other.
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+#[error("{member} has asked this server not to be added to the channels it sequences")]
+pub struct MemberDeclined {
+    pub member: String,
+}
+
+/// Whether `block` adds a DID other than its signer that has ended local
+/// adds here (JEP-0017 rule 16). A DID's own join is its act, not an add by
+/// others, so it is never declined. Read on the landing's transaction.
+fn declined_on(
+    conn: &Connection,
+    block: &StoredBlock,
+    membership: &MembershipChange,
+) -> Result<bool> {
+    let MembershipChange::Upsert(m) = membership else {
+        return Ok(false);
+    };
+    if block.block_kind != "member-add" {
+        return Ok(false);
+    }
+    let member = crate::effect::canonical_did_string(&m.member_did);
+    if member == crate::effect::canonical_did_string(&block.sender_did) {
+        return Ok(false);
+    }
+    local_adds_ended_on(conn, &member)
 }
 
 fn role_blocks_before_on(
@@ -1324,6 +1389,18 @@ impl SqliteStore {
                 stored_at  INTEGER NOT NULL
             );
 
+            -- Each DID's newest local-adds marker (JEP-0017 R2): whether
+            -- others may add it to the channels this server sequences. The
+            -- envelope is the DID's own `jig-local-adds-v1`. `seq` is 8
+            -- big-endian bytes, as in `reachability_records`.
+            CREATE TABLE IF NOT EXISTS local_adds (
+                did        TEXT PRIMARY KEY,
+                seq        BLOB NOT NULL,
+                allow      INTEGER NOT NULL,
+                envelope   BLOB NOT NULL,
+                stored_at  INTEGER NOT NULL
+            );
+
             -- Every key package this server released as a custodian
             -- (JEP-0005 rule 21), with the signed request it answered. Also
             -- what the per-DID and per-requester limits count.
@@ -1456,6 +1533,9 @@ impl SqliteStore {
         rekey_channels_by_id(conn)?;
         rebuild_channels_slug_per_sequencer(conn)?;
         add_channel_tiers(conn)?;
+        // JEP-0017 rule 32: a custody release made before a withdrawal is
+        // never repeated after it.
+        add_column_if_missing(conn, "kp_releases", "retired", "INTEGER NOT NULL DEFAULT 0")?;
         rebuild_alias_attestations_with_suffix(conn)?;
         crate::contracts::migrate(conn)?;
         crate::follow::migrate(conn)?;
@@ -1718,6 +1798,9 @@ impl SqliteStore {
         }
         let mut conn = self.conn.lock().expect("poisoned");
         let tx = conn.transaction()?;
+        if declined_on(&tx, b, membership)? {
+            return Ok(Landing::Declined);
+        }
         insert_block_on(&tx, b)?;
         let record = sequence_on(&tx, &b.cid, signer)?;
         if let Some(guard) = guard
@@ -2623,7 +2706,7 @@ impl SqliteStore {
                 signer, None,
             )? {
                 Landing::Landed(record) => Some(record),
-                Landing::LostRace | Landing::Unauthorized => None,
+                Landing::LostRace | Landing::Unauthorized | Landing::Declined => None,
             },
         )
     }
@@ -2649,6 +2732,9 @@ impl SqliteStore {
     ) -> Result<Landing> {
         let mut conn = self.conn.lock().expect("poisoned");
         let tx = conn.transaction()?;
+        if declined_on(&tx, block, membership)? {
+            return Ok(Landing::Declined);
+        }
         // `group_info` replaces the stored one even when `None`: a group info
         // describes one epoch, and serving the previous epoch's under the new
         // one would send every external joiner into a stale commit.
@@ -2703,13 +2789,81 @@ impl SqliteStore {
         Ok(inserted > 0)
     }
 
+    /// After `did` withdrew custody here: mark every custody release of its
+    /// packages retired, so none is answered again as a repeat. Its owner
+    /// deletes those packages' keys (JEP-0017 rule 32). The rows stay in the
+    /// log, and still count against the limits.
+    pub fn retire_custody_releases(&self, did: &str) -> Result<usize> {
+        let changed = self.conn.lock().expect("poisoned").execute(
+            "UPDATE kp_releases SET retired = 1
+              WHERE did = ?1 AND kind = 'custody' AND retired = 0",
+            [did],
+        )?;
+        Ok(changed)
+    }
+
+    /// Store `did`'s new last-resort package and retire any it had: they are
+    /// no longer released, and their rows stay, marked `consumed_at`, so
+    /// nobody holding one can upload it again to bring it back (JEP-0017
+    /// rule 32). Returns whether the package was new.
+    pub fn replace_last_resort(
+        &self,
+        reference: &[u8],
+        did: &str,
+        package: &[u8],
+        now: i64,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO mls_key_packages
+                (reference, did, package, last_resort, published_at)
+             VALUES (?,?,?,1,?)",
+            params![reference, did, package, now],
+        )? > 0;
+        if inserted {
+            retire_last_resorts_on(&tx, did, reference, now)?;
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
     /// Keep `envelope`, `did`'s reachability record at `seq`, unless a record
     /// with this `seq` or a higher one is kept already. Returns whether it was
     /// stored. The caller verifies the record.
-    pub fn put_reachability(&self, did: &str, seq: u64, envelope: &[u8], now: i64) -> Result<bool> {
+    ///
+    /// In the same transaction: if the record kept now withdraws custody from
+    /// `server_did` while `did` has ended local adds here, `did`'s stock has
+    /// no use and is deleted (JEP-0017 rule 19).
+    pub fn put_reachability(
+        &self,
+        did: &str,
+        seq: u64,
+        envelope: &[u8],
+        server_did: &str,
+        now: i64,
+    ) -> Result<bool> {
+        self.put_reachability_retiring(did, seq, envelope, server_did, now, false)
+    }
+
+    /// [`Self::put_reachability`]; with `withdrawal`, a stored record also
+    /// retires `did`'s custody releases ([`Self::retire_custody_releases`])
+    /// in the same transaction, so a crash cannot keep the record and leave
+    /// the releases repeatable.
+    pub fn put_reachability_retiring(
+        &self,
+        did: &str,
+        seq: u64,
+        envelope: &[u8],
+        server_did: &str,
+        now: i64,
+        withdrawal: bool,
+    ) -> Result<bool> {
         // Big-endian bytes compare as the numbers do, across all of u64.
         let seq = seq.to_be_bytes().to_vec();
-        let changed = self.conn.lock().expect("poisoned").execute(
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
             "INSERT INTO reachability_records (did, seq, envelope, stored_at)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(did) DO UPDATE
@@ -2718,7 +2872,146 @@ impl SqliteStore {
               WHERE excluded.seq > reachability_records.seq",
             params![did, seq, envelope, now],
         )?;
+        if changed > 0 && withdrawal {
+            tx.execute(
+                "UPDATE kp_releases SET retired = 1
+                  WHERE did = ?1 AND kind = 'custody' AND retired = 0",
+                [did],
+            )?;
+        }
+        if stock_ended_on(&tx, did, server_did)? {
+            purge_stock_on(&tx, did, now)?;
+        }
+        tx.commit()?;
         Ok(changed > 0)
+    }
+
+    /// Keep `envelope`, `did`'s local-adds marker at `seq` (JEP-0017 R2),
+    /// unless one with this `seq` or a higher one is kept already. Returns the
+    /// marker kept afterwards, whichever it is. The caller verifies the
+    /// marker.
+    ///
+    /// In the same transaction, as [`Self::put_reachability`]: once custody
+    /// and local adds are both ended here, `did`'s stock is deleted.
+    pub fn put_local_adds(
+        &self,
+        did: &str,
+        seq: u64,
+        allow: bool,
+        envelope: &[u8],
+        server_did: &str,
+        now: i64,
+    ) -> Result<LocalAddsMarker> {
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO local_adds (did, seq, allow, envelope, stored_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(did) DO UPDATE
+                SET seq = excluded.seq, allow = excluded.allow,
+                    envelope = excluded.envelope, stored_at = excluded.stored_at
+              WHERE excluded.seq > local_adds.seq",
+            params![did, seq.to_be_bytes().to_vec(), allow, envelope, now],
+        )?;
+        let kept = local_adds_on(&tx, did)?.expect("a marker was just kept");
+        if stock_ended_on(&tx, did, server_did)? {
+            purge_stock_on(&tx, did, now)?;
+        }
+        tx.commit()?;
+        Ok(kept)
+    }
+
+    /// `did`'s kept local-adds marker, if it sent one.
+    pub fn local_adds(&self, did: &str) -> Result<Option<LocalAddsMarker>> {
+        local_adds_on(&self.conn.lock().expect("poisoned"), did)
+    }
+
+    /// Whether `did` has ended local adds here: its kept marker says
+    /// `allow = false`.
+    pub fn local_adds_ended(&self, did: &str) -> Result<bool> {
+        local_adds_ended_on(&self.conn.lock().expect("poisoned"), did)
+    }
+
+    /// Whether `did` has ended both custody and local adds at `server_did`
+    /// (JEP-0017 rule 19): its stock is ended here, and nothing of it is
+    /// handed out any more.
+    pub fn stock_ended(&self, did: &str, server_did: &str) -> Result<bool> {
+        stock_ended_on(&self.conn.lock().expect("poisoned"), did, server_did)
+    }
+
+    /// Store `did`'s validated packages, `(reference, bytes, last_resort)`,
+    /// in one transaction: at most one last-resort package, and ordinary ones
+    /// up to `max_stock` unconsumed. Nothing is stored while `did` has ended
+    /// both custody and local adds at `server_did` (JEP-0017 rule 19).
+    pub fn stock_key_packages(
+        &self,
+        did: &str,
+        packages: &[(Vec<u8>, Vec<u8>, bool)],
+        max_stock: u64,
+        server_did: &str,
+        owner_signed: bool,
+        now: i64,
+    ) -> Result<Stocked> {
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        if stock_ended_on(&tx, did, server_did)? {
+            return Ok(Stocked::NotStockedHere);
+        }
+        let mut available: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM mls_key_packages
+              WHERE did = ? AND consumed_at IS NULL AND last_resort = 0",
+            [did],
+            |r| r.get(0),
+        )?;
+        let has_last_resort: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mls_key_packages
+                            WHERE did = ? AND last_resort = 1 AND consumed_at IS NULL)",
+            [did],
+            |r| r.get(0),
+        )?;
+        let mut accepted = 0;
+        let mut last_resort_seen = false;
+        for (reference, package, last_resort) in packages {
+            // One last-resort package per DID is in use at a time. A new one
+            // replaces the old, which its owner rotates out after withdrawing
+            // custody (JEP-0017 rule 32); only the DID can sign a new one, and
+            // a batch replaces it at most once.
+            if *last_resort {
+                if last_resort_seen {
+                    continue;
+                }
+                last_resort_seen = true;
+                // A package signature is not fresh: anyone released an old
+                // last-resort package could upload it to retire a usable one.
+                // Only an upload the DID signed replaces the one held.
+                if has_last_resort && !owner_signed {
+                    continue;
+                }
+            } else if available as u64 >= max_stock {
+                continue;
+            }
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO mls_key_packages
+                    (reference, did, package, last_resort, published_at)
+                 VALUES (?,?,?,?,?)",
+                params![reference, did, package, last_resort, now],
+            )? > 0;
+            if !inserted {
+                continue;
+            }
+            accepted += 1;
+            if *last_resort {
+                // The rows retired stay, marked consumed, so the package is
+                // never released or accepted again.
+                if has_last_resort {
+                    retire_last_resorts_on(&tx, did, reference, now)?;
+                }
+            } else {
+                available += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(Stocked::Accepted(accepted))
     }
 
     /// `did`'s kept reachability record, as its envelope.
@@ -2762,15 +3055,27 @@ impl SqliteStore {
                 return Ok(Release::NotListed);
             }
         }
+        // JEP-0017 R2, in the same transaction as the release: a marker
+        // stored meanwhile wins. Custody for channels other servers sequence,
+        // or that this server does not know, is unaffected.
+        if local_adds_ended_on(&tx, ask.did)?
+            && (ask.kind == ReleaseKind::Local
+                || channel_sequenced_here_on(&tx, ask.channel_id, ask.server_did)?)
+        {
+            return Ok(Release::LocalAddsEnded);
+        }
         let earlier: Option<(Vec<u8>, Vec<u8>, bool)> = if ask.repeat {
             tx.query_row(
                 // The exact request first: its own answer, even when a later
                 // request for the same tuple got another package.
+                // A replaced last-resort package is dead (its owner deleted
+                // its key): a repeat gets a fresh release instead.
                 "SELECT k.package, r.reference, r.last_resort
                    FROM kp_releases r JOIN mls_key_packages k ON k.reference = r.reference
-                  WHERE r.request_hash = ?5
-                     OR (r.did = ?1 AND r.requester = ?2 AND r.channel_id = ?3
-                         AND r.released_at > ?4)
+                  WHERE (k.last_resort = 0 OR k.consumed_at IS NULL) AND r.retired = 0
+                    AND (r.request_hash = ?5
+                         OR (r.did = ?1 AND r.requester = ?2 AND r.channel_id = ?3
+                             AND r.released_at > ?4))
                   ORDER BY (r.request_hash = ?5) DESC, r.released_at DESC LIMIT 1",
                 params![
                     ask.did,
@@ -2829,7 +3134,7 @@ impl SqliteStore {
                 let resort: Option<(Vec<u8>, Vec<u8>)> = tx
                     .query_row(
                         "SELECT reference, package FROM mls_key_packages
-                          WHERE did = ? AND last_resort = 1
+                          WHERE did = ? AND last_resort = 1 AND consumed_at IS NULL
                           ORDER BY published_at DESC, reference DESC LIMIT 1",
                         [ask.did],
                         |r| Ok((r.get(0)?, r.get(1)?)),
@@ -2867,10 +3172,17 @@ impl SqliteStore {
             )?;
         }
         tx.execute(
+            // The same request can be here already only if the package it
+            // got was a last-resort one since replaced, or it was retired by
+            // a withdrawal (the repeat lookup above skips both): it now
+            // names the new one.
             "INSERT INTO kp_releases
                 (request_hash, did, requester, channel_id, reference, last_resort,
                  request, released_at, kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(request_hash) DO UPDATE
+                SET reference = excluded.reference, last_resort = excluded.last_resort,
+                    released_at = excluded.released_at, counted = 1, retired = 0",
             params![
                 ask.request_hash,
                 ask.did,
@@ -2892,15 +3204,30 @@ impl SqliteStore {
 
     /// The custodian's log of `did`'s releases, newest first, at most `limit`.
     pub fn key_package_releases(&self, did: &str, limit: u32) -> Result<Vec<ReleaseLogEntry>> {
+        self.key_package_releases_page(did, limit, 0)
+    }
+
+    /// [`Self::key_package_releases`], skipping the `offset` newest entries.
+    /// A release logged between two pages shifts the next page by one, so a
+    /// reader paging through sees an entry twice, never misses one.
+    pub fn key_package_releases_page(
+        &self,
+        did: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<ReleaseLogEntry>> {
         let conn = self.conn.lock().expect("poisoned");
         let mut stmt = conn.prepare(
-            "SELECT requester, channel_id, last_resort, request, released_at, kind
+            "SELECT requester, channel_id, last_resort, request, released_at, kind, reference,
+                    request_hash
                FROM kp_releases WHERE did = ?1 AND counted = 1
-              ORDER BY released_at DESC, request_hash ASC LIMIT ?2",
+              ORDER BY released_at DESC, request_hash ASC LIMIT ?2 OFFSET ?3",
         )?;
         let rows = stmt
-            .query_map(params![did, limit], |r| {
+            .query_map(params![did, limit, offset], |r| {
                 Ok(ReleaseLogEntry {
+                    id: r.get(7)?,
+                    reference: r.get(6)?,
                     requester: r.get(0)?,
                     channel_id: r.get(1)?,
                     last_resort: r.get(2)?,
@@ -2967,7 +3294,8 @@ impl SqliteStore {
             |r| r.get(0),
         )?;
         let last_resort: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM mls_key_packages WHERE did = ? AND last_resort = 1)",
+            "SELECT EXISTS(SELECT 1 FROM mls_key_packages
+                            WHERE did = ? AND last_resort = 1 AND consumed_at IS NULL)",
             [did],
             |r| r.get(0),
         )?;
@@ -3394,6 +3722,124 @@ pub(crate) fn archive_channel_by_id_on(
     )?;
     Ok(changed > 0)
 }
+/// `did`'s kept local-adds marker, read on `conn` (a transaction's, so the
+/// caller's checks see what it will commit against).
+fn local_adds_on(conn: &Connection, did: &str) -> Result<Option<LocalAddsMarker>> {
+    conn.query_row(
+        "SELECT seq, allow, envelope FROM local_adds WHERE did = ?",
+        [did],
+        |r| {
+            let seq: Vec<u8> = r.get(0)?;
+            Ok((seq, r.get::<_, bool>(1)?, r.get::<_, Vec<u8>>(2)?))
+        },
+    )
+    .optional()?
+    .map(|(seq, allow, envelope)| {
+        let seq: [u8; 8] = seq
+            .try_into()
+            .map_err(|_| PersistError::Corrupt("a local-adds seq is not 8 bytes".into()))?;
+        Ok(LocalAddsMarker {
+            seq: u64::from_be_bytes(seq),
+            allow,
+            envelope,
+        })
+    })
+    .transpose()
+}
+
+/// Whether `did`'s kept marker ends local adds here (JEP-0017 R2).
+pub(crate) fn local_adds_ended_on(conn: &Connection, did: &str) -> Result<bool> {
+    Ok(local_adds_on(conn, did)?.is_some_and(|m| !m.allow))
+}
+
+/// Whether `did`'s kept reachability record withdraws custody from
+/// `server_did` (JEP-0005 rule 21a): one is kept and it does not list this
+/// server. A record that does not parse was verified when kept, so this
+/// does not happen; it is read as not withdrawing.
+fn custody_withdrawn_on(conn: &Connection, did: &str, server_did: &str) -> Result<bool> {
+    let kept: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT envelope FROM reachability_records WHERE did = ?",
+            [did],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(envelope) = kept else {
+        return Ok(false);
+    };
+    let ours = crate::effect::canonical_did_string(server_did);
+    Ok(
+        jig_core::naming::ReachabilityRecord::from_envelope(&envelope).is_ok_and(|record| {
+            !record
+                .servers
+                .iter()
+                .any(|(server, _)| crate::effect::canonical_did_string(server) == ours)
+        }),
+    )
+}
+
+/// Whether `did` has ended both custody and local adds at `server_did`, so
+/// its stock there has no use (JEP-0017 rule 19).
+fn stock_ended_on(conn: &Connection, did: &str, server_did: &str) -> Result<bool> {
+    Ok(local_adds_ended_on(conn, did)? && custody_withdrawn_on(conn, did, server_did)?)
+}
+
+/// Retire every last-resort package of `did` in use but `reference`: never
+/// released or accepted again, its row kept, marked consumed (JEP-0017
+/// rule 32).
+fn retire_last_resorts_on(conn: &Connection, did: &str, reference: &[u8], now: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE mls_key_packages SET consumed_at = ?
+          WHERE did = ? AND last_resort = 1 AND consumed_at IS NULL
+            AND reference != ?",
+        params![now, did, reference],
+    )?;
+    Ok(())
+}
+
+/// End `did`'s stock (JEP-0017 rule 19): delete its ordinary packages never
+/// released, which nobody else holds, and retire its last-resort one in use.
+/// Rows of released or retired packages stay, marked consumed, so their
+/// references cannot be stored again: whoever was released one could
+/// otherwise upload it once uploads resume, and the server would hand out a
+/// package whose key its owner deleted.
+fn purge_stock_on(conn: &Connection, did: &str, now: i64) -> Result<usize> {
+    let deleted = conn.execute(
+        "DELETE FROM mls_key_packages
+          WHERE did = ? AND consumed_at IS NULL AND last_resort = 0",
+        [did],
+    )?;
+    let retired = conn.execute(
+        "UPDATE mls_key_packages SET consumed_at = ?
+          WHERE did = ? AND consumed_at IS NULL AND last_resort = 1",
+        params![now, did],
+    )?;
+    Ok(deleted + retired)
+}
+
+/// Whether the channel `channel_id` names is one this server sequences: a
+/// channel it holds whose sequencer is `server_did`, or names none (a
+/// channel from before sequencers were recorded is this server's own). A
+/// channel it does not hold is not.
+fn channel_sequenced_here_on(
+    conn: &Connection,
+    channel_id: &str,
+    server_did: &str,
+) -> Result<bool> {
+    let sequencer: Option<String> = conn
+        .query_row(
+            "SELECT sequencer_did FROM channels WHERE id = ?",
+            [channel_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(sequencer.is_some_and(|s| {
+        s.is_empty()
+            || crate::effect::canonical_did_string(&s)
+                == crate::effect::canonical_did_string(server_did)
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4773,6 +5219,7 @@ mod tests {
             per_requester: 2,
             listing: None,
             kind: ReleaseKind::Custody,
+            server_did: "did:jig:zserver",
         }
     }
 
@@ -4824,6 +5271,264 @@ mod tests {
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].requester, "did:jig:zA");
         assert_eq!(log[0].request, b"signed request");
+    }
+
+    #[test]
+    fn a_new_last_resort_package_retires_the_old_for_good() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let did = "did:jig:zD";
+        store
+            .insert_key_package(b"old", did, b"kpOld", true, 1)
+            .unwrap();
+        assert_eq!(
+            store
+                .release_key_package(&ask(did, "did:jig:zA", b"h1", 100))
+                .unwrap(),
+            Release::Released {
+                package: b"kpOld".to_vec(),
+                last_resort: true
+            }
+        );
+        assert!(
+            store
+                .replace_last_resort(b"new", did, b"kpNew", 200)
+                .unwrap()
+        );
+        assert_eq!(store.key_package_stock(did).unwrap(), (0, true));
+        // A repeat of the earlier request gets the new package, not the dead one.
+        assert_eq!(
+            store
+                .release_key_package(&ask(did, "did:jig:zA", b"h1", 300))
+                .unwrap(),
+            Release::Released {
+                package: b"kpNew".to_vec(),
+                last_resort: true
+            }
+        );
+        // The old one cannot be brought back, by either route.
+        assert!(
+            !store
+                .replace_last_resort(b"old", did, b"kpOld", 400)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .insert_key_package(b"old", did, b"kpOld", true, 400)
+                .unwrap()
+        );
+        let resort = store
+            .release_key_package(&ask(did, "did:jig:zB", b"h2", 500))
+            .unwrap();
+        assert_eq!(
+            resort,
+            Release::Released {
+                package: b"kpNew".to_vec(),
+                last_resort: true
+            }
+        );
+    }
+
+    /// Replacing a held last-resort package takes an upload the DID signed:
+    /// an unsigned one, perhaps replaying an old package released elsewhere,
+    /// is skipped and the held one stays in use. With none held, an unsigned
+    /// upload stocks one as before.
+    #[test]
+    fn an_unsigned_upload_does_not_replace_the_last_resort_package() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let did = "did:jig:zD";
+        let stock = |r: &[u8], p: &[u8], signed, now| {
+            store
+                .stock_key_packages(
+                    did,
+                    &[(r.to_vec(), p.to_vec(), true)],
+                    10,
+                    "did:jig:zS",
+                    signed,
+                    now,
+                )
+                .unwrap()
+        };
+        assert_eq!(stock(b"held", b"kpHeld", false, 1), Stocked::Accepted(1));
+        assert_eq!(
+            stock(b"replay", b"kpReplay", false, 2),
+            Stocked::Accepted(0)
+        );
+        assert_eq!(
+            store
+                .release_key_package(&ask(did, "did:jig:zA", b"h1", 100))
+                .unwrap(),
+            Release::Released {
+                package: b"kpHeld".to_vec(),
+                last_resort: true
+            }
+        );
+        assert_eq!(stock(b"fresh", b"kpFresh", true, 200), Stocked::Accepted(1));
+        assert_eq!(
+            store
+                .release_key_package(&ask(did, "did:jig:zB", b"h2", 300))
+                .unwrap(),
+            Release::Released {
+                package: b"kpFresh".to_vec(),
+                last_resort: true
+            }
+        );
+    }
+
+    /// The same through an upload batch (`stock_key_packages`), which is
+    /// what the key-package route runs: a repeat after a replacement never
+    /// gets the replaced package, and the replaced one is never taken back.
+    #[test]
+    fn an_uploaded_last_resort_package_retires_the_old_for_good() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let did = "did:jig:zD";
+        let stock = |r: &[u8], p: &[u8], now| {
+            store
+                .stock_key_packages(
+                    did,
+                    &[(r.to_vec(), p.to_vec(), true)],
+                    10,
+                    "did:jig:zS",
+                    true,
+                    now,
+                )
+                .unwrap()
+        };
+        assert_eq!(stock(b"old", b"kpOld", 1), Stocked::Accepted(1));
+        let released = |requester, hash: &[u8], now| {
+            store
+                .release_key_package(&ask(did, requester, hash, now))
+                .unwrap()
+        };
+        let got = |p: &[u8]| Release::Released {
+            package: p.to_vec(),
+            last_resort: true,
+        };
+        assert_eq!(released("did:jig:zA", b"h1", 100), got(b"kpOld"));
+        assert_eq!(stock(b"new", b"kpNew", 200), Stocked::Accepted(1));
+        assert_eq!(store.key_package_stock(did).unwrap(), (0, true));
+        assert_eq!(released("did:jig:zA", b"h1", 300), got(b"kpNew"));
+        assert_eq!(stock(b"old", b"kpOld", 400), Stocked::Accepted(0));
+        // Two in one batch: the first replaces, the second is ignored.
+        let batch = [
+            (b"n2".to_vec(), b"kpN2".to_vec(), true),
+            (b"n3".to_vec(), b"kpN3".to_vec(), true),
+        ];
+        assert_eq!(
+            store
+                .stock_key_packages(did, &batch, 10, "did:jig:zS", true, 500)
+                .unwrap(),
+            Stocked::Accepted(1)
+        );
+        assert_eq!(released("did:jig:zB", b"h2", 600), got(b"kpN2"));
+        assert_eq!(released("did:jig:zA", b"h1", 700), got(b"kpN2"));
+    }
+
+    #[test]
+    fn a_withdrawal_retires_custody_releases_so_no_repeat_returns_them() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let did = "did:jig:zD";
+        store
+            .insert_key_package(b"r1", did, b"kp1", false, 1)
+            .unwrap();
+        store
+            .insert_key_package(b"r2", did, b"kp2", false, 2)
+            .unwrap();
+        let first = store
+            .release_key_package(&ask(did, "did:jig:zA", b"h1", 100))
+            .unwrap();
+        assert!(matches!(first, Release::Released { ref package, .. } if package == b"kp1"));
+        // Stored with the withdrawal, in one transaction.
+        assert!(
+            store
+                .put_reachability_retiring(did, 2, b"w", "did:jig:zserver", 120, true)
+                .unwrap()
+        );
+        // Within the repeat window, a new request and the same request
+        // resent both get a fresh package, never the retired one.
+        let again = store
+            .release_key_package(&ask(did, "did:jig:zA", b"h2", 150))
+            .unwrap();
+        assert!(matches!(again, Release::Released { ref package, .. } if package == b"kp2"));
+        assert_eq!(store.retire_custody_releases(did).unwrap(), 1);
+        let resent = store
+            .release_key_package(&ask(did, "did:jig:zA", b"h1", 160))
+            .unwrap();
+        assert_eq!(resent, Release::Empty);
+    }
+
+    #[test]
+    fn a_withdrawal_whose_retirement_fails_is_not_kept() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let did = "did:jig:zD";
+        store
+            .insert_key_package(b"r1", did, b"kp1", false, 1)
+            .unwrap();
+        let _ = store
+            .release_key_package(&ask(did, "did:jig:zA", b"h1", 100))
+            .unwrap();
+        assert!(
+            store
+                .put_reachability(did, 1, b"listing", "did:jig:zserver", 100)
+                .unwrap()
+        );
+        // Make the retirement step fail inside the transaction.
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_retire BEFORE UPDATE OF retired ON kp_releases
+                 BEGIN SELECT RAISE(ABORT, 'retirement fails'); END;",
+            )
+            .unwrap();
+        assert!(
+            store
+                .put_reachability_retiring(did, 2, b"withdrawal", "did:jig:zserver", 120, true)
+                .is_err()
+        );
+        // Rolled back whole: the listing is still the kept record.
+        assert_eq!(
+            store.reachability(did).unwrap().as_deref(),
+            Some(&b"listing"[..])
+        );
+    }
+
+    #[test]
+    fn the_release_log_names_each_package_and_pages_newest_first() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let did = "did:jig:zD";
+        for (n, r) in [b"r1", b"r2", b"r3"].iter().enumerate() {
+            store
+                .insert_key_package(*r, did, b"kp", false, n as i64)
+                .unwrap();
+        }
+        for (n, h) in [b"h1", b"h2", b"h3"].iter().enumerate() {
+            let requester = format!("did:jig:zA{n}");
+            let released = store
+                .release_key_package(&ask(did, &requester, *h, 100 + n as i64 * 10_000))
+                .unwrap();
+            assert!(matches!(released, Release::Released { .. }));
+        }
+        let first = store.key_package_releases_page(did, 2, 0).unwrap();
+        let rest = store.key_package_releases_page(did, 2, 2).unwrap();
+        let refs: Vec<_> = first
+            .iter()
+            .chain(&rest)
+            .map(|e| e.reference.clone())
+            .collect();
+        // Oldest package released first, so the newest entry names r3.
+        assert_eq!(refs, [b"r3".to_vec(), b"r2".to_vec(), b"r1".to_vec()]);
+        assert!(
+            store
+                .key_package_releases_page(did, 2, 3)
+                .unwrap()
+                .is_empty()
+        );
+        // Each entry has its own id, even where package and time could repeat.
+        let mut ids: Vec<_> = first.iter().chain(&rest).map(|e| e.id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 3);
     }
 
     #[test]
@@ -4907,10 +5612,26 @@ mod tests {
         let store = SqliteStore::open_in_memory().unwrap();
         let did = "did:jig:zD";
         let edge = i64::MAX as u64;
-        assert!(store.put_reachability(did, edge, b"edge", 1).unwrap());
-        assert!(store.put_reachability(did, edge + 1, b"past", 2).unwrap());
-        assert!(store.put_reachability(did, u64::MAX, b"top", 3).unwrap());
-        assert!(!store.put_reachability(did, edge + 1, b"older", 4).unwrap());
+        assert!(
+            store
+                .put_reachability(did, edge, b"edge", "did:jig:zserver", 1)
+                .unwrap()
+        );
+        assert!(
+            store
+                .put_reachability(did, edge + 1, b"past", "did:jig:zserver", 2)
+                .unwrap()
+        );
+        assert!(
+            store
+                .put_reachability(did, u64::MAX, b"top", "did:jig:zserver", 3)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .put_reachability(did, edge + 1, b"older", "did:jig:zserver", 4)
+                .unwrap()
+        );
         assert_eq!(store.reachability(did).unwrap().unwrap(), b"top");
     }
 
@@ -5041,9 +5762,13 @@ mod tests {
         store
             .insert_key_package(b"r1", did, b"kp1", false, 1)
             .unwrap();
-        store.put_reachability(did, 1, b"listing", 1).unwrap();
+        store
+            .put_reachability(did, 1, b"listing", "did:jig:zserver", 1)
+            .unwrap();
         // A withdrawal lands between the handler's check and the release.
-        store.put_reachability(did, 2, b"withdrawal", 2).unwrap();
+        store
+            .put_reachability(did, 2, b"withdrawal", "did:jig:zserver", 2)
+            .unwrap();
         let mut a = ask(did, "did:jig:zA", b"h1", 100);
         a.listing = Some(b"listing");
         assert_eq!(store.release_key_package(&a).unwrap(), Release::NotListed);
@@ -5058,6 +5783,263 @@ mod tests {
             store.release_key_package(&a).unwrap(),
             Release::Released { .. }
         ));
+    }
+
+    /// A member, the server, and a record of the member's that lists or
+    /// withdraws the server, signed as they are on the wire (JEP-0017 R2).
+    struct R2 {
+        did: String,
+        server: String,
+        key: ed25519_dalek::SigningKey,
+    }
+
+    impl R2 {
+        fn new() -> Self {
+            let key = ed25519_dalek::SigningKey::from_bytes(&[0x21; 32]);
+            let did_of = |k: &ed25519_dalek::SigningKey| {
+                jig_core::Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+            };
+            let server = did_of(&ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]));
+            Self {
+                did: did_of(&key),
+                server,
+                key,
+            }
+        }
+
+        /// Store a record at `seq` that lists this server, or withdraws it.
+        fn reach(&self, store: &SqliteStore, seq: u64, lists_here: bool) {
+            let servers = if lists_here {
+                vec![(self.server.clone(), "https://here.example".to_string())]
+            } else {
+                vec![]
+            };
+            let record = jig_core::naming::ReachabilityRecord::sign(&self.key, servers, seq);
+            store
+                .put_reachability(&self.did, seq, &record.envelope, &self.server, 1)
+                .unwrap();
+        }
+
+        fn local_adds(&self, store: &SqliteStore, seq: u64, allow: bool) -> LocalAddsMarker {
+            store
+                .put_local_adds(&self.did, seq, allow, b"marker", &self.server, 1)
+                .unwrap()
+        }
+
+        fn stock(&self, store: &SqliteStore) -> Stocked {
+            store
+                .stock_key_packages(
+                    &self.did,
+                    &[
+                        (b"r1".to_vec(), b"kp1".to_vec(), false),
+                        (b"lr".to_vec(), b"kplr".to_vec(), true),
+                    ],
+                    200,
+                    &self.server,
+                    true,
+                    1,
+                )
+                .unwrap()
+        }
+
+        fn ask<'a>(&'a self, channel_id: &'a str, kind: ReleaseKind) -> ReleaseAsk<'a> {
+            ReleaseAsk {
+                did: &self.did,
+                requester: "did:jig:zA",
+                channel_id,
+                request_hash: b"h",
+                request: b"signed request",
+                now: 100,
+                repeat_window: 0,
+                repeat: false,
+                per_did: 10,
+                per_requester: 10,
+                listing: None,
+                kind,
+                server_did: &self.server,
+            }
+        }
+    }
+
+    #[test]
+    fn a_local_adds_marker_is_kept_only_at_a_higher_seq() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let r2 = R2::new();
+        assert_eq!(store.local_adds(&r2.did).unwrap(), None);
+        assert!(!store.local_adds_ended(&r2.did).unwrap());
+        let kept = r2.local_adds(&store, 5, false);
+        assert_eq!((kept.seq, kept.allow), (5, false));
+        // A lower or equal seq changes nothing, and the answer is what holds.
+        let kept = r2.local_adds(&store, 5, true);
+        assert_eq!((kept.seq, kept.allow), (5, false));
+        let kept = r2.local_adds(&store, 4, true);
+        assert_eq!((kept.seq, kept.allow), (5, false));
+        assert!(store.local_adds_ended(&r2.did).unwrap());
+        // `allow = true` at a higher seq undoes it.
+        let kept = r2.local_adds(&store, u64::MAX, true);
+        assert_eq!((kept.seq, kept.allow), (u64::MAX, true));
+        assert!(!store.local_adds_ended(&r2.did).unwrap());
+    }
+
+    #[test]
+    fn ending_local_adds_alone_keeps_the_stock_for_custody() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let r2 = R2::new();
+        r2.reach(&store, 1, true);
+        assert_eq!(r2.stock(&store), Stocked::Accepted(2));
+        r2.local_adds(&store, 1, false);
+        assert_eq!(store.key_package_stock(&r2.did).unwrap(), (1, true));
+        // Uploads are still accepted: custody may use them.
+        assert_eq!(r2.stock(&store), Stocked::Accepted(0), "already held");
+    }
+
+    #[test]
+    fn custody_and_local_adds_both_ended_delete_the_stock_whichever_comes_second() {
+        for r1_first in [true, false] {
+            let store = SqliteStore::open_in_memory().unwrap();
+            let r2 = R2::new();
+            r2.reach(&store, 1, true);
+            assert_eq!(r2.stock(&store), Stocked::Accepted(2));
+            if r1_first {
+                r2.reach(&store, 2, false);
+                assert_eq!(store.key_package_stock(&r2.did).unwrap(), (1, true));
+                r2.local_adds(&store, 1, false);
+            } else {
+                r2.local_adds(&store, 1, false);
+                assert_eq!(store.key_package_stock(&r2.did).unwrap(), (1, true));
+                r2.reach(&store, 2, false);
+            }
+            assert_eq!(
+                store.key_package_stock(&r2.did).unwrap(),
+                (0, false),
+                "the stock has no use (r1_first = {r1_first})"
+            );
+            assert_eq!(r2.stock(&store), Stocked::NotStockedHere);
+            assert_eq!(store.key_package_stock(&r2.did).unwrap(), (0, false));
+        }
+    }
+
+    #[test]
+    fn uploads_resume_when_either_side_is_undone() {
+        for undo_r1 in [true, false] {
+            let store = SqliteStore::open_in_memory().unwrap();
+            let r2 = R2::new();
+            r2.reach(&store, 1, false);
+            r2.local_adds(&store, 1, false);
+            assert_eq!(r2.stock(&store), Stocked::NotStockedHere);
+            if undo_r1 {
+                r2.reach(&store, 2, true);
+            } else {
+                r2.local_adds(&store, 2, true);
+            }
+            // Nothing was stocked before both were ended: both references
+            // are fresh.
+            assert_eq!(
+                r2.stock(&store),
+                Stocked::Accepted(2),
+                "undo_r1 = {undo_r1}"
+            );
+        }
+    }
+
+    /// Ending the stock keeps the rows of last-resort packages, the retired
+    /// and the one in use, as consumed: both went out to requesters, whose
+    /// copies must not be uploadable once uploads resume, since their owner
+    /// deleted the keys (rule 32). A fresh one is taken.
+    #[test]
+    fn last_resort_packages_stay_retired_through_an_ended_stock() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let r2 = R2::new();
+        let upload = |r: &[u8], p: &[u8], signed| {
+            store
+                .stock_key_packages(
+                    &r2.did,
+                    &[(r.to_vec(), p.to_vec(), true)],
+                    200,
+                    &r2.server,
+                    signed,
+                    1,
+                )
+                .unwrap()
+        };
+        assert_eq!(upload(b"L0", b"kpL0", false), Stocked::Accepted(1));
+        assert_eq!(upload(b"L1", b"kpL1", true), Stocked::Accepted(1));
+        r2.reach(&store, 1, false);
+        r2.local_adds(&store, 1, false);
+        assert_eq!(store.key_package_stock(&r2.did).unwrap(), (0, false));
+        r2.local_adds(&store, 2, true);
+        for (r, p) in [(b"L0", b"kpL0"), (b"L1", b"kpL1")] {
+            assert_eq!(upload(r, p, false), Stocked::Accepted(0));
+            assert_eq!(upload(r, p, true), Stocked::Accepted(0));
+        }
+        assert_eq!(store.key_package_stock(&r2.did).unwrap(), (0, false));
+        assert_eq!(upload(b"L2", b"kpL2", false), Stocked::Accepted(1));
+        assert_eq!(store.key_package_stock(&r2.did).unwrap(), (0, true));
+    }
+
+    #[test]
+    fn a_local_take_under_ended_local_adds_releases_nothing() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let r2 = R2::new();
+        r2.stock(&store);
+        r2.local_adds(&store, 1, false);
+        assert_eq!(
+            store
+                .release_key_package(&r2.ask("", ReleaseKind::Local))
+                .unwrap(),
+            Release::LocalAddsEnded
+        );
+        assert_eq!(store.key_package_stock(&r2.did).unwrap(), (1, true));
+        assert!(store.key_package_releases(&r2.did, 10).unwrap().is_empty());
+        r2.local_adds(&store, 2, true);
+        assert!(matches!(
+            store
+                .release_key_package(&r2.ask("", ReleaseKind::Local))
+                .unwrap(),
+            Release::Released { .. }
+        ));
+    }
+
+    /// Custody under R2 is refused only for a channel this server sequences:
+    /// one another server sequences, or one it does not know, is released
+    /// (JEP-0017 rule 16). A `member-add` to a channel sequenced here is
+    /// refused at ingest whatever the package's source.
+    #[test]
+    fn custody_under_ended_local_adds_is_refused_only_for_channels_sequenced_here() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let r2 = R2::new();
+        let mut here = sample_channel("chan-here", "#here");
+        here.sequencer_did = r2.server.clone();
+        store.upsert_channel(&here).unwrap();
+        store
+            .upsert_channel(&sample_channel("chan-legacy", "#legacy"))
+            .unwrap();
+        let mut elsewhere = sample_channel("chan-elsewhere", "#elsewhere");
+        elsewhere.sequencer_did = "did:jig:zelsewhere".to_string();
+        store.upsert_channel(&elsewhere).unwrap();
+        r2.stock(&store);
+        r2.local_adds(&store, 1, false);
+        for channel in ["chan-here", "chan-legacy"] {
+            assert_eq!(
+                store
+                    .release_key_package(&r2.ask(channel, ReleaseKind::Custody))
+                    .unwrap(),
+                Release::LocalAddsEnded,
+                "{channel}"
+            );
+        }
+        for channel in ["chan-elsewhere", "chan-unknown"] {
+            let mut ask = r2.ask(channel, ReleaseKind::Custody);
+            let hash = format!("h-{channel}");
+            ask.request_hash = hash.as_bytes();
+            assert!(
+                matches!(
+                    store.release_key_package(&ask).unwrap(),
+                    Release::Released { .. } | Release::Again { .. }
+                ),
+                "{channel}"
+            );
+        }
     }
 
     #[test]
@@ -5093,11 +6075,27 @@ mod tests {
         let store = SqliteStore::open_in_memory().unwrap();
         let did = "did:jig:zD";
         assert_eq!(store.reachability(did).unwrap(), None);
-        assert!(store.put_reachability(did, 5, b"five", 1).unwrap());
-        assert!(!store.put_reachability(did, 5, b"other five", 2).unwrap());
-        assert!(!store.put_reachability(did, 4, b"four", 3).unwrap());
+        assert!(
+            store
+                .put_reachability(did, 5, b"five", "did:jig:zserver", 1)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .put_reachability(did, 5, b"other five", "did:jig:zserver", 2)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .put_reachability(did, 4, b"four", "did:jig:zserver", 3)
+                .unwrap()
+        );
         assert_eq!(store.reachability(did).unwrap().unwrap(), b"five");
-        assert!(store.put_reachability(did, 6, b"six", 4).unwrap());
+        assert!(
+            store
+                .put_reachability(did, 6, b"six", "did:jig:zserver", 4)
+                .unwrap()
+        );
         assert_eq!(store.reachability(did).unwrap().unwrap(), b"six");
     }
 
