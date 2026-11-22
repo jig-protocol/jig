@@ -11,6 +11,12 @@
 //! - the document decodes, and says what the welcome says: the welcome's
 //!   version is one it lists, and its suites and capabilities are the same.
 //!
+//! - the ruleset the block declares beside the document
+//!   ([`jig_pipeline::server_manifest::RULESET_METADATA_KEY`], JEP-0009
+//!   rule 4) is the one the welcome
+//!   names, and a welcome that does not name one cites a block that declares
+//!   none.
+//!
 //! The first two failing mean the server did not prove what it cited
 //! ([`ManifestCheck::Unproven`]). The last failing is a contradiction the
 //! server signed twice ([`ManifestCheck::Contradicts`]): a welcome and a
@@ -23,7 +29,7 @@ use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 use jig_core::{BlockKind, BlockManifest};
 pub use jig_pipeline::handshake::{ManifestRef, VerifiedWelcome};
 use jig_pipeline::ingest_record::IngestRecord;
-use jig_pipeline::server_manifest::{METADATA_KEY, ServerManifest};
+use jig_pipeline::server_manifest::{METADATA_KEY, ServerManifest, declared_ruleset};
 
 pub use jig_pipeline::server_manifest::LOG_SLUG;
 
@@ -33,16 +39,51 @@ pub enum ManifestCheck {
     Unproven(String),
     #[error("the server's welcome contradicts the manifest it cites: {0}")]
     Contradicts(String),
+    /// A client that asked for the server's ruleset was answered by a
+    /// welcome that does not grant it, while the manifest the welcome cites
+    /// declares one ([`check_cited_asked`]). Only the client knows it asked,
+    /// so this is a refusal, not evidence anyone else can check.
+    #[error("the server's welcome withholds the ruleset its manifest declares: {0}")]
+    Withheld(String),
 }
 
 /// Check `cited`, the block and record `welcome` cites, as served. Returns
 /// the document on success.
+///
+/// It checks only what the welcome signs, so it holds for evidence: a
+/// welcome that does not grant the ruleset capability makes no claim about
+/// the ruleset, whatever the manifest declares. A client that asked uses
+/// [`check_cited_asked`].
 pub fn check_cited(
     welcome: &VerifiedWelcome,
     cited: &ManifestRef,
     bundle_b64: &str,
     sig_b64: &str,
     record: &IngestRecord,
+) -> Result<ServerManifest, ManifestCheck> {
+    check_cited_as(welcome, cited, bundle_b64, sig_b64, record, false)
+}
+
+/// [`check_cited`] for a client whose hello asked for the ruleset: a welcome
+/// that does not grant it, citing a manifest that declares one, is refused
+/// as [`ManifestCheck::Withheld`].
+pub fn check_cited_asked(
+    welcome: &VerifiedWelcome,
+    cited: &ManifestRef,
+    bundle_b64: &str,
+    sig_b64: &str,
+    record: &IngestRecord,
+) -> Result<ServerManifest, ManifestCheck> {
+    check_cited_as(welcome, cited, bundle_b64, sig_b64, record, true)
+}
+
+fn check_cited_as(
+    welcome: &VerifiedWelcome,
+    cited: &ManifestRef,
+    bundle_b64: &str,
+    sig_b64: &str,
+    record: &IngestRecord,
+    asked_ruleset: bool,
 ) -> Result<ServerManifest, ManifestCheck> {
     let unproven = |reason: &str| ManifestCheck::Unproven(reason.to_string());
     let manifest = served_block(&cited.cid, bundle_b64, sig_b64).map_err(|r| unproven(&r))?;
@@ -98,7 +139,42 @@ pub fn check_cited(
             claimed.suites, claimed.capabilities, doc.suites, doc.capabilities
         )));
     }
+    let declared = declared_ruleset(&manifest.metadata).map_err(|e| {
+        contradicts(format!(
+            "the manifest it signed declares no valid ruleset: {e}"
+        ))
+    })?;
+    // A welcome that grants the capability signs the ruleset, or its
+    // absence (`Capabilities::ruleset`): that claim must be the manifest's.
+    // One that does not grant it claims nothing about the ruleset (a server
+    // answers a hello that did not ask that way), so only a client that
+    // asked can hold its silence against the manifest.
+    if !welcome.capabilities.ruleset {
+        if asked_ruleset && let Some(declared) = &declared {
+            return Err(ManifestCheck::Withheld(format!(
+                "this client asked for the ruleset; the welcome does not grant it, and the \
+                 manifest declares {}",
+                ruleset_name(Some(declared))
+            )));
+        }
+        return Ok(doc);
+    }
+    let named = welcome.ruleset.as_deref();
+    if named != declared.as_ref() {
+        return Err(contradicts(format!(
+            "the welcome names ruleset {}, the manifest declares {}",
+            ruleset_name(named),
+            ruleset_name(declared.as_ref())
+        )));
+    }
     Ok(doc)
+}
+
+fn ruleset_name(ruleset: Option<&jig_pipeline::handshake::RulesetRef>) -> String {
+    ruleset.map_or_else(
+        || "none".to_string(),
+        |r| format!("{} v{} ({})", r.id, r.version, r.hash),
+    )
 }
 
 /// One entry of a server's manifest log as served (`jig trust show`): its
@@ -187,7 +263,7 @@ fn dedup(items: &[String]) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::identity::Identity;
-    use jig_pipeline::handshake::{Capabilities, Reputation};
+    use jig_pipeline::handshake::{Capabilities, Reputation, RulesetRef};
     use jig_pipeline::ingest_record::{GENESIS_PREV, RecordSigner, label_cid};
     use jig_pipeline::server_manifest::PeerPolicy;
 
@@ -226,14 +302,43 @@ mod tests {
             doc: &ServerManifest,
             seq: u64,
         ) -> (ManifestRef, String, String, IngestRecord) {
-            let block = crate::blocks::build_with_metadata(
-                &self.identity,
-                BlockKind::ServerManifest,
-                jig_core::HlcTimestamp::now_wall(self.identity.did().clone()),
+            self.publish_block(
                 serde_json::json!({
                     "channel": channel,
                     METADATA_KEY: STANDARD.encode(doc.encode().unwrap()),
                 }),
+                seq,
+            )
+        }
+
+        /// [`Self::publish`], with the block declaring `ruleset` beside the
+        /// document.
+        fn publish_declaring(
+            &self,
+            doc: &ServerManifest,
+            ruleset: &RulesetRef,
+            seq: u64,
+        ) -> (ManifestRef, String, String, IngestRecord) {
+            self.publish_block(
+                serde_json::json!({
+                    "channel": LOG_SLUG,
+                    METADATA_KEY: STANDARD.encode(doc.encode().unwrap()),
+                    jig_pipeline::server_manifest::RULESET_METADATA_KEY: ruleset,
+                }),
+                seq,
+            )
+        }
+
+        fn publish_block(
+            &self,
+            metadata: serde_json::Value,
+            seq: u64,
+        ) -> (ManifestRef, String, String, IngestRecord) {
+            let block = crate::blocks::build_with_metadata(
+                &self.identity,
+                BlockKind::ServerManifest,
+                jig_core::HlcTimestamp::now_wall(self.identity.did().clone()),
+                metadata,
             );
             let cid = block.cid();
             let record = RecordSigner {
@@ -263,6 +368,7 @@ mod tests {
                     federation: true,
                     max_future_skew_ms: 300_000,
                     tiers: false,
+                    ruleset: false,
                 },
                 reputation: Reputation::none(),
                 nonce: String::new(),
@@ -270,6 +376,7 @@ mod tests {
                 tls_exporter: Vec::new(),
                 manifest: None,
                 admit: None,
+                ruleset: None,
                 moved_from: None,
                 evidence: String::new(),
             }
@@ -286,9 +393,93 @@ mod tests {
                 federation: true,
                 max_future_skew_ms: 300_000,
                 tiers: false,
+                ruleset: false,
             },
             peer_policy: PeerPolicy::default(),
         }
+    }
+
+    fn ruleset(version: u64) -> RulesetRef {
+        let hash = jig_core::canonical_cid::of(&version.to_le_bytes()).to_string();
+        RulesetRef {
+            id: "jig-reference".into(),
+            version,
+            url: format!("/api/v1/ruleset/{hash}"),
+            hash,
+        }
+    }
+
+    /// A welcome to a hello that asked, naming `named`.
+    fn declaring(mut welcome: VerifiedWelcome, named: Option<RulesetRef>) -> VerifiedWelcome {
+        welcome.capabilities.ruleset = true;
+        welcome.ruleset = named.map(Box::new);
+        welcome
+    }
+
+    /// JEP-0009 rule 4: the welcome and the manifest name one ruleset, and a
+    /// server that declares none says so in both.
+    #[test]
+    fn the_welcome_and_the_manifest_declare_the_same_ruleset() {
+        let server = Server::new();
+        let base = server.welcome(&["none", "mls"], &["text-render", "member-add"]);
+
+        let (cited, bundle, sig, record) = server.publish_declaring(&doc(), &ruleset(1), 1);
+        let welcome = declaring(base.clone(), Some(ruleset(1)));
+        check_cited(&welcome, &cited, &bundle, &sig, &record).unwrap();
+
+        let (cited, bundle, sig, record) = server.publish(&doc(), 1);
+        check_cited(
+            &declaring(base.clone(), None),
+            &cited,
+            &bundle,
+            &sig,
+            &record,
+        )
+        .unwrap();
+    }
+
+    /// Any disagreement is one the server signed twice: another ruleset,
+    /// one named and none declared, or one declared and none named (the
+    /// welcome hiding it from a client that asked).
+    #[test]
+    fn a_welcome_that_names_another_ruleset_than_its_manifest_contradicts_it() {
+        let server = Server::new();
+        let base = server.welcome(&["none", "mls"], &["text-render", "member-add"]);
+        let (declared, d_bundle, d_sig, d_record) =
+            server.publish_declaring(&doc(), &ruleset(1), 1);
+        let (none, n_bundle, n_sig, n_record) = server.publish(&doc(), 1);
+        let contradicts = |r: Result<ServerManifest, ManifestCheck>| {
+            assert!(matches!(r, Err(ManifestCheck::Contradicts(_))), "{r:?}")
+        };
+
+        let other = declaring(base.clone(), Some(ruleset(2)));
+        contradicts(check_cited(&other, &declared, &d_bundle, &d_sig, &d_record));
+        let named = declaring(base.clone(), Some(ruleset(1)));
+        contradicts(check_cited(&named, &none, &n_bundle, &n_sig, &n_record));
+        let hidden = declaring(base.clone(), None);
+        contradicts(check_cited(
+            &hidden, &declared, &d_bundle, &d_sig, &d_record,
+        ));
+    }
+
+    /// A welcome that does not grant the capability says nothing about the
+    /// ruleset, so it is no evidence against a manifest that declares one:
+    /// a server answers a hello that did not ask that way. A client that
+    /// asked refuses it, without evidence.
+    #[test]
+    fn a_welcome_without_the_capability_is_refused_only_by_a_client_that_asked() {
+        let server = Server::new();
+        let base = server.welcome(&["none", "mls"], &["text-render", "member-add"]);
+        let (cited, bundle, sig, record) = server.publish_declaring(&doc(), &ruleset(1), 1);
+        check_cited(&base, &cited, &bundle, &sig, &record).unwrap();
+        let asked = check_cited_asked(&base, &cited, &bundle, &sig, &record);
+        assert!(
+            matches!(asked, Err(ManifestCheck::Withheld(_))),
+            "{asked:?}"
+        );
+        // Nothing declared: nothing withheld.
+        let (cited, bundle, sig, record) = server.publish(&doc(), 1);
+        check_cited_asked(&base, &cited, &bundle, &sig, &record).unwrap();
     }
 
     #[test]

@@ -20,7 +20,8 @@ use jig_core::{Author, BlockBundle, BlockKind, BlockManifest};
 use jig_pipeline::handshake::{ManifestRef, implemented_suite_names};
 use jig_pipeline::ingest::{IngestSource, ingest};
 use jig_pipeline::server_manifest::{
-    AttestedSuffix, LOG_SLUG, METADATA_KEY, PeerPolicy, PeerQuota, Quota, ServerManifest,
+    AttestedSuffix, LOG_SLUG, METADATA_KEY, PeerPolicy, PeerQuota, Quota, RULESET_METADATA_KEY,
+    ServerManifest,
 };
 
 use crate::v0_0_2::AppState;
@@ -132,12 +133,16 @@ pub async fn publish(state: &Arc<AppState>) -> anyhow::Result<ManifestRef> {
         .list_blocks_by_channel(LOG_SLUG, 1, None)?
         .pop()
         .filter(|b| b.block_kind == BlockKind::ServerManifest.as_str());
-    // The newest says what this server advertises now, and was written by
-    // the DID it signs as now: a welcome cites only its own DID's entry, so
-    // after a key change the same document is published again.
+    let ruleset = state.ruleset.as_ref().map(|r| r.reference.clone());
+    let supersedes = newest.as_ref().map(|block| block.cid.clone());
+    // The newest says what this server advertises now, and declares the
+    // ruleset it declares now, and was written by the DID it signs as now: a
+    // welcome cites only its own DID's entry, so after a key change the same
+    // document is published again.
     let cid = match newest {
         Some(block)
             if document_of(&block.bundle_bytes).as_deref() == Some(&document[..])
+                && ruleset_of(&block.bundle_bytes) == Some(ruleset.clone())
                 && author_of(&block.bundle_bytes).is_some_and(|a| {
                     jig_pipeline::handshake::same_did(&a, &state.server_did.to_did_jig_string())
                 }) =>
@@ -149,7 +154,26 @@ pub async fn publish(state: &Arc<AppState>) -> anyhow::Result<ManifestRef> {
             let cid = submit(
                 state,
                 block(state, BlockKind::ServerManifest, |m| {
-                    m.metadata_entry(METADATA_KEY, serde_json::json!(encoded))
+                    let m = m.metadata_entry(METADATA_KEY, serde_json::json!(encoded));
+                    // The entry it replaces, so going back to an earlier
+                    // advertisement (ruleset A, then none, then A) is a new
+                    // block, not the earlier one again: identical bytes would
+                    // ingest as the block already held, and leave the log's
+                    // newest entry saying something this server no longer does.
+                    let m = match &supersedes {
+                        Some(cid) => m.metadata_entry(SUPERSEDES_KEY, serde_json::json!(cid)),
+                        None => m,
+                    };
+                    // Only when it declares one: a server that declares none
+                    // carries no ruleset key, which is all an older client
+                    // reads besides the document.
+                    match &ruleset {
+                        Some(ruleset) => m.metadata_entry(
+                            RULESET_METADATA_KEY,
+                            serde_json::to_value(ruleset).expect("a ruleset reference is JSON"),
+                        ),
+                        None => m,
+                    }
                 })?,
             )
             .await
@@ -250,6 +274,19 @@ fn author_of(bundle_bytes: &[u8]) -> Option<String> {
     let (manifest_bytes, _code): (Vec<u8>, Vec<u8>) = serde_json::from_slice(bundle_bytes).ok()?;
     let manifest: BlockManifest = serde_json::from_slice(&manifest_bytes).ok()?;
     Some(manifest.authors.first()?.did.to_did_jig_string())
+}
+
+/// The block metadata key naming the manifest-log entry a `server-manifest`
+/// replaces. Clients read only [`METADATA_KEY`] and [`RULESET_METADATA_KEY`].
+const SUPERSEDES_KEY: &str = "supersedes";
+
+/// The ruleset a stored `server-manifest` block declares: `Some(None)` for
+/// none, `None` when the block does not parse or declares something that is
+/// not a ruleset reference.
+fn ruleset_of(bundle_bytes: &[u8]) -> Option<Option<jig_pipeline::handshake::RulesetRef>> {
+    let (manifest_bytes, _code): (Vec<u8>, Vec<u8>) = serde_json::from_slice(bundle_bytes).ok()?;
+    let manifest: BlockManifest = serde_json::from_slice(&manifest_bytes).ok()?;
+    jig_pipeline::server_manifest::declared_ruleset(&manifest.metadata).ok()
 }
 
 /// The document a stored `server-manifest` block carries.
@@ -522,6 +559,98 @@ pub(crate) mod tests {
             vec![jig_core::Did::from_ed25519_pubkey(&[9u8; 32]).to_did_jig_string()];
         assert!(!is_own(&unlinked, &old_did));
         assert!(is_own(&after, &old_did));
+    }
+
+    /// JEP-0009 rule 4: a declared ruleset rides beside the document, which
+    /// stays the document old clients decode, and a change to it publishes
+    /// a new entry. A server that declares none publishes no key at all.
+    #[tokio::test]
+    async fn a_declared_ruleset_rides_beside_the_document() {
+        let signed = crate::v0_0_2_ruleset::tests::signed_ruleset();
+        let (_dir, declaring) = crate::v0_0_2_ruleset::tests::declaring_state(&signed);
+        let declaring = Arc::new(declaring);
+        let first = publish(&declaring).await.unwrap();
+        let store = &declaring.ingest_ctx.store;
+        let block = store.get_block(&first.cid).unwrap().unwrap();
+        assert_eq!(
+            ruleset_of(&block.bundle_bytes),
+            Some(Some(declaring.ruleset.as_ref().unwrap().reference.clone()))
+        );
+        let doc = ServerManifest::decode(&document_of(&block.bundle_bytes).unwrap()).unwrap();
+        assert_eq!(doc.encode(), current(&declaring).encode());
+        assert_eq!(publish(&declaring).await.unwrap(), first, "no change");
+
+        // The same server, declaring nothing now: a new entry, without the key.
+        let mut plain = AppState::for_test().unwrap();
+        plain.ingest_ctx = declaring.ingest_ctx.clone();
+        plain.server_did = declaring.server_did.clone();
+        let plain = Arc::new(plain);
+        let second = publish(&plain).await.unwrap();
+        assert_ne!(second.cid, first.cid);
+        let block = store.get_block(&second.cid).unwrap().unwrap();
+        assert_eq!(ruleset_of(&block.bundle_bytes), Some(None));
+    }
+
+    /// Declaring A, then none, then A again ends with an entry that declares
+    /// A: going back is a new entry, not the first A entry again.
+    #[tokio::test]
+    async fn going_back_to_an_earlier_ruleset_publishes_a_new_entry() {
+        let signed = crate::v0_0_2_ruleset::tests::signed_ruleset();
+        let (_dir, declaring) = crate::v0_0_2_ruleset::tests::declaring_state(&signed);
+        let declaring = Arc::new(declaring);
+        let first = publish(&declaring).await.unwrap();
+
+        let mut plain = AppState::for_test().unwrap();
+        plain.ingest_ctx = declaring.ingest_ctx.clone();
+        plain.server_did = declaring.server_did.clone();
+        let second = publish(&Arc::new(plain)).await.unwrap();
+
+        let third = publish(&declaring).await.unwrap();
+        assert!(
+            first.seq < second.seq && second.seq < third.seq,
+            "{first:?} {second:?} {third:?}"
+        );
+        assert_ne!(third.cid, first.cid);
+        let store = &declaring.ingest_ctx.store;
+        let newest = store
+            .list_blocks_by_channel(LOG_SLUG, 1, None)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(newest.cid, third.cid);
+        assert_eq!(
+            ruleset_of(&newest.bundle_bytes),
+            Some(Some(declaring.ruleset.as_ref().unwrap().reference.clone()))
+        );
+    }
+
+    /// A welcome to a client that asks names the declared ruleset; the
+    /// connection this server's own client makes asks.
+    #[tokio::test]
+    async fn every_welcome_names_the_declared_ruleset() {
+        let signed = crate::v0_0_2_ruleset::tests::signed_ruleset();
+        let (_dir, state) = crate::v0_0_2_ruleset::tests::declaring_state(&signed);
+        let state = Arc::new(state);
+        publish(&state).await.unwrap();
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/ws",
+                axum::routing::get(crate::v0_0_2_ws::ws_handler),
+            )
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/v1/ws"))
+            .await
+            .unwrap();
+        let welcome = crate::v0_0_2_federation::complete_client_handshake(&mut ws, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            welcome.ruleset.as_deref(),
+            Some(&state.ruleset.as_ref().unwrap().reference)
+        );
     }
 
     #[tokio::test]
