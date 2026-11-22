@@ -731,9 +731,9 @@ fn advance_mirror(
     Ok(())
 }
 
-/// Hand a carried block to this server's own subscribers, under the
-/// channel's policy as it now stands. Never to peers: the owner sends its
-/// blocks to each follower itself.
+/// Hand a carried block to this server's own subscribers and to the bridge
+/// sinks of its members, under the channel's policy as it now stands. Never
+/// to peers: the owner sends its blocks to each follower itself.
 async fn deliver(
     ctx: &IngestContext,
     block: &StoredBlock,
@@ -748,13 +748,7 @@ async fn deliver(
                 .map(|ms| ms.into_iter().map(|m| m.member_did).collect())
                 .unwrap_or_default();
             members.extend(removed);
-            // Not to this server's federation subscribers either: a peer of
-            // this one would take the channel as a copy of its own, and a
-            // channel has one sequencer (JEP-0005 rule 1).
-            DeliveryPolicy {
-                federates: false,
-                ..DeliveryPolicy::for_channel(&chan, members)
-            }
+            DeliveryPolicy::for_channel(&chan, members)
         }
         // Narrow delivery on any doubt, never widen it.
         _ => DeliveryPolicy::default(),

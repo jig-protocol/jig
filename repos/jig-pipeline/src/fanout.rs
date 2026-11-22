@@ -54,10 +54,6 @@ pub struct DeliveryPolicy {
     pub open: bool,
     pub owner_did: String,
     pub member_dids: Vec<String>,
-    /// Whether the channel is one the legacy relay carried: open,
-    /// unencrypted, not `#jig/`. The relay no longer sends; this server still
-    /// judges by it what an older peer relays to it.
-    pub federates: bool,
 }
 
 impl DeliveryPolicy {
@@ -67,12 +63,6 @@ impl DeliveryPolicy {
             open,
             owner_did: channel.owner_did.clone(),
             member_dids,
-            // A server's own `#jig/` channels (its manifest log) are its own:
-            // a peer refuses them, and never sequences a copy.
-            federates: open
-                && channel.suite == jig_core::EncryptionSuite::Unencrypted.as_str()
-                && jig_core::slug::classify_slug(&channel.slug)
-                    != Ok(jig_core::slug::SlugClass::Server),
         }
     }
 
@@ -375,7 +365,6 @@ mod tests {
             open: true,
             owner_did: "did:jig:zOwner".to_string(),
             member_dids: members.iter().map(|m| m.to_string()).collect(),
-            federates: true,
         }
     }
 
@@ -384,7 +373,6 @@ mod tests {
             open: false,
             owner_did: owner.to_string(),
             member_dids: members.iter().map(|m| m.to_string()).collect(),
-            federates: false,
         }
     }
 
@@ -523,32 +511,6 @@ mod tests {
         .await
         .unwrap();
         assert!(received(&mut rx).await);
-    }
-
-    #[test]
-    fn a_channel_federates_only_if_open_and_unencrypted() {
-        let row = |visibility: &str, suite: &str| StoredChannel {
-            id: "c".to_string(),
-            slug: "#c".to_string(),
-            visibility: visibility.to_string(),
-            created_at: 0,
-            owner_did: "did:jig:zOwner".to_string(),
-            suite: suite.to_string(),
-            sequencer_did: String::new(),
-            co_owners: Vec::new(),
-            tiering: crate::persist::ChannelTiering::current(visibility, suite),
-        };
-        assert!(DeliveryPolicy::for_channel(&row("open", "none"), vec![]).federates);
-        assert!(!DeliveryPolicy::for_channel(&row("restricted", "none"), vec![]).federates);
-        assert!(!DeliveryPolicy::for_channel(&row("open", "mls"), vec![]).federates);
-        let manifest_log = StoredChannel {
-            slug: "#jig/manifest".to_string(),
-            ..row("open", "none")
-        };
-        assert!(
-            !DeliveryPolicy::for_channel(&manifest_log, vec![]).federates,
-            "a server's own channels stay home"
-        );
     }
 
     // ---- scope matching ----------------------------------------------------
