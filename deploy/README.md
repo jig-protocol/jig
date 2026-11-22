@@ -357,6 +357,22 @@ Three landmines:
   refuses to boot. `jig read` uses the
   signed history endpoint, `GET /api/v1/channels/<slug>/blocks`.
 
+### Stopping and restarting
+
+On SIGTERM (`systemctl stop` or `restart`, or `install.sh` replacing a running
+server) or SIGINT, jig-server shuts down gracefully:
+- it stops accepting connections;
+- it closes each WebSocket session with code 1001 (going away), so clients
+  reconnect promptly;
+- it gives the requests in flight up to `[server] shutdown_drain_ms` (default
+  5000) to finish, then exits 0.
+
+What is still open when the drain runs out is cut, and a second signal cuts the
+drain short. A block being ingested at that moment is stored whole or not at
+all. `install.sh` waits 10 s for the server it replaces, and the unit's
+`TimeoutStopSec` defaults to 90 s, so keep the drain under both. A client that
+resubmits a block it got no answer for is told the block's CID (#396).
+
 ### Size limits
 
 `[limits]` sets explicit, configurable limits on how much jig-server reads at

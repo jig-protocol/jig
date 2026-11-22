@@ -7,6 +7,7 @@ pub mod handler;
 pub mod proxy_protocol;
 pub mod runtime;
 pub mod server;
+pub mod shutdown;
 pub mod v0_0_2;
 pub mod v0_0_2_admin;
 pub mod v0_0_2_admission;
