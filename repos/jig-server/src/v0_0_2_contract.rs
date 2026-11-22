@@ -2235,7 +2235,16 @@ mod tests {
     fn own_post(state: &AppState, key: &SigningKey, channel: &str) -> String {
         let parts = signed(key, BlockKind::TextRender, text_in(channel, "only here"));
         let bundle_bytes = serde_json::to_vec(&(&parts.0, &parts.1)).unwrap();
-        let cid = crate::v0_0_2_federation::peer_block_cid(&bundle_bytes).unwrap();
+        let (manifest_bytes, code_bytes): (Vec<u8>, Vec<u8>) =
+            serde_json::from_slice(&bundle_bytes).unwrap();
+        let cid = jig_core::BlockBundle {
+            manifest_bytes: &manifest_bytes,
+            code_bytes: &code_bytes,
+            resources: vec![],
+        }
+        .block_cid()
+        .unwrap()
+        .to_string();
         state
             .ingest_ctx
             .store
@@ -2626,25 +2635,29 @@ mod tests {
         }
     }
 
-    /// The dialer still subscribes to the federation stream, as one on a
-    /// release before this does; this server answers `FEDERATION_STREAM_RETIRED`
-    /// and registers nothing. The dialer logs it and keeps the connection,
-    /// over which a share is then offered, accepted and streamed.
+    /// A peer on a release before this one asks, on each connection, for a
+    /// catch-up of the legacy relay (`federation-catch-up`). Nothing here
+    /// speaks that frame any more: it is logged and dropped, and the link,
+    /// which carries the peer's shares too, goes on. A share offered after it
+    /// is accepted, streamed and caught up, both ways round.
     #[tokio::test]
-    async fn a_dialer_told_the_stream_is_retired_keeps_its_link() {
+    async fn an_older_peers_catch_up_ask_leaves_the_link_and_its_shares() {
         let p = pair(OfferPolicy::Accept).await;
-        // The subscribe and its answer have crossed before anything else.
+        let ask = b"{\"after\":\"\"}".to_vec();
+        p.follower
+            .peers
+            .sender_for(&p.owner.server_did)
+            .expect("the owner is live on the follower")
+            .send("federation-catch-up", ask.clone())
+            .unwrap();
+        p.owner
+            .peers
+            .sender_for(&p.follower.server_did)
+            .expect("the follower is live on the owner")
+            .send("federation-catch-up", ask)
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(
-            p.follower
-                .ingest_ctx
-                .fanout
-                .local_subscription_count()
-                .await,
-            0,
-            "the follower registers no federation subscription"
-        );
-        assert!(!p.dial.is_finished(), "the dialer keeps its connection");
+        assert!(!p.dial.is_finished(), "the link is still up");
 
         let channel = p.shared(1).await;
         p.follows.stream.pull_all();

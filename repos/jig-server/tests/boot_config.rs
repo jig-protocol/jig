@@ -464,6 +464,83 @@ fn no_config_flag_still_uses_defaults() {
     let _ = child.wait();
 }
 
+/// SIGTERM, the signal a service manager's stop and `install.sh`'s restart
+/// send, stops the server gracefully (#424): it logs the shutdown, drains, and
+/// exits 0 well within the drain bound, rather than dying on the signal.
+#[cfg(unix)]
+#[test]
+fn sigterm_stops_the_server_gracefully_and_it_exits_cleanly() {
+    use std::io::BufRead;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    std::fs::write(&cfg, valid_config(dir.path())).unwrap();
+    let mut child = spawn(dir.path(), &["--config", cfg.to_str().unwrap()]);
+
+    // Every log line, from both streams, as it is written.
+    let (lines_tx, lines) = std::sync::mpsc::channel::<String>();
+    let readers: Vec<_> = [
+        Box::new(child.stdout.take().unwrap()) as Box<dyn Read + Send>,
+        Box::new(child.stderr.take().unwrap()),
+    ]
+    .into_iter()
+    .map(|stream| {
+        let lines_tx = lines_tx.clone();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stream)
+                .lines()
+                .map_while(|l| l.ok())
+            {
+                let _ = lines_tx.send(line);
+            }
+        })
+    })
+    .collect();
+    drop(lines_tx);
+
+    let mut log = String::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        match lines.recv_timeout(wait) {
+            Ok(line) => {
+                let listening = line.contains("listening on");
+                log.push_str(&line);
+                log.push('\n');
+                if listening {
+                    break;
+                }
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("jig-server never reported listening\n{log}");
+            }
+        }
+    }
+
+    let sent = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("run kill");
+    assert!(sent.success(), "kill -TERM failed");
+    // Idle, so the drain is immediate; the default bound is five seconds.
+    let Some(status) = wait_bounded(&mut child, Duration::from_secs(5)) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("jig-server outlived its drain after SIGTERM\n{log}");
+    };
+    for reader in readers {
+        let _ = reader.join();
+    }
+    log.extend(lines.try_iter().map(|line| line + "\n"));
+    assert!(
+        status.success(),
+        "a graceful stop exits 0, not on the signal: {status:?}\n{log}"
+    );
+    assert!(log.contains("SIGTERM received"), "{log}");
+    assert!(log.contains("shutdown complete"), "{log}");
+}
+
 /// Wait up to `limit` for the child to exit. `None` means it outlived the
 /// deadline — the caller is responsible for killing it.
 fn wait_bounded(child: &mut Child, limit: Duration) -> Option<std::process::ExitStatus> {

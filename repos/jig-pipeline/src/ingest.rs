@@ -14,9 +14,8 @@ use crate::hlc::HlcClock;
 use crate::identity::IdentityResolver;
 use crate::persist::{SqliteStore, StoredBlock, StoredReceipt};
 
-/// Where a block came from. Discriminates broadcast policy: federated-peer
-/// blocks are NOT re-broadcast to peers (avoids loops); local + admin
-/// blocks ARE broadcast to peers.
+/// Where a block came from: what admission it gets, and what it is stored
+/// as having come through.
 #[derive(Debug, Clone)]
 pub enum IngestSource {
     LocalClient {
@@ -27,10 +26,6 @@ pub enum IngestSource {
         /// the `public` label, so it may not post to a `public` channel
         /// (rule 5).
         tiers: bool,
-    },
-    FederatedPeer {
-        peer_did: Did,
-        peer_url: String,
     },
     AdminEndpoint,
     /// Submitted by an in-process bridge (e.g. the email bridge translating
@@ -186,9 +181,8 @@ pub struct IngestContext {
     /// anyway. Wired from `[identity] naively_allow_unknown_handles_fallback`.
     /// Surfaces in `unsafe_options_active`.
     pub naively_allow_unknown_handles_fallback: bool,
-    /// Take a `channel-create` a configured peer relays as a copy this
-    /// server sequences, whatever server it names ([`copies_relayed_create`]).
-    /// Wired from `[federation] naively_accept_peer_relayed_creates`.
+    /// `[federation] naively_accept_peer_relayed_creates`. Read by nothing
+    /// since this server stopped taking relayed blocks; the key goes next.
     pub naively_accept_peer_relayed_creates: bool,
     /// Executes canonical Wasm block modules, holding them pre-compiled.
     ///
@@ -330,15 +324,6 @@ pub enum IngestError {
         channel_id: String,
         sequencer: String,
     },
-    /// A block a peer's legacy relay brought for a channel this server
-    /// sequences (JEP-0014 rule 37, #357). The relay would give the channel's
-    /// posts a second order: a channel crosses servers only by a share, and
-    /// a peer's users post through its grant.
-    #[error(
-        "`{kind}` refused: {RELAYED_INTO_SEQUENCED}: channel {channel_id} is sequenced \
-         here, and a peer's relay does not post to it; share the channel to carry it"
-    )]
-    RelayedIntoSequencedChannel { kind: String, channel_id: String },
     /// A relayed block for a channel the relaying server's share does not
     /// cover (JEP-0005 rule 15).
     #[error("`{kind}` refused: `{via}` relayed it outside its share of channel {channel_id}")]
@@ -577,9 +562,9 @@ pub async fn ingest(
     let own = sender.to_did_jig_string() == ctx.server_did.to_did_jig_string();
     let admitted = match source {
         _ if own => Ok(()),
-        IngestSource::FederatedPeer { .. }
-        | IngestSource::Bridge
-        | IngestSource::Relayed { .. } => ctx.admission.admit_relayed(sender.as_str()),
+        IngestSource::Bridge | IngestSource::Relayed { .. } => {
+            ctx.admission.admit_relayed(sender.as_str())
+        }
         IngestSource::LocalClient { .. } | IngestSource::AdminEndpoint => {
             ctx.admission.admit(sender.as_str())
         }
@@ -729,21 +714,6 @@ pub async fn ingest(
             sequencer: chan.sequencer_did.clone(),
         });
     }
-    // The legacy relay's blocks for a channel this server sequences: a peer
-    // posting into it this way would order the channel's posts a second
-    // time, as its own copy does (#357). A channel crosses servers only by a
-    // share (JEP-0014 rule 37). A channel-create names the channel it makes,
-    // which is not yet here: rule 1 and the sequencer binding judge it.
-    if let IngestSource::FederatedPeer { .. } = &source
-        && kind != BlockKind::ChannelCreate
-        && let Some(chan) = resolved_channel.as_ref()
-    {
-        return Err(IngestError::RelayedIntoSequencedChannel {
-            kind: kind_str.to_string(),
-            channel_id: chan.id.clone(),
-        });
-    }
-
     // Step 3b': the channel's tier (JEP-0014). It is fixed for the channel's
     // life, so nothing promotes a channel (rule 2); a frozen channel takes
     // nothing but an archive by its owner, which the write gate checks
@@ -956,18 +926,11 @@ pub async fn ingest(
             &server_did,
             &source,
         )?;
-        let relayed_copy = copies_relayed_create(ctx, &source);
-        let terms = if relayed_copy {
-            channel_terms(&as_relayed_copy(&manifest), &server_did)?
-        } else {
-            channel_terms(&manifest, &server_did)?
-        };
+        let terms = channel_terms(&manifest, &server_did)?;
         // A channel names the server that orders it, so a create signed for
         // one server is valid on no other. An in-process bridge's create
         // reaches no other server.
-        if !relayed_copy
-            && !matches!(source, IngestSource::Bridge)
-            && !manifest.metadata.contains_key(SEQUENCER_KEY)
+        if !matches!(source, IngestSource::Bridge) && !manifest.metadata.contains_key(SEQUENCER_KEY)
         {
             return Err(IngestError::SequencerRequired { server: server_did });
         }
@@ -1129,12 +1092,8 @@ pub async fn ingest(
         hlc_logical: hlc.map(|h| h.logical).unwrap_or(0),
         hlc_origin: hlc.map(|h| h.server_did.to_string()).unwrap_or_default(),
         posted_at: chrono::Utc::now().timestamp(),
-        origin_server: match &source {
-            IngestSource::FederatedPeer { peer_url, .. } => peer_url.clone(),
-            _ => ctx.server_url.clone(),
-        },
+        origin_server: ctx.server_url.clone(),
         federated_from: match &source {
-            IngestSource::FederatedPeer { peer_url, .. } => Some(peer_url.clone()),
             // The relaying server's DID (JEP-0005 rule 15).
             IngestSource::Relayed { via, .. } => Some(via.to_did_jig_string()),
             _ => None,
@@ -1279,12 +1238,11 @@ pub async fn ingest(
             }
             // Step 5: apply effect. A declined member-add returns before
             // step 6 stores the block.
-            crate::effect::apply_effect_as(
+            crate::effect::apply_effect(
                 &ctx.store,
                 &bundle,
                 &stored_receipt.receipt_bytes,
                 &block_cid,
-                copies_relayed_create(ctx, &source),
             )
             .await
             .map_err(
@@ -1381,19 +1339,8 @@ pub async fn ingest(
         ctx.fanout.bind_pending_channel(slug, &block_cid).await;
     }
 
-    // Step 7: fanout — broadcast policy depends on source
+    // Step 7: fanout
     match source {
-        IngestSource::FederatedPeer { .. } => {
-            // Federated source: locals + bridge sinks, but NOT re-broadcast to
-            // peers (would cause a relay loop).
-            ctx.fanout
-                .broadcast_local_only(&stored_block, &stored_receipt, policy.as_ref())
-                .await
-                .map_err(IngestError::Other)?;
-            ctx.fanout
-                .dispatch_to_bridges_public(&stored_block, &stored_receipt, policy.as_ref())
-                .await;
-        }
         IngestSource::LocalClient { .. }
         | IngestSource::AdminEndpoint
         | IngestSource::Bridge
@@ -1516,58 +1463,6 @@ fn self_join_admitted(
         }
         _ => false,
     }
-}
-
-/// The reason a refusal of a peer-relayed block into a channel this server
-/// sequences is logged under (JEP-0014 rule 37). Stable: operators grep for it.
-pub const RELAYED_INTO_SEQUENCED: &str = "relayed-into-sequenced-channel";
-
-/// The refusal [`ingest`] gives a block the legacy relay brought
-/// ([`IngestSource::FederatedPeer`]) for the channel it names, if it gives
-/// one: an archived channel, an unknown one, one another server sequences,
-/// or one this server sequences (#357). Ingest makes the same checks in the
-/// same order, after admission, so that a caller it will not deal with gets
-/// one answer whatever channel it names. Admission charges the author's rate,
-/// though, so a busy author's relayed posts would spend it on blocks that are
-/// only refused, and once it is spent come back as rate-limited, which the
-/// relay asks for again, rather than refused. The relay answers its peer
-/// nothing, so it asks this first and drops what it names. A `channel-create`
-/// gets `None`: it names a channel not yet here, and ingest judges it.
-pub fn refused_from_a_peer(
-    store: &SqliteStore,
-    server_did: &Did,
-    kind: BlockKind,
-    manifest: &jig_core::BlockManifest,
-    block_cid: &str,
-    source: &IngestSource,
-) -> crate::persist::Result<Option<IngestError>> {
-    if kind == BlockKind::ChannelCreate || !matches!(source, IngestSource::FederatedPeer { .. }) {
-        return Ok(None);
-    }
-    let Some(named) = channel_id_of(store, kind, manifest, block_cid)? else {
-        return Ok(None);
-    };
-    let Some(id) = named.id else {
-        return Ok(requires_existing_channel(kind, source)
-            .then_some(IngestError::UnknownChannel { slug: named.named }));
-    };
-    let Some(chan) = store.get_channel_by_id(&id)? else {
-        return Ok(Some(IngestError::ChannelArchived { slug: named.named }));
-    };
-    if !chan.sequencer_did.is_empty()
-        && crate::effect::canonical_did_string(&chan.sequencer_did)
-            != server_did.to_did_jig_string()
-    {
-        return Ok(Some(IngestError::CarriedChannel {
-            kind: kind.as_str().to_string(),
-            channel_id: chan.id,
-            sequencer: chan.sequencer_did,
-        }));
-    }
-    Ok(Some(IngestError::RelayedIntoSequencedChannel {
-        kind: kind.as_str().to_string(),
-        channel_id: chan.id,
-    }))
 }
 
 /// The channel a block belongs to — the ONE rule shared by the write gate,
@@ -1774,13 +1669,9 @@ fn requires_existing_channel(kind: BlockKind, _source: &IngestSource) -> bool {
 /// - `Dm`: anyone here; the DM rule in [`crate::mls_gate`] then limits it to
 ///   one of the pair that derives the slug;
 /// - `Email`: only the email bridge (`IngestSource::Bridge`), so nobody can
-///   take a DID pair's mail-thread slug before the bridge does. A relayed
-///   create (`IngestSource::FederatedPeer`) is refused on purpose: bridge
-///   threads are local-only. The bridge creates them restricted
-///   (`bridges/email/src/channel.rs`, `ensure_thread_channel`), and v0.2
-///   federates only open, unencrypted channels (`DeliveryPolicy::federates`),
-///   so no peer legitimately relays one. A future peer-policy field naming a
-///   peer's bridge DIDs could relax this;
+///   take a DID pair's mail-thread slug before the bridge does. Bridge
+///   threads are local-only: the bridge creates them restricted
+///   (`bridges/email/src/channel.rs`, `ensure_thread_channel`);
 /// - `Server`: only this server's own DID.
 pub fn check_create_slug(
     slug: &str,
@@ -1810,24 +1701,6 @@ pub fn check_create_slug(
 /// The metadata key a `channel-create` names its sequencer under.
 pub const SEQUENCER_KEY: &str = "sequencer";
 
-/// Whether a block from `source` that creates a channel is taken as a copy
-/// this server sequences, whatever server it names: only a block a configured
-/// peer relayed ([`IngestSource::FederatedPeer`]: a connection this server
-/// dialed to a listed peer, its DID checked at the handshake), and only under
-/// `[federation] naively_accept_peer_relayed_creates`. Otherwise a create is
-/// held to the server it names like any other, so a channel reaches a peer
-/// only once it is shared (JEP-0005).
-pub fn copies_relayed_create(ctx: &IngestContext, source: &IngestSource) -> bool {
-    ctx.naively_accept_peer_relayed_creates && matches!(source, IngestSource::FederatedPeer { .. })
-}
-
-/// `manifest` without the server its creator named: what a relayed copy is
-/// judged and stored as ([`copies_relayed_create`]).
-pub(crate) fn as_relayed_copy(manifest: &jig_core::BlockManifest) -> jig_core::BlockManifest {
-    let mut copy = manifest.clone();
-    copy.metadata.remove(SEQUENCER_KEY);
-    copy
-}
 /// The metadata key a `channel-create` lists its co-owners under.
 pub const CO_OWNERS_KEY: &str = "co_owners";
 /// The metadata keys of a `channel-create`'s tier terms (JEP-0014).
@@ -4823,70 +4696,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn federated_text_render_to_unknown_channel_is_refused() {
-        // Fail closed: a relayed post for a channel this server has no row
-        // for has no membership or ownership to be gated against, so it used
-        // to be stored as an orphan. Channels federate by their
-        // channel-create, which gives the receiving server a row first.
-        let ctx = test_ctx();
-        let sender_key = random_signing_key();
-        let (mb, cb, sig) =
-            build_bundle_parts_with_channel(&sender_key, BlockKind::TextRender, "#remote-only");
-
-        let err = do_ingest(
-            &ctx,
-            mb,
-            cb,
-            sig,
-            IngestSource::FederatedPeer {
-                peer_did: Did::default(),
-                peer_url: "wss://peer-a.jig.onl".into(),
-            },
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(&err, IngestError::UnknownChannel { slug } if slug == "#remote-only"),
-            "expected UnknownChannel, got {err:?}"
-        );
-        assert!(
-            ctx.store
-                .list_blocks_by_channel("#remote-only", 10, None)
-                .unwrap()
-                .is_empty(),
-            "a refused relayed post must leave nothing behind"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_peers_control_block_for_an_unknown_channel_is_refused() {
-        // A member-add for a channel this server has no row for has no owner
-        // to be authorized against. It must not ride the text-render
-        // exemption past the write gate.
-        let ctx = test_ctx_allowing(&["member-add"]);
-        let sender_key = random_signing_key();
-        let (mb, cb, sig) =
-            build_bundle_parts_with_channel(&sender_key, BlockKind::MemberAdd, "#remote-only");
-
-        let err = do_ingest(
-            &ctx,
-            mb,
-            cb,
-            sig,
-            IngestSource::FederatedPeer {
-                peer_did: Did::default(),
-                peer_url: "wss://peer-a.jig.onl".into(),
-            },
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(&err, IngestError::UnknownChannel { slug } if slug == "#remote-only"),
-            "expected UnknownChannel, got {err:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn bridge_text_render_to_unknown_channel_is_rejected() {
         // Bridges are NOT exempt: the email bridge awaits `ensure_dm_channel`
         // (a real channel-create through this same pipeline) before submitting
@@ -5290,61 +5099,6 @@ mod tests {
             matches!(not_a_did, Err(IngestError::InvalidTerms { ref field, .. }) if field == "sequencer"),
             "got {not_a_did:?}"
         );
-    }
-
-    /// A create relayed by a configured peer names that peer, or no server.
-    /// By default it is held to the server it names like any other create,
-    /// and refused here; under `naively_accept_peer_relayed_creates` it is a
-    /// copy this server sequences. A client's create naming another server is
-    /// refused either way: only a peer's relay is ever taken as a copy.
-    #[tokio::test]
-    async fn a_relayed_create_is_a_copy_only_when_the_operator_opts_in() {
-        let peer = random_signing_key();
-        let relayed = || IngestSource::FederatedPeer {
-            peer_did: Did::from_ed25519_pubkey(peer.verifying_key().as_bytes()),
-            peer_url: "wss://peer".to_string(),
-        };
-        for opted_in in [false, true] {
-            let mut ctx = roles_ctx();
-            ctx.naively_accept_peer_relayed_creates = opted_in;
-            let owner = person();
-            let create = |slug: &str, sequencer: serde_json::Value| {
-                signed_parts(
-                    &owner.key,
-                    BlockKind::ChannelCreate,
-                    jig_core::EncryptionSuite::Unencrypted,
-                    serde_json::json!({"slug": slug, "sequencer": sequencer}),
-                )
-            };
-
-            let (mb, cb, sig) = create("#theirs", serde_json::json!(did_of(&peer)));
-            let named = do_ingest(&ctx, mb, cb, sig, relayed()).await;
-            let (mb, cb, sig) = create("#unnamed", serde_json::Value::Null);
-            let unnamed = do_ingest(&ctx, mb, cb, sig, relayed()).await;
-            if opted_in {
-                for cid in [named.unwrap(), unnamed.unwrap()] {
-                    let row = ctx.store.get_channel_by_id(&cid).unwrap().unwrap();
-                    assert_eq!(row.sequencer_did, ctx.server_did.to_did_jig_string());
-                }
-            } else {
-                assert!(
-                    matches!(named, Err(IngestError::NotSequencer { .. })),
-                    "{named:?}"
-                );
-                assert!(
-                    matches!(unnamed, Err(IngestError::SequencerRequired { .. })),
-                    "{unnamed:?}"
-                );
-            }
-
-            // The same block from a client is never a copy.
-            let (mb, cb, sig) = create("#from-a-client", serde_json::json!(did_of(&peer)));
-            let from_client = do_ingest(&ctx, mb, cb, sig, local()).await;
-            assert!(
-                matches!(from_client, Err(IngestError::NotSequencer { .. })),
-                "opted in: {opted_in}: {from_client:?}"
-            );
-        }
     }
 
     #[tokio::test]
@@ -6840,8 +6594,7 @@ mod tests {
 
     /// `#email/` threads are the email bridge's: only a bridge-sourced create
     /// is taken. Not from a client, which could otherwise squat a DID pair's
-    /// thread before the bridge; not from a peer either, since bridge threads
-    /// are local-only (restricted, so they never federate).
+    /// thread before the bridge.
     #[tokio::test]
     async fn an_email_thread_is_created_only_through_the_bridge() {
         let ctx = roles_ctx();
@@ -6851,12 +6604,6 @@ mod tests {
         assert!(invalid_slug(&r), "client: {r:?}");
         let r = create_from(&ctx, &who, thread, IngestSource::AdminEndpoint).await;
         assert!(invalid_slug(&r), "admin endpoint: {r:?}");
-        let peer = IngestSource::FederatedPeer {
-            peer_did: Did::from_ed25519_pubkey(random_signing_key().verifying_key().as_bytes()),
-            peer_url: "wss://peer.invalid".to_string(),
-        };
-        let r = create_from(&ctx, &who, thread, peer).await;
-        assert!(invalid_slug(&r), "peer: {r:?}");
         assert!(ctx.store.get_channel_by_slug(thread).unwrap().is_none());
 
         create_from(&ctx, &who, thread, IngestSource::Bridge)
