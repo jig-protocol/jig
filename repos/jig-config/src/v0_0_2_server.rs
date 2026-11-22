@@ -44,6 +44,50 @@ pub struct JigServerConfig {
     pub keys: KeysSection,
     #[serde(default)]
     pub limits: LimitsSection,
+    #[serde(default)]
+    pub custody: CustodySection,
+}
+
+/// `[custody]`: this server as a custodian of key packages (JEP-0005 rule
+/// 21) for the DIDs whose reachability record lists it. Another server's
+/// member asks it, with a signed request, for one package of such a DID to
+/// add them to a channel.
+///
+/// Until DIDs sign their own release policies, `release` is the server's
+/// policy for all of them.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CustodySection {
+    /// `open`: release to any signed request this server admits, within the
+    /// limits below. `closed`: release to none, so only this server's own
+    /// channels can add its users.
+    pub release: ReleasePolicy,
+    /// Most packages released for one DID per hour, across requesters.
+    pub per_member_per_hour: u64,
+    /// Most packages released to one requester per hour, across DIDs.
+    pub per_requester_per_hour: u64,
+    /// How far a request's `issued_at` may be from this server's clock, in
+    /// seconds, either way.
+    pub request_window_secs: u64,
+}
+
+impl Default for CustodySection {
+    fn default() -> Self {
+        Self {
+            release: ReleasePolicy::Open,
+            per_member_per_hour: 10,
+            per_requester_per_hour: 20,
+            request_window_secs: 300,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReleasePolicy {
+    #[default]
+    Open,
+    Closed,
 }
 
 /// `[limits]`: the most bytes one HTTP request body or one WebSocket message

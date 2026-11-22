@@ -539,9 +539,18 @@ pub(crate) async fn create_with(
 ///    the nameserver that vouched for it are printed; a name whose DID
 ///    changed is refused. There is no fallback to an unverified answer.
 pub(crate) async fn resolve_who(ctx: &CliContext, who: &str) -> Result<String> {
+    Ok(resolve_who_reachable(ctx, who).await?.0)
+}
+
+/// [`resolve_who`], with the DID's reachability record when `who` was a
+/// name and the nameserver served one the DID signed.
+async fn resolve_who_reachable(
+    ctx: &CliContext,
+    who: &str,
+) -> Result<(String, Option<jig_core::naming::ReachabilityRecord>)> {
     let who = who.trim();
     if who.starts_with("did:jig:") {
-        return canonical_did(who);
+        return Ok((canonical_did(who)?, None));
     }
     let matches: Vec<&String> = ctx
         .effective()
@@ -554,8 +563,9 @@ pub(crate) async fn resolve_who(ctx: &CliContext, who: &str) -> Result<String> {
         // A hand-edited `[contacts]` entry may spell the DID differently;
         // everything downstream (DM slugs, membership) compares canonical ones.
         [did] => {
-            return canonical_did(did)
-                .with_context(|| format!("the `[contacts]` entry for `{who}`"));
+            let did = canonical_did(did)
+                .with_context(|| format!("the `[contacts]` entry for `{who}`"))?;
+            return Ok((did, None));
         }
         [] => {}
         _ => anyhow::bail!("more than one contact is called `{who}`; pass the DID"),
@@ -586,7 +596,11 @@ pub(crate) async fn resolve_who(ctx: &CliContext, who: &str) -> Result<String> {
         jig_client::naming::Verified::Pinned(binding)
         | jig_client::naming::Verified::Rotated { binding, .. } => binding,
     };
-    canonical_did(binding.did())
+    let did = canonical_did(binding.did())?;
+    // The client kept the record only if the DID signed it; it must also be
+    // the record of the DID the name verified to.
+    let reach = binding.reachability.filter(|r| r.did == did);
+    Ok((did, reach))
 }
 
 /// The canonical spelling of a key-derived `did:jig` a person typed: the one
@@ -609,22 +623,22 @@ async fn visible_channel(secure: &Secure, slug: &str) -> Result<ChannelInfo> {
         .ok_or_else(|| anyhow::anyhow!("no channel {slug} that you can see on this server"))
 }
 
-/// Apply `jig channel add <slug> <who>`. Owner only. On an encrypted channel
-/// this fetches one of the member's key packages and commits their addition;
-/// the welcome rides the same block.
-pub async fn add(ctx: &CliContext, slug: String, who: String) -> Result<()> {
-    let did = resolve_who(ctx, &who).await?;
+/// Apply `jig channel add <slug> <who> [--via <server-url>]`. Owner only. On
+/// an encrypted channel this fetches one of the member's key packages and
+/// commits their addition; the welcome rides the same block.
+///
+/// The package comes from this server when the member stocked it here, and
+/// otherwise from a custodian of theirs (JEP-0005 rule 21): a server their
+/// reachability record lists, the record coming from the nameserver that
+/// verified their name or from the server `via`.
+pub async fn add(ctx: &CliContext, slug: String, who: String, via: Option<String>) -> Result<()> {
+    let (did, reach) = resolve_who_reachable(ctx, &who).await?;
     refuse_growing_a_dm(&slug, &ctx.identity()?.did_string(), &did)?;
     let secure = Secure::open(ctx)?;
     let info = visible_channel(&secure, &slug).await?;
     let id = secure.identity();
     let cid = if info.encrypted() {
-        let kp = secure.take_key_package(&did).await.with_context(|| {
-            format!(
-                "fetching a key package for {did} — they need to have run `jig chat` or \
-                 `jig init` against this server at least once"
-            )
-        })?;
+        let kp = member_key_package(&secure, &info, &did, reach, via.as_deref()).await?;
         let server = secure.server().to_string();
         secure
             .commit(
@@ -644,6 +658,41 @@ pub async fn add(ctx: &CliContext, slug: String, who: String) -> Result<()> {
     println!("added {did} to {slug}");
     println!("  block_cid: {cid}");
     Ok(())
+}
+
+/// One of `did`'s key packages to add them to `info`: from this server's
+/// stock, or failing that from their custodians ([`Secure::key_package_from_custodians`]).
+async fn member_key_package(
+    secure: &Secure,
+    info: &ChannelInfo,
+    did: &str,
+    reach: Option<jig_core::naming::ReachabilityRecord>,
+    via: Option<&str>,
+) -> Result<Vec<u8>> {
+    let local = match secure.take_key_package(did).await {
+        Ok(kp) => return Ok(kp),
+        Err(e) => e,
+    };
+    let no_package = local
+        .downcast_ref::<Refused>()
+        .is_some_and(|r| r.code == "NO_KEY_PACKAGE");
+    if !no_package {
+        return Err(local.context(format!("fetching a key package for {did}")));
+    }
+    let record = match (via, reach) {
+        (Some(via), _) => crate::cmd::secure::custodians_via(via, did, secure.identity())
+            .await
+            .with_context(|| format!("asking {via} where {did} keeps key packages"))?,
+        (None, Some(record)) => record,
+        (None, None) => anyhow::bail!(
+            "{did} has no key packages on this server, and nothing says where else to ask. \
+             Add them by their verified name, or pass `--via <server-url>` naming a server \
+             they use"
+        ),
+    };
+    secure
+        .key_package_from_custodians(did, &info.id, &record)
+        .await
 }
 
 /// Apply `jig channel kick <slug> <who>`. Owner only.

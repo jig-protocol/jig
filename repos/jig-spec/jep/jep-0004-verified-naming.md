@@ -222,7 +222,9 @@ Non-goals:
     - A nameserver whose data contract requires a contact point MAY require a record at
       registration (`POST /v1/register` then carries it).
     - The record with the highest valid `seq` wins.
-    - A server SHOULD serve the records of DIDs that list it.
+    - A server SHOULD serve the records of DIDs that list it. A jig-server keeps a record
+      only if it lists that server: `PUT /api/v1/reach/{did}` stores one with a higher
+      `seq` than it holds, and `GET /api/v1/reach/{did}` serves it back.
     - A nameserver MAY serve one beside an attestation.
     - Nobody but the DID can produce one.
 

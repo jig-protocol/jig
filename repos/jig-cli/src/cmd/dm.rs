@@ -76,7 +76,7 @@ pub async fn run(ctx: &CliContext, who: String, message: String) -> Result<()> {
     // Add the other side if they are not in yet — on first use, or when an
     // earlier add failed (they had published no key packages, say).
     if !roster.contains(&peer) {
-        crate::cmd::channel::add(ctx, slug.clone(), peer.clone())
+        crate::cmd::channel::add(ctx, slug.clone(), peer.clone(), None)
             .await
             .with_context(|| format!("adding {peer} to {slug}"))?;
     }

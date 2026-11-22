@@ -21,6 +21,7 @@ use jig_client::pins::{
 use jig_client::read_auth::{ReadProof, signable_path};
 use jig_client::secure::{CommitLock, ReadIn, Seen, Session, history_reaches, replay_order};
 use jig_client::{Client, ClientError, DeliveredBlock, Identity};
+use jig_core::naming::ReachabilityRecord;
 use jig_mls::member::Commit;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -157,6 +158,85 @@ pub async fn connect_pinned(server: &str, identity: Identity) -> Result<Client> 
     Ok(client)
 }
 
+/// A reachability record as a server serves it.
+#[derive(Debug, Deserialize)]
+struct RecordBody {
+    record_b64: String,
+}
+
+/// Hold the server at `url` to `server_did` with its signed welcome, without
+/// pinning it: a custodian is trusted with nothing but answering.
+async fn prove_server(url: &str, server_did: &str, identity: Identity) -> Result<()> {
+    let tls = crate::cmd::trust::server_tls(url).await?;
+    let mut options = jig_client::connection::ConnectOptions {
+        tls,
+        ..Default::default()
+    };
+    options.offer.pinned_server_did = Some(server_did.to_string());
+    Client::connect_with_options(url, identity, options)
+        .await
+        .map(drop)
+        .with_context(|| format!("{url} did not prove it is {server_did}"))
+}
+
+/// The server at `url`'s DID, as its signed welcome says.
+async fn server_did_at(url: &str, identity: Identity) -> Result<String> {
+    let tls = crate::cmd::trust::server_tls(url).await?;
+    let options = jig_client::connection::ConnectOptions {
+        tls,
+        ..Default::default()
+    };
+    let client = Client::connect_with_options(url, identity, options)
+        .await
+        .with_context(|| format!("connecting to {url}"))?;
+    client
+        .welcome()
+        .map(|w| w.server_did.clone())
+        .with_context(|| format!("{url} sent no welcome"))
+}
+
+/// Where to ask for `did`'s key packages, from the server at `via`: the
+/// reachability record it keeps for `did`, if `did` signed one, or else that
+/// server alone, under the DID its welcome proves. Asking a server `did` did
+/// not list gets `NO_CUSTODY`; a record a server makes up gets nothing, since
+/// only `did` can sign one.
+pub async fn custodians_via(
+    via: &str,
+    did: &str,
+    identity: &Identity,
+) -> Result<ReachabilityRecord> {
+    let url = format!("{}/api/v1/reach/{did}", base_http_url(via));
+    let proof = ReadProof::sign(identity, "GET", signable_path(&url));
+    let mut req = crate::cmd::trust::http(via, std::time::Duration::from_secs(15))
+        .await?
+        .get(&url);
+    for (name, value) in proof.headers() {
+        req = req.header(name, value);
+    }
+    let resp = req.send().await.with_context(|| format!("GET {url}"))?;
+    if resp.status().is_success() {
+        let body: RecordBody = limits::json_capped(resp, limits::MAX_DOCUMENT_BYTES)
+            .await
+            .with_context(|| format!("reading {url}"))?;
+        let record = STANDARD
+            .decode(body.record_b64)
+            .ok()
+            .and_then(|e| ReachabilityRecord::from_envelope(&e).ok())
+            .filter(|r| r.did == did);
+        if let Some(record) = record {
+            return Ok(record);
+        }
+        eprintln!("warning: {via} served a reachability record {did} did not sign; ignoring it");
+    }
+    let server_did = server_did_at(via, identity.duplicate()).await?;
+    Ok(ReachabilityRecord {
+        did: did.to_string(),
+        servers: vec![(server_did, via.to_string())],
+        seq: 0,
+        envelope: Vec::new(),
+    })
+}
+
 /// History replayed through the session.
 pub struct Synced {
     /// What to show, oldest first.
@@ -269,6 +349,8 @@ pub struct Secure {
     server: String,
     /// The same server as an `http(s)://` base for REST.
     base: String,
+    /// `[server] publish_reachability` ([`Self::ensure_reachable`]).
+    publish_reachability: bool,
     /// Set once this process has held the server to its pin
     /// ([`Self::ensure_pinned`]).
     pinned: tokio::sync::OnceCell<()>,
@@ -300,6 +382,7 @@ impl Secure {
             identity: ctx.identity()?,
             base: base_http_url(&server),
             server,
+            publish_reachability: ctx.effective().server.publishes_reachability(),
             pinned: tokio::sync::OnceCell::new(),
             forward: tokio::sync::OnceCell::new(),
             forward_broken: std::sync::atomic::AtomicBool::new(false),
@@ -651,7 +734,7 @@ impl Secure {
             packages.extend(self.session.key_packages(1, true)?);
         }
         if packages.is_empty() {
-            return Ok(());
+            return self.ensure_reachable().await;
         }
         self.ensure_pinned().await?;
         let url = format!("{}/api/v1/mls/key-packages", self.base);
@@ -669,7 +752,153 @@ impl Secure {
         if !resp.status().is_success() {
             return Err(Self::refusal(resp).await.into());
         }
+        self.ensure_reachable().await
+    }
+
+    /// The DID this device pinned for its server.
+    async fn server_did(&self) -> Result<String> {
+        self.ensure_pinned().await?;
+        Pins::load(&Pins::default_path())?
+            .offer(&self.server)
+            .pinned_server_did
+            .with_context(|| format!("no DID is pinned for {}", self.server))
+    }
+
+    /// Keep a reachability record on this server that lists it (JEP-0004
+    /// rule 21), so members of other servers can ask it for our key packages
+    /// ([`Self::key_package_from_custodians`]). Servers the record kept here
+    /// already listed stay listed; this server is put first.
+    /// Nothing, with `[server] publish_reachability = false`.
+    pub async fn ensure_reachable(&self) -> Result<()> {
+        if !self.publish_reachability {
+            return Ok(());
+        }
+        let did = self.session.did().to_string();
+        let server_did = self.server_did().await?;
+        let here = (server_did.clone(), self.base.clone());
+        let kept = match self
+            .get_json::<RecordBody>(&format!("/api/v1/reach/{did}"))
+            .await
+        {
+            Ok(body) => STANDARD
+                .decode(body.record_b64)
+                .ok()
+                .and_then(|e| ReachabilityRecord::from_envelope(&e).ok())
+                .filter(|r| r.did == did),
+            Err(e) => match e.downcast_ref::<Refused>() {
+                Some(r) if r.code == "NO_RECORD" => None,
+                // A server from before reachability records has no route for
+                // them: nothing to keep there, and nothing wrong.
+                Some(r) if r.status == 404 || r.status == 405 => return Ok(()),
+                _ => return Err(e),
+            },
+        };
+        if kept.as_ref().is_some_and(|r| r.servers.contains(&here)) {
+            return Ok(());
+        }
+        let mut servers = vec![here];
+        let mut seq = 1;
+        if let Some(kept) = kept {
+            seq = kept.seq.saturating_add(1);
+            servers.extend(kept.servers.into_iter().filter(|(s, _)| *s != server_did));
+        }
+        // A record kept on another server may have reached a higher seq: the
+        // clock keeps each new record above any this device signed before.
+        let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
+        let record = self.identity.sign_reachability(servers, seq.max(now));
+        let url = format!("{}/api/v1/reach/{did}", self.base);
+        let resp = self
+            .http()
+            .await?
+            .put(&url)
+            .json(&serde_json::json!({"record_b64": STANDARD.encode(&record.envelope)}))
+            .send()
+            .await
+            .with_context(|| format!("PUT {url}"))?;
+        if !resp.status().is_success() {
+            return Err(Self::refusal(resp).await.into());
+        }
         Ok(())
+    }
+
+    /// One of `did`'s key packages for the channel `channel_id`, asked of
+    /// each custodian `record` lists in turn (JEP-0005 rule 21). Each is held
+    /// to the server DID the record names by its signed welcome before it is
+    /// asked. What comes back is checked here only for being `did`'s package;
+    /// the commit that adds it checks its signature again
+    /// (`jig_mls::member::Member::add`), so a custodian can withhold a package
+    /// but not substitute one.
+    pub async fn key_package_from_custodians(
+        &self,
+        did: &str,
+        channel_id: &str,
+        record: &ReachabilityRecord,
+    ) -> Result<Vec<u8>> {
+        let channel_id = cid::Cid::try_from(channel_id)
+            .ok()
+            .filter(|_| jig_core::canonical_cid::is_canonical_text(channel_id))
+            .with_context(|| format!("the channel's id `{channel_id}` is not a canonical CID"))?;
+        let mut tried = Vec::new();
+        for (server_did, url) in &record.servers {
+            match self.ask_custodian(did, channel_id, server_did, url).await {
+                Ok(package) => return Ok(package),
+                Err(e) => tried.push(format!("  {url} ({server_did}): {e:#}")),
+            }
+        }
+        if tried.is_empty() {
+            anyhow::bail!("{did}'s reachability record lists no servers");
+        }
+        anyhow::bail!(
+            "no server {did} lists released a key package; nothing was changed. Tried:\n{}",
+            tried.join("\n")
+        )
+    }
+
+    async fn ask_custodian(
+        &self,
+        did: &str,
+        channel_id: cid::Cid,
+        server_did: &str,
+        url: &str,
+    ) -> Result<Vec<u8>> {
+        prove_server(url, server_did, self.identity.duplicate()).await?;
+        // A custodian that asks unknown DIDs for proof of work asks the
+        // requester too.
+        crate::cmd::admission::ensure_for(url, &self.identity).await?;
+        let request = self.identity.sign_kp_request(
+            did,
+            channel_id,
+            server_did,
+            rand::random(),
+            chrono::Utc::now().timestamp(),
+        );
+        let endpoint = format!("{}/api/v1/custody/{did}/requests", base_http_url(url));
+        let resp = crate::cmd::trust::http(url, std::time::Duration::from_secs(15))
+            .await?
+            .post(&endpoint)
+            .json(&serde_json::json!({"request_b64": STANDARD.encode(&request.envelope)}))
+            .send()
+            .await
+            .with_context(|| format!("POST {endpoint}"))?;
+        if !resp.status().is_success() {
+            return Err(Self::refusal(resp).await.into());
+        }
+        #[derive(Deserialize)]
+        struct Released {
+            key_package_b64: String,
+        }
+        let released: Released = limits::json_capped(resp, limits::MAX_DOCUMENT_BYTES)
+            .await
+            .with_context(|| format!("reading {endpoint}"))?;
+        let package = STANDARD
+            .decode(released.key_package_b64)
+            .context("key package is not base64")?;
+        let info = jig_mls::delivery::validate_key_package(&package)
+            .context("the custodian sent a key package that does not verify")?;
+        if info.did != did {
+            anyhow::bail!("the custodian sent {}'s key package, not {did}'s", info.did);
+        }
+        Ok(package)
     }
 
     pub async fn take_key_package(&self, did: &str) -> Result<Vec<u8>> {
