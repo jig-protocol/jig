@@ -45,7 +45,86 @@ pub struct JigServerConfig {
     #[serde(default)]
     pub limits: LimitsSection,
     #[serde(default)]
+    pub ruleset: RulesetSection,
+    #[serde(default)]
     pub custody: CustodySection,
+}
+
+/// `[ruleset]`: the ruleset this server declares (JEP-0009 rule 4).
+///
+/// Unset, the server declares none, which rule 4 allows. Set, `path` names a
+/// signed ruleset document (a COSE_Sign1 envelope, as `jig-core`'s
+/// `SignedRuleset` writes it). The server refuses to boot on a file that is
+/// missing or does not open, names the document in its welcome and its
+/// manifest log, and serves it at `GET /api/v1/ruleset/{hash}`.
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RulesetSection {
+    pub path: Option<String>,
+    /// Where clients fetch the document. Unset, the path this server serves
+    /// it at, `/api/v1/ruleset/{hash}`, which a client resolves against the
+    /// server it is connected to. Set it to an absolute `https://` URL to
+    /// name a mirror; the client still checks what it fetches against the
+    /// signed hash.
+    pub url: Option<String>,
+}
+
+impl RulesetSection {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.path.as_deref().is_some_and(|p| p.trim().is_empty()) {
+            return Err("[ruleset] path is empty: remove it to declare no ruleset".to_string());
+        }
+        if self.url.is_some() && self.path.is_none() {
+            return Err(
+                "[ruleset] url is set without a path: there is nothing to serve".to_string(),
+            );
+        }
+        if let Some(url) = &self.url
+            && !is_https_url_with_host(url)
+        {
+            return Err(format!(
+                "[ruleset] url {url:?} is not an absolute https:// URL with a host"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// `url` is an absolute `https://` URL whose authority names a host: a
+/// registered name or IPv4 address of letters, digits, `.` and `-`, or an
+/// IPv6 literal in brackets, then at most a numeric port. No userinfo.
+fn is_https_url_with_host(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // The host, and the port after it when there is a `:`.
+    let (host_ok, port) = if let Some(v6) = authority.strip_prefix('[') {
+        let Some((inner, after)) = v6.split_once(']') else {
+            return false;
+        };
+        let port = match after {
+            "" => None,
+            _ => match after.strip_prefix(':') {
+                Some(port) => Some(port),
+                None => return false,
+            },
+        };
+        let ok = !inner.is_empty() && inner.chars().all(|c| c.is_ascii_hexdigit() || c == ':');
+        (ok, port)
+    } else {
+        let (name, port) = match authority.split_once(':') {
+            Some((name, port)) => (name, Some(port)),
+            None => (authority, None),
+        };
+        let ok = !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+        (ok, port)
+    };
+    let port_ok = port.is_none_or(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+    host_ok && port_ok
 }
 
 /// `[custody]`: this server as a custodian of key packages (JEP-0005 rule
@@ -607,15 +686,6 @@ pub struct FederationSection {
     /// still checked by the signed welcome, but nothing after the welcome is
     /// protected on a plaintext link. Surfaces in `unsafe_options_active`.
     pub dangerously_allow_plaintext_federation: bool,
-    /// For tests only: a `channel-create` a configured peer relays, which
-    /// names another server as its sequencer (or none), is stored as a copy
-    /// this server sequences, as the legacy relay did before creates named
-    /// their sequencer. Clients refuse to read such a copy, because its
-    /// creation block names another server. Off, such a create is refused,
-    /// and a channel reaches a peer only once it is shared (JEP-0005):
-    /// servers that trust each other set `offers = "accept"` and use
-    /// `jig channel share`. Surfaces in `unsafe_options_active`.
-    pub naively_accept_peer_relayed_creates: bool,
     /// The quota for every peer without its own `quota`, published in the
     /// server manifest (JEP-0005 rule 16). Defaults to
     /// [`DEFAULT_PEER_BLOCKS_PER_MIN`] blocks and [`DEFAULT_PEER_BYTES_PER_MIN`]
@@ -661,7 +731,6 @@ impl Default for FederationSection {
             peers: Vec::new(),
             dangerously_disable_federation_tls: false,
             dangerously_allow_plaintext_federation: false,
-            naively_accept_peer_relayed_creates: false,
             default_peer_quota: PeerQuotaConfig {
                 blocks_per_min: DEFAULT_PEER_BLOCKS_PER_MIN,
                 bytes_per_min: DEFAULT_PEER_BYTES_PER_MIN,
@@ -770,12 +839,12 @@ impl FederationSection {
                 ));
             }
         }
-        let mut quotas: BTreeMap<&str, Option<PeerQuotaConfig>> = BTreeMap::new();
+        let mut quotas: BTreeMap<String, Option<PeerQuotaConfig>> = BTreeMap::new();
         for (i, peer) in self.peers.iter().enumerate() {
             if let Some(q) = &peer.quota {
                 check_quota(q, &format!("peers[{i}].quota"))?;
             }
-            if let Some(earlier) = quotas.insert(&peer.expected_did, peer.quota)
+            if let Some(earlier) = quotas.insert(did_spelling_key(&peer.expected_did), peer.quota)
                 && earlier != peer.quota
             {
                 return Err(format!(
@@ -1257,9 +1326,6 @@ impl JigServerConfig {
         if self.federation.dangerously_allow_plaintext_federation {
             active.push("federation.dangerously_allow_plaintext_federation".to_string());
         }
-        if self.federation.naively_accept_peer_relayed_creates {
-            active.push("federation.naively_accept_peer_relayed_creates".to_string());
-        }
         if self.identity.naively_allow_unknown_handles_fallback {
             active.push("identity.naively_allow_unknown_handles_fallback".to_string());
         }
@@ -1311,6 +1377,19 @@ impl JigServerConfig {
         // Step 3: per-bridge enabled check (also acts as deny-by-default
         // for bridges with no per_bridge entry at all)
         matches!(self.bridges.per_bridge.get(name), Some(b) if b.enabled)
+    }
+}
+
+/// One key for every spelling of a DID an operator may type: the server reads
+/// `expected_did` with `Did::canonicalize`, which trims it and decodes the
+/// body after `did:jig:z` in any letter case, so two entries that differ only
+/// there name one peer (#460). A string that is not a DID keys as itself;
+/// boot refuses it later.
+fn did_spelling_key(did: &str) -> String {
+    let did = did.trim();
+    match did.strip_prefix("did:jig:z") {
+        Some(body) => format!("did:jig:z{}", body.to_uppercase()),
+        None => did.to_string(),
     }
 }
 
@@ -1501,7 +1580,6 @@ mod tests {
         let cfg = JigServerConfig::default();
         assert!(!cfg.federation.dangerously_disable_federation_tls);
         assert!(!cfg.federation.dangerously_allow_plaintext_federation);
-        assert!(!cfg.federation.naively_accept_peer_relayed_creates);
         assert!(!cfg.identity.naively_allow_unknown_handles_fallback);
         assert!(!cfg.debug.list_handles);
     }
@@ -1557,7 +1635,6 @@ mod tests {
         let mut cfg = JigServerConfig::default();
         cfg.federation.dangerously_disable_federation_tls = true;
         cfg.federation.dangerously_allow_plaintext_federation = true;
-        cfg.federation.naively_accept_peer_relayed_creates = true;
         cfg.identity.naively_allow_unknown_handles_fallback = true;
         cfg.identity.dangerously_allow_plaintext_nameservers = true;
         cfg.debug.list_handles = true;
@@ -1570,7 +1647,6 @@ mod tests {
         assert!(active.contains(&"auth.require_authenticated_reads=false".to_string()));
         assert!(active.contains(&"federation.dangerously_disable_federation_tls".to_string()));
         assert!(active.contains(&"federation.dangerously_allow_plaintext_federation".to_string()));
-        assert!(active.contains(&"federation.naively_accept_peer_relayed_creates".to_string()));
         assert!(active.contains(&"identity.naively_allow_unknown_handles_fallback".to_string()));
         assert!(active.contains(&"identity.dangerously_allow_plaintext_nameservers".to_string()));
         assert!(active.contains(&"debug.list_handles".to_string()));
@@ -1899,6 +1975,49 @@ mod tests {
             .expect_err("a misspelled per-bridge key must be rejected");
         assert!(err.to_string().contains("enabeld"), "got: {err}");
         assert!(toml::from_str::<JigServerConfig>("[sever]\n").is_err());
+    }
+
+    /// `naively_accept_peer_relayed_creates` went with the legacy relay it
+    /// configured. A config that still sets it does not boot, and the error
+    /// names the key, so the operator knows which line to delete.
+    #[test]
+    fn the_removed_relayed_creates_flag_is_refused_by_name() {
+        for value in ["true", "false"] {
+            let err = toml::from_str::<JigServerConfig>(&format!(
+                "[federation]\nnaively_accept_peer_relayed_creates = {value}\n"
+            ))
+            .expect_err("the removed key must not parse");
+            assert!(
+                err.to_string()
+                    .contains("naively_accept_peer_relayed_creates"),
+                "{err}"
+            );
+        }
+    }
+
+    /// Two entries for one peer, spelled in different letter case, are one
+    /// peer: given different quotas they are refused as a duplicate, as the
+    /// same spelling twice is (#460).
+    #[test]
+    fn one_peer_in_two_letter_cases_with_two_quotas_is_refused() {
+        let config = |second: &str| {
+            format!(
+                "[[federation.peers]]\nurl = \"wss://a.example\"\nexpected_did = \"did:jig:zabcd\"\n\
+                 quota = {{ blocks_per_min = 10, bytes_per_min = 1000 }}\n\
+                 [[federation.peers]]\nurl = \"wss://a.example\"\nexpected_did = \"{second}\"\n\
+                 quota = {{ blocks_per_min = 20, bytes_per_min = 1000 }}\n"
+            )
+        };
+        for second in ["did:jig:zabcd", "did:jig:zABCD", " did:jig:zAbCd "] {
+            let cfg: JigServerConfig = toml::from_str(&config(second)).unwrap();
+            let err = cfg.federation.validate().expect_err(second);
+            assert!(
+                err.contains("more than once with different quotas"),
+                "{err}"
+            );
+        }
+        let cfg: JigServerConfig = toml::from_str(&config("did:jig:zwxyz")).unwrap();
+        assert!(cfg.federation.validate().is_ok());
     }
 
     #[test]

@@ -422,6 +422,20 @@ just older than that block. A restricted channel you are not
 a member of is `403 NOT_A_MEMBER`; a channel with no local row (federated, or
 mistyped) is `200` with `[]`. `limit` defaults to and is clamped at **200**.
 
+### Declaring a ruleset
+
+`[ruleset] path` names a signed ruleset document (JEP-0009). The server
+refuses to boot if the file is missing or does not verify, logs `declaring a
+ruleset` with its id, version, hash and URL, and serves it at
+`GET /api/v1/ruleset/<hash>`. Clients that ask are told it in the signed
+welcome; the manifest log names it too, so a change of ruleset publishes a
+new manifest entry. Clients from before rulesets never ask and see the
+welcome they always did. Declaring is a public, signed claim, so the server
+refuses to boot when the ruleset's pool shares are not the ones
+`[auth.pools]` enforces (or the pools are off), naming both values. The pools
+are all it enforces today: standing and the ruleset's other parameters are
+not applied until acknowledgements and earned standing land.
+
 ---
 
 ## A CA-issued certificate with `tailscale cert` (no certbot, no public DNS)
@@ -762,10 +776,10 @@ this server.
 
 A channel reaches another server only once it is shared. Its creation block
 names the server that orders it, so a peer no longer takes a channel this
-server creates as one of its own. `naively_accept_peer_relayed_creates` (see
-`config.example.toml`) has no effect: this server takes no relayed blocks.
-Servers that trust each other set `offers = "accept"` and use `jig channel
-share`.
+server creates as one of its own. Servers that trust each other set
+`offers = "accept"` and use `jig channel share`. The test-only key
+`naively_accept_peer_relayed_creates` is removed: a config that still sets it
+does not boot, and the error names the key. Delete the line before upgrading.
 
 This server neither sends nor takes relayed posts. Its posts reach another
 server only through a channel it shares, and another server's posts reach it

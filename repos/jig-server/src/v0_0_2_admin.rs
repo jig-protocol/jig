@@ -412,7 +412,6 @@ mod tests {
             fanout,
             server_url: server_url.clone(),
             naively_allow_unknown_handles_fallback: false,
-            naively_accept_peer_relayed_creates: false,
             executor: Some(BlockExecutor::shared()),
         });
 
@@ -435,6 +434,7 @@ mod tests {
             prior_dids: Vec::new(),
             peer_frames: Default::default(),
             peers: Default::default(),
+            ruleset: None,
             relay: Default::default(),
         })
     }

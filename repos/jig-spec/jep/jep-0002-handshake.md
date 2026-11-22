@@ -54,10 +54,17 @@ Draft. Field names are provisional. The design behind this revision is
    | `key_link` | During a key change: the public key link (JEP-0012) from the server's old DID to `server_did`, signed by both keys; absent otherwise | OP-08 |
    | `admit` | The work asked of a DID the server has not admitted, `{alg, effort, salt_id, expires_at}` (JEP-0008 rule 15); absent when admission asks none | AB-02 |
    | `prior_key_links` | The server's earlier key links, oldest first, each leaving the DID the one before it moves to, so that with `key_link` last they form one chain to `server_did` (JEP-0012, "Following a chain"); absent when there are none | OP-08 |
+   | `ruleset` | The ruleset the server applies, `{id, version, hash, url}` (JEP-0009 rule 4). Only in a welcome to a hello whose `capabilities` set `ruleset`, and absent there when the server declares none | OP-02, GV-03 |
    | `nonce` | Echo of the client's nonce | replayed `welcome` |
    | `server_nonce` | A fresh random value from the server | replayed `peer_proof` |
    | `tls_exporter` | 32 bytes exported from the TLS session (RFC 9266, label `EXPORTER-jig-handshake`); empty over plaintext | relayed handshake |
-   | `sig` | ed25519 over the above. The optional `key_link`, `admit` and `prior_key_links` come last, in that order, each only when present and each under its own tag (1, 2 and 3), so no two can be read as one another and a welcome without them signs what it did before they existed | OP-02 |
+   | `sig` | ed25519 over the above. The optional `key_link`, `admit` and `prior_key_links` come last, in that order, each only when present and each under its own tag (1, 2 and 3), so no two can be read as one another and a welcome without them signs what it did before they existed. Then the features a hello asks for, each under its own tag and only when granted: `tiers` (4, JEP-0014) and `ruleset` (5). Under tag 5 the server signs its ruleset or, with a 0, that it declares none | OP-02 |
+
+   A client that predates a feature never asks for it, and is answered with the bytes it
+   always verified. A client that asked MUST refuse a welcome that grants a feature it did
+   not ask for, and MUST hold a welcome's `ruleset` to the one its cited `server-manifest`
+   declares (rule 12): a welcome that names another, or names none while the manifest
+   declares one, is a contradiction the server signed.
 
 3. If the server shares no version or suite with the `hello`, it sends a `refusal`
    instead of a `welcome`: a COSE_Sign1 (EdDSA) by `server_did` over a deterministic
@@ -179,7 +186,12 @@ Draft. Field names are provisional. The design behind this revision is
     whenever its versions, suites, capabilities, skew bound or signed peer policy
     (JEP-0005) change, and every `welcome` and federation contract message cites the
     current one. A public manifest log exposes the server's peer graph; a server MAY
-    publish only the peers it wants known. A server MAY keep an optional handshake-transcript
+    publish only the peers it wants known. A `server-manifest` block carries the ruleset
+    the server declares (JEP-0009 rule 4) beside its document, under the metadata key
+    `server_ruleset`, and not in the document: clients before rulesets refuse a document
+    with a key they do not know, and read only the document's own key. The block's CID
+    covers both, and the welcome signs that CID. A change of ruleset publishes a new block.
+    A server MAY keep an optional handshake-transcript
     channel; if it does, its manifest MUST advertise it, and a client MUST agree to it
     before posting, as part of the ruleset it consents to.
 

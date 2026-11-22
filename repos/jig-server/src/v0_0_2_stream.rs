@@ -661,13 +661,10 @@ impl Stream {
     /// Count `bytes` of one block against `peer`'s quota for this minute.
     /// Whether it is within it.
     fn within_quota(&self, peer: &str, bytes: usize) -> bool {
-        let quota: PeerQuotaConfig = self
-            .federation
-            .peers
-            .iter()
-            .find(|p| jig_pipeline::effect::canonical_did_string(&p.expected_did) == peer)
-            .and_then(|p| p.quota)
-            .unwrap_or(self.federation.default_peer_quota);
+        let quota: PeerQuotaConfig =
+            crate::v0_0_2_federation::configured_peer(&self.federation, peer)
+                .and_then(|p| p.quota)
+                .unwrap_or(self.federation.default_peer_quota);
         let mut used = self.used.lock().unwrap_or_else(|p| p.into_inner());
         let window = used.entry(peer.to_string()).or_insert(Window {
             start: Instant::now(),

@@ -198,12 +198,6 @@ list_handles = false
 # DID is still checked at the handshake, but nothing after it is protected;
 # the flag is advertised in /.well-known/jig. Prefer wss://.
 # dangerously_allow_plaintext_federation = false
-# A channel reaches a peer only once it is shared. This flag has no effect:
-# this server takes no relayed blocks, so there is no relayed create for it
-# to copy. Servers that trust each other set offers = "accept" in the peer
-# entry and use `jig channel share`. Set, it is still advertised in
-# /.well-known/jig as an unsafe option.
-# naively_accept_peer_relayed_creates = false
 # Listing a peer is what trusts it: this server dials `url` (it appends
 # /api/v1/ws), refuses a welcome signed by any DID but `expected_did`, and
 # offers a share only to a listed server. Both servers list each other.
@@ -262,3 +256,16 @@ list_handles = false
 # [bridges.per_bridge.email.config]
 # bridge_secret = "${JIG_BRIDGE_SECRET}"
 # resend_api_key = "${RESEND_API_KEY}"
+
+# [ruleset]
+# The ruleset this server declares (JEP-0009 rule 4): a signed ruleset document,
+# a COSE_Sign1 envelope. Unset, it declares none. Set, every welcome to a client
+# that asks and the manifest log name it by id, version and hash, and
+# GET /api/v1/ruleset/<hash> serves it. A missing or unverifiable file stops the
+# server from booting, and so do pool shares that differ from [auth.pools]: the
+# pools are the one part of a ruleset enforced today. Its standing and other
+# parameters are not applied until acknowledgements (R2.3) and standing (R2.4).
+# path = "/var/lib/jig/ruleset.cose"
+# An https:// mirror clients fetch it from instead of this server. They check
+# what they fetch against the signed hash either way.
+# url = "https://example.org/ruleset.cose"

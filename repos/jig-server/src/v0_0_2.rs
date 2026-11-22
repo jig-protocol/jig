@@ -85,6 +85,9 @@ pub struct AppState {
     /// ([`crate::v0_0_2_relay`]), set once the contract runs. Shared by
     /// every clone.
     pub relay: Arc<std::sync::OnceLock<Arc<crate::v0_0_2_relay::Relay>>>,
+    /// The ruleset this server declares (`[ruleset]`, JEP-0009 rule 4), read
+    /// at boot; `None` when it declares none.
+    pub ruleset: Option<Arc<crate::v0_0_2_ruleset::Declared>>,
 }
 
 /// Where the server's key link is read from: beside its key file, with
@@ -289,6 +292,8 @@ impl AppState {
             );
         }
         let server_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
+        let ruleset =
+            crate::v0_0_2_ruleset::load(&config.ruleset, &config.auth.pools)?.map(Arc::new);
         let (key_link, prior_key_links) = load_key_chain(
             Path::new(shellexpand::tilde(&config.server.server_did_keyfile).as_ref()),
             &server_did,
@@ -409,9 +414,6 @@ impl AppState {
             fanout,
             server_url: server_url.clone(),
             naively_allow_unknown_handles_fallback,
-            naively_accept_peer_relayed_creates: config
-                .federation
-                .naively_accept_peer_relayed_creates,
             executor: Some(executor),
         });
 
@@ -433,6 +435,7 @@ impl AppState {
             peer_frames: Default::default(),
             relay: Default::default(),
             peers: Default::default(),
+            ruleset,
         })
     }
 
@@ -457,6 +460,8 @@ impl AppState {
         signing_key: SigningKey,
     ) -> Result<Self> {
         let server_did = Did::from_ed25519_pubkey(signing_key.verifying_key().as_bytes());
+        let ruleset =
+            crate::v0_0_2_ruleset::load(&config.ruleset, &config.auth.pools)?.map(Arc::new);
 
         checked_identity(&config)?;
         let identity: Arc<dyn IdentityResolver> = Arc::new(TofuResolver::new(store.clone()));
@@ -484,9 +489,6 @@ impl AppState {
             fanout,
             server_url: server_url.clone(),
             naively_allow_unknown_handles_fallback,
-            naively_accept_peer_relayed_creates: config
-                .federation
-                .naively_accept_peer_relayed_creates,
             executor: Some(BlockExecutor::shared()),
         });
 
@@ -508,6 +510,7 @@ impl AppState {
             peer_frames: Default::default(),
             relay: Default::default(),
             peers: Default::default(),
+            ruleset,
         })
     }
 
@@ -524,6 +527,7 @@ impl AppState {
         let hlc_clock = Arc::new(HlcClock::new(server_did.clone()));
         let fanout = Arc::new(Fanout::new());
         let config = JigServerConfig::default();
+        let ruleset = None;
         let server_url = format!("ws://{}", config.server.listen);
 
         let naively_allow_unknown_handles_fallback =
@@ -544,9 +548,6 @@ impl AppState {
             fanout,
             server_url: server_url.clone(),
             naively_allow_unknown_handles_fallback,
-            naively_accept_peer_relayed_creates: config
-                .federation
-                .naively_accept_peer_relayed_creates,
             executor: Some(BlockExecutor::shared()),
         });
 
@@ -568,6 +569,7 @@ impl AppState {
             peer_frames: Default::default(),
             relay: Default::default(),
             peers: Default::default(),
+            ruleset,
         })
     }
 }

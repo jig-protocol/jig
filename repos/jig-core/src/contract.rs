@@ -28,6 +28,7 @@ pub const ACCEPT_DOMAIN: &str = "jig-contract-accept-v1";
 pub const REFUSE_DOMAIN: &str = "jig-contract-refuse-v1";
 pub const END_DOMAIN: &str = "jig-contract-end-v1";
 pub const KP_REQUEST_DOMAIN: &str = "jig-kp-request-v1";
+pub const LOCAL_ADDS_DOMAIN: &str = "jig-local-adds-v1";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ContractError {
@@ -682,6 +683,81 @@ impl KpRequest {
     }
 }
 
+/// A member's word to one server on whether others may add it to the
+/// channels that server sequences (JEP-0017 R2, rules 16-20). Signed by the
+/// member, it names the server, so it cannot be replayed to another, and
+/// carries a `seq`: the server keeps only a higher one, and `allow = true`
+/// at a higher `seq` undoes an earlier `allow = false`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalAdds {
+    /// The member, which signs.
+    pub did: String,
+    /// The server DID the marker is addressed to.
+    pub server: String,
+    /// `false` ends local adds; `true` undoes that.
+    pub allow: bool,
+    pub seq: u64,
+    /// `did`'s COSE_Sign1 over [`LocalAdds::payload`].
+    pub envelope: Vec<u8>,
+}
+
+impl LocalAdds {
+    const WHAT: &'static str = "local-adds marker";
+
+    pub fn payload(&self) -> Vec<u8> {
+        encode(Value::text_map([
+            ("domain", Value::text(LOCAL_ADDS_DOMAIN)),
+            ("did", Value::text(self.did.clone())),
+            ("server", Value::text(self.server.clone())),
+            ("allow", Value::Bool(self.allow)),
+            ("seq", Value::Unsigned(self.seq)),
+        ]))
+    }
+
+    pub fn sign(key: &SigningKey, server: &str, allow: bool, seq: u64) -> Self {
+        let mut marker = Self {
+            did: did_of(key),
+            server: server.to_string(),
+            allow,
+            seq,
+            envelope: Vec::new(),
+        };
+        marker.envelope = cose::sign1(key, &marker.payload());
+        marker
+    }
+
+    pub fn from_envelope(envelope: &[u8]) -> Result<Self, ContractError> {
+        let p = open(envelope, LOCAL_ADDS_DOMAIN, Self::WHAT)?;
+        let allow = match field(&p, "allow", Self::WHAT)? {
+            Value::Bool(b) => *b,
+            _ => return Err(ContractError::BadPayload(Self::WHAT)),
+        };
+        let seq = field(&p, "seq", Self::WHAT)?
+            .as_u64()
+            .ok_or(ContractError::BadPayload(Self::WHAT))?;
+        let marker = Self {
+            did: text(&p, "did", Self::WHAT)?,
+            server: text(&p, "server", Self::WHAT)?,
+            allow,
+            seq,
+            envelope: envelope.to_vec(),
+        };
+        marker.verify()?;
+        Ok(marker)
+    }
+
+    /// The member signed exactly these fields, and both DIDs are keys in
+    /// their canonical spelling.
+    pub fn verify(&self) -> Result<(), ContractError> {
+        for did in [&self.did, &self.server] {
+            if !is_canonical_did(did) {
+                return Err(ContractError::BadDid(did.clone()));
+            }
+        }
+        verify_envelope(&self.envelope, &self.payload(), &self.did)
+    }
+}
+
 fn answers(
     offer_id: [u8; 32],
     channel_id: Cid,
@@ -1286,6 +1362,90 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(kp_request_vectors(), v);
+    }
+
+    fn local_adds() -> LocalAdds {
+        LocalAdds::sign(&key(6), &did_of(&key(7)), false, 3)
+    }
+
+    #[test]
+    fn a_local_adds_marker_round_trips() {
+        for allow in [false, true] {
+            let m = LocalAdds::sign(&key(6), &did_of(&key(7)), allow, 9);
+            let back = LocalAdds::from_envelope(&m.envelope).unwrap();
+            assert_eq!(back, m);
+            assert_eq!(back.did, did_of(&key(6)));
+            assert_eq!(back.server, did_of(&key(7)));
+            assert_eq!((back.allow, back.seq), (allow, 9));
+        }
+    }
+
+    #[test]
+    fn a_local_adds_marker_signed_by_anyone_but_its_member_is_refused() {
+        let mut m = local_adds();
+        m.did = did_of(&key(9));
+        m.envelope = cose::sign1(&key(6), &m.payload());
+        assert!(matches!(
+            LocalAdds::from_envelope(&m.envelope),
+            Err(ContractError::BadSignature(_))
+        ));
+    }
+
+    #[test]
+    fn a_local_adds_marker_naming_a_non_canonical_server_is_refused() {
+        let mut m = local_adds();
+        m.server = "did:jig:not-a-key".into();
+        m.envelope = cose::sign1(&key(6), &m.payload());
+        assert!(matches!(
+            LocalAdds::from_envelope(&m.envelope),
+            Err(ContractError::BadDid(_))
+        ));
+    }
+
+    #[test]
+    fn a_local_adds_marker_under_another_domain_is_not_one() {
+        let r = kp_request();
+        assert!(matches!(
+            LocalAdds::from_envelope(&r.envelope),
+            Err(ContractError::BadPayload(_))
+        ));
+    }
+
+    fn local_adds_vectors() -> serde_json::Value {
+        let m = local_adds();
+        serde_json::json!({
+            "comment": "A jig-local-adds-v1 (JEP-0017 rule 8, R2) with allow = false. payload_hex is the deterministic CBOR payload; cose_sign1_hex is the envelope.",
+            "keys": {
+                "comment": "Ed25519 seeds: every byte set to the given value",
+                "did": {"seed_byte": 6, "did": did_of(&key(6))},
+                "server": {"seed_byte": 7, "did": did_of(&key(7))},
+            },
+            "marker": {
+                "allow": false,
+                "seq": 3,
+                "payload_hex": hex::encode(m.payload()),
+                "cose_sign1_hex": hex::encode(&m.envelope),
+            },
+        })
+    }
+
+    #[test]
+    fn local_adds_bytes_match_the_committed_vectors() {
+        let v: serde_json::Value = serde_json::from_str(include_str!(
+            "../../jig-spec/jep/vectors/0017/local-adds.json"
+        ))
+        .unwrap();
+        assert_eq!(local_adds_vectors(), v);
+    }
+
+    /// `cargo test -p jig-core --features ed25519 contract::tests::print_local_adds_vectors -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn print_local_adds_vectors() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&local_adds_vectors()).unwrap()
+        );
     }
 
     /// `cargo test -p jig-core --features ed25519 contract::tests::print_kp_request_vectors -- --ignored --nocapture`

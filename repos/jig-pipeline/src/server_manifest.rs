@@ -37,6 +37,31 @@ pub const RESERVED_PREFIX: &str = "#jig/";
 /// The block metadata key that carries the document, base64.
 pub const METADATA_KEY: &str = "server_manifest";
 
+/// The block metadata key, beside [`METADATA_KEY`], that carries the ruleset
+/// the server declares (JEP-0009 rule 4), as a JSON
+/// [`crate::handshake::RulesetRef`]. Absent when it declares none.
+///
+/// It is not a key of the document: [`ServerManifest::decode`] refuses keys it
+/// does not know, and every client before it decodes the document, so it would
+/// refuse every manifest that carried one. Beside it, old clients read only
+/// [`METADATA_KEY`]; the block's CID covers both, and the welcome signs that
+/// CID, so the declaration is signed all the same.
+pub const RULESET_METADATA_KEY: &str = "server_ruleset";
+
+/// The ruleset a `server-manifest` block's metadata declares: `Ok(None)` for
+/// none, `Err` for a value that is not a ruleset reference.
+pub fn declared_ruleset(
+    metadata: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<Option<crate::handshake::RulesetRef>, String> {
+    metadata
+        .get(RULESET_METADATA_KEY)
+        .map(|value| {
+            serde_json::from_value(value.clone())
+                .map_err(|e| format!("`{RULESET_METADATA_KEY}` is not a ruleset reference: {e}"))
+        })
+        .transpose()
+}
+
 /// What a server advertises, as its manifest log records it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerManifest {
@@ -215,6 +240,9 @@ impl ServerManifest {
                 // Not in the document: a key old decoders do not know would
                 // make them refuse it. A welcome carries it (`Capabilities::tiers`).
                 tiers: false,
+                // Likewise: the declaration rides beside the document, under
+                // [`RULESET_METADATA_KEY`].
+                ruleset: false,
             },
             peer_policy: PeerPolicy {
                 relayed_kinds: text_list(&doc, "relayed_kinds")?,
@@ -379,6 +407,7 @@ mod tests {
                 federation: true,
                 max_future_skew_ms: 300_000,
                 tiers: false,
+                ruleset: false,
             },
             peer_policy: PeerPolicy::default(),
         }
