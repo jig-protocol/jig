@@ -20,7 +20,7 @@ use jig_client::pins::{
 };
 use jig_client::read_auth::{ReadProof, signable_path};
 use jig_client::secure::{CommitLock, ReadIn, Seen, Session, history_reaches, replay_order};
-use jig_client::servers::{Reach, ServerStates};
+use jig_client::servers::{LocalAdds, Reach, ServerState, ServerStates};
 use jig_client::{Client, ClientError, DeliveredBlock, Identity};
 use jig_core::naming::ReachabilityRecord;
 use jig_mls::member::Commit;
@@ -70,6 +70,74 @@ impl Refused {
     pub fn is_definite(&self) -> bool {
         (400..500).contains(&self.status)
     }
+}
+
+/// Whether `e` is a server saying the member it was asked to add ended local
+/// adds there (JEP-0017 R2): `LOCAL_ADDS_ENDED` for a key package,
+/// `MEMBER_DECLINED` for the `member-add`. Both are final for that channel
+/// (rule 18).
+pub fn local_adds_ended(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<Refused>()
+            .is_some_and(|r| r.code == "LOCAL_ADDS_ENDED" || r.code == "MEMBER_DECLINED")
+    })
+}
+
+/// Drop the references in `refs` from `state`, keeping any recorded since.
+fn forget_stock_refs(state: &mut ServerState, refs: &std::collections::BTreeSet<String>) {
+    state.packages.retain(|r| !refs.contains(r));
+    state.retiring.retain(|r| !refs.contains(r));
+    if state.last_resort.as_ref().is_some_and(|r| refs.contains(r)) {
+        state.last_resort = None;
+    }
+}
+
+/// How [`first_release`] ended without a package.
+enum Asked {
+    /// A refusal no other custodian can get around (JEP-0017 rule 18).
+    Final(anyhow::Error),
+    /// Each custodian asked, and why it gave nothing.
+    Tried(Vec<String>),
+}
+
+/// Ask each of `servers` in turn with `ask` until one releases a package.
+/// A custodian that sequences the channel, where the member ended local
+/// adds, would refuse the member-add too: the next is not asked.
+async fn first_release<'a, F, Fut>(
+    servers: &'a [(String, String)],
+    mut ask: F,
+) -> std::result::Result<Vec<u8>, Asked>
+where
+    F: FnMut(&'a str, &'a str) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+{
+    let mut tried = Vec::new();
+    for (server_did, url) in servers {
+        match ask(server_did, url).await {
+            Ok(package) => return Ok(package),
+            Err(e) if local_adds_ended(&e) => {
+                return Err(Asked::Final(e.context(format!("{url} ({server_did})"))));
+            }
+            Err(e) => tried.push(format!("  {url} ({server_did}): {e:#}")),
+        }
+    }
+    Err(Asked::Tried(tried))
+}
+
+/// Send a local-adds marker at `seq` with `put`, which answers the marker
+/// the server keeps. If that is a later one from another device saying the
+/// opposite, say ours once more, above it, and take what is kept then: one
+/// retry, so two devices disagreeing do not race without end.
+async fn settle_local_adds<F, Fut>(allow: bool, seq: u64, mut put: F) -> Result<LocalAdds>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = Result<LocalAdds>>,
+{
+    let kept = put(seq).await?;
+    if kept.allow == allow {
+        return Ok(kept);
+    }
+    put(kept.seq.saturating_add(1)).await
 }
 
 /// Whether `e` is the server definitely turning a request down.
@@ -913,13 +981,33 @@ impl Secure {
 
     /// Keep enough key packages published that others can add us while we
     /// are offline, plus one last-resort package so we are never unreachable.
-    pub async fn ensure_key_packages(&self) -> Result<()> {
+    /// `false` where this server keeps no stock for us: custody and local
+    /// adds are both ended there (JEP-0017 rule 19).
+    pub async fn ensure_key_packages(&self) -> Result<bool> {
         #[derive(Deserialize)]
         struct Stock {
             available: u64,
             last_resort: bool,
         }
         let did = self.session.did().to_string();
+        let server_did = self.server_did().await?;
+        // Custody withdrawn and local adds ended: the server keeps no stock
+        // for this identity and refuses uploads (JEP-0017 rule 19). The
+        // reachability check still runs: it is how this device learns that
+        // another restored custody (`ensure_reachable` keeps a withdrawal as
+        // it is).
+        let ended = |s: &Self| -> Result<bool> {
+            Ok(s.server_state(&server_did)?
+                .is_some_and(|s| s.stock_ended()))
+        };
+        if ended(self)? {
+            self.ensure_reachable().await?;
+            if ended(self)? {
+                // Finishes a deletion an earlier run left undone.
+                self.end_stock_if_purged(&server_did).await?;
+                return Ok(false);
+            }
+        }
         let stock: Stock = self
             .get_json(&format!("/api/v1/mls/key-packages/{did}/stock"))
             .await?;
@@ -934,10 +1022,24 @@ impl Secure {
             packages.extend(self.session.key_packages(1, true)?);
         }
         if packages.is_empty() {
-            return self.ensure_reachable().await;
+            self.ensure_reachable().await?;
+            return Ok(true);
         }
-        self.publish_packages(&packages).await?;
-        self.ensure_reachable().await
+        let stocked_before = self.stock_refs(&server_did)?;
+        if !self.publish_packages(&packages).await? {
+            // Another of this identity's devices ended both custody and local
+            // adds here, and the server deleted the stock (rule 19): this
+            // device's keys for it are of no further use (rule 32).
+            eprintln!(
+                "note: {} keeps no key packages for you any more (custody and local adds \
+                 were both ended, from another device); deleting this device's keys for them",
+                self.server
+            );
+            self.delete_stock_keys(&server_did, &stocked_before)?;
+            return Ok(false);
+        }
+        self.ensure_reachable().await?;
+        Ok(true)
     }
 
     /// The DID this device pinned for its server.
@@ -1013,6 +1115,7 @@ impl Secure {
                     );
                     self.rotate_after_withdrawal(&server_did).await?;
                     self.note_reach(&server_did, k.seq, true)?;
+                    self.end_stock_if_purged(&server_did).await?;
                 }
                 return Ok(());
             }
@@ -1157,6 +1260,44 @@ impl Secure {
         Ok(())
     }
 
+    /// JEP-0017 rules 19 and 32: where this device's state says custody and
+    /// local adds are both ended at `server_did`, and the server confirms its
+    /// stock for us is ended, delete this device's keys for that stock.
+    /// The state alone is not enough: another device may have undone either
+    /// since, and the server then still hands out packages whose keys this
+    /// would delete. Nor is an empty stock: a released package is handed
+    /// again to a repeated request. A server that does not say (`stocked`
+    /// absent) predates R2 and never ends a stock. Repeatable, so a
+    /// deletion cut short runs again.
+    async fn end_stock_if_purged(&self, server_did: &str) -> Result<()> {
+        #[derive(Deserialize)]
+        struct Stock {
+            #[serde(default = "stocked_by_default")]
+            stocked: bool,
+        }
+        fn stocked_by_default() -> bool {
+            true
+        }
+        if !self
+            .server_state(server_did)?
+            .is_some_and(|s| s.stock_ended())
+        {
+            return Ok(());
+        }
+        // Taken before the server is asked: what it says is ended is the
+        // stock as of then, not packages stocked after (see
+        // `delete_stock_keys`).
+        let refs = self.stock_refs(server_did)?;
+        let did = self.session.did().to_string();
+        let stock: Stock = self
+            .get_json(&format!("/api/v1/mls/key-packages/{did}/stock"))
+            .await?;
+        if !stock.stocked {
+            self.delete_stock_keys(server_did, &refs)?;
+        }
+        Ok(())
+    }
+
     /// End (`on = false`) or restore custody of our key packages at this
     /// server: JEP-0017 R1 and its undo (rules 12–15). The new record goes
     /// here, then, best effort, to every other server it lists, which should
@@ -1232,6 +1373,7 @@ impl Secure {
             self.rotate_after_withdrawal(&server_did).await?
         };
         self.note_reach(&server_did, record.seq, true)?;
+        self.end_stock_if_purged(&server_did).await?;
         Ok(change)
     }
 
@@ -1276,6 +1418,9 @@ impl Secure {
         })?;
         let fresh = self.session.key_packages(1, true)?;
         let fresh_ref = jig_mls::delivery::validate_key_package(&fresh[0])?.reference;
+        // Refused only with local adds ended too: its key is deleted then and
+        // nothing is recorded as stocked, and `note_reach` deletes every other
+        // key stocked here.
         self.publish_packages(&fresh).await?;
         dead.retain(|r| *r != fresh_ref);
         let deleted = self.session.forget_key_packages(&dead)?;
@@ -1308,31 +1453,39 @@ impl Secure {
         Ok(deleted)
     }
 
-    /// JEP-0017 rule 32, under R1 and R2 together and on R3: delete the
-    /// private init keys of every package this device stocked at
-    /// `server_did`, the last-resort one included, and forget their
-    /// references. Local only, and repeatable. Returns how many keys were
-    /// deleted.
-    #[expect(dead_code, reason = "R2's client (JEP-0017 rules 19 and 32) calls it")]
-    pub fn delete_stock_keys(&self, server_did: &str) -> Result<usize> {
-        let path = self.server_states_path();
-        let refs: Vec<Vec<u8>> = ServerStates::load(&path)?
+    /// The references this device has recorded as stocked at `server_did`
+    /// (packages, last resort, retiring), as lowercase hex.
+    fn stock_refs(&self, server_did: &str) -> Result<std::collections::BTreeSet<String>> {
+        Ok(ServerStates::load(&self.server_states_path())?
             .get(server_did)
             .map(|s| {
                 s.packages
                     .iter()
                     .chain(&s.last_resort)
                     .chain(&s.retiring)
-                    .filter_map(|h| hex::decode(h).ok())
+                    .cloned()
                     .collect()
             })
-            .unwrap_or_default();
-        let deleted = self.session.forget_key_packages(&refs)?;
-        ServerStates::update(&path, |s| {
+            .unwrap_or_default())
+    }
+
+    /// JEP-0017 rule 32, under R1 and R2 together and on R3: delete the
+    /// private init keys of the packages `refs` names, the stock this device
+    /// had at `server_did` when the server said it was ended
+    /// ([`Self::stock_refs`], taken before asking), and forget those
+    /// references. Packages another `jig` process on this device stocked
+    /// since (after undoing R1 or R2) are not in `refs`, and keep their keys.
+    /// Local only, and repeatable. Returns how many keys were deleted.
+    fn delete_stock_keys(
+        &self,
+        server_did: &str,
+        refs: &std::collections::BTreeSet<String>,
+    ) -> Result<usize> {
+        let bytes: Vec<Vec<u8>> = refs.iter().filter_map(|h| hex::decode(h).ok()).collect();
+        let deleted = self.session.forget_key_packages(&bytes)?;
+        ServerStates::update(&self.server_states_path(), |s| {
             if let Some(state) = s.servers.get_mut(server_did) {
-                state.packages.clear();
-                state.last_resort = None;
-                state.retiring.clear();
+                forget_stock_refs(state, refs);
             }
         })?;
         Ok(deleted)
@@ -1361,7 +1514,9 @@ impl Secure {
 
     /// Upload `packages` here, and remember their references
     /// ([`ServerStates`]), so their keys can be deleted later (rule 32).
-    async fn publish_packages(&self, packages: &[Vec<u8>]) -> Result<()> {
+    /// `false`, with their keys deleted, when the server keeps no stock for
+    /// this identity (`NOT_STOCKED_HERE`, JEP-0017 rule 19).
+    async fn publish_packages(&self, packages: &[Vec<u8>]) -> Result<bool> {
         self.ensure_pinned().await?;
         let url = format!("{}/api/v1/mls/key-packages", self.base);
         let body = serde_json::to_vec(&serde_json::json!({
@@ -1383,7 +1538,16 @@ impl Secure {
         }
         let resp = req.send().await.with_context(|| format!("POST {url}"))?;
         if !resp.status().is_success() {
-            return Err(Self::refusal(resp).await.into());
+            let refused = Self::refusal(resp).await;
+            if refused.code == "NOT_STOCKED_HERE" {
+                let refs = packages
+                    .iter()
+                    .map(|p| Ok(jig_mls::delivery::validate_key_package(p)?.reference))
+                    .collect::<Result<Vec<_>>>()?;
+                self.session.forget_key_packages(&refs)?;
+                return Ok(false);
+            }
+            return Err(refused.into());
         }
         let server_did = self.server_did().await?;
         let base = self.base.clone();
@@ -1402,7 +1566,82 @@ impl Secure {
                 }
             }
         })?;
-        Ok(())
+        Ok(true)
+    }
+
+    /// End (`allow = false`) or allow again (`allow = true`) local adds at
+    /// this server (JEP-0017 R2): while ended, nobody else can add this
+    /// identity to a channel the server sequences. Answers the marker the
+    /// server keeps afterwards, and records it for this device.
+    pub async fn set_local_adds(&self, allow: bool) -> Result<LocalAdds> {
+        let did = self.session.did().to_string();
+        let server_did = self.server_did().await?;
+        let path = self.server_states_path();
+        let sent = ServerStates::load(&path)?
+            .get(&server_did)
+            .and_then(|s| s.local_adds)
+            .map_or(0, |l| l.seq);
+        // Like reachability records, the clock keeps each marker above any
+        // another device of this identity sent.
+        let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
+        let kept = settle_local_adds(allow, sent.saturating_add(1).max(now), |seq| {
+            self.put_local_adds(&did, &server_did, allow, seq)
+        })
+        .await?;
+        ServerStates::update(&path, |s| {
+            s.entry(&server_did, &self.base).local_adds = Some(kept);
+        })?;
+        self.end_stock_if_purged(&server_did).await?;
+        Ok(kept)
+    }
+
+    async fn put_local_adds(
+        &self,
+        did: &str,
+        server_did: &str,
+        allow: bool,
+        seq: u64,
+    ) -> Result<LocalAdds> {
+        #[derive(Deserialize)]
+        struct Kept {
+            allow: bool,
+            seq: u64,
+        }
+        let marker = self.identity.sign_local_adds(server_did, allow, seq);
+        let url = format!("{}/api/v1/local-adds/{did}", self.base);
+        let resp = self
+            .http()
+            .await?
+            .put(&url)
+            .json(&serde_json::json!({"request_b64": STANDARD.encode(&marker.envelope)}))
+            .send()
+            .await
+            .with_context(|| format!("PUT {url}"))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND
+            || resp.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED
+        {
+            anyhow::bail!(
+                "{} does not support ending local adds (JEP-0017)",
+                self.server
+            );
+        }
+        if !resp.status().is_success() {
+            return Err(Self::refusal(resp).await.into());
+        }
+        let kept: Kept = limits::json_capped(resp, limits::MAX_DOCUMENT_BYTES)
+            .await
+            .with_context(|| format!("PUT {url} answered something other than a marker"))?;
+        Ok(LocalAdds {
+            allow: kept.allow,
+            seq: kept.seq,
+        })
+    }
+
+    /// This device's state at its server ([`ServerStates`]), if it has any.
+    fn server_state(&self, server_did: &str) -> Result<Option<ServerState>> {
+        Ok(ServerStates::load(&self.server_states_path())?
+            .get(server_did)
+            .cloned())
     }
 
     /// One of `did`'s key packages for the channel `channel_id`, asked of
@@ -1422,13 +1661,15 @@ impl Secure {
             .ok()
             .filter(|_| jig_core::canonical_cid::is_canonical_text(channel_id))
             .with_context(|| format!("the channel's id `{channel_id}` is not a canonical CID"))?;
-        let mut tried = Vec::new();
-        for (server_did, url) in &record.servers {
-            match self.ask_custodian(did, channel_id, server_did, url).await {
-                Ok(package) => return Ok(package),
-                Err(e) => tried.push(format!("  {url} ({server_did}): {e:#}")),
-            }
-        }
+        let tried = match first_release(&record.servers, |server_did, url| {
+            self.ask_custodian(did, channel_id, server_did, url)
+        })
+        .await
+        {
+            Ok(package) => return Ok(package),
+            Err(Asked::Final(e)) => return Err(e),
+            Err(Asked::Tried(tried)) => tried,
+        };
         if tried.is_empty() {
             anyhow::bail!("{did}'s reachability record lists no servers");
         }
@@ -2292,11 +2533,166 @@ fn shadow_note(reference: &str, own: &ChannelInfo, carried: &ChannelInfo) -> Str
 #[cfg(test)]
 mod tests {
     use super::{
-        ChannelInfo, KeptAnswer, LogWalk, RELEASE_PAGE, RecordBody, ReleaseEntry,
-        creation_group_id, group_name, judge_kept_answer, kept_leaves_out, must_encrypt,
-        ordered_here, own_group_name, pick, sequencers_for, shadow_note, split_unchecked,
-        walk_release_log,
+        Asked, ChannelInfo, KeptAnswer, LocalAdds, LogWalk, RELEASE_PAGE, RecordBody, Refused,
+        ReleaseEntry, ServerState, creation_group_id, first_release, forget_stock_refs, group_name,
+        judge_kept_answer, kept_leaves_out, must_encrypt, ordered_here, own_group_name, pick,
+        sequencers_for, settle_local_adds, shadow_note, split_unchecked, walk_release_log,
     };
+    use std::cell::RefCell;
+
+    fn refusal(status: u16, code: &str) -> anyhow::Error {
+        Refused {
+            status,
+            code: code.into(),
+            message: String::new(),
+        }
+        .into()
+    }
+
+    fn custodians() -> Vec<(String, String)> {
+        ["one", "two", "three"]
+            .iter()
+            .map(|n| (format!("did:jig:z{n}"), format!("https://{n}")))
+            .collect()
+    }
+
+    /// JEP-0017 rule 18: the custodian sequences the channel and refuses
+    /// it; a second custodian's package would be refused at the member-add
+    /// anyway, so none is asked.
+    #[tokio::test]
+    async fn ended_local_adds_at_a_custodian_stop_the_search() {
+        for code in ["LOCAL_ADDS_ENDED", "MEMBER_DECLINED"] {
+            let servers = custodians();
+            let asked = RefCell::new(Vec::new());
+            let got = first_release(&servers, |_, url| {
+                asked.borrow_mut().push(url.to_string());
+                let e = refusal(403, code).context("asking");
+                async move { Err(e) }
+            })
+            .await;
+            match got {
+                Err(Asked::Final(e)) => {
+                    assert!(format!("{e:#}").contains(code), "{e:#}");
+                    assert!(format!("{e:#}").contains("https://one"), "{e:#}");
+                }
+                _ => panic!("{code}: not final"),
+            }
+            assert_eq!(*asked.borrow(), ["https://one"], "{code}");
+        }
+    }
+
+    /// Any other refusal moves on to the next custodian.
+    #[tokio::test]
+    async fn other_refusals_ask_the_next_custodian() {
+        let servers = custodians();
+        let asked = RefCell::new(0);
+        let got = first_release(&servers, |_, url| {
+            *asked.borrow_mut() += 1;
+            let answer = match url {
+                "https://one" => Err(refusal(404, "NO_CUSTODY")),
+                "https://two" => Err(refusal(429, "RATE_LIMITED")),
+                _ => Ok(b"kp".to_vec()),
+            };
+            async move { answer }
+        })
+        .await;
+        assert!(matches!(got, Ok(ref p) if p == b"kp"));
+        assert_eq!(*asked.borrow(), 3);
+        let got = first_release(&servers, |_, _| async { Err(refusal(404, "NO_CUSTODY")) }).await;
+        assert!(matches!(got, Err(Asked::Tried(ref t)) if t.len() == 3));
+    }
+
+    /// A marker the server keeps is answered back. Ours kept: no retry. A
+    /// later, opposite one from another device: exactly one retry, above
+    /// its seq, and what is kept then is the answer even if it still
+    /// disagrees.
+    #[tokio::test]
+    async fn a_stale_local_adds_marker_is_sent_once_more_above_the_kept_one() {
+        let sent = RefCell::new(Vec::new());
+        let kept = settle_local_adds(false, 10, |seq| {
+            sent.borrow_mut().push(seq);
+            async move { Ok(LocalAdds { seq, allow: false }) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            kept,
+            LocalAdds {
+                seq: 10,
+                allow: false
+            }
+        );
+        assert_eq!(*sent.borrow(), [10]);
+
+        // A kept marker that agrees, at a higher seq, is taken as it is.
+        sent.borrow_mut().clear();
+        let kept = settle_local_adds(false, 10, |seq| {
+            sent.borrow_mut().push(seq);
+            async move {
+                Ok(LocalAdds {
+                    seq: 50,
+                    allow: false,
+                })
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            kept,
+            LocalAdds {
+                seq: 50,
+                allow: false
+            }
+        );
+        assert_eq!(*sent.borrow(), [10]);
+
+        sent.borrow_mut().clear();
+        let kept = settle_local_adds(false, 10, |seq| {
+            sent.borrow_mut().push(seq);
+            async move {
+                Ok(if seq == 51 {
+                    LocalAdds { seq, allow: false }
+                } else {
+                    LocalAdds {
+                        seq: 50,
+                        allow: true,
+                    }
+                })
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            kept,
+            LocalAdds {
+                seq: 51,
+                allow: false
+            }
+        );
+        assert_eq!(*sent.borrow(), [10, 51]);
+
+        // Still outrun: one retry only, and the kept marker is the answer.
+        sent.borrow_mut().clear();
+        let kept = settle_local_adds(false, 10, |seq| {
+            sent.borrow_mut().push(seq);
+            async move {
+                Ok(LocalAdds {
+                    seq: seq + 100,
+                    allow: true,
+                })
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            kept,
+            LocalAdds {
+                seq: 211,
+                allow: true
+            }
+        );
+        assert_eq!(*sent.borrow(), [10, 111]);
+    }
 
     #[test]
     fn an_answer_that_is_not_our_record_concludes_nothing() {
@@ -2454,6 +2850,35 @@ mod tests {
 
     fn ids(xs: &[&str]) -> Option<Vec<String>> {
         Some(xs.iter().map(|x| x.to_string()).collect())
+    }
+
+    /// The stock references taken when the server said the stock was ended
+    /// are the ones forgotten; references another process recorded since,
+    /// a fresh last-resort package included, stay with their keys.
+    #[test]
+    fn only_the_stock_seen_ended_is_forgotten() {
+        let mut state = ServerState {
+            packages: vec!["a".into(), "b".into()],
+            last_resort: Some("l0".into()),
+            retiring: vec!["old".into()],
+            ..ServerState::default()
+        };
+        let seen: std::collections::BTreeSet<String> =
+            ["a", "b", "l0", "old"].map(String::from).into();
+        // Another process undid R2 and stocked anew in between.
+        state.packages.push("c".into());
+        state.last_resort = Some("l1".into());
+        forget_stock_refs(&mut state, &seen);
+        assert_eq!(state.packages, ["c"]);
+        assert_eq!(state.last_resort.as_deref(), Some("l1"));
+        assert!(state.retiring.is_empty());
+
+        let mut same = ServerState {
+            last_resort: Some("l0".into()),
+            ..ServerState::default()
+        };
+        forget_stock_refs(&mut same, &seen);
+        assert_eq!(same.last_resort, None);
     }
 
     #[test]

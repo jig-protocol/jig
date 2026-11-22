@@ -379,6 +379,14 @@ pub enum IngestError {
          To talk as a group, create a new channel linked to it with `from_dm`"
     )]
     DmIsAPair { slug: String, member: String },
+    /// A `member-add` of a DID that has ended local adds at this server, to
+    /// a channel this server sequences (JEP-0017 rule 16). Nothing is
+    /// stored.
+    #[error(
+        "`{member}` has asked this server not to be added to the channels it sequences, so \
+         '{slug}' cannot add them here. They can still join it themselves"
+    )]
+    MemberDeclined { slug: String, member: String },
     /// The signer lacks the right the block needs as of its position in the
     /// channel's ingest chain (JEP-0005 rule 7b).
     #[error("`{kind}` on `{slug}` refused: `{sender}` does not hold the `{right}` right")]
@@ -742,6 +750,25 @@ pub async fn ingest(
                     member,
                 });
             }
+        }
+        // JEP-0017 rule 16: a member who has ended local adds here is not
+        // added by others to a channel this server sequences (a carried one
+        // was refused above), wherever the key package came from. Read again
+        // inside the landing, so a marker stored meanwhile wins. Their own
+        // join is theirs to make.
+        if kind == BlockKind::MemberAdd
+            && let Some(member) = manifest
+                .metadata
+                .get("member_did")
+                .and_then(|v| v.as_str())
+                .map(crate::effect::canonical_did_string)
+            && member != sender.to_did_jig_string()
+            && ctx.store.local_adds_ended(&member)?
+        {
+            return Err(IngestError::MemberDeclined {
+                slug: chan.slug.clone(),
+                member,
+            });
         }
     }
 
@@ -1142,6 +1169,9 @@ pub async fn ingest(
             if landing == crate::persist::Landing::Unauthorized {
                 return Err(refused_at_landing(guard_refusal, kind_str));
             }
+            if landing == crate::persist::Landing::Declined {
+                return Err(declined(&manifest, resolved_channel.as_ref()));
+            }
             if landing == crate::persist::Landing::LostRace {
                 let current = ctx
                     .store
@@ -1182,6 +1212,9 @@ pub async fn ingest(
                 guard.as_ref(),
             )? {
                 crate::persist::Landing::Landed(record) => record,
+                crate::persist::Landing::Declined => {
+                    return Err(declined(&manifest, resolved_channel.as_ref()));
+                }
                 _ => return Err(refused_at_landing(guard_refusal, kind_str)),
             };
             witness_record(ctx, record.as_ref());
@@ -1200,14 +1233,21 @@ pub async fn ingest(
                 group.channel_id = block_cid.clone();
                 ctx.store.put_mls_group(&group)?;
             }
-            // Step 5: apply effect
+            // Step 5: apply effect. A declined member-add returns before
+            // step 6 stores the block.
             crate::effect::apply_effect(
                 &ctx.store,
                 &bundle,
                 &stored_receipt.receipt_bytes,
                 &block_cid,
             )
-            .await?;
+            .await
+            .map_err(
+                |e| match e.downcast_ref::<crate::persist::MemberDeclined>() {
+                    Some(_) => declined(&manifest, resolved_channel.as_ref()),
+                    None => IngestError::from(e),
+                },
+            )?;
             // Step 6: persist block (+ its record) + receipt
             let record = match signer.as_ref() {
                 Some(signer) => Some(ctx.store.insert_block_sequenced(&stored_block, signer)?),
@@ -1315,6 +1355,23 @@ pub async fn ingest(
 
 /// The refusal a block gets when its role no longer held at the seq it was
 /// to be given: the one the write gate would have returned.
+/// The refusal of a `member-add` whose member has ended local adds here
+/// (JEP-0017 rule 16), found at landing.
+fn declined(
+    manifest: &jig_core::BlockManifest,
+    channel: Option<&crate::persist::StoredChannel>,
+) -> IngestError {
+    IngestError::MemberDeclined {
+        slug: channel.map(|c| c.slug.clone()).unwrap_or_default(),
+        member: manifest
+            .metadata
+            .get("member_did")
+            .and_then(|v| v.as_str())
+            .map(crate::effect::canonical_did_string)
+            .unwrap_or_default(),
+    }
+}
+
 fn refused_at_landing(refusal: Option<IngestError>, kind: &str) -> IngestError {
     tracing::info!(
         kind,
@@ -5159,6 +5216,193 @@ mod tests {
 
     /// Rule 7b: an admin holds `membership` but not the owner role. Its
     /// member-add passes; its role-assign is refused; the owner's passes.
+    /// `who` ends local adds at `ctx`'s server (JEP-0017 R2), as its
+    /// `PUT /api/v1/local-adds` stores it.
+    fn end_local_adds(ctx: &IngestContext, who: &str, seq: u64, allow: bool) {
+        ctx.store
+            .put_local_adds(
+                who,
+                seq,
+                allow,
+                b"marker",
+                &ctx.server_did.to_did_jig_string(),
+                1,
+            )
+            .unwrap();
+    }
+
+    /// The same, from inside the next landing: past ingest's early check,
+    /// so only the check in the landing itself can refuse the add.
+    fn end_local_adds_before_landing(ctx: &IngestContext, who: &str, seq: u64) {
+        let store = ctx.store.clone();
+        let server = ctx.server_did.to_did_jig_string();
+        let who = who.to_string();
+        super::BEFORE_LANDING.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                store
+                    .put_local_adds(&who, seq, false, b"marker", &server, 1)
+                    .unwrap();
+            }));
+        });
+    }
+
+    fn blocks_in(ctx: &IngestContext, channel_id: &str) -> usize {
+        ctx.store
+            .list_blocks_by_channel_id(channel_id, 1000, None)
+            .unwrap()
+            .len()
+    }
+
+    /// JEP-0017 rule 16 on the owner's plain path: a member who has ended
+    /// local adds is not added, at ingest's early check or inside the
+    /// landing, and nothing of the block is stored. `allow = true` undoes it.
+    #[tokio::test]
+    async fn a_member_who_ended_local_adds_is_not_added_on_the_plain_path() {
+        let ctx = roles_ctx();
+        let (owner, bob) = (person(), person());
+        let chan = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#team"}),
+        )
+        .await
+        .unwrap();
+        let add = || {
+            plain(
+                &ctx,
+                &owner,
+                BlockKind::MemberAdd,
+                serde_json::json!({"channel_id": chan, "member_did": bob.did}),
+            )
+        };
+        let before = blocks_in(&ctx, &chan);
+
+        end_local_adds(&ctx, &bob.did, 1, false);
+        match add().await {
+            Err(IngestError::MemberDeclined { member, slug }) => {
+                assert_eq!(
+                    (member.as_str(), slug.as_str()),
+                    (bob.did.as_str(), "#team")
+                );
+            }
+            other => panic!("refused at the early check: {other:?}"),
+        }
+        end_local_adds(&ctx, &bob.did, 2, true);
+        end_local_adds_before_landing(&ctx, &bob.did, 3);
+        assert!(
+            matches!(add().await, Err(IngestError::MemberDeclined { .. })),
+            "refused inside the landing"
+        );
+        assert!(!ctx.store.is_member_by_id(&chan, &bob.did).unwrap());
+        assert_eq!(blocks_in(&ctx, &chan), before, "no block stored");
+
+        end_local_adds(&ctx, &bob.did, 4, true);
+        add().await.expect("allow = true at a higher seq undoes it");
+        assert!(ctx.store.is_member_by_id(&chan, &bob.did).unwrap());
+    }
+
+    /// The role path: an admin's add of a member who has ended local adds
+    /// is refused inside the guarded landing, and nothing is written.
+    #[tokio::test]
+    async fn a_member_who_ended_local_adds_is_not_added_on_the_role_path() {
+        let ctx = roles_ctx();
+        let (owner, admin, bob) = (person(), person(), person());
+        let chan = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#team"}),
+        )
+        .await
+        .unwrap();
+        plain(
+            &ctx,
+            &owner,
+            BlockKind::RoleAssign,
+            serde_json::json!({"channel_id": chan, "role": "admin", "member": admin.did}),
+        )
+        .await
+        .unwrap();
+        let before = blocks_in(&ctx, &chan);
+        end_local_adds_before_landing(&ctx, &bob.did, 1);
+        let added = plain(
+            &ctx,
+            &admin,
+            BlockKind::MemberAdd,
+            serde_json::json!({"channel_id": chan, "member_did": bob.did}),
+        )
+        .await;
+        assert!(
+            matches!(added, Err(IngestError::MemberDeclined { .. })),
+            "{added:?}"
+        );
+        assert!(!ctx.store.is_member_by_id(&chan, &bob.did).unwrap());
+        assert_eq!(blocks_in(&ctx, &chan), before);
+    }
+
+    /// The encrypted path: the add is refused inside the MLS landing's
+    /// transaction, so the group does not advance either.
+    #[tokio::test]
+    async fn a_member_who_ended_local_adds_is_not_added_to_an_encrypted_channel() {
+        let ctx = all_channel_kinds();
+        let (owner, bob) = (person(), person());
+        let gid = create_sealed(&ctx, &owner).await;
+        let chan = ctx
+            .store
+            .get_channel_by_slug("#sealed")
+            .unwrap()
+            .unwrap()
+            .id;
+        let epoch = ctx.store.get_mls_group("#sealed").unwrap().unwrap().epoch;
+        end_local_adds_before_landing(&ctx, &bob.did, 1);
+        let kp = bob.mls.key_packages(1, false).unwrap().remove(0);
+        let c = owner.mls.add(&gid, &kp, &bob.did).unwrap();
+        let added = submit(
+            &ctx,
+            &owner,
+            BlockKind::MemberAdd,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"channel": "#sealed", "member_did": bob.did,
+                "mls_commit": b64(&c.commit), "mls_welcome": b64(c.welcome.as_ref().unwrap()),
+                "mls_group_info": b64(c.group_info.as_ref().unwrap()), "mls_epoch": c.epoch}),
+        )
+        .await;
+        assert!(
+            matches!(added, Err(IngestError::MemberDeclined { .. })),
+            "{added:?}"
+        );
+        assert!(!ctx.store.is_member_by_id(&chan, &bob.did).unwrap());
+        assert_eq!(
+            ctx.store.get_mls_group("#sealed").unwrap().unwrap().epoch,
+            epoch,
+            "the group did not advance"
+        );
+    }
+
+    /// R2 governs being added by others: a member who has ended local adds
+    /// still joins by its own external commit.
+    #[tokio::test]
+    async fn a_member_who_ended_local_adds_still_joins_by_itself() {
+        let mut ctx = all_channel_kinds();
+        let (owner, bob) = (person(), person());
+        ctx.admission = Arc::new(Recorded {
+            members: vec![bob.did.clone()],
+        });
+        create_sealed_as(&ctx, &owner, Some("server")).await;
+        let chan = ctx
+            .store
+            .get_channel_by_slug("#sealed")
+            .unwrap()
+            .unwrap()
+            .id;
+        end_local_adds(&ctx, &bob.did, 1, false);
+        join_sealed(&ctx, &bob)
+            .await
+            .expect("a self-join is not an add");
+        assert!(ctx.store.is_member_by_id(&chan, &bob.did).unwrap());
+    }
+
     #[tokio::test]
     async fn an_admin_adds_members_but_only_an_owner_assigns_roles() {
         let ctx = roles_ctx();
