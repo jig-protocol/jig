@@ -3107,21 +3107,10 @@ mod tests {
 
     // ---- A channel crosses servers by a share ------------------------------
 
-    /// The v0.0.2 acceptance case (once `integration-tests` H3), on the one
-    /// path a channel now crosses servers by (JEP-0014 rule 37, #357): Alice
-    /// posts on `a`, and `b`, following `a`'s shared channel, holds the same
-    /// block under the same CID, in `a`'s records byte for byte.
-    ///
-    /// `b` executed nothing: a carried block has no receipt of the follower's
-    /// (JEP-0005 rule 12; `crate::follow`). H3 compared two servers'
-    /// `render_hash`es, which only the legacy relay, re-running each block on
-    /// the receiver, could give. Cross-server render agreement is
-    /// `integration-tests/tests/federated_render_agrees.rs`. This fails if a
-    /// follower starts executing carried blocks without that being decided.
     /// #454: a member of a shared channel whose DID a bridge on the follower
     /// manages gets the owner's posts at that bridge's sink, as from a
     /// channel the follower sequences. The delivery says it was not sequenced
-    /// on the follower and carries no receipt of its.
+    /// on the follower and carries no receipt of its own.
     #[tokio::test]
     async fn a_shared_channels_post_reaches_a_bridged_member_on_the_follower() {
         let p = pair(OfferPolicy::Accept).await;
@@ -3201,6 +3190,17 @@ mod tests {
         );
     }
 
+    /// The v0.0.2 acceptance case (once `integration-tests` H3), on the one
+    /// path a channel now crosses servers by (JEP-0014 rule 37, #357): Alice
+    /// posts on `a`, and `b`, following `a`'s shared channel, holds the same
+    /// block under the same CID, in `a`'s records byte for byte.
+    ///
+    /// `b` executed nothing: a carried block has no receipt of the follower's
+    /// (JEP-0005 rule 12; `crate::follow`). H3 compared two servers'
+    /// `render_hash`es, which only the legacy relay, re-running each block on
+    /// the receiver, could give. Cross-server render agreement is
+    /// `integration-tests/tests/federated_render_agrees.rs`. This fails if a
+    /// follower starts executing carried blocks without that being decided.
     #[tokio::test]
     async fn a_post_crosses_by_a_share_and_runs_only_on_its_owner() {
         let p = pair(OfferPolicy::Accept).await;
