@@ -1663,7 +1663,7 @@ mod tests {
     /// clients verifying welcomes from a server that declares a ruleset.
     #[test]
     fn a_welcome_to_a_hello_that_did_not_ask_signs_what_it_always_did() {
-        let view = hello_view("bm9uY2U=");
+        let view = hello_view(&fresh_nonce());
         assert!(!view.capabilities.ruleset);
         let mut declaring = negotiate(&view, &declaring_server(Some(declared_ruleset()))).unwrap();
         let mut before = negotiate(&view, &offer_server()).unwrap();
@@ -1772,7 +1772,7 @@ mod tests {
     /// canonical CID, is a welcome contradicting itself, signed or not.
     #[test]
     fn a_ruleset_outside_its_capability_or_hash_contradicts_the_welcome() {
-        let mut statement = negotiate(&hello_view("bm9uY2U="), &offer_server()).unwrap();
+        let mut statement = negotiate(&hello_view(&fresh_nonce()), &offer_server()).unwrap();
         statement.ruleset = Some(declared_ruleset());
         assert_eq!(
             statement.contradicts_itself(),
