@@ -164,8 +164,9 @@ pub async fn publish(state: &Arc<AppState>) -> anyhow::Result<ManifestRef> {
                         Some(cid) => m.metadata_entry(SUPERSEDES_KEY, serde_json::json!(cid)),
                         None => m,
                     };
-                    // Only when it declares one, so a server that declares
-                    // none publishes the block it always did.
+                    // Only when it declares one: a server that declares none
+                    // carries no ruleset key, which is all an older client
+                    // reads besides the document.
                     match &ruleset {
                         Some(ruleset) => m.metadata_entry(
                             RULESET_METADATA_KEY,

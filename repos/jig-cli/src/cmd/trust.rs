@@ -613,10 +613,7 @@ async fn check_manifest_in(
         .ruleset
         .then_some(welcome.ruleset.as_deref())
         .flatten();
-    if pins
-        .server(server)
-        .is_some_and(|p| p.manifest.as_ref() == Some(cited) && p.ruleset.as_ref() == named)
-    {
+    if pins.manifest_checked(server, cited, named) {
         return Ok(());
     }
     #[derive(serde::Deserialize)]
