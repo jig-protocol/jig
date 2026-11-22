@@ -237,7 +237,7 @@ pub async fn run_http_server(
 ) -> Result<()> {
     // Before anything binds, so a signal once the server is listening is
     // always graceful, never the default action.
-    let stop = crate::shutdown::signal();
+    let (stop, cut) = crate::shutdown::signals();
     let mut cfg = NameServerConfig::load(config)?;
     if let Some(bind) = bind_override {
         cfg.network.bind = bind;
@@ -252,7 +252,7 @@ pub async fn run_http_server(
         .map_err(|e| NameServerError::Other(anyhow::anyhow!("binding {addr}: {e}")))?;
     let app = build_app_parts(&cfg)?;
     // A second signal cuts the drain short.
-    serve_app_until(&cfg, app, listener, stop, crate::shutdown::signal).await
+    serve_app_until(&cfg, app, listener, stop, move || cut).await
 }
 
 /// Serve `cfg`'s nameserver on `listener`: over TLS (JEP-0004 rule 12) unless
@@ -1126,7 +1126,10 @@ mod tests {
             let mut served = Served::start("drain-finish", tls, 10_000).await;
             let request = served.client().get(served.url("/hang"));
             let in_flight = tokio::spawn(request.send());
-            served.started.recv().await.expect("/hang reached");
+            tokio::time::timeout(std::time::Duration::from_secs(5), served.started.recv())
+                .await
+                .expect("timed out waiting for the request to reach its handler")
+                .expect("/hang reached");
             served.stop();
             // Give the listener a moment to stop, then let /hang answer.
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1156,7 +1159,10 @@ mod tests {
                 let mut served = Served::start("drain-bound", tls, drain).await;
                 let request = served.client().get(served.url("/hang"));
                 let _in_flight = tokio::spawn(request.send());
-                served.started.recv().await.expect("/hang reached");
+                tokio::time::timeout(std::time::Duration::from_secs(5), served.started.recv())
+                    .await
+                    .expect("timed out waiting for the request to reach its handler")
+                    .expect("/hang reached");
                 served.stop();
                 let stopped = std::time::Instant::now();
                 if cut_short {
@@ -1226,7 +1232,10 @@ mod tests {
                 let request = served.client().get(served.url("/watched"));
                 tokio::spawn(async move { request.send().await.ok().map(|r| r.status()) })
             };
-            served.started.recv().await.expect("/watched reached");
+            tokio::time::timeout(std::time::Duration::from_secs(5), served.started.recv())
+                .await
+                .expect("timed out waiting for the request to reach its handler")
+                .expect("/watched reached");
             served.stop();
             tokio::time::timeout(std::time::Duration::from_secs(5), &mut served.task)
                 .await

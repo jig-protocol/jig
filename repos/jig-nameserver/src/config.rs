@@ -211,6 +211,10 @@ impl NameServerConfig {
                  for {DEFAULT_MAX_BODY_BYTES}"
             )));
         }
+        // An override that does not parse would otherwise be dropped in
+        // silence, leaving the file's value in force.
+        drain_override(std::env::var("JIG_NS_SHUTDOWN_DRAIN_MS").ok().as_deref())
+            .map_err(|e| NameServerError::Other(anyhow::anyhow!(e)))?;
         if self.network.shutdown_drain_ms > MAX_SHUTDOWN_DRAIN_MS {
             return Err(NameServerError::Other(anyhow::anyhow!(
                 "[network] shutdown_drain_ms = {} is over the maximum of {MAX_SHUTDOWN_DRAIN_MS} \
@@ -403,6 +407,17 @@ pub const DEFAULT_SHUTDOWN_DRAIN_MS: u64 = 5_000;
 /// The largest `[network] shutdown_drain_ms` the nameserver boots with.
 pub const MAX_SHUTDOWN_DRAIN_MS: u64 = 300_000;
 
+/// `JIG_NS_SHUTDOWN_DRAIN_MS`, when set: a number of milliseconds, or an
+/// error naming the variable.
+fn drain_override(raw: Option<&str>) -> std::result::Result<Option<u64>, String> {
+    raw.map(|raw| {
+        raw.trim().parse::<u64>().map_err(|e| {
+            format!("JIG_NS_SHUTDOWN_DRAIN_MS = {raw:?} is not a number of milliseconds ({e})")
+        })
+    })
+    .transpose()
+}
+
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
@@ -435,8 +450,8 @@ impl NetworkConfig {
         if let Ok(header) = std::env::var("JIG_NS_PROXY_IP_HEADER") {
             cfg.proxy_ip_header = header;
         }
-        if let Ok(val) = std::env::var("JIG_NS_SHUTDOWN_DRAIN_MS")
-            && let Ok(parsed) = val.parse::<u64>()
+        if let Ok(Some(parsed)) =
+            drain_override(std::env::var("JIG_NS_SHUTDOWN_DRAIN_MS").ok().as_deref())
         {
             cfg.shutdown_drain_ms = parsed;
         }
@@ -460,8 +475,8 @@ impl NetworkConfig {
         if let Ok(header) = std::env::var("JIG_NS_PROXY_IP_HEADER") {
             self.proxy_ip_header = header;
         }
-        if let Ok(val) = std::env::var("JIG_NS_SHUTDOWN_DRAIN_MS")
-            && let Ok(parsed) = val.parse::<u64>()
+        if let Ok(Some(parsed)) =
+            drain_override(std::env::var("JIG_NS_SHUTDOWN_DRAIN_MS").ok().as_deref())
         {
             self.shutdown_drain_ms = parsed;
         }
@@ -1397,6 +1412,20 @@ mod tests {
         assert!(cfg.reputation.translation_contracts.is_empty());
         assert!(cfg.useful_work.assignment_ttl_secs > 0);
         assert!(cfg.useful_work.max_queue_depth > 0);
+    }
+
+    /// `JIG_NS_SHUTDOWN_DRAIN_MS`: unset is no override, `0` is one, and a
+    /// value that is not a `u64` (an overflow included) is an error naming
+    /// the variable, so `validate` refuses to boot rather than ignore it.
+    #[test]
+    fn a_drain_override_that_does_not_parse_is_an_error() {
+        assert_eq!(drain_override(None), Ok(None));
+        assert_eq!(drain_override(Some("0")), Ok(Some(0)));
+        assert_eq!(drain_override(Some("2500")), Ok(Some(2500)));
+        for bad in ["", "5s", "-1", "18446744073709551616"] {
+            let err = drain_override(Some(bad)).unwrap_err();
+            assert!(err.contains("JIG_NS_SHUTDOWN_DRAIN_MS"), "{err}");
+        }
     }
 
     /// `[network] shutdown_drain_ms`: 5000 unset, the template's value, and

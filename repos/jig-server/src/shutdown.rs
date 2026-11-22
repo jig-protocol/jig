@@ -132,38 +132,102 @@ pub fn run<F: Future>(main: F) -> std::io::Result<F::Output> {
     Ok(out)
 }
 
-/// A future that resolves on the next SIGTERM or SIGINT. The handlers are
-/// registered when this is called, not when the future is first polled, so a
-/// signal that arrives once the server has logged that it is listening is
-/// never the default action (an immediate exit).
+/// The process's first and second SIGTERM or SIGINT, as two futures. The
+/// handlers are registered here, before the server binds, not when a future is
+/// first polled: a signal that arrives once the server has logged that it is
+/// listening is never the default action (an immediate exit).
 ///
-/// The server waits on one to start shutting down, then calls this again
-/// while draining, so a second signal cuts the drain short: the escape from a
-/// drain an operator won't wait for.
-pub fn signal() -> impl Future<Output = ()> + Send + 'static {
+/// The server waits on the first to start shutting down, and on the second to
+/// cut the drain short: the escape from a drain an operator won't wait for.
+/// Both come from one set of receivers, kept from start to end, so a second
+/// signal that arrives just as the drain begins is not lost.
+pub fn signals() -> (
+    impl Future<Output = ()> + Send + 'static,
+    impl Future<Output = ()> + Send + 'static,
+) {
+    let (first_tx, first) = tokio::sync::oneshot::channel::<()>();
+    let (second_tx, second) = tokio::sync::oneshot::channel::<()>();
+    let mut listener = Listener::register();
+    tokio::spawn(async move {
+        listener.recv().await;
+        let _ = first_tx.send(());
+        listener.recv().await;
+        let _ = second_tx.send(());
+    });
+    // A sender dropped unsent (the runtime ending) is no signal.
+    let wait = |rx: tokio::sync::oneshot::Receiver<()>| async move {
+        if rx.await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    (wait(first), wait(second))
+}
+
+/// The receivers [`signals`] listens on. Registration failing leaves the
+/// process with the default action, and every `recv` pending.
+struct Listener {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let term = signal(SignalKind::terminate());
-        let int = signal(SignalKind::interrupt());
-        async move {
-            let (mut term, mut int) = match (term, int) {
-                (Ok(term), Ok(int)) => (term, int),
+    receivers: Option<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)>,
+    #[cfg(windows)]
+    receivers: Option<tokio::signal::windows::CtrlC>,
+}
+
+impl Listener {
+    fn register() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let receivers = match (
+                signal(SignalKind::terminate()),
+                signal(SignalKind::interrupt()),
+            ) {
+                (Ok(term), Ok(int)) => Some((term, int)),
                 (Err(e), _) | (_, Err(e)) => {
-                    // No graceful stop; the process keeps the default action.
                     tracing::warn!("cannot listen for SIGTERM/SIGINT ({e}); stopping is immediate");
-                    return std::future::pending().await;
+                    None
                 }
+            };
+            Self { receivers }
+        }
+        #[cfg(windows)]
+        {
+            let receivers = match tokio::signal::windows::ctrl_c() {
+                Ok(ctrl_c) => Some(ctrl_c),
+                Err(e) => {
+                    tracing::warn!("cannot listen for Ctrl-C ({e}); stopping is immediate");
+                    None
+                }
+            };
+            Self { receivers }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Self {}
+        }
+    }
+
+    /// The next signal.
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            let Some((term, int)) = self.receivers.as_mut() else {
+                return std::future::pending().await;
             };
             tokio::select! {
                 _ = term.recv() => tracing::info!("SIGTERM received"),
                 _ = int.recv() => tracing::info!("SIGINT received"),
             }
         }
-    }
-    #[cfg(not(unix))]
-    {
-        async move {
+        #[cfg(windows)]
+        {
+            let Some(ctrl_c) = self.receivers.as_mut() else {
+                return std::future::pending().await;
+            };
+            let _ = ctrl_c.recv().await;
+            tracing::info!("Ctrl-C received");
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
             let _ = tokio::signal::ctrl_c().await;
             tracing::info!("Ctrl-C received");
         }
@@ -224,6 +288,36 @@ mod tests {
         assert!(!shutdown.drain(Duration::from_millis(50)).await);
         drop(held);
         assert!(shutdown.drain(Duration::from_secs(5)).await);
+    }
+
+    /// One SIGINT resolves the first future and not the second; another
+    /// resolves the second.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signals_hands_out_the_first_and_the_second_signal() {
+        let (first, second) = signals();
+        let interrupt = || {
+            let sent = std::process::Command::new("kill")
+                .args(["-INT", &std::process::id().to_string()])
+                .status()
+                .expect("run kill");
+            assert!(sent.success());
+        };
+        tokio::pin!(second);
+        interrupt();
+        tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("the first signal");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut second)
+                .await
+                .is_err(),
+            "one signal is not two"
+        );
+        interrupt();
+        tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("the second signal");
     }
 
     #[tokio::test]

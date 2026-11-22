@@ -86,8 +86,8 @@ impl JigServer {
     pub async fn start(&self) -> Result<()> {
         // Registered before anything is bound: from here a SIGTERM stops the
         // server gracefully rather than killing it.
-        let stop = crate::shutdown::signal();
-        self.serve_until(stop, crate::shutdown::signal).await
+        let (stop, cut) = crate::shutdown::signals();
+        self.serve_until(stop, move || cut).await
     }
 
     /// [`JigServer::start`] with the signals as futures: `stop` starts the
@@ -1227,7 +1227,10 @@ mod tests {
                 _held = Some(conn);
                 None
             };
-            started.recv().await.expect("/watched reached");
+            tokio::time::timeout(std::time::Duration::from_secs(5), started.recv())
+                .await
+                .expect("timed out waiting for the request to reach its handler")
+                .expect("/watched reached");
             stop_tx.send(()).unwrap();
             tokio::time::timeout(Duration::from_secs(5), served)
                 .await
