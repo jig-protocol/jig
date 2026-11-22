@@ -211,6 +211,13 @@ impl NameServerConfig {
                  for {DEFAULT_MAX_BODY_BYTES}"
             )));
         }
+        if self.network.shutdown_drain_ms > MAX_SHUTDOWN_DRAIN_MS {
+            return Err(NameServerError::Other(anyhow::anyhow!(
+                "[network] shutdown_drain_ms = {} is over the maximum of {MAX_SHUTDOWN_DRAIN_MS} \
+                 (five minutes); leave it unset for {DEFAULT_SHUTDOWN_DRAIN_MS}",
+                self.network.shutdown_drain_ms
+            )));
+        }
         self.v0_0_2
             .nameserver
             .validate()
@@ -380,10 +387,21 @@ pub struct NetworkConfig {
     /// refused with `413` before it is parsed. The nameserver's requests are a
     /// few kilobytes at most.
     pub max_body_bytes: usize,
+    /// How long, in milliseconds, a stopping nameserver (SIGTERM or SIGINT)
+    /// waits for the requests in flight before it cuts them (#438). `0` cuts
+    /// at once; at most [`MAX_SHUTDOWN_DRAIN_MS`].
+    pub shutdown_drain_ms: u64,
 }
 
 /// The default `[network] max_body_bytes`.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024;
+
+/// The default `[network] shutdown_drain_ms`: under `install.sh`'s wait and
+/// the unit's `TimeoutStopSec`, as for jig-server.
+pub const DEFAULT_SHUTDOWN_DRAIN_MS: u64 = 5_000;
+
+/// The largest `[network] shutdown_drain_ms` the nameserver boots with.
+pub const MAX_SHUTDOWN_DRAIN_MS: u64 = 300_000;
 
 impl Default for NetworkConfig {
     fn default() -> Self {
@@ -393,6 +411,7 @@ impl Default for NetworkConfig {
             trust_proxy: false,
             proxy_ip_header: default_proxy_header(),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            shutdown_drain_ms: DEFAULT_SHUTDOWN_DRAIN_MS,
         }
     }
 }
@@ -416,6 +435,11 @@ impl NetworkConfig {
         if let Ok(header) = std::env::var("JIG_NS_PROXY_IP_HEADER") {
             cfg.proxy_ip_header = header;
         }
+        if let Ok(val) = std::env::var("JIG_NS_SHUTDOWN_DRAIN_MS")
+            && let Ok(parsed) = val.parse::<u64>()
+        {
+            cfg.shutdown_drain_ms = parsed;
+        }
         cfg
     }
 
@@ -435,6 +459,11 @@ impl NetworkConfig {
         }
         if let Ok(header) = std::env::var("JIG_NS_PROXY_IP_HEADER") {
             self.proxy_ip_header = header;
+        }
+        if let Ok(val) = std::env::var("JIG_NS_SHUTDOWN_DRAIN_MS")
+            && let Ok(parsed) = val.parse::<u64>()
+        {
+            self.shutdown_drain_ms = parsed;
         }
     }
 }
@@ -1191,6 +1220,9 @@ trust_proxy = false
 proxy_ip_header = "x-forwarded-for"
 # Largest request body on every route; a bigger one gets 413.
 max_body_bytes = 65536
+# On SIGTERM or SIGINT, how long (ms) the requests in flight get to finish
+# before they are cut. 0 cuts at once; at most 300000.
+shutdown_drain_ms = 5000
 
 [storage]
 # Names where the nameserver keeps <stem>_v002.db (aliases) and <stem>_v002.key
@@ -1365,6 +1397,20 @@ mod tests {
         assert!(cfg.reputation.translation_contracts.is_empty());
         assert!(cfg.useful_work.assignment_ttl_secs > 0);
         assert!(cfg.useful_work.max_queue_depth > 0);
+    }
+
+    /// `[network] shutdown_drain_ms`: 5000 unset, the template's value, and
+    /// any value up to the maximum.
+    #[test]
+    fn shutdown_drain_ms_defaults_and_parses() {
+        assert_eq!(
+            NetworkConfig::default().shutdown_drain_ms,
+            DEFAULT_SHUTDOWN_DRAIN_MS
+        );
+        let cfg: NameServerConfig = toml::from_str(TEMPLATE).expect("template parses");
+        assert_eq!(cfg.network.shutdown_drain_ms, 5_000);
+        let cfg: NetworkConfig = toml::from_str("shutdown_drain_ms = 0").unwrap();
+        assert_eq!(cfg.shutdown_drain_ms, 0);
     }
 
     #[test]

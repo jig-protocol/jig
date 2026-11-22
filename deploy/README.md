@@ -373,6 +373,9 @@ all. `install.sh` waits 10 s for the server it replaces, and the unit's
 `TimeoutStopSec` defaults to 90 s, so keep the drain under both. A client that
 resubmits a block it got no answer for is told the block's CID (#396).
 
+The nameserver stops the same way, with its own `[network] shutdown_drain_ms`
+(default 5000): see `repos/jig-nameserver/OPERATOR_GUIDE.md`.
+
 ### Size limits
 
 `[limits]` sets explicit, configurable limits on how much jig-server reads at

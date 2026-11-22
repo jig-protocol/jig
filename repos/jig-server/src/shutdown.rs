@@ -8,6 +8,9 @@
 //! Ingest needs nothing here. A block being ingested when the signal arrives
 //! finishes or fails as one unit, because persistence runs in a transaction;
 //! the drain only bounds how long the server waits for it.
+//!
+//! `jig_nameserver::shutdown` (#438) is a copy of this, less the WebSocket
+//! hold. A fix to one belongs in the other.
 
 use std::future::Future;
 use std::time::Duration;
@@ -19,8 +22,8 @@ use tokio_util::task::TaskTracker;
 /// it stops. Cloning shares both.
 ///
 /// The listeners spawn every connection through [`Shutdown::spawn`], and the
-/// WebSocket handler runs each session through [`Shutdown::track`], so
-/// [`Shutdown::drain`] waits for all of them.
+/// WebSocket handler holds a token from [`Shutdown::hold`] for each session,
+/// so [`Shutdown::drain`] waits for all of them.
 #[derive(Clone, Debug, Default)]
 pub struct Shutdown {
     token: CancellationToken,

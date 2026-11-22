@@ -227,16 +227,19 @@ pub fn build_app_parts(cfg: &NameServerConfig) -> Result<NameServerApp> {
     })
 }
 
-/// Load config, apply the CLI overrides, and serve. `config` is
-/// `jig-nameserver --config`, else `JIG_NS_CONFIG` is read. `bind_override` /
-/// `port_override` come from `jig-nameserver serve --bind/--port` and win over
-/// both the config file and `JIG_NS_BIND`/`JIG_NS_PORT`, which `load` has
-/// already applied.
+/// Load config, apply the CLI overrides, and serve until SIGTERM or SIGINT,
+/// then shut down gracefully (#438). `config` is `jig-nameserver --config`,
+/// else `JIG_NS_CONFIG` is read. `bind_override` / `port_override` come from
+/// `jig-nameserver serve --bind/--port` and win over both the config file and
+/// `JIG_NS_BIND`/`JIG_NS_PORT`, which `load` has already applied.
 pub async fn run_http_server(
     config: Option<&std::path::Path>,
     bind_override: Option<String>,
     port_override: Option<u16>,
 ) -> Result<()> {
+    // Before anything binds, so a signal once the server is listening is
+    // always graceful, never the default action.
+    let stop = crate::shutdown::signal();
     let mut cfg = NameServerConfig::load(config)?;
     if let Some(bind) = bind_override {
         cfg.network.bind = bind;
@@ -249,11 +252,13 @@ pub async fn run_http_server(
     let listener = TcpListener::bind(&addr)
         .await
         .map_err(|e| NameServerError::Other(anyhow::anyhow!("binding {addr}: {e}")))?;
-    serve(&cfg, listener).await
+    let app = build_app_parts(&cfg)?;
+    // A second signal cuts the drain short.
+    serve_app_until(&cfg, app, listener, stop, crate::shutdown::signal).await
 }
 
 /// Serve `cfg`'s nameserver on `listener`: over TLS (JEP-0004 rule 12) unless
-/// `[tls] enabled = false`.
+/// `[tls] enabled = false`. Serves until the future is dropped.
 pub async fn serve(cfg: &NameServerConfig, listener: TcpListener) -> Result<()> {
     serve_app(cfg, build_app_parts(cfg)?, listener).await
 }
@@ -265,11 +270,37 @@ pub async fn serve_app(
     app: NameServerApp,
     listener: TcpListener,
 ) -> Result<()> {
+    serve_app_until(
+        cfg,
+        app,
+        listener,
+        std::future::pending(),
+        std::future::pending,
+    )
+    .await
+}
+
+/// [`serve_app`] until `stop`, then shut down gracefully (#438): stop
+/// accepting, let the requests in flight finish within `[network]
+/// shutdown_drain_ms` (or until `cut`), and return.
+pub async fn serve_app_until<S, C, CF>(
+    cfg: &NameServerConfig,
+    app: NameServerApp,
+    listener: TcpListener,
+    stop: S,
+    cut: C,
+) -> Result<()>
+where
+    S: std::future::Future<Output = ()>,
+    C: FnOnce() -> CF,
+    CF: std::future::Future<Output = ()>,
+{
     let other = |e: String| NameServerError::Other(anyhow::anyhow!(e));
     let addr = listener
         .local_addr()
         .map_err(|e| NameServerError::Other(e.into()))?;
-    if !cfg.tls.enabled {
+    let shutdown = crate::shutdown::Shutdown::new();
+    let listening: tokio::task::JoinHandle<Result<()>> = if !cfg.tls.enabled {
         tracing::warn!(
             "[tls] enabled = false: serving plaintext on http://{addr}. This is an unsafe \
              option, listed in /.well-known/jig-ns; use it only on loopback or behind a proxy \
@@ -278,27 +309,89 @@ pub async fn serve_app(
         let make_svc = app
             .router
             .into_make_service_with_connect_info::<SocketAddr>();
-        return axum::serve(listener, make_svc)
-            .await
-            .map_err(|e| NameServerError::Other(e.into()));
+        let stopped = shutdown.cancelled_owned();
+        shutdown.spawn(async move {
+            axum::serve(listener, make_svc)
+                .with_graceful_shutdown(stopped)
+                .await
+                .map_err(|e| NameServerError::Other(e.into()))
+        })
+    } else {
+        // Not jig-server's `tls/`: the two often share a data directory, and each
+        // DID vouches for its own certificate.
+        let dir = cfg
+            .storage
+            .database_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."))
+            .join("nameserver");
+        let (cert, key) = cfg
+            .tls
+            .material(&dir, &tls_names(&cfg.network.bind))
+            .map_err(other)?;
+        let (rustls_config, leaf) =
+            jig_config::tls::load_rustls_config(&cert, &key).map_err(other)?;
+        app.bind_tls_certificate(leaf.as_ref());
+        tracing::info!("nameserver listening on https://{addr}");
+        shutdown.spawn(serve_tls(
+            listener,
+            app.router,
+            rustls_config,
+            shutdown.clone(),
+        ))
+    };
+    // The listener lives no longer than this future: dropped early, or
+    // returning once the drain has run out or been cut, it stops accepting
+    // and frees the port rather than serving on detached.
+    let _listener_lifetime = AbortOnDrop(listening.abort_handle());
+
+    tokio::pin!(listening);
+    tokio::pin!(stop);
+    tokio::select! {
+        served = &mut listening => {
+            return match served {
+                Ok(result) => result,
+                Err(e) => Err(other(format!("listener task failed: {e}"))),
+            };
+        }
+        () = &mut stop => {}
     }
-    // Not jig-server's `tls/`: the two often share a data directory, and each
-    // DID vouches for its own certificate.
-    let dir = cfg
-        .storage
-        .database_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(std::path::Path::new("."))
-        .join("nameserver");
-    let (cert, key) = cfg
-        .tls
-        .material(&dir, &tls_names(&cfg.network.bind))
-        .map_err(other)?;
-    let (rustls_config, leaf) = jig_config::tls::load_rustls_config(&cert, &key).map_err(other)?;
-    app.bind_tls_certificate(leaf.as_ref());
-    tracing::info!("nameserver listening on https://{addr}");
-    serve_tls(listener, app.router, rustls_config).await
+    shutdown.begin();
+    let drain = std::time::Duration::from_millis(cfg.network.shutdown_drain_ms);
+    tracing::info!(
+        in_flight = shutdown.in_flight(),
+        drain_ms = cfg.network.shutdown_drain_ms,
+        "shutting down: no new connections; draining in-flight requests"
+    );
+    tokio::select! {
+        drained = shutdown.drain(drain) => {
+            if drained {
+                tracing::info!("shutdown complete: every connection drained");
+            } else {
+                tracing::warn!(
+                    still_open = shutdown.in_flight(),
+                    "shutdown drain ran out; cutting what is still open"
+                );
+            }
+        }
+        () = cut() => {
+            tracing::warn!(
+                still_open = shutdown.in_flight(),
+                "second signal: cutting the drain short"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Aborts a task when dropped.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Names a self-signed certificate is made for: `localhost`, and the bind
@@ -314,25 +407,35 @@ fn tls_names(bind: &str) -> Vec<String> {
 
 /// Serve `router` over rustls. Each connection's handshake runs in its own
 /// task, so a slow one can't block accept.
+///
+/// Once `shutdown` begins this stops accepting and returns, dropping the
+/// listener. A connection still in its TLS handshake is closed; a served one
+/// finishes the request in flight, then closes instead of keeping alive.
 async fn serve_tls(
     listener: TcpListener,
     router: Router,
     rustls_config: RustlsServerConfig,
+    shutdown: crate::shutdown::Shutdown,
 ) -> Result<()> {
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(rustls_config));
     loop {
-        let (tcp, peer) = listener
-            .accept()
-            .await
-            .map_err(|e| NameServerError::Other(anyhow::anyhow!("accept error: {e}")))?;
-        let (acceptor, router) = (acceptor.clone(), router.clone());
-        tokio::spawn(async move {
-            let tls = match acceptor.accept(tcp).await {
-                Ok(tls) => tls,
-                Err(e) => {
-                    tracing::debug!("TLS handshake failed: {e}");
-                    return;
-                }
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            () = shutdown.cancelled() => return Ok(()),
+        };
+        let (tcp, peer) =
+            accepted.map_err(|e| NameServerError::Other(anyhow::anyhow!("accept error: {e}")))?;
+        let (acceptor, router, watched) = (acceptor.clone(), router.clone(), shutdown.clone());
+        shutdown.spawn(async move {
+            let tls = tokio::select! {
+                tls = acceptor.accept(tcp) => match tls {
+                    Ok(tls) => tls,
+                    Err(e) => {
+                        tracing::debug!("TLS handshake failed: {e}");
+                        return;
+                    }
+                },
+                () = watched.cancelled() => return,
             };
             let service = hyper::service::service_fn(
                 move |mut req: hyper::Request<hyper::body::Incoming>| {
@@ -344,10 +447,18 @@ async fn serve_tls(
                 },
             );
             // ALPN offers only http/1.1.
-            if let Err(e) = hyper::server::conn::http1::Builder::new()
-                .serve_connection(TokioIo::new(tls), service)
-                .await
-            {
+            let conn = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(tls), service);
+            tokio::pin!(conn);
+            let served = tokio::select! {
+                served = conn.as_mut() => served,
+                () = watched.cancelled() => {
+                    // Finish the request in flight, then close.
+                    conn.as_mut().graceful_shutdown();
+                    conn.as_mut().await
+                }
+            };
+            if let Err(e) = served {
                 tracing::debug!("connection error: {e}");
             }
         });
@@ -703,6 +814,17 @@ mod tests {
         assert!(err.contains("max_body_bytes"), "{err}");
     }
 
+    #[test]
+    fn a_drain_over_the_maximum_does_not_boot() {
+        let dir = ScratchDir::new("drain-max");
+        let mut cfg = scratch_config(&dir, "dj.jig");
+        cfg.network.shutdown_drain_ms = crate::config::MAX_SHUTDOWN_DRAIN_MS;
+        cfg.validate().expect("the maximum itself boots");
+        cfg.network.shutdown_drain_ms = crate::config::MAX_SHUTDOWN_DRAIN_MS + 1;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("shutdown_drain_ms"), "{err}");
+    }
+
     /// `GET /v1/challenge` has a per-IP bucket of its own (JEP-0008 rule 31).
     #[tokio::test]
     async fn challenges_are_rate_limited_per_ip() {
@@ -799,6 +921,203 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["code"], "RATE_LIMITED");
+    }
+
+    // -----------------------------------------------------------------------
+    // Graceful shutdown (#438), on a real socket, over plaintext and TLS
+    // -----------------------------------------------------------------------
+
+    /// A nameserver on a real socket, with two test routes merged in:
+    /// `/hang` (holds until `release`, after reporting on `started`) and
+    /// `/peer` (the `ConnectInfo` the rate limiter keys on).
+    struct Served {
+        _dir: ScratchDir,
+        addr: SocketAddr,
+        tls: bool,
+        stop: Option<tokio::sync::oneshot::Sender<()>>,
+        cut: Option<tokio::sync::oneshot::Sender<()>>,
+        task: tokio::task::JoinHandle<Result<()>>,
+        started: tokio::sync::mpsc::UnboundedReceiver<()>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl Served {
+        async fn start(tag: &str, tls: bool, drain_ms: u64) -> Self {
+            let dir = ScratchDir::new(tag);
+            let mut cfg = scratch_config(&dir, "dj.jig");
+            cfg.tls.enabled = tls;
+            cfg.network.shutdown_drain_ms = drain_ms;
+            let mut app = build_app_parts(&cfg).expect("build_app_parts");
+            let (started_tx, started) = tokio::sync::mpsc::unbounded_channel();
+            let release = Arc::new(tokio::sync::Notify::new());
+            let held = release.clone();
+            app.router = app
+                .router
+                .route(
+                    "/hang",
+                    axum::routing::get(move || {
+                        let (started_tx, held) = (started_tx.clone(), held.clone());
+                        async move {
+                            let _ = started_tx.send(());
+                            held.notified().await;
+                            "released"
+                        }
+                    }),
+                )
+                .route(
+                    "/peer",
+                    axum::routing::get(
+                        |axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<
+                            SocketAddr,
+                        >| async move { peer.ip().to_string() },
+                    ),
+                );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
+            let (cut, cut_rx) = tokio::sync::oneshot::channel::<()>();
+            let task = tokio::spawn(async move {
+                serve_app_until(
+                    &cfg,
+                    app,
+                    listener,
+                    async move {
+                        let _ = stop_rx.await;
+                    },
+                    move || async move {
+                        let _ = cut_rx.await;
+                    },
+                )
+                .await
+            });
+            Self {
+                _dir: dir,
+                addr,
+                tls,
+                stop: Some(stop),
+                cut: Some(cut),
+                task,
+                started,
+                release,
+            }
+        }
+
+        fn url(&self, path: &str) -> String {
+            let scheme = if self.tls { "https" } else { "http" };
+            format!("{scheme}://{}{path}", self.addr)
+        }
+
+        /// A fresh client: the self-signed certificate is trusted through the
+        /// DID elsewhere (`tests/tls.rs`); these tests are about shutdown.
+        fn client() -> reqwest::Client {
+            reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap()
+        }
+
+        fn stop(&mut self) {
+            self.stop.take().unwrap().send(()).unwrap();
+        }
+
+        async fn accepts(&self) -> bool {
+            tokio::net::TcpStream::connect(self.addr).await.is_ok()
+        }
+    }
+
+    /// A request in flight when the signal arrives gets its answer; a new
+    /// connection is refused; the server returns once drained.
+    #[tokio::test]
+    async fn shutdown_finishes_the_request_in_flight_and_refuses_new_connections() {
+        for tls in [false, true] {
+            let mut served = Served::start("drain-finish", tls, 10_000).await;
+            let url = served.url("/hang");
+            let in_flight = tokio::spawn(async move { Served::client().get(url).send().await });
+            served.started.recv().await.expect("/hang reached");
+            served.stop();
+            // Give the listener a moment to stop, then let /hang answer.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert!(!served.accepts().await, "tls={tls}: still accepting");
+            served.release.notify_one();
+            let answer = in_flight
+                .await
+                .unwrap()
+                .expect("the request in flight is answered");
+            assert_eq!(answer.status(), StatusCode::OK, "tls={tls}");
+            assert_eq!(answer.text().await.unwrap(), "released");
+            tokio::time::timeout(std::time::Duration::from_secs(5), served.task)
+                .await
+                .unwrap_or_else(|_| panic!("tls={tls}: did not return once drained"))
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    /// A request that never finishes holds the server only until the drain
+    /// runs out, or until a second signal cuts it short.
+    #[tokio::test]
+    async fn shutdown_is_bounded_by_the_drain_and_cut_by_a_second_signal() {
+        for tls in [false, true] {
+            for cut_short in [false, true] {
+                let drain = if cut_short { 600_000 } else { 300 };
+                let mut served = Served::start("drain-bound", tls, drain).await;
+                let url = served.url("/hang");
+                let _in_flight =
+                    tokio::spawn(async move { Served::client().get(url).send().await });
+                served.started.recv().await.expect("/hang reached");
+                served.stop();
+                let stopped = std::time::Instant::now();
+                if cut_short {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    assert!(
+                        !served.task.is_finished(),
+                        "tls={tls}: the drain waits for /hang"
+                    );
+                    served.cut.take().unwrap().send(()).unwrap();
+                }
+                tokio::time::timeout(std::time::Duration::from_secs(5), &mut served.task)
+                    .await
+                    .unwrap_or_else(|_| panic!("tls={tls} cut={cut_short}: not bounded"))
+                    .unwrap()
+                    .unwrap();
+                if !cut_short {
+                    assert!(
+                        stopped.elapsed() >= std::time::Duration::from_millis(250),
+                        "tls={tls}: returned before the drain ran out"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A server future dropped before its signal (a caller aborting it) takes
+    /// its listener with it.
+    #[tokio::test]
+    async fn dropping_the_server_stops_its_listener() {
+        for tls in [false, true] {
+            let served = Served::start("dropped", tls, 5_000).await;
+            assert!(served.accepts().await, "tls={tls}: serving");
+            served.task.abort();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert!(
+                !served.accepts().await,
+                "tls={tls}: still accepting once dropped"
+            );
+        }
+    }
+
+    /// Both listeners still hand each request its peer address, which the
+    /// per-IP rate limits key on (`v0_0_2_rate_limit::client_ip`).
+    #[tokio::test]
+    async fn the_rate_limiter_still_sees_the_peer_on_both_listeners() {
+        for tls in [false, true] {
+            let served = Served::start("peer", tls, 5_000).await;
+            let client = Served::client();
+            let peer = client.get(served.url("/peer")).send().await.unwrap();
+            assert_eq!(peer.status(), StatusCode::OK, "tls={tls}");
+            assert_eq!(peer.text().await.unwrap(), "127.0.0.1", "tls={tls}");
+        }
     }
 
     #[test]

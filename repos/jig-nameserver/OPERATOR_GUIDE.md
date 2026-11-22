@@ -42,6 +42,7 @@ Settings come from the config file named by `--config <path>` or else `JIG_NS_CO
 - `[tls]`: see [TLS](#tls).
 - `[network] trust_proxy` / `JIG_NS_TRUST_PROXY` and `[network] proxy_ip_header` / `JIG_NS_PROXY_IP_HEADER`: see [Behind a reverse proxy](#behind-a-reverse-proxy).
 - `[network] max_body_bytes` (default `65536`): the largest request body on every route. A bigger one is refused with `413 Payload Too Large` before it is parsed. Registration, rotation and renewal requests are a few kilobytes at most. `0` refuses to boot.
+- `[network] shutdown_drain_ms` / `JIG_NS_SHUTDOWN_DRAIN_MS` (default `5000`): see [Stopping and restarting](#stopping-and-restarting).
 
 Every config section denies unknown keys: a typo, or a key in the wrong section, stops the nameserver at start-up with an error naming the key. A section or key that was removed (`[pow]`, `[rate_limits]`, `[transparency]`, `[runtime]`, `[anomaly_detection]`, `[hot]`, `[federation]`, `capabilities.federation_enabled`, `storage.backend*`, `analytics.backend*`) fails with a message saying so; delete it. Removed environment variables, such as `JIG_NS_SECRET`, `JIG_NS_POW_*` and the federation `JIG_NS_*` variables, don't stop start-up: the nameserver logs a warning naming each one and ignores it.
 
@@ -159,6 +160,10 @@ unlock = "credential:/run/credentials/jig-nameserver.service/jig-nameserver-key"
 **Plaintext.** `[v0_0_2.keys] storage = "plaintext"` keeps a raw key in clear. It is an antipattern, warned about on every boot. It is not listed in `unsafe_options_active`, so it does not advertise this nameserver as a soft target.
 
 **Changing the key.** The nameserver serves no key link: unlike jig-server, it has no `.link` file that moves its old DID to a new one. Changing its key means updating every delegation that names the old DID.
+
+## Stopping and restarting
+
+On SIGTERM (`systemctl stop` or `restart`) or SIGINT, the nameserver shuts down gracefully: it stops accepting connections, gives the requests in flight up to `[network] shutdown_drain_ms` (default `5000`) to finish, then exits 0. What is still open when the drain runs out is cut, and a second signal cuts the drain short. `0` cuts at once; over `300000` (five minutes) refuses to boot. A registration, rotation or renewal being written when the drain is cut is stored whole or not at all. The unit's `TimeoutStopSec` defaults to 90 s, so keep the drain under it.
 
 ## Security notes
 
