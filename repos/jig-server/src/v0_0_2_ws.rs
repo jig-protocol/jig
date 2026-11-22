@@ -45,6 +45,10 @@ use crate::v0_0_2::AppState;
 /// disambiguation. Not auth-significant.
 static CONN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// How long a session closed for shutdown (#424) waits for the client's
+/// Close reply before it drops the socket anyway.
+const CLOSE_REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Process-lifetime counters behind `GET /metrics` (served from
 /// [`crate::handler::build_router`]).
 ///
@@ -214,6 +218,7 @@ pub async fn ws_handler(
     State(state): State<Arc<AppState>>,
     peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     exporter: Option<axum::Extension<crate::server::TlsExporter>>,
+    shutdown: Option<axum::Extension<crate::shutdown::Shutdown>>,
 ) -> Response {
     let conn_id = CONN_COUNTER.fetch_add(1, Ordering::SeqCst);
     let ip = peer.map(|p| p.0.0.ip());
@@ -222,9 +227,19 @@ pub async fn ws_handler(
     let tls_exporter = exporter.map(|e| e.0.0.to_vec()).unwrap_or_default();
     // `[limits]`: a message or frame over these closes the connection.
     let limits = state.limits();
+    // A stopping server waits for the session to send its close frame
+    // (#424). The hold is taken here, before the upgrade completes, so a
+    // drain that starts in between still waits for the session; a failed
+    // upgrade drops it. A router served without the listener's `Shutdown`
+    // (tests driving it directly) has none to watch.
+    let shutdown = shutdown.map(|axum::Extension(shutdown)| shutdown);
+    let held = shutdown.as_ref().map(crate::shutdown::Shutdown::hold);
     ws.max_message_size(limits.ws_message)
         .max_frame_size(limits.ws_frame)
-        .on_upgrade(move |socket| handle_socket(socket, state, conn_id, ip, tls_exporter))
+        .on_upgrade(move |socket| async move {
+            handle_socket(socket, state, conn_id, ip, tls_exporter, shutdown).await;
+            drop(held);
+        })
 }
 
 /// The address a request came from: its TCP peer, as the listener recorded
@@ -315,6 +330,7 @@ async fn handle_socket(
     conn_id: u64,
     ip: Option<std::net::IpAddr>,
     tls_exporter: Vec<u8>,
+    shutdown: Option<crate::shutdown::Shutdown>,
 ) {
     metrics::connection_opened();
     // Per-connection channel: fanout delivers (StoredBlock, StoredReceipt) here.
@@ -359,6 +375,38 @@ async fn handle_socket(
                         reason: "no peer_proof".into(),
                     })))
                     .await;
+                break;
+            }
+            // --- The server is stopping (#424) ---
+            // Checked between frames, so a frame already being handled
+            // (an ingest included) finishes first.
+            () = async {
+                match &shutdown {
+                    Some(shutdown) => shutdown.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                tracing::debug!(conn_id, "closing: server shutting down");
+                let sent = socket
+                    .send(Message::Close(Some(CloseFrame {
+                        code: axum::extract::ws::close_code::AWAY,
+                        reason: "server shutting down".into(),
+                    })))
+                    .await;
+                // Finish the closing handshake (RFC 6455 §7.1.1): read until
+                // the client's Close, discarding anything else, so the 1001
+                // isn't lost to a reset from closing on unread data. A client
+                // that never answers is given CLOSE_REPLY_WAIT.
+                if sent.is_ok() {
+                    let _ = tokio::time::timeout(CLOSE_REPLY_WAIT, async {
+                        while let Some(Ok(msg)) = socket.recv().await {
+                            if matches!(msg, Message::Close(_)) {
+                                break;
+                            }
+                        }
+                    })
+                    .await;
+                }
                 break;
             }
             // --- Client → Server ---
@@ -2097,6 +2145,94 @@ mod tests {
             Some(1),
             "per-channel counter must record the slug lifted from the manifest"
         );
+    }
+
+    // --- graceful shutdown (#424) ---------------------------------------------
+
+    /// A stopping server closes every WebSocket session with 1001 (going
+    /// away), so clients reconnect promptly, and waits for that before it
+    /// returns. A session that is not yet past `hello` is closed the same way.
+    #[tokio::test]
+    async fn shutdown_closes_each_session_with_going_away() {
+        let state = Arc::new(AppState::for_test().unwrap());
+        let app = Router::new()
+            .route("/api/v1/ws", get(ws_handler))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/api/v1/ws", listener.local_addr().unwrap());
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let served = tokio::spawn(crate::server::serve_listener(
+            listener,
+            app,
+            None,
+            None,
+            Duration::from_secs(10),
+            async move {
+                let _ = stop_rx.await;
+            },
+            std::future::pending,
+        ));
+
+        let mut established = established(&url).await;
+        let (mut fresh, _) = connect_async(&url).await.unwrap();
+        stop_tx.send(()).unwrap();
+
+        assert_eq!(
+            close_code(&mut established).await,
+            Some(axum::extract::ws::close_code::AWAY)
+        );
+        assert_eq!(
+            close_code(&mut fresh).await,
+            Some(axum::extract::ws::close_code::AWAY)
+        );
+        tokio::time::timeout(Duration::from_secs(5), served)
+            .await
+            .expect("the server returns once both sessions closed")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// After its 1001 a session waits for the client's Close, so the close
+    /// frame is not lost to a reset, but not for long: a client that never
+    /// answers holds a ten-second drain for about CLOSE_REPLY_WAIT.
+    #[tokio::test]
+    async fn shutdown_waits_briefly_for_the_close_reply() {
+        let state = Arc::new(AppState::for_test().unwrap());
+        let app = Router::new()
+            .route("/api/v1/ws", get(ws_handler))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/api/v1/ws", listener.local_addr().unwrap());
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let served = tokio::spawn(crate::server::serve_listener(
+            listener,
+            app,
+            None,
+            None,
+            Duration::from_secs(10),
+            async move {
+                let _ = stop_rx.await;
+            },
+            std::future::pending,
+        ));
+
+        // Never read: the client neither sees the 1001 nor answers it.
+        let (silent, _) = connect_async(&url).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stop_tx.send(()).unwrap();
+        let stopped = std::time::Instant::now();
+        tokio::time::sleep(CLOSE_REPLY_WAIT / 2).await;
+        assert!(
+            !served.is_finished(),
+            "the session waits for the Close reply"
+        );
+        tokio::time::timeout(Duration::from_secs(5), served)
+            .await
+            .expect("bounded by CLOSE_REPLY_WAIT, not the drain")
+            .unwrap()
+            .unwrap();
+        assert!(stopped.elapsed() < CLOSE_REPLY_WAIT + Duration::from_secs(2));
+        drop(silent);
     }
 
     // --- bad JSON → connection stays alive ----------------------------------
