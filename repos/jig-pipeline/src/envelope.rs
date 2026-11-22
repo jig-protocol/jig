@@ -200,6 +200,11 @@ pub enum Frame {
         /// `server_did`, each link leaving the DID the one before moved to.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         prior_key_links: Vec<String>,
+        /// The ruleset the server applies (JEP-0009 rule 4), sent and signed
+        /// only to a hello that asked for `ruleset`. Absent otherwise, or when
+        /// the server declares none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ruleset: Option<crate::handshake::RulesetRef>,
         /// base64 ed25519 over [`crate::handshake::WelcomeStatement::canonical_bytes`].
         sig: String,
     },

@@ -655,24 +655,38 @@ pub async fn add(ctx: &CliContext, slug: String, who: String, via: Option<String
     let secure = Secure::open(ctx)?;
     let info = visible_channel(&secure, &slug).await?;
     let id = secure.identity();
-    let cid = if info.encrypted() {
-        let kp = member_key_package(&secure, &info, &did, reach, via.as_deref()).await?;
-        let server = secure.server().to_string();
-        secure
-            .commit(
-                &slug,
-                |s, key| Ok(s.prepare_add(&server, key, &kp, &did)?),
-                |c| {
-                    let mut meta = json!({"channel": slug, "member_did": did});
-                    merge(&mut meta, mls_fields(c));
-                    build_with_metadata(id, BlockKind::MemberAdd, now(id), meta)
-                },
-            )
-            .await?
-    } else {
-        let block = build_member_add(id, &slug, &did, now(id));
-        secure.submit(&block).await?
+    let added = async {
+        if info.encrypted() {
+            let kp = member_key_package(&secure, &info, &did, reach, via.as_deref()).await?;
+            let server = secure.server().to_string();
+            secure
+                .commit(
+                    &slug,
+                    |s, key| Ok(s.prepare_add(&server, key, &kp, &did)?),
+                    |c| {
+                        let mut meta = json!({"channel": slug, "member_did": did});
+                        merge(&mut meta, mls_fields(c));
+                        build_with_metadata(id, BlockKind::MemberAdd, now(id), meta)
+                    },
+                )
+                .await
+        } else {
+            let block = build_member_add(id, &slug, &did, now(id));
+            secure.submit(&block).await
+        }
     };
+    // Final for this channel: its sequencer refuses the member-add whichever
+    // server the package came from (JEP-0017 rule 18).
+    let cid = added.await.map_err(|e| {
+        if crate::cmd::secure::local_adds_ended(&e) {
+            e.context(format!(
+                "{did} ended local adds at the server that sequences {slug}: they can join it \
+                 themselves, but nobody can add them; nothing was changed"
+            ))
+        } else {
+            e
+        }
+    })?;
     println!("added {did} to {slug}");
     println!("  block_cid: {cid}");
     Ok(())

@@ -173,9 +173,15 @@ pub struct ServerPin {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub welcome: Option<String>,
     /// The `server-manifest` this device last checked a welcome against
-    /// ([`crate::manifest`]); a welcome citing it needs no second check.
+    /// ([`crate::manifest`]); a welcome citing it, and naming
+    /// [`Self::ruleset`], needs no second check. The manifest reference does
+    /// not cover the ruleset a welcome names, so the cache holds both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest: Option<jig_pipeline::handshake::ManifestRef>,
+    /// The ruleset the welcome checked against [`Self::manifest`] named, when
+    /// it granted the ruleset capability (JEP-0009 rule 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ruleset: Option<jig_pipeline::handshake::RulesetRef>,
     /// The public key links this pin moved along, and those the server
     /// served leading to its pinned DID, base64 as served: a later link out
     /// of one of their DIDs to another is a fork
@@ -668,16 +674,34 @@ impl Pins {
         })
     }
 
+    /// Whether a welcome from `server` citing `manifest` and naming `ruleset`
+    /// (when it grants the ruleset capability) was already checked: both must
+    /// be what was pinned, since the manifest reference does not cover the
+    /// ruleset a welcome names ([`ServerPin::ruleset`]).
+    pub fn manifest_checked(
+        &self,
+        server: &str,
+        manifest: &jig_pipeline::handshake::ManifestRef,
+        ruleset: Option<&jig_pipeline::handshake::RulesetRef>,
+    ) -> bool {
+        self.server(server).is_some_and(|pin| {
+            pin.manifest.as_ref() == Some(manifest) && pin.ruleset.as_ref() == ruleset
+        })
+    }
+
     /// Record that `server`'s welcome was checked against `manifest`.
     pub fn set_manifest(
         &mut self,
         server: &str,
         manifest: &jig_pipeline::handshake::ManifestRef,
+        ruleset: Option<&jig_pipeline::handshake::RulesetRef>,
     ) -> Result<(), PinError> {
         self.update(|file| {
             let pin = file.servers.entry(server_key(server)).or_default();
-            let changed = pin.manifest.as_ref() != Some(manifest);
+            let changed =
+                pin.manifest.as_ref() != Some(manifest) || pin.ruleset.as_ref() != ruleset;
             pin.manifest = Some(manifest.clone());
+            pin.ruleset = ruleset.cloned();
             Ok(((), changed))
         })
     }
@@ -1257,6 +1281,7 @@ mod tests {
             tls_exporter: Vec::new(),
             manifest: None,
             admit: None,
+            ruleset: None,
             moved_from: None,
             evidence: String::new(),
         }
@@ -1418,6 +1443,49 @@ mod tests {
                 &STANDARD.encode(&text.sender_sig)
             )
             .is_err()
+        );
+    }
+
+    /// A checked manifest is a cache hit only with the ruleset it was checked
+    /// with: the same manifest naming another ruleset, or none, is checked
+    /// again. A pin from before rulesets has none.
+    #[test]
+    fn a_checked_manifest_is_a_hit_only_with_the_ruleset_it_was_checked_with() {
+        use jig_pipeline::handshake::{ManifestRef, RulesetRef};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        let server = "ws://host:7117";
+        let manifest = ManifestRef {
+            cid: "bafyManifest".into(),
+            seq: 3,
+        };
+        let ruleset = |version| RulesetRef {
+            id: "jig-reference".into(),
+            version,
+            hash: format!("bafyRuleset{version}"),
+            url: "/api/v1/ruleset/x".into(),
+        };
+        let mut pins = Pins::load(&path).unwrap();
+        assert!(!pins.manifest_checked(server, &manifest, None));
+
+        pins.set_manifest(server, &manifest, Some(&ruleset(1)))
+            .unwrap();
+        let pins = Pins::load(&path).unwrap();
+        assert!(pins.manifest_checked(server, &manifest, Some(&ruleset(1))));
+        assert!(!pins.manifest_checked(server, &manifest, Some(&ruleset(2))));
+        assert!(!pins.manifest_checked(server, &manifest, None));
+        let other = ManifestRef {
+            cid: "bafyOther".into(),
+            seq: 4,
+        };
+        assert!(!pins.manifest_checked(server, &other, Some(&ruleset(1))));
+
+        let mut pins = pins;
+        pins.set_manifest(server, &manifest, None).unwrap();
+        assert!(
+            Pins::load(&path)
+                .unwrap()
+                .manifest_checked(server, &manifest, None)
         );
     }
 
@@ -1752,6 +1820,7 @@ mod tests {
                 key_link: newest,
                 admit: None,
                 prior_key_links: prior,
+                ruleset: None,
                 sig: String::new(),
             }))
             .unwrap();
@@ -1863,6 +1932,7 @@ mod tests {
                 key_link: newest,
                 admit: None,
                 prior_key_links: prior,
+                ruleset: None,
                 sig: String::new(),
             }))
             .unwrap();

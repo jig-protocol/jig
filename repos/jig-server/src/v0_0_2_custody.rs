@@ -26,11 +26,11 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use jig_config::v0_0_2_server::ReleasePolicy;
-use jig_core::contract::KpRequest;
+use jig_core::contract::{KpRequest, LocalAdds};
 use jig_core::naming::ReachabilityRecord;
 use jig_pipeline::persist::{LimitHit, Release, ReleaseAsk};
 use serde::{Deserialize, Serialize};
@@ -65,6 +65,15 @@ pub struct StoredBody {
 pub struct RequestBody {
     /// A `jig-kp-request-v1`, base64.
     pub request_b64: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LocalAddsBody {
+    /// Whether others may add the DID to channels this server sequences,
+    /// as the marker kept now says.
+    pub allow: bool,
+    /// The `seq` of the marker kept now.
+    pub seq: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -106,6 +115,16 @@ pub struct LogBody {
 
 fn bad(code: &'static str, msg: impl Into<String>) -> Refusal {
     err(StatusCode::BAD_REQUEST, code, msg)
+}
+
+/// `did` has ended local adds here (JEP-0017 rule 16): no package of its is
+/// handed out for a channel this server sequences.
+pub(crate) fn local_adds_ended(did: &str) -> Refusal {
+    err(
+        StatusCode::FORBIDDEN,
+        "LOCAL_ADDS_ENDED",
+        format!("{did} has asked this server not to be added to the channels it sequences"),
+    )
 }
 
 fn now() -> i64 {
@@ -187,7 +206,7 @@ pub async fn put_reachability(
     // repeats, since their owner deletes the keys (JEP-0017 rule 32), even if
     // custody is restored inside the window.
     let stored = store
-        .put_reachability_retiring(&did, record.seq, &envelope, now(), !listed)
+        .put_reachability_retiring(&did, record.seq, &envelope, &ours, now(), !listed)
         .map_err(persist_err)?;
     let seq = kept_record(&state, &did)?.map_or(record.seq, |kept| kept.seq);
     Ok(Json(StoredBody { stored, seq }))
@@ -307,6 +326,7 @@ pub async fn request_key_package(
         // since `listing_record` read it stops this release.
         listing: Some(&listing.envelope),
         kind: jig_pipeline::persist::ReleaseKind::Custody,
+        server_did: &ours,
     };
     match state
         .ingest_ctx
@@ -352,7 +372,53 @@ pub async fn request_key_package(
             },
         )),
         Release::Empty | Release::NotListed => Err(no_custody(&did)),
+        Release::LocalAddsEnded => Err(local_adds_ended(&did)),
     }
+}
+
+/// PUT /api/v1/local-adds/:did (JEP-0017 R2)
+///
+/// The body is `did`'s own `jig-local-adds-v1`, naming this server. The
+/// marker is kept only at a `seq` above the one kept; the answer is the
+/// marker kept afterwards, so a stale one is answered with what holds. While
+/// it says `allow = false`, nobody else can add `did` to a channel this
+/// server sequences; once custody is withdrawn too, `did`'s stock is
+/// deleted (rule 19).
+pub async fn put_local_adds(
+    State(state): State<Arc<AppState>>,
+    Path(did): Path<String>,
+    Json(body): Json<RequestBody>,
+) -> Result<Json<LocalAddsBody>, Refusal> {
+    let started = std::time::Instant::now();
+    let did = jig_pipeline::effect::canonical_did_string(&did);
+    let envelope = STANDARD
+        .decode(&body.request_b64)
+        .map_err(|e| bad("BAD_REQUEST", format!("request_b64: {e}")))?;
+    let marker = LocalAdds::from_envelope(&envelope)
+        .map_err(|e| bad("BAD_REQUEST", format!("not a local-adds marker: {e}")))?;
+    if marker.did != did {
+        return Err(bad("BAD_REQUEST", "the marker is signed for another DID"));
+    }
+    let ours = state.server_did.to_did_jig_string();
+    if marker.server != ours {
+        return Err(bad(
+            "WRONG_SERVER",
+            "the marker names another server; send it to the server it names",
+        ));
+    }
+    state
+        .auth
+        .admit_and_charge(&did)
+        .map_err(|outcome| refuse(&state, &outcome, started))?;
+    let kept = state
+        .ingest_ctx
+        .store
+        .put_local_adds(&did, marker.seq, marker.allow, &envelope, &ours, now())
+        .map_err(persist_err)?;
+    Ok(Json(LocalAddsBody {
+        allow: kept.allow,
+        seq: kept.seq,
+    }))
 }
 
 fn no_custody(did: &str) -> Refusal {
@@ -408,6 +474,7 @@ pub fn build_custody_router(state: Arc<AppState>) -> Router {
             "/api/v1/reach/{did}",
             get(get_reachability).put(put_reachability),
         )
+        .route("/api/v1/local-adds/{did}", put(put_local_adds))
         .route("/api/v1/custody/{did}/requests", post(request_key_package))
         .route("/api/v1/custody/{did}/releases", get(release_log))
         .with_state(state)
@@ -504,6 +571,234 @@ mod tests {
 
     fn code(r: &Refusal) -> (StatusCode, String) {
         (r.0, r.1.0.code.clone())
+    }
+
+    /// `seed`'s local-adds marker for `server`, sent to `state`.
+    async fn mark(
+        state: &Arc<AppState>,
+        seed: u8,
+        server: &str,
+        allow: bool,
+        seq: u64,
+    ) -> Result<Json<LocalAddsBody>, Refusal> {
+        let marker = LocalAdds::sign(&key(seed), server, allow, seq);
+        put_local_adds(
+            State(state.clone()),
+            Path(did_of(seed)),
+            Json(RequestBody {
+                request_b64: STANDARD.encode(&marker.envelope),
+            }),
+        )
+        .await
+    }
+
+    async fn take(state: &Arc<AppState>, seed: u8) -> Result<(), Refusal> {
+        let did = did_of(seed);
+        crate::v0_0_2_mls::take_key_package(
+            State(state.clone()),
+            Path(did.clone()),
+            format!("/api/v1/mls/key-packages/{did}").parse().unwrap(),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .map(drop)
+    }
+
+    async fn publish(state: &Arc<AppState>, seed: u8) -> Result<(), Refusal> {
+        let did = jig_core::Did::from_ed25519_pubkey(&key(seed).verifying_key().to_bytes());
+        let m = jig_mls::member::Member::new(&[seed; 32], &did).unwrap();
+        // Ordinary packages only: an unsigned upload stocks them.
+        crate::v0_0_2_mls::publish_key_packages(
+            State(state.clone()),
+            "/api/v1/mls/key-packages".parse().unwrap(),
+            axum::http::HeaderMap::new(),
+            serde_json::to_vec(&crate::v0_0_2_mls::PublishBody {
+                key_packages_b64: m
+                    .key_packages(2, false)
+                    .unwrap()
+                    .iter()
+                    .map(|p| STANDARD.encode(p))
+                    .collect(),
+            })
+            .unwrap()
+            .into(),
+        )
+        .await
+        .map(drop)
+    }
+
+    fn open_reads() -> Arc<AppState> {
+        let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
+        config.auth.require_authenticated_reads = false;
+        Arc::new(AppState::for_test_with_config(config).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_local_adds_marker_must_be_the_members_and_name_this_server() {
+        let state = state();
+        let refused = mark(&state, 4, &did_of(90), false, 1).await.unwrap_err();
+        assert_eq!(
+            code(&refused),
+            (StatusCode::BAD_REQUEST, "WRONG_SERVER".into())
+        );
+        let marker = LocalAdds::sign(&key(4), &ours(&state), false, 1);
+        let refused = put_local_adds(
+            State(state.clone()),
+            Path(did_of(5)),
+            Json(RequestBody {
+                request_b64: STANDARD.encode(&marker.envelope),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            code(&refused),
+            (StatusCode::BAD_REQUEST, "BAD_REQUEST".into())
+        );
+        let refused = put_local_adds(
+            State(state.clone()),
+            Path(did_of(4)),
+            Json(RequestBody {
+                request_b64: STANDARD.encode(b"not a marker"),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            code(&refused),
+            (StatusCode::BAD_REQUEST, "BAD_REQUEST".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_local_adds_marker_is_answered_with_the_one_kept() {
+        let state = state();
+        let Json(kept) = mark(&state, 4, &ours(&state), false, 5).await.unwrap();
+        assert_eq!((kept.allow, kept.seq), (false, 5));
+        // A lower seq is not kept: the answer is the marker that holds, not
+        // the one sent.
+        let Json(kept) = mark(&state, 4, &ours(&state), true, 3).await.unwrap();
+        assert_eq!((kept.allow, kept.seq), (false, 5));
+        let Json(kept) = mark(&state, 4, &ours(&state), true, 6).await.unwrap();
+        assert_eq!((kept.allow, kept.seq), (true, 6));
+    }
+
+    #[tokio::test]
+    async fn ended_local_adds_close_this_servers_key_package_route() {
+        let state = open_reads();
+        stock(&state, 4, 2).await;
+        let _ = mark(&state, 4, &ours(&state), false, 1).await.unwrap();
+        let refused = take(&state, 4).await.unwrap_err();
+        assert_eq!(
+            code(&refused),
+            (StatusCode::FORBIDDEN, "LOCAL_ADDS_ENDED".into())
+        );
+        let _ = mark(&state, 4, &ours(&state), true, 2).await.unwrap();
+        take(&state, 4).await.unwrap();
+    }
+
+    /// Custody under R2 is refused for a channel this server sequences and
+    /// released for one it does not know: the sequencer's own refusal of the
+    /// `member-add` is what holds then (JEP-0017 rule 16).
+    #[tokio::test]
+    async fn ended_local_adds_refuse_custody_only_for_channels_sequenced_here() {
+        let state = state();
+        stock(&state, 4, 3).await;
+        let here = (ours(&state), "https://here.example".to_string());
+        let _ = keep(&state, 4, vec![here], 1).await.unwrap();
+        let _ = mark(&state, 4, &ours(&state), false, 1).await.unwrap();
+        // `channel()` is not a channel this server holds.
+        let _ = ask(&state, 3, 4, &ours(&state), now()).await.unwrap();
+
+        let sequenced = jig_pipeline::persist::StoredChannel {
+            id: channel().to_string(),
+            slug: "#here".into(),
+            visibility: "open".into(),
+            created_at: 0,
+            owner_did: did_of(3),
+            suite: "mls".into(),
+            sequencer_did: ours(&state),
+            co_owners: vec![],
+            tiering: jig_pipeline::persist::ChannelTiering::current("open", "mls"),
+        };
+        state.ingest_ctx.store.upsert_channel(&sequenced).unwrap();
+        let refused = ask(&state, 5, 4, &ours(&state), now()).await.unwrap_err();
+        assert_eq!(
+            code(&refused),
+            (StatusCode::FORBIDDEN, "LOCAL_ADDS_ENDED".into())
+        );
+        // A channel another server sequences is covered in `persist`: a
+        // channel's sequencer is fixed for its life.
+    }
+
+    #[tokio::test]
+    async fn with_custody_and_local_adds_both_ended_the_stock_goes_and_uploads_stop() {
+        let state = state();
+        stock(&state, 4, 3).await;
+        let here = (ours(&state), "https://here.example".to_string());
+        let elsewhere = (did_of(90), "https://elsewhere.example".to_string());
+        let _ = keep(&state, 4, vec![here], 1).await.unwrap();
+        let _ = keep(&state, 4, vec![elsewhere], 2).await.unwrap();
+        publish(&state, 4).await.unwrap();
+        let _ = mark(&state, 4, &ours(&state), false, 1).await.unwrap();
+        assert_eq!(
+            state
+                .ingest_ctx
+                .store
+                .key_package_stock(&did_of(4))
+                .unwrap(),
+            (0, false)
+        );
+        let refused = publish(&state, 4).await.unwrap_err();
+        assert_eq!(
+            code(&refused),
+            (StatusCode::FORBIDDEN, "NOT_STOCKED_HERE".into())
+        );
+        assert!(
+            !stocked(&state, 4).await,
+            "the stock route says it is ended"
+        );
+        let _ = mark(&state, 4, &ours(&state), true, 2).await.unwrap();
+        assert!(stocked(&state, 4).await);
+        publish(&state, 4).await.unwrap();
+    }
+
+    /// The stock route's `stocked` is the server's own rule-19 state, not
+    /// an empty stock: a stock emptied by takes, or under one of R1 and R2
+    /// alone, is still in use (a released package is handed again to a
+    /// repeated request), so its owner must keep the keys.
+    #[tokio::test]
+    async fn the_stock_route_says_stocked_until_both_are_ended() {
+        let state = state();
+        let here = (ours(&state), "https://here.example".to_string());
+        let elsewhere = (did_of(90), "https://elsewhere.example".to_string());
+        assert!(stocked(&state, 4).await, "nothing stocked yet");
+        let _ = keep(&state, 4, vec![here.clone()], 1).await.unwrap();
+        let _ = keep(&state, 4, vec![elsewhere], 2).await.unwrap();
+        assert!(stocked(&state, 4).await, "R1 alone");
+        let _ = keep(&state, 4, vec![here], 3).await.unwrap();
+        let _ = mark(&state, 4, &ours(&state), false, 1).await.unwrap();
+        assert!(stocked(&state, 4).await, "R2 alone");
+    }
+
+    async fn stocked(state: &Arc<AppState>, seed: u8) -> bool {
+        let did = did_of(seed);
+        let path = format!("/api/v1/mls/key-packages/{did}/stock");
+        let reader = jig_client::identity::Identity::from_signing_key(key(seed));
+        let mut headers = axum::http::HeaderMap::new();
+        for (name, value) in jig_client::read_auth::ReadProof::sign(&reader, "GET", &path).headers()
+        {
+            headers.insert(name, value.parse().unwrap());
+        }
+        let Json(body) = crate::v0_0_2_mls::key_package_stock(
+            State(state.clone()),
+            Path(did.clone()),
+            path.parse().unwrap(),
+            headers,
+        )
+        .await
+        .unwrap();
+        body.stocked
     }
 
     #[tokio::test]

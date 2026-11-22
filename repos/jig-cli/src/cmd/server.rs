@@ -266,6 +266,22 @@ pub async fn custody(ctx: &CliContext, state: Switch) -> Result<()> {
     Ok(())
 }
 
+/// Apply `jig server local-adds on|off` (JEP-0017 R2 and its undo).
+pub async fn local_adds(ctx: &CliContext, state: Switch) -> Result<()> {
+    let secure = crate::cmd::secure::Secure::open(ctx)?;
+    let kept = secure.set_local_adds(state == Switch::On).await?;
+    let server = secure.server();
+    if kept.allow {
+        println!("others can again add you to channels {server} sequences");
+    } else {
+        println!(
+            "others can no longer add you to channels {server} sequences; channels you are in \
+             stay as they are, and you can still join one yourself"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

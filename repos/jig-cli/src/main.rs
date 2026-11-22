@@ -475,6 +475,15 @@ enum ServerAction {
         #[arg(value_enum)]
         state: cmd::server::Switch,
     },
+
+    /// End (`off`) or allow again (`on`) others adding you to channels the
+    /// configured server sequences (JEP-0017 R2). While off, members there
+    /// see `LOCAL_ADDS_ENDED` or `MEMBER_DECLINED`. Channels you are in stay
+    /// as they are, and you can still join one yourself.
+    LocalAdds {
+        #[arg(value_enum)]
+        state: cmd::server::Switch,
+    },
 }
 
 // Parsed once per process; boxing `Run`'s fields would buy nothing.
@@ -879,7 +888,11 @@ async fn run() -> Result<()> {
                     Err(e) => Err(e),
                 };
                 match published {
-                    Ok(()) => println!(
+                    Ok(false) => println!(
+                        "published no MLS key packages: you ended both custody and local adds \
+                         at this server"
+                    ),
+                    Ok(true) => println!(
                         "published MLS key packages (others can now add you to encrypted \
                          channels)"
                     ),
@@ -896,6 +909,9 @@ async fn run() -> Result<()> {
             }
             ServerAction::Custody { state } => {
                 cmd::server::custody(&ctx, state).await?;
+            }
+            ServerAction::LocalAdds { state } => {
+                cmd::server::local_adds(&ctx, state).await?;
             }
         }
         return Ok(());

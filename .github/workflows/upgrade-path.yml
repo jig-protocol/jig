@@ -2,9 +2,11 @@ name: Upgrade path
 
 # Installs v0.2.0-alpha.1, creates the state a beta user has (identities,
 # open, restricted and MLS-encrypted channels, a DM, messages, jig-server's
-# key, a nameserver key and an alias), upgrades it to v0.2.0-alpha.2 and then
-# to this PR's build the way a user does (install.sh again), and checks after
-# each step that all of it survived and still works. Finally rotates
+# key, a nameserver key and an alias), upgrades it to v0.2.0-alpha.2, then to
+# v0.2.0-alpha.6, then to this PR's build the way a user does (install.sh
+# again), and checks after each step that all of it survived and still works.
+# Then this build's server declares a ruleset, and a new user on alpha.6's
+# `jig` must still verify its welcome and manifest. Finally rotates
 # jig-server's key and checks that clients follow the key link.
 # scripts/upgrade-path.sh has the details and the known gaps.
 
@@ -22,7 +24,7 @@ on:
       from:
         description: Releases to install, in order, before this ref's build (space-separated tags)
         required: true
-        default: v0.2.0-alpha.1 v0.2.0-alpha.2
+        default: v0.2.0-alpha.1 v0.2.0-alpha.2 v0.2.0-alpha.6
 
 permissions:
   contents: read
@@ -33,7 +35,7 @@ concurrency:
 
 jobs:
   upgrade:
-    name: ${{ inputs.from || 'v0.2.0-alpha.1 v0.2.0-alpha.2' }} → this build
+    name: ${{ inputs.from || 'v0.2.0-alpha.1 v0.2.0-alpha.2 v0.2.0-alpha.6' }} → this build
     # Drafts skip it (about 11 minutes of runner time); marking the PR ready
     # for review runs it.
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
@@ -78,7 +80,7 @@ jobs:
       - name: Upgrade path
         shell: bash
         env:
-          FROM: ${{ inputs.from || 'v0.2.0-alpha.1 v0.2.0-alpha.2' }}
+          FROM: ${{ inputs.from || 'v0.2.0-alpha.1 v0.2.0-alpha.2 v0.2.0-alpha.6' }}
           JIG_VERIFY_SIGNATURE: '1'
           JIG_UPGRADE_MIRROR_SIGNER: ${{ steps.mirror.outputs.signer }}
         run: |
