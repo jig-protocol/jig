@@ -464,6 +464,17 @@ enum ServerAction {
         #[arg(long)]
         url: Option<String>,
     },
+
+    /// End (`off`) or restore (`on`) the configured server's custody of
+    /// your key packages: whether it releases them to members of other
+    /// servers who add you (JEP-0017 R1). Members of this server can still
+    /// add you. `off` publishes a record without this server here and to
+    /// each other server it lists, and deletes this device's keys for the
+    /// packages it already released elsewhere.
+    Custody {
+        #[arg(value_enum)]
+        state: cmd::server::Switch,
+    },
 }
 
 // Parsed once per process; boxing `Run`'s fields would buy nothing.
@@ -863,12 +874,18 @@ async fn run() -> Result<()> {
                 // Publish MLS key packages to the new server so others can
                 // add this identity to encrypted channels and DMs straight
                 // away. Best effort: the server may be down, or predate v0.2.
-                if let Ok(secure) = cmd::secure::Secure::open(&ctx)
-                    && secure.ensure_key_packages().await.is_ok()
-                {
-                    println!(
-                        "published MLS key packages (others can now add you to encrypted channels)"
-                    );
+                let published = match cmd::secure::Secure::open(&ctx) {
+                    Ok(secure) => secure.ensure_key_packages().await,
+                    Err(e) => Err(e),
+                };
+                match published {
+                    Ok(()) => println!(
+                        "published MLS key packages (others can now add you to encrypted \
+                         channels)"
+                    ),
+                    Err(e) => {
+                        eprintln!("warning: MLS key-package setup did not complete: {e:#}")
+                    }
                 }
             }
             ServerAction::Info { url } => {
@@ -876,6 +893,9 @@ async fn run() -> Result<()> {
             }
             ServerAction::Forget { url } => {
                 cmd::server::forget(&ctx, url.as_deref())?;
+            }
+            ServerAction::Custody { state } => {
+                cmd::server::custody(&ctx, state).await?;
             }
         }
         return Ok(());

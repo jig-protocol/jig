@@ -224,6 +224,48 @@ pub fn forget(ctx: &CliContext, url: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// custody
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Switch {
+    On,
+    Off,
+}
+
+/// Apply `jig server custody on|off` (JEP-0017 R1 and its undo).
+pub async fn custody(ctx: &CliContext, state: Switch) -> Result<()> {
+    let secure = crate::cmd::secure::Secure::open(ctx)?;
+    let on = state == Switch::On;
+    let change = secure.set_custody(on).await?;
+    let server = secure.server();
+    if on {
+        println!(
+            "{server} is again a custodian of your key packages (record seq {})",
+            change.seq
+        );
+    } else {
+        println!(
+            "{server} no longer releases your key packages to other servers (record seq {}). \
+             Members of {server} can still add you.",
+            change.seq
+        );
+        println!(
+            "deleted this device's keys for {} package(s) already released; run this on each \
+             of your devices, or let each find out on its next contact with {server}",
+            change.deleted
+        );
+    }
+    for (url, result) in &change.elsewhere {
+        match result {
+            Ok(()) => println!("  record kept at {url}"),
+            Err(e) => eprintln!("  warning: {url} did not take the record: {e}"),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
