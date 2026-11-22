@@ -150,7 +150,9 @@ private network:
   the rest. Members are the DIDs in `records` with no negative score, plus
   those whose admission proof is `local_member_age_secs` old. The second
   kind share `aged_share_pct` (25 %) of the member share, so a batch of
-  proofs that ages in together cannot crowd out the recorded members.
+  proofs that ages in together cannot crowd out the recorded members. An
+  aged proof buys capacity only: such a DID self-joins channels as a
+  `guest`, so a `join = member` channel takes recorded members alone.
 - **A follower vouches for its users.** Under a `write` or `member` share, the
   server that follows a channel relays its users' posts to this one. They run
   the same admission, write and suite gates as local posts, and the share's

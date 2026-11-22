@@ -125,7 +125,10 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
 
 8. **Every authenticated caller has one server role** on a given server:
    - **`member`**: a DID the server's admission policy records as a member. Until JEP-0009,
-     that is local policy: admission `records`, or JEP-0008 rule 21's member pool.
+     that is local policy: admission `records`. A DID in JEP-0008 rule 21's member pool by an
+     aged admission proof alone is a `guest` (DJ, 2026-11-21): waiting out a proof's age is
+     cheap, so it buys capacity but does not open `join = member` channels. This applies to
+     joins checked after the change; memberships made before it are unchanged (rule 9).
    - **`guest`**: a key that has proven possession of itself (JEP-0002 request proofs) and
      that admission lets through, but that is not a member.
    - **`stranger`**: everyone else: a caller that admission refuses, or that has not proven
@@ -139,9 +142,9 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
    moment the join is checked. It is not carried to other servers.
 10. **Join roles are not capacity pools.** JEP-0008 rule 21's pools (members, invited and
     strangers) decide how much capacity a caller gets. The roles here decide who may join a
-    channel. A `member` is in JEP-0008's member pool. A `guest` is in whichever other pool
-    JEP-0008 puts it: the invited pool if it was admitted on an invite, the stranger pool
-    otherwise (JEP-0008 rules 21 and 22). Either way it is a `guest` for joining. A key the
+    channel. A `member` is in JEP-0008's member pool. A `guest` is in whichever pool
+    JEP-0008 puts it: the member pool if it aged in (rule 8), the invited pool if it was
+    admitted on an invite, the stranger pool otherwise (JEP-0008 rules 21 to 23). Either way it is a `guest` for joining. A key the
     server has no record of, which covers every `--anon` session key, starts in the stranger
     pool until it meets JEP-0008's ageing or record rules (rule 21), and is a `guest` for
     joining. A server MUST NOT admit to a join a DID its capacity pools refuse at that moment.
