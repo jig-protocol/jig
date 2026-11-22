@@ -237,7 +237,17 @@ pub async fn ws_handler(
     ws.max_message_size(limits.ws_message)
         .max_frame_size(limits.ws_frame)
         .on_upgrade(move |socket| async move {
-            handle_socket(socket, state, conn_id, ip, tls_exporter, shutdown).await;
+            // A drain that runs out, or is cut, ends the session where it
+            // stands, as it ends every other connection.
+            let cut = shutdown.clone();
+            let session = handle_socket(socket, state, conn_id, ip, tls_exporter, shutdown);
+            match cut {
+                Some(cut) => tokio::select! {
+                    () = session => {}
+                    () = cut.cut_off() => {}
+                },
+                None => session.await,
+            }
             drop(held);
         })
 }

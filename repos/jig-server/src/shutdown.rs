@@ -27,6 +27,9 @@ use tokio_util::task::TaskTracker;
 #[derive(Clone, Debug, Default)]
 pub struct Shutdown {
     token: CancellationToken,
+    /// Set when the drain runs out or is cut: every task spawned with
+    /// [`Shutdown::spawn_cut`] ends at its next poll.
+    cut: CancellationToken,
     tracker: TaskTracker,
 }
 
@@ -50,12 +53,6 @@ impl Shutdown {
         self.token.cancelled().await;
     }
 
-    /// [`Shutdown::cancelled`] as an owned future, for APIs that take one
-    /// (`axum::serve(..).with_graceful_shutdown`).
-    pub fn cancelled_owned(&self) -> impl Future<Output = ()> + Send + 'static {
-        self.token.clone().cancelled_owned()
-    }
-
     /// Spawn `task`, and have [`Shutdown::drain`] wait for it.
     pub fn spawn<F>(&self, task: F) -> tokio::task::JoinHandle<F::Output>
     where
@@ -70,6 +67,34 @@ impl Shutdown {
     /// WebSocket session whose upgrade has not completed yet.
     pub fn hold(&self) -> tokio_util::task::task_tracker::TaskTrackerToken {
         self.tracker.token()
+    }
+
+    /// [`Shutdown::spawn`] a connection: `task` also ends, dropped where it
+    /// stands, once [`Shutdown::cut`] is called, so nothing outlives a drain
+    /// that ran out, whether or not the runtime keeps running.
+    pub fn spawn_cut<F>(&self, task: F) -> tokio::task::JoinHandle<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let cut = self.cut.clone();
+        self.tracker.spawn(async move {
+            tokio::select! {
+                () = task => {}
+                () = cut.cancelled() => {}
+            }
+        })
+    }
+
+    /// Resolves once [`Shutdown::cut`] has been called.
+    pub async fn cut_off(&self) {
+        self.cut.cancelled().await;
+    }
+
+    /// End every task spawned with [`Shutdown::spawn_cut`], then wait up to
+    /// `bound` for the tracked tasks to finish. `true` when they all did.
+    pub async fn cut(&self, bound: Duration) -> bool {
+        self.cut.cancel();
+        self.drain(bound).await
     }
 
     /// How many tracked connections and sessions are still running.
