@@ -939,6 +939,9 @@ mod tests {
         task: tokio::task::JoinHandle<Result<()>>,
         started: tokio::sync::mpsc::UnboundedReceiver<()>,
         release: Arc<tokio::sync::Notify>,
+        /// Over TLS, a client config that trusts the certificate the
+        /// nameserver's DID vouches for, as a real client does.
+        pinned: Option<Arc<tokio_rustls::rustls::ClientConfig>>,
     }
 
     impl Served {
@@ -948,6 +951,7 @@ mod tests {
             cfg.tls.enabled = tls;
             cfg.network.shutdown_drain_ms = drain_ms;
             let mut app = build_app_parts(&cfg).expect("build_app_parts");
+            let did = app.v0_0_2_state.ns_did.to_did_jig_string();
             let (started_tx, started) = tokio::sync::mpsc::unbounded_channel();
             let release = Arc::new(tokio::sync::Notify::new());
             let held = release.clone();
@@ -990,6 +994,18 @@ mod tests {
                 )
                 .await
             });
+            let pinned = if tls {
+                let probed = jig_client::tls::probe_at(
+                    &format!("https://{addr}"),
+                    "/.well-known/jig-ns",
+                    Some(&did),
+                )
+                .await
+                .expect("the DID vouches for the certificate");
+                Some(probed.config.expect("a TLS config"))
+            } else {
+                None
+            };
             Self {
                 _dir: dir,
                 addr,
@@ -999,6 +1015,7 @@ mod tests {
                 task,
                 started,
                 release,
+                pinned,
             }
         }
 
@@ -1007,14 +1024,14 @@ mod tests {
             format!("{scheme}://{}{path}", self.addr)
         }
 
-        /// A fresh client: the self-signed certificate is trusted through the
-        /// DID elsewhere (`tests/tls.rs`); these tests are about shutdown.
-        fn client() -> reqwest::Client {
-            reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap()
+        /// A fresh client, trusting over TLS only the certificate the
+        /// nameserver's DID vouches for.
+        fn client(&self) -> reqwest::Client {
+            let mut client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
+            if let Some(pinned) = &self.pinned {
+                client = client.use_preconfigured_tls(pinned.as_ref().clone());
+            }
+            client.build().unwrap()
         }
 
         fn stop(&mut self) {
@@ -1032,8 +1049,8 @@ mod tests {
     async fn shutdown_finishes_the_request_in_flight_and_refuses_new_connections() {
         for tls in [false, true] {
             let mut served = Served::start("drain-finish", tls, 10_000).await;
-            let url = served.url("/hang");
-            let in_flight = tokio::spawn(async move { Served::client().get(url).send().await });
+            let request = served.client().get(served.url("/hang"));
+            let in_flight = tokio::spawn(request.send());
             served.started.recv().await.expect("/hang reached");
             served.stop();
             // Give the listener a moment to stop, then let /hang answer.
@@ -1062,9 +1079,8 @@ mod tests {
             for cut_short in [false, true] {
                 let drain = if cut_short { 600_000 } else { 300 };
                 let mut served = Served::start("drain-bound", tls, drain).await;
-                let url = served.url("/hang");
-                let _in_flight =
-                    tokio::spawn(async move { Served::client().get(url).send().await });
+                let request = served.client().get(served.url("/hang"));
+                let _in_flight = tokio::spawn(request.send());
                 served.started.recv().await.expect("/hang reached");
                 served.stop();
                 let stopped = std::time::Instant::now();
@@ -1113,8 +1129,12 @@ mod tests {
     async fn the_rate_limiter_still_sees_the_peer_on_both_listeners() {
         for tls in [false, true] {
             let served = Served::start("peer", tls, 5_000).await;
-            let client = Served::client();
-            let peer = client.get(served.url("/peer")).send().await.unwrap();
+            let peer = served
+                .client()
+                .get(served.url("/peer"))
+                .send()
+                .await
+                .unwrap();
             assert_eq!(peer.status(), StatusCode::OK, "tls={tls}");
             assert_eq!(peer.text().await.unwrap(), "127.0.0.1", "tls={tls}");
         }
