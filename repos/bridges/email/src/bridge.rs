@@ -135,6 +135,19 @@ impl Bridge for EmailBridge {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("email bridge outbound() called before start()"))?;
 
+        // The routing below is by slug, and a channel this server carries for
+        // another under a share need not have a unique slug here: it may share
+        // one with a thread of this bridge's, whose recipient would then get
+        // the post. Only a thread this bridge made on this server is routed
+        // (#474 tracks routing by channel id).
+        if !block.sequenced_here {
+            tracing::debug!(
+                "email bridge: {} is from a carried channel, not routed",
+                block.delivery_cid
+            );
+            return Ok(());
+        }
+
         // Dedup on the delivery CID (the fanout layer may deliver more than once).
         if octx
             .storage
@@ -363,6 +376,7 @@ mod tests {
             bundle_b64: "x".into(),
             receipts: vec![],
             delivery_cid: "c".into(),
+            sequenced_here: true,
         };
         assert!(bridge.outbound(&delivered).await.is_err());
     }
@@ -384,6 +398,7 @@ mod tests {
             bundle_b64: base64::engine::general_purpose::STANDARD.encode(blk.canonical_bytes()),
             receipts: vec![],
             delivery_cid: "deliv-1".into(),
+            sequenced_here: true,
         };
 
         // Pre-seed the slug -> email map (the inbound handler would have done this).
@@ -425,6 +440,7 @@ mod tests {
             bundle_b64: base64::engine::general_purpose::STANDARD.encode(blk.canonical_bytes()),
             receipts: vec![],
             delivery_cid: "deliv-2".into(),
+            sequenced_here: true,
         };
         let mut bridge = EmailBridge::from_config_with_provider(test_config(), mock.clone());
         bridge
@@ -433,5 +449,50 @@ mod tests {
             .unwrap();
         bridge.outbound(&delivered).await.unwrap(); // no mapping -> Ok, no send
         assert_eq!(mock.sent.lock().unwrap().len(), 0);
+    }
+
+    /// A post from a channel this server carries for another goes to no
+    /// recipient, even when its slug is one this bridge has mapped: the
+    /// carried channel only shares the thread's name (#454). It is not marked
+    /// seen either, so nothing about the thread changes.
+    #[tokio::test]
+    async fn outbound_drops_a_carried_delivery_even_when_its_slug_is_mapped() {
+        use base64::Engine as _;
+        let storage: Arc<dyn BridgeStorage> = Arc::new(MemStore::default());
+        let mock = Arc::new(MockProvider::default());
+        let dir = tempfile::tempdir().unwrap();
+        let author = jig_client::Identity::generate_for_tests(dir.path());
+        let slug = thread_slug(&author.did().to_string(), "did:jig:zShadowAlice");
+        let hlc = jig_core::HlcTimestamp::now_wall(author.did().clone());
+        let blk = jig_client::blocks::build_text_render(&author, &slug, "not for alice", hlc);
+        storage
+            .put("channel-email", &slug, b"alice@example.com", None)
+            .await
+            .unwrap();
+        let mut bridge = EmailBridge::from_config_with_provider(test_config(), mock.clone());
+        bridge
+            .start(test_ctx(storage.clone(), RouterMount::new()))
+            .await
+            .unwrap();
+        let carried = DeliveredBlock {
+            bundle_b64: base64::engine::general_purpose::STANDARD.encode(blk.canonical_bytes()),
+            receipts: vec![],
+            delivery_cid: "deliv-carried".into(),
+            sequenced_here: false,
+        };
+        bridge.outbound(&carried).await.unwrap();
+        assert_eq!(
+            mock.sent.lock().unwrap().len(),
+            0,
+            "no email for a carried post"
+        );
+        assert!(
+            storage
+                .get(OUTBOUND_SEEN_NS, "deliv-carried")
+                .await
+                .unwrap()
+                .is_none(),
+            "a carried delivery is not marked seen"
+        );
     }
 }
