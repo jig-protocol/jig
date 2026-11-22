@@ -390,3 +390,51 @@ fn an_owner_refuses_a_key_package_for_the_wrong_did() {
         Err(MlsError::Rejected(_))
     ));
 }
+
+#[test]
+fn a_forgotten_key_package_can_no_longer_be_joined_with() {
+    let owner = Person::new(1);
+    let mut bob = Person::new(2);
+    let kept = bob.kp();
+    let forgotten = bob.kp();
+    let last_resort = bob.member.key_packages(1, true).unwrap().remove(0);
+    let reference = |kp: &[u8]| delivery::validate_key_package(kp).unwrap().reference;
+
+    let gone = vec![reference(&forgotten), reference(&last_resort)];
+    assert_eq!(bob.member.forget_key_packages(&gone).unwrap(), 2);
+    // Repeatable: nothing left to delete.
+    assert_eq!(bob.member.forget_key_packages(&gone).unwrap(), 0);
+    // The deletion survives a snapshot and restore.
+    bob.reload();
+
+    for dead in [&forgotten, &last_resort] {
+        let mut ch = Channel::create(&owner);
+        let commit = owner.member.add(&ch.group_id, dead, &bob.id()).unwrap();
+        ch.accept(
+            &commit,
+            Intent::Add {
+                committer: &owner.id(),
+                member: &bob.id(),
+            },
+        )
+        .unwrap();
+        owner.member.confirm(&ch.group_id).unwrap();
+        let welcome = commit.welcome.as_ref().unwrap();
+        assert!(bob.member.join_welcome(welcome).is_err());
+    }
+
+    let mut ch = Channel::create(&owner);
+    let commit = owner.member.add(&ch.group_id, &kept, &bob.id()).unwrap();
+    ch.accept(
+        &commit,
+        Intent::Add {
+            committer: &owner.id(),
+            member: &bob.id(),
+        },
+    )
+    .unwrap();
+    owner.member.confirm(&ch.group_id).unwrap();
+    bob.member
+        .join_welcome(commit.welcome.as_ref().unwrap())
+        .unwrap();
+}

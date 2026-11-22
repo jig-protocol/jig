@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::{get, post},
 };
@@ -36,7 +36,7 @@ use jig_pipeline::persist::{LimitHit, Release, ReleaseAsk};
 use serde::{Deserialize, Serialize};
 
 use crate::v0_0_2::AppState;
-use crate::v0_0_2_blocks::{ErrorBody, admit_caller, err, persist_err, refuse};
+use crate::v0_0_2_blocks::{ErrorBody, err, optional_caller, persist_err, refuse};
 
 /// Most servers a reachability record kept here may list.
 pub const MAX_RECORD_SERVERS: usize = 16;
@@ -79,12 +79,24 @@ pub struct ReleasedBody {
 pub struct LogEntryBody {
     /// `custody` or `local` (JEP-0017 rule 32).
     pub kind: String,
+    /// The released package's hash reference, lowercase hex.
+    pub reference_hex: String,
+    /// The entry's own identity, unique in the log, lowercase hex.
+    pub id_hex: String,
     pub requester: String,
     pub channel_id: String,
     pub last_resort: bool,
     pub released_at: i64,
     /// The signed request the release answered, base64.
     pub request_b64: String,
+}
+
+/// `?offset=N`: skip the `N` newest entries. A page holds at most
+/// [`MAX_LOG_ENTRIES`]; a shorter one is the last.
+#[derive(Debug, Default, Deserialize)]
+pub struct LogPage {
+    #[serde(default)]
+    pub offset: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -170,8 +182,12 @@ pub async fn put_reachability(
         .admit_and_charge(&did)
         .map_err(|outcome| refuse(&state, &outcome, started))?;
     let store = &state.ingest_ctx.store;
+    // A withdrawal also retires what this server released through custody
+    // before it, in the same transaction: those are never answered again as
+    // repeats, since their owner deletes the keys (JEP-0017 rule 32), even if
+    // custody is restored inside the window.
     let stored = store
-        .put_reachability(&did, record.seq, &envelope, now())
+        .put_reachability_retiring(&did, record.seq, &envelope, now(), !listed)
         .map_err(persist_err)?;
     let seq = kept_record(&state, &did)?.map_or(record.seq, |kept| kept.seq);
     Ok(Json(StoredBody { stored, seq }))
@@ -185,9 +201,20 @@ pub async fn get_reachability(
     headers: axum::http::HeaderMap,
 ) -> Result<Json<RecordBody>, Refusal> {
     let started = std::time::Instant::now();
-    admit_caller(&state, &headers, "GET", uri.path(), started)?;
+    let caller = optional_caller(&state, &headers, "GET", uri.path(), started)?;
     let did = jig_pipeline::effect::canonical_did_string(&did);
-    match listing_record(&state, &did)? {
+    // `did` itself gets the record kept here even when it is a withdrawal, so
+    // each of its devices learns custody here ended and does not list this
+    // server again (JEP-0017 rule 13). Anyone else gets no record.
+    let own = caller
+        .as_ref()
+        .is_some_and(|c| c.to_did_jig_string() == did);
+    let record = if own {
+        kept_record(&state, &did)?
+    } else {
+        listing_record(&state, &did)?
+    };
+    match record {
         Some(record) => Ok(Json(RecordBody {
             record_b64: STANDARD.encode(&record.envelope),
         })),
@@ -341,11 +368,12 @@ fn no_custody(did: &str) -> Refusal {
 pub async fn release_log(
     State(state): State<Arc<AppState>>,
     Path(did): Path<String>,
+    Query(page): Query<LogPage>,
     uri: axum::http::Uri,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<LogBody>, Refusal> {
     let started = std::time::Instant::now();
-    let caller = admit_caller(&state, &headers, "GET", uri.path(), started)?;
+    let caller = optional_caller(&state, &headers, "GET", uri.path(), started)?;
     let did = jig_pipeline::effect::canonical_did_string(&did);
     if caller.as_ref().map(|c| c.as_str()) != Some(did.as_str()) {
         return Err(err(
@@ -357,11 +385,13 @@ pub async fn release_log(
     let releases = state
         .ingest_ctx
         .store
-        .key_package_releases(&did, MAX_LOG_ENTRIES)
+        .key_package_releases_page(&did, MAX_LOG_ENTRIES, page.offset)
         .map_err(persist_err)?
         .into_iter()
         .map(|e| LogEntryBody {
             kind: e.kind.as_str().to_string(),
+            reference_hex: hex::encode(&e.reference),
+            id_hex: hex::encode(&e.id),
             requester: e.requester,
             channel_id: e.channel_id,
             last_resort: e.last_resort,
@@ -435,9 +465,13 @@ mod tests {
         kps.extend(m.key_packages(1, true).unwrap());
         let _ = crate::v0_0_2_mls::publish_key_packages(
             State(state.clone()),
-            Json(crate::v0_0_2_mls::PublishBody {
+            "/api/v1/mls/key-packages".parse().unwrap(),
+            axum::http::HeaderMap::new(),
+            serde_json::to_vec(&crate::v0_0_2_mls::PublishBody {
                 key_packages_b64: kps.iter().map(|p| STANDARD.encode(p)).collect(),
-            }),
+            })
+            .unwrap()
+            .into(),
         )
         .await
         .unwrap();
@@ -513,6 +547,115 @@ mod tests {
         assert!(ask(&state, 5, 4, &ours(&state), now()).await.is_err());
         let _ = keep(&state, 4, vec![here], 3).await.unwrap();
         assert!(ask(&state, 5, 4, &ours(&state), now()).await.is_ok());
+    }
+
+    async fn read_record(
+        state: &Arc<AppState>,
+        reader: u8,
+        did: u8,
+    ) -> Result<RecordBody, Refusal> {
+        let path = format!("/api/v1/reach/{}", did_of(did));
+        let identity = jig_client::identity::Identity::from_signing_key(key(reader));
+        let mut headers = axum::http::HeaderMap::new();
+        for (name, value) in
+            jig_client::read_auth::ReadProof::sign(&identity, "GET", &path).headers()
+        {
+            headers.insert(name, value.parse().unwrap());
+        }
+        get_reachability(
+            State(state.clone()),
+            Path(did_of(did)),
+            path.parse().unwrap(),
+            headers,
+        )
+        .await
+        .map(|Json(b)| b)
+    }
+
+    #[tokio::test]
+    async fn a_withdrawal_is_served_to_its_did_alone() {
+        let state = state();
+        let here = (ours(&state), "https://here.example".to_string());
+        let elsewhere = (did_of(90), "https://elsewhere.example".to_string());
+        let _ = keep(&state, 4, vec![here], 1).await.unwrap();
+        let _ = keep(&state, 4, vec![elsewhere.clone()], 2).await.unwrap();
+
+        let refused = read_record(&state, 5, 4).await.unwrap_err();
+        assert_eq!(code(&refused), (StatusCode::NOT_FOUND, "NO_RECORD".into()));
+
+        let own = read_record(&state, 4, 4).await.unwrap();
+        let record =
+            ReachabilityRecord::from_envelope(&STANDARD.decode(own.record_b64).unwrap()).unwrap();
+        assert_eq!((record.seq, record.servers), (2, vec![elsewhere]));
+    }
+
+    #[tokio::test]
+    async fn without_required_reads_an_owner_proof_is_still_checked() {
+        let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
+        config.auth.require_authenticated_reads = false;
+        let state = Arc::new(AppState::for_test_with_config(config).unwrap());
+        let here = (ours(&state), "https://here.example".to_string());
+        let elsewhere = (did_of(90), "https://elsewhere.example".to_string());
+        let _ = keep(&state, 4, vec![here], 1).await.unwrap();
+        let _ = keep(&state, 4, vec![elsewhere], 2).await.unwrap();
+
+        // The owner, signed, sees its withdrawal; another DID does not.
+        assert!(read_record(&state, 4, 4).await.is_ok());
+        let other = read_record(&state, 5, 4).await.unwrap_err();
+        assert_eq!(code(&other), (StatusCode::NOT_FOUND, "NO_RECORD".into()));
+        // Anonymous, with no proof at all: no record either.
+        let path = format!("/api/v1/reach/{}", did_of(4));
+        let anon = get_reachability(
+            State(state.clone()),
+            Path(did_of(4)),
+            path.parse().unwrap(),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(code(&anon), (StatusCode::NOT_FOUND, "NO_RECORD".into()));
+        // A proof header that does not parse is refused too.
+        let mut malformed = axum::http::HeaderMap::new();
+        malformed.insert(
+            jig_core::request_auth::headers::SIGNATURE,
+            "not base64!".parse().unwrap(),
+        );
+        let refused = get_reachability(
+            State(state.clone()),
+            Path(did_of(4)),
+            path.parse().unwrap(),
+            malformed,
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(
+            code(&refused),
+            (StatusCode::UNAUTHORIZED, "INVALID_SIG".into()),
+            "refused, not answered as anonymous with NO_RECORD"
+        );
+        // A proof that does not verify is refused, not read as anonymous.
+        let mut forged = axum::http::HeaderMap::new();
+        let identity = jig_client::identity::Identity::from_signing_key(key(4));
+        for (name, value) in
+            jig_client::read_auth::ReadProof::sign(&identity, "GET", "/somewhere/else").headers()
+        {
+            forged.insert(name, value.parse().unwrap());
+        }
+        let refused = get_reachability(
+            State(state.clone()),
+            Path(did_of(4)),
+            path.parse().unwrap(),
+            forged,
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(
+            code(&refused),
+            (StatusCode::UNAUTHORIZED, "INVALID_SIG".into())
+        );
     }
 
     #[tokio::test]
