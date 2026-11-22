@@ -79,13 +79,8 @@ impl RulesetSection {
                 "[ruleset] url is set without a path: there is nothing to serve".to_string(),
             );
         }
-        // An absolute https:// URL naming a host: the authority is what
-        // follows the scheme, up to the first path, query or fragment.
         if let Some(url) = &self.url
-            && !url.strip_prefix("https://").is_some_and(|rest| {
-                let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
-                !host.is_empty() && !host.contains(char::is_whitespace) && !host.contains('@')
-            })
+            && !is_https_url_with_host(url)
         {
             return Err(format!(
                 "[ruleset] url {url:?} is not an absolute https:// URL with a host"
@@ -93,6 +88,43 @@ impl RulesetSection {
         }
         Ok(())
     }
+}
+
+/// `url` is an absolute `https://` URL whose authority names a host: a
+/// registered name or IPv4 address of letters, digits, `.` and `-`, or an
+/// IPv6 literal in brackets, then at most a numeric port. No userinfo.
+fn is_https_url_with_host(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // The host, and the port after it when there is a `:`.
+    let (host_ok, port) = if let Some(v6) = authority.strip_prefix('[') {
+        let Some((inner, after)) = v6.split_once(']') else {
+            return false;
+        };
+        let port = match after {
+            "" => None,
+            _ => match after.strip_prefix(':') {
+                Some(port) => Some(port),
+                None => return false,
+            },
+        };
+        let ok = !inner.is_empty() && inner.chars().all(|c| c.is_ascii_hexdigit() || c == ':');
+        (ok, port)
+    } else {
+        let (name, port) = match authority.split_once(':') {
+            Some((name, port)) => (name, Some(port)),
+            None => (authority, None),
+        };
+        let ok = !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+        (ok, port)
+    };
+    let port_ok = port.is_none_or(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+    host_ok && port_ok
 }
 
 /// `[custody]`: this server as a custodian of key packages (JEP-0005 rule

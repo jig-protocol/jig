@@ -363,6 +363,25 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_mirror_url_with_a_host_boots() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(&dir, signed_ruleset().envelope());
+        for url in [
+            "https://mirror.example/r.cose",
+            "https://mirror.example:8443/r.cose",
+            "https://10.0.0.1/r",
+            "https://[::1]:8443/r",
+            "https://mirror.example",
+        ] {
+            let section = RulesetSection {
+                path: Some(path.clone()),
+                url: Some(url.into()),
+            };
+            assert!(load(&section, &enforced()).is_ok(), "{url}");
+        }
+    }
+
+    #[test]
     fn a_mirror_url_without_a_host_refuses_boot() {
         let dir = tempfile::tempdir().unwrap();
         let path = write(&dir, signed_ruleset().envelope());
@@ -372,6 +391,11 @@ pub(crate) mod tests {
             "https://?x",
             "https://a b/r",
             "https://u@h/r",
+            "https://:443/x",
+            "https://h:/x",
+            "https://h:44x/x",
+            "https://[]/x",
+            "https://[::1/x",
         ] {
             let section = RulesetSection {
                 path: Some(path.clone()),
