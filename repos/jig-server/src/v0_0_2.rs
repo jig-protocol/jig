@@ -135,8 +135,9 @@ pub fn predecessor_dids(key_link: Option<&[u8]>, prior_key_links: &[Vec<u8>]) ->
         .collect()
 }
 
-/// Gates 1 and 2 from `[auth]`, plus the federation peers from `[federation]`:
-/// listing a peer is what lets its DID subscribe to this server's stream.
+/// Gates 1 and 2 from `[auth]`, and the checks on `[federation]`: each
+/// peer's `expected_did` must parse, since an entry that can never match a
+/// welcome is a peer locked out with no message.
 ///
 /// Every `AppState` constructor goes through here, so this is also where a
 /// peer that must not be dialed — a `ws://` URL without
@@ -153,7 +154,8 @@ fn build_auth(
     check_published_peer_dids(&config.federation)?;
     let auth = crate::auth::AuthState::from_config(&config.auth)?.with_proofs(store);
     for (i, peer) in config.federation.peers.iter().enumerate() {
-        auth.trust_federation_peer(&peer.expected_did)
+        jig_core::did::Did::canonicalize(&peer.expected_did)
+            .map_err(|e| anyhow::anyhow!("`{}` is not a did:jig:z… DID ({e})", peer.expected_did))
             .with_context(|| format!("[federation] peers[{i}].expected_did"))?;
     }
     Ok(Arc::new(auth))

@@ -345,28 +345,25 @@ reads no encrypted tier.
         policy is `offers = "hold"`.
 
       Until then, a `public` channel reaches a peer only by a share, as every other channel
-      does: rule 1 refuses its relayed `channel-create`, and the next bullet refuses relayed
-      posts into it.
-    - **A server relays nothing** (DJ, 2026-11-15). A server MUST NOT send a peer a block over
-      the legacy relay: its channels reach other servers only by a share. It MAY answer a
-      configured peer's federation-scope subscription with an error and send nothing on it.
-    - **A server refuses a relayed post into a channel it sequences** (DJ, 2026-11-10; #357).
-      A block (other than the `channel-create` that makes it) that a configured peer relays
-      over the legacy relay into a channel this server sequences MUST be refused, whether the
-      block names the channel by slug or by id. Rule 1 and the sequencer binding judge a
-      relayed `channel-create`.
+      does.
+    - **A server neither sends nor takes legacy-relay blocks** (DJ, 2026-11-15). A server
+      MUST NOT send a peer a block over the legacy relay, and MUST NOT take one a peer sends
+      over it: a channel reaches another server only by a share.
       - A write relayed under a share's grant (JEP-0005 rule 15) is not a legacy-relay block,
         and this rule does not apply to it.
-      - The refusal is logged with the reason `relayed-into-sequenced-channel`. It is not a
-        wire code: the legacy relay has no refusal frame. A server MAY count such refusals.
-      - Catch-up (#340) skips the refused record and advances, so one refusal does not stop
-        the link, and resumes past it on reconnect.
-      - A channel that exists on both servers is carried only once it is shared. Until then,
-        each server's posts to it stay on that server.
+      - A peer on an older release still subscribes to the federation stream and asks for a
+        catch-up on each connection. A server MAY answer the subscription as malformed and
+        drop the catch-up request. It SHOULD keep the connection, since it carries the
+        peer's shares too.
+      - Before this rule, from v0.2.0-alpha.6 (DJ, 2026-11-10; #357), a server took relayed
+        blocks but refused a relayed post into a channel it sequenced, logged with the reason
+        `relayed-into-sequenced-channel`, and its catch-up (#340) skipped the refused record.
+        A server took relayed blocks before that, and a peer's post landed in its channel of
+        the same name; those posts stay where they landed.
     - **A channel is carried by a contract, never by the relay** (#344, #357). Relayed, a
       channel would get a second sequencer on the receiving server, and that server would then
-      refuse the owner's records. So the relay brings nothing into a channel the receiving
-      server sequences (above), and a contract carries a channel from the accept on.
+      refuse the owner's records. So a server takes nothing from the relay (above), and a
+      contract carries a channel from the accept on.
 
 # Security Considerations (Zero-Trust)
 

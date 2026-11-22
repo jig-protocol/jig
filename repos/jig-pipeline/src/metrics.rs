@@ -18,7 +18,7 @@ pub(crate) fn block_ingested(source: &IngestSource) {
     let counter = match source {
         IngestSource::LocalClient { .. } => &LOCAL,
         // A write a follower relayed arrived over federation too.
-        IngestSource::FederatedPeer { .. } | IngestSource::Relayed { .. } => &FEDERATION,
+        IngestSource::Relayed { .. } => &FEDERATION,
         IngestSource::AdminEndpoint => &ADMIN,
         IngestSource::Bridge => &BRIDGE,
     };
@@ -62,9 +62,10 @@ mod tests {
                 "local",
             ),
             (
-                IngestSource::FederatedPeer {
-                    peer_did: jig_core::Did::from_ed25519_pubkey(&[1; 32]),
-                    peer_url: "wss://peer.example".into(),
+                IngestSource::Relayed {
+                    via: jig_core::Did::from_ed25519_pubkey(&[1; 32]),
+                    channel_id: "bafy-shared".into(),
+                    grant: jig_core::contract::Grant::Read,
                 },
                 "federation",
             ),
