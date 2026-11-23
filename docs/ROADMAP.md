@@ -200,13 +200,13 @@ Since then, each in one or more PRs:
   block ABIs (#291, #299), the v0.2 receipt formats (#308) and the unused nameserver modules
   are gone.
 
-**Exit criteria, as of 2026-10-26:**
+**Exit criteria, as of 2026-11-23:**
 
 | # | Criterion | State |
 | --- | --- | --- |
-| 1 | The spec's privacy claims are true | Mostly. Each chapter's banner and the threat register's status column say what `main` implements (last re-checked in full on 2026-10-18; PRs since update the rows they change). Open channels are plaintext unless created `--encrypted`, and the spec says so |
+| 1 | The spec's privacy claims are true | Met. Each chapter's banner and the threat register's status column say what `main` implements (last re-checked in full on 2026-11-23, against `f9cdc2da`; PRs since update the rows they change). Every channel is encrypted except a `public` one (JEP-0014), and the spec says so |
 | 2 | The operator cannot read restricted content | Met (D25) |
-| 3 | A hostile operator's downgrade or false handshake is detected | Largely met: the slices the D11 plan names for it (1, 3, 4a, 4b, 6, 7) are merged, as are 0, 2, 8 and 9. Slice 5 (`seen` and head gossip, so members compare chains) is not built, slice 10 (`sequencer-set`) lands with F2, and OP-01, OP-02 and TM-01 still read Partial |
+| 3 | A hostile operator's downgrade or false handshake is detected | Met: the slices the D11 plan names for it (1, 3, 4a, 4b, 6, 7) are merged, as are 0, 2, 8 and 9, and OP-01, OP-02 and TM-01 read Mitigated, each within the scope the register states. Slice 5 (`seen` and head gossip, so members compare chains) is not built, so OP-06 stays Partial; slice 10 (`sequencer-set`) lands with F2 |
 | 4 | Suites are pluggable, shown through the registry with conformance vectors | Met (#165) |
 | 5 | The federation contract is specified, and two jig servers federate an encrypted channel through it | Not met: relayed writes are merged (Task 6, #316); Tasks 7 to 11 remain (MLS across servers, custodians, sequencer moves, abuse defences, end to end), and Task 0c (clients address channels by `channel_id`) |
 | 6 | An external audit is scoped | Scoped (D27, decided 2026-10-25): Phase 1 before G3, Phase 2 after code-complete |
@@ -220,9 +220,8 @@ Still to do in this phase:
   subnets and ruleset groups follow. Federating with a differently built server comes after the
   MVP.
 - **Handshake slices 5 and 10:** `seen` and head gossip, so members compare chains and detect
-  omission (OP-06); `sequencer-set`, with F2. Then the threat-register rows the D11 design
-  proposes for OP-01, OP-02 and TM-01. Reputation in the welcome stays `null` until the
-  reputation design (D15, D21) lands.
+  omission (OP-06); `sequencer-set`, with F2. Reputation in the welcome stays `null` until
+  the reputation design (D15, D21) lands.
 - Multi-device. One device per DID today.
 - A documented server-key rotation ceremony. Rotation works (#298, #302), but a link is signed by
   the old key, so a lost key still means restoring it from backup.
