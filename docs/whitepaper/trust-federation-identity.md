@@ -762,31 +762,30 @@ a high-sec ruleset group, cross-checked.
 
 ### 9.2 Today (v0.2)
 
-- **Partial.** Federation is block relay over WebSocket between configured peers
+- **Partial.** Federation is the channel contract (JEP-0005) between configured peers. A
+  server dials each configured peer by URL over a mutual handshake bound to the TLS session
   ([`jig-server/src/v0_0_2_federation.rs`](../../repos/jig-server/src/v0_0_2_federation.rs),
-  [`h3_federation.rs`](../../repos/integration-tests/tests/h3_federation.rs)). A server dials
-  each configured peer by URL, completes the same JEP-0002 handshake a client does, and
-  subscribes with a request signed by its own server DID. A relayed block is re-verified
-  against its author's signature and must pass the manifest's version and schema gates.
-- **Built: a channel's suite is fixed at creation.** It is chosen by the creator, recorded
+  `v0_0_2_peer.rs`), and channels cross that connection only by a share. The legacy relay of
+  open channels between peers is gone (#439, #453, #470).
+- **Built: a channel's suite is fixed at creation.** Its tier fixes it (JEP-0014): `private`,
+  `server` and `shared` are `mls`, and `public` is `none`. It is recorded
   in the signed `channel-create` block, fixed for the channel's life, and checked on every
   later post (`channels.suite`,
   [`jig-pipeline/src/mls_gate.rs`](../../repos/jig-pipeline/src/mls_gate.rs),
   [spec: Encryption](../../repos/jig-spec/src/encryption.md#channels)).
 - **Partial: a channel reaches another server only by a share.** Under the federation
   contract (JEP-0005, JEP-0014) a `shared` channel is carried as ciphertext, and `private`
-  and `server` channels never leave the server that orders them. The legacy relay carries
-  only open, unencrypted channels (`DeliveryPolicy::federates`,
-  [`jig-pipeline/src/fanout.rs`](../../repos/jig-pipeline/src/fanout.rs)), and a relayed
-  block for a local channel that does not federate is refused.
-- **Built: relayed blocks pass the gates a local block passes, with one exception.** A
-  relayed block runs through `ingest` like a local submission: author signature, version and
-  suite gates, admission, the write gate, effects, and the receiving server's own execution
-  and receipt (OP-09). Its author is not asked for admission proof-of-work. A relayed
-  `channel-create` that names another server as its sequencer is refused.
-- **Built: peers are pinned and listed.** A server accepts relayed blocks only over a
-  connection it dialed to a listed peer whose welcome is signed by that peer's configured
-  DID, and only listed peers may subscribe to its federation stream. Peer connections use
+  and `server` channels never leave the server that orders them.
+- **Built: relayed writes pass the owner's gate, with one exception.** A follower relays its
+  clients' writes to the channel's owner within its share's grant
+  ([`v0_0_2_relay.rs`](../../repos/jig-server/src/v0_0_2_relay.rs), JEP-0005 rule 15). The
+  owner runs its full write gate on each: author signature, role checks, the grant, bans and
+  floors. Its author is not asked for admission proof-of-work, which is the follower's to ask.
+  A follower executes nothing for a carried block; only the owner does.
+- **Built: peers are pinned and listed.** A server takes a peer's frames only over a
+  connection on which the peer proved its configured DID, and the owner streams a channel
+  only to a peer holding an accepted share of it. The follower that receives the stream enforces
+  the owner's per-peer quota. Peer connections use
   TLS by default. Antipattern flags that weaken federation are off by default and listed in
   `/.well-known/jig` under `unsafe_options_active` when set.
 - **Built: the owner sequences, and followers carry its records.** A shared channel's owner
@@ -901,9 +900,10 @@ proposal.
   creation and enforced on every post (OP-03). The server executes nothing under an encrypted
   suite, and its receipt says `"content": "sealed"`.
 - **Partial.** Restricted channels are always MLS (D25), and `jig dm` always creates an
-  encrypted channel. An open channel created without a suite is plaintext to the operator,
-  and a restricted channel created plaintext before D25 is frozen.
-- **Partial.** Encrypted channels do not federate (section 9.2).
+  encrypted channel. Only a `public` channel is plaintext to the operator (JEP-0014), and a
+  restricted channel created plaintext before D25 is frozen.
+- **Partial.** A `shared` channel crosses servers as ciphertext; a `contract-end` does not yet
+  remove the follower's members (section 9.2).
 - **None.** A second suite, and conformance vectors per suite (JEP-0001, open question 8).
 
 **What the operator sees.** Being precise matters more than sounding reassuring. On an
@@ -1307,9 +1307,9 @@ gap.
 | Anchors are opt-in with no veto (D19) | None | Structural "no veto"; anchor replacement |
 | Federation is a data contract fixing the channel's suite (D12) | Partial: suite fixed per channel; channels cross only by a share, `shared` ones as ciphertext | Contract contents and signed acceptance |
 | One owning server per channel (D24) | Partial: a shared channel's owner sequences it and followers carry its records; members on a follower write through it under a grant | Cross-server writes: survey XMPP MUC, IRC, Matrix, ActivityPub groups |
-| A peer is a transport; relayed blocks pass every gate | Built: relayed blocks run through `ingest` and the write gate (authors not asked for admission proof-of-work); peers listed and pinned in configuration | Peer DID in the contract; per-peer limits |
+| A peer is a transport; relayed blocks pass every gate | Built: writes a follower relays run through the owner's write gate (authors not asked for admission proof-of-work); peers listed and pinned in configuration; per-peer quotas on what a peer streams | Peer DID in the contract |
 | Pluggable suites, MLS default and first (D1, D13) | Built: MLS per channel; validating delivery service | Non-MLS plug-in shape (D13); per-suite conformance |
-| End-to-end encryption by default | Partial: DMs and restricted channels always encrypted; open channels plaintext unless created `mls` | Encryption on by default |
+| End-to-end encryption by default | Built: every channel created under tiers is encrypted except a `public` one (JEP-0014); DMs always. Pre-tier plaintext channels outside `#jig/` are frozen. A passive operator cannot read the encrypted tiers; one that controls a `server` or `shared` channel's membership can add a member, which members see | — |
 | Mandatory signed handshake; clients fail closed and pin | Partial: signed welcome with nonce; CLI pins server DIDs, suites and channel suites; later frames checked against the welcome; refusals close with 4002; the welcome is bound to the TLS session and federation peers prove their DID (#234) | Pins between servers; real reputation (D11) |
 | No backdoors, no scanning, no default escrow | Holds: no backdoor, scanning or escrow exists | Keep it so as reporting is designed |
 | Provable abuse reports from encrypted channels, by participants only (D22) | None: signature exists; no tooling | Delegation or proof mechanism (AB-06) |
