@@ -202,13 +202,13 @@ Since then, each in one or more PRs:
   block ABIs (#291, #299), the v0.2 receipt formats (#308) and the unused nameserver modules
   are gone.
 
-**Exit criteria, as of 2026-10-26:**
+**Exit criteria, as of 2026-11-23:**
 
 | # | Criterion | State |
 | --- | --- | --- |
-| 1 | The spec's privacy claims are true | Mostly. Each chapter's banner and the threat register's status column say what `main` implements (last re-checked in full on 2026-10-18; PRs since update the rows they change). Open channels are plaintext unless created `--encrypted`, and the spec says so |
+| 1 | The spec's privacy claims are true | Met. Each chapter's banner and the threat register's status column say what `main` implements (last re-checked in full on 2026-11-23, against `f9cdc2da`; PRs since update the rows they change). Every channel is encrypted except a `public` one (JEP-0014), and the spec says so |
 | 2 | The operator cannot read restricted content | Met (D25) |
-| 3 | A hostile operator's downgrade or false handshake is detected | Largely met: the slices the D11 plan names for it (1, 3, 4a, 4b, 6, 7) are merged, as are 0, 2, 8 and 9. Slice 5 (`seen` and head gossip, so members compare chains) is not built, slice 10 (`sequencer-set`) lands with F2, and OP-01, OP-02 and TM-01 still read Partial |
+| 3 | A hostile operator's downgrade or false handshake is detected | Met: the slices the D11 plan names for it (1, 3, 4a, 4b, 6, 7) are merged, as are 0, 2, 8 and 9, and OP-01, OP-02 and TM-01 read Mitigated, each within the scope the register states. Slice 5 (`seen` and head gossip, so members compare chains) is not built, so OP-06 stays Partial; slice 10 (`sequencer-set`) lands with F2 |
 | 4 | Suites are pluggable, shown through the registry with conformance vectors | Met (#165) |
 | 5 | The federation contract is specified, and two jig servers federate an encrypted channel through it | Not a `v0.2.0` gate: it ships as v0.2.x (D35, DJ, 2026-11-23). Not met: F2 Tasks 0a, 0b and 1 to 6 are merged. Task 0c is mostly done (#430; `jig:<cid>` is not parsed yet). Task 7 is partly done: a follower carries an MLS channel through its mirror of the group (#378), but a `contract-end` removes no one. Task 8 is partly done (#440, #461, #463): DID-signed release policies, held requests, the Welcome mailbox and one package per device remain. Task 10 is partly done: per-peer quotas are enforced before ingest. Task 9 (the contract half of a sequencer move) and Task 11 (the end-to-end test, JEP-0005 out of Draft) are not started |
 | 6 | An external audit is scoped | Scoped (D27, decided 2026-10-25): Phase 1 before G3, Phase 2 after code-complete |
@@ -221,9 +221,8 @@ Still to do in this phase:
   the end-to-end test (Task 11). Nameserver-led shared contracts for trusted subnets and
   ruleset groups follow. Federating with a differently built server comes after the MVP.
 - **Handshake slices 5 and 10:** `seen` and head gossip, so members compare chains and detect
-  omission (OP-06); `sequencer-set`, with F2. Then the threat-register rows the D11 design
-  proposes for OP-01, OP-02 and TM-01. Reputation in the welcome stays `null` until the
-  reputation design (D15, D21) lands.
+  omission (OP-06); `sequencer-set`, with F2. Reputation in the welcome stays `null` until
+  the reputation design (D15, D21) lands.
 - Multi-device. One device per DID today.
 - A documented server-key rotation ceremony. Rotation works (#298, #302), but a link is signed by
   the old key, so a lost key still means restoring it from backup.

@@ -324,7 +324,7 @@ No `ssh-rsa` (weak), `3des-cbc` (broken), or `arcfour` (broken).
 
 ## Abuse Mitigation
 
-**MUST enforce rate limiting and admission control** at all ingress points. *(partial: the reference server's token buckets are on by default, per verified DID across REST, WebSocket, federation and bridge writes, and per remote address on every v0.0.2 HTTP request and WebSocket frame (not `/.well-known/jig`, `/healthz` or `/metrics`). Its defaults (a burst of 300 refilling at 50/s per DID, 600 at 100/s per address) are far looser than the per-minute figures below. There is no per-federated-server limit.)*
+**MUST enforce rate limiting and admission control** at all ingress points. *(partial: the reference server's token buckets are on by default, per verified DID across REST, WebSocket, federation and bridge writes, and per remote address on every v0.0.2 HTTP request and WebSocket frame (not `/.well-known/jig`, `/healthz` or `/metrics`). Its defaults (a burst of 300 refilling at 50/s per DID, 600 at 100/s per address) are far looser than the per-minute figures below. Per federated server, what a peer streams counts against its quota, and the writes it relays are limited per channel.)*
 
 ### Rate Limiting
 
@@ -361,7 +361,7 @@ No `ssh-rsa` (weak), `3des-cbc` (broken), or `arcfour` (broken).
 
 ### Backoff and Jitter
 
-**MUST use exponential backoff + jitter** for retries (see [Federation § Retry Logic](federation.md#retry-logic)). *(not yet implemented: the federation dialer reconnects after a constant delay, and the CLI does not reconnect.)*
+**MUST use exponential backoff + jitter** for retries (see [Federation § Retry Logic](federation.md#retry-logic)). *(not yet implemented: the federation dialer waits a constant 5 s after a dropped connection and backs off exponentially, without jitter, only after the peer closes for a contract reason; the CLI does not reconnect.)*
 
 **Why jitter:** Prevents all clients from retrying at the exact same time (avoids thundering herd).
 

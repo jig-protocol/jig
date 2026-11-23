@@ -45,7 +45,11 @@ defines what the signature covers.
 | `UNSUPPORTED_SCHEMA` | Manifest `schema` not implemented |
 | `SUITE_MISMATCH` | A block's suite is not its channel's |
 | `RESTRICTED_REQUIRES_MLS` | A restricted channel created with a suite other than `mls` |
-| `CHANNEL_FROZEN` | Content for a restricted channel created unencrypted, before restricted channels were always `mls` (`409`) |
+| `CHANNEL_FROZEN` | Content for a channel created before tiers that maps to no tier, such as a plaintext channel outside `#jig/` (`409`) |
+| `UNKNOWN_TIER` | A `channel-create` that names no tier this server knows, or an open plaintext one with no tier (`400`). A tierless restricted one gets `RESTRICTED_REQUIRES_MLS`, and a plaintext one naming `private`, `server` or `shared` gets `TIER_SUITE_MISMATCH` |
+| `TIER_SUITE_MISMATCH` | A channel's tier and suite contradict each other (`400`) |
+| `TIER_FIXED` | A block that would change a channel's tier (`409`) |
+| `TIER_UNSUPPORTED` | A post to a `public` channel from a client that has not said it supports tiers (`403`) |
 | `MLS_REJECTED` | The MLS payload of a block on an `mls` channel is invalid, or does not do what the block says |
 | `STALE_EPOCH` | A commit built on an epoch the channel has left (`409` on both transports) |
 

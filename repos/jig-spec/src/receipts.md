@@ -141,8 +141,7 @@ names its shape:
 Every payload carries `block_cid` and `server_did`. A reader MUST check the signature before
 using any of it.
 
-`jig-runtime` also still builds the v0.2 runtime receipt for its WASI preview 1 path. No server
-path signs or serves it, and it is removed with that path.
+The v0.2 runtime receipt went with the WASI preview 1 path (#299).
 
 ## What a receipt reveals
 
