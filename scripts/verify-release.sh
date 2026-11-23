@@ -5,8 +5,10 @@
 # Usage: scripts/verify-release.sh TAG
 #
 # For TAG it checks, and fails loudly on the first mismatch:
-#   1. The GitHub Release exists, is published (not a draft), is marked
-#      prerelease, and is titled TAG.
+#   1. The GitHub Release exists, is published (not a draft), and is titled
+#      TAG. A pre-release tag (v0.2.0-alpha.8) must be marked prerelease; a
+#      final tag (v0.2.0) must not be, and must be the repo's latest release
+#      (scripts/release-kind.sh decides which TAG is).
 #   2. Its assets are exactly install.sh, SHA256SUMS, SHA256SUMS.sig and one
 #      tarball per built target.
 #   3. SHA256SUMS.sig is a valid `ssh-keygen -Y` signature of SHA256SUMS by
@@ -34,6 +36,7 @@ TAG="${1:?usage: $0 TAG}"
 JIG_REPO="${JIG_REPO:-jig-protocol/jig}"
 EXPECT_VERSION="${JIG_VERIFY_EXPECT_VERSION:-${TAG#v}}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+KIND="$("$ROOT/scripts/release-kind.sh" "$TAG")"
 ALLOWED_SIGNERS="$ROOT/.github/release/allowed_signers"
 # One tarball per target built by .github/workflows/release.yml.
 TARBALLS=(jig-linux-x86_64.tar.gz jig-linux-aarch64.tar.gz jig-darwin-aarch64.tar.gz)
@@ -69,24 +72,34 @@ api() {
 
 api "repos/$JIG_REPO/releases/tags/$TAG" > "$work/release.json" \
   || fail "no published release $TAG in $JIG_REPO (a draft is not visible here either)"
-python3 - "$work/release.json" "$TAG" "$work/assets.tsv" <<'PY' || exit 1
+python3 - "$work/release.json" "$TAG" "$work/assets.tsv" "$KIND" <<'PY' || exit 1
 import json, sys
-path, tag, out = sys.argv[1:]
+path, tag, out, kind = sys.argv[1:]
 r = json.load(open(path))
 def fail(msg):
     print(f"FAIL: {msg}", file=sys.stderr)
     sys.exit(1)
 if r.get("draft"):
     fail(f"{tag} is still a draft")
-if not r.get("prerelease"):
+if kind == "prerelease" and not r.get("prerelease"):
     fail(f"{tag} is not marked prerelease")
+if kind == "final" and r.get("prerelease"):
+    fail(f"{tag} is a final release but is marked prerelease")
 if r.get("name") != tag:
     fail(f"{tag} is titled {r.get('name')!r}, not {tag!r}")
 with open(out, "w") as f:
     for a in r.get("assets", []):
         f.write(f"{a['name']}\t{a['size']}\t{a['browser_download_url']}\n")
-print(f"ok: {tag} is a published prerelease titled {tag}")
+print(f"ok: {tag} is a published {kind} titled {tag}")
 PY
+if [ "$KIND" = final ]; then
+  # /releases/latest never returns a prerelease, so this is the release
+  # `--latest` marked.
+  latest="$(api "repos/$JIG_REPO/releases/latest" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')" \
+    || fail "could not read the latest release of $JIG_REPO"
+  [ "$latest" = "$TAG" ] || fail "$TAG is not the latest release ($latest is)"
+  ok "$TAG is the latest release"
+fi
 
 # --- 2. the assets ---------------------------------------------------------------
 

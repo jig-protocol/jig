@@ -106,7 +106,8 @@ API="https://api.github.com/repos/$JIG_REPO"
 resolve_release() {
   local tmp="$1" json="$1/release.json"
   if [ "$JIG_VERSION" = "latest" ]; then
-    # /releases/latest skips prereleases, and every v0.x tag is one. Each
+    # /releases/latest skips prereleases, and most v0.x tags are one, so
+    # "latest" is the newest non-draft release, prerelease or not. Each
     # release object has exactly one top-level tag_name and draft, so the
     # two lists pair up by index.
     fetch "$API/releases?per_page=20" "$tmp/releases.json" application/vnd.github+json \

@@ -1,7 +1,10 @@
 name: Release
 
-# Tag push (v*) → build → sign → install smoke (gate) → publish prerelease →
-# install smoke against the published release.
+# Tag push (v*) → build → sign → install smoke (gate) → publish → install
+# smoke against the published release. A tag with a pre-release part
+# (v0.2.0-alpha.8) publishes as a GitHub prerelease; a bare v<major.minor.patch>
+# (v0.2.0) publishes as a final release marked latest
+# (scripts/release-kind.sh decides, and refuses a tag that is not v<semver>).
 #
 # Targets: static musl Linux (x86_64, aarch64 — the VPS and Pi/ARM-VPS
 # "potato" class) and Apple Silicon macOS. Intel macOS and Windows are not
@@ -30,6 +33,10 @@ name: Release
 # * Never re-run a failed tag's workflow after fixing main. A re-run uses the
 #   workflow, scripts and pinned key as they were at the tag's commit, so it
 #   cannot pick up the fix. Cut a new tag instead.
+# * Version: the tag must be v<workspace version>. Run
+#   `scripts/bump-version.sh 0.2.0` (no "v"): it sets [workspace.package]
+#   version in repos/Cargo.toml, has cargo update repos/Cargo.lock, and checks
+#   `cargo metadata --locked`. Commit that as "chore(release): 0.2.0".
 # * Before tagging: a green dry run and a green verify-key on the commit to tag.
 # * Release notes must list the threat-register entries the release mitigates
 #   (repos/jig-spec/src/threat-register.md). Commit them as
@@ -151,6 +158,9 @@ jobs:
               echo "tag $GITHUB_REF_NAME does not match the workspace version $versions" >&2
               exit 1
             fi
+            # Fails here, before signing, on a tag that is not v<semver>.
+            release_kind=$(../scripts/release-kind.sh "$GITHUB_REF_NAME")
+            echo "$GITHUB_REF_NAME publishes as: $release_kind" | tee -a "$GITHUB_STEP_SUMMARY"
           fi
           echo "workspace version $versions" | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -397,7 +407,7 @@ jobs:
           rm -rf "$HOME/.jig"
 
   publish:
-    name: publish GitHub prerelease
+    name: publish GitHub release
     needs: smoke
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
@@ -407,12 +417,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          sparse-checkout: .github/release
+          sparse-checkout: |
+            .github/release
+            scripts
       - uses: actions/download-artifact@v8
         with:
           name: release-dist
           path: dist
-      - name: Create prerelease
+      - name: Create release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -446,8 +458,17 @@ jobs:
           sha256sum -c --ignore-missing SHA256SUMS   # macOS: shasum -a 256 -c --ignore-missing SHA256SUMS
           \`\`\`
           EOF
+          # -alpha.N and other pre-release tags stay prereleases, never latest;
+          # a bare vX.Y.Z is a final release and becomes latest.
+          release_kind=$(scripts/release-kind.sh "$TAG")
+          case "$release_kind" in
+            prerelease) kind=(--prerelease) ;;
+            final) kind=(--latest) ;;
+            *) echo "unknown release kind '$release_kind'" >&2; exit 1 ;;
+          esac
+          echo "publishing $TAG with ${kind[*]}" | tee -a "$GITHUB_STEP_SUMMARY"
           gh release create "$TAG" dist/* \
-            --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
+            --repo "$GITHUB_REPOSITORY" --verify-tag "${kind[@]}" \
             --title "$TAG" --notes-file notes.md --generate-notes
 
   smoke-published:

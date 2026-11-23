@@ -176,7 +176,7 @@ disagree are surfaced to the reader as a warning, not refused
 encryption suite, the manifest schema and the receipt domain are gates. The
 README (*"v0.x makes no compatibility guarantee"*) and every release's notes
 say that pre-1.0 releases make no wire, receipt or storage compatibility
-guarantee, and `release.yml` publishes every tag as a prerelease. A
+guarantee, and `release.yml` publishes every `-alpha` tag as a prerelease. A
 compatibility promise is still a BLOCKER for the day one is made.
 
 ---
@@ -254,7 +254,7 @@ registry, or copied code may appear anywhere under `repos/`. This belongs in
 | `CODEOWNERS` | DJ owns everything, repeated on sensitive paths | READY |
 | Discussion / support channel | dev@jig.onl and issues; security reports go to security@jig.onl or GitHub private reporting. No public chat. | GAP |
 | Triage owner | DJ, named in `SECURITY.md` for vulnerability reports. No rotation or SLA for ordinary issues. | GAP |
-| Release cadence | Two signed prereleases so far, `v0.2.0-alpha.1` (2026-10-19) and `v0.2.0-alpha.2` (2026-10-25), each with notes in [`.github/release/notes/`](../.github/release/notes/). `release.yml` is tag-triggered, waits for a maintainer's approval in the `release` environment, refuses notes that do not list the threat-register entries mitigated, and publishes every tag as a prerelease. No cadence is promised. | GAP |
+| Release cadence | Two signed prereleases so far, `v0.2.0-alpha.1` (2026-10-19) and `v0.2.0-alpha.2` (2026-10-25), each with notes in [`.github/release/notes/`](../.github/release/notes/). `release.yml` is tag-triggered, waits for a maintainer's approval in the `release` environment, refuses notes that do not list the threat-register entries mitigated, and publishes a tag with a pre-release part (`-alpha.N`) as a prerelease and a bare `vX.Y.Z` as the latest release. No cadence is promised. | GAP |
 | CI coverage | `changes`, `workspace` (fmt, clippy and nextest on every workspace crate), `wasm-build` and `dependency-policy` (also daily at 07:17 UTC against `main`). A `nightly` job on the same schedule runs doc tests, skips nights when nothing under `repos/` (Markdown aside) and not `rust-toolchain.toml` changed, and does not gate merges. Drafts and docs-only PRs skip the build jobs; the merge queue runs everything. Linux only for the workspace job; macOS runs in the install smoke test inside `release.yml` and after each release, and in `block-abi-vectors.yml` on manual dispatch only. | GAP |
 
 **Test counts, measured at `1fa5681`** (`cargo nextest list`, stable 1.97.1): 1,054 tests in
