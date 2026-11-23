@@ -7488,4 +7488,59 @@ mod tests {
             )]
         );
     }
+
+    /// TM-01: an admission proof's time is this server's clock when it
+    /// recorded the proof. The record takes no time from the caller, so no
+    /// field of the subject's proof can set it.
+    #[test]
+    fn an_admission_proof_is_dated_by_this_servers_clock() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let before = chrono::Utc::now().timestamp();
+        store.record_admission_proof("did:jig:zProven", 8).unwrap();
+        let after = chrono::Utc::now().timestamp();
+        let at = store
+            .admission_proven_at("did:jig:zProven")
+            .unwrap()
+            .unwrap();
+        assert!(
+            (before..=after).contains(&at),
+            "{before} <= {at} <= {after}"
+        );
+        assert_eq!(store.admission_proven_at("did:jig:zOther").unwrap(), None);
+    }
+
+    /// TM-01: a later, larger proof raises the bits and keeps the first
+    /// proof's time, so a DID's age is not reset by proving again.
+    #[test]
+    fn a_later_larger_proof_keeps_the_first_proofs_time() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let did = "did:jig:zProven";
+        store.record_admission_proof(did, 8).unwrap();
+        // Back-date the first proof, so a reset to now would show.
+        let first = chrono::Utc::now().timestamp() - 86_400;
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE admission_proofs SET proven_at = ? WHERE did = ?",
+                params![first, did],
+            )
+            .unwrap();
+
+        store.record_admission_proof(did, 20).unwrap();
+        store.record_admission_proof(did, 4).unwrap();
+        assert_eq!(store.admission_proven_at(did).unwrap(), Some(first));
+        let bits: u8 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT bits FROM admission_proofs WHERE did = ?",
+                [did],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bits, 20);
+    }
 }
