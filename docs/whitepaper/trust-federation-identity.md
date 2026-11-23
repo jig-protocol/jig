@@ -784,7 +784,8 @@ a high-sec ruleset group, cross-checked.
   A follower executes nothing for a carried block; only the owner does.
 - **Built: peers are pinned and listed.** A server takes a peer's frames only over a
   connection on which the peer proved its configured DID, and the owner streams a channel
-  only to a peer holding an accepted share of it, within that peer's quota. Peer connections use
+  only to a peer holding an accepted share of it. The follower that receives the stream enforces
+  the owner's per-peer quota. Peer connections use
   TLS by default. Antipattern flags that weaken federation are off by default and listed in
   `/.well-known/jig` under `unsafe_options_active` when set.
 - **Built: the owner sequences, and followers carry its records.** A shared channel's owner
@@ -1308,7 +1309,7 @@ gap.
 | One owning server per channel (D24) | Partial: a shared channel's owner sequences it and followers carry its records; members on a follower write through it under a grant | Cross-server writes: survey XMPP MUC, IRC, Matrix, ActivityPub groups |
 | A peer is a transport; relayed blocks pass every gate | Built: writes a follower relays run through the owner's write gate (authors not asked for admission proof-of-work); peers listed and pinned in configuration; per-peer quotas on what a peer streams | Peer DID in the contract |
 | Pluggable suites, MLS default and first (D1, D13) | Built: MLS per channel; validating delivery service | Non-MLS plug-in shape (D13); per-suite conformance |
-| End-to-end encryption by default | Built: every channel is encrypted except a `public` one (JEP-0014); DMs always | — |
+| End-to-end encryption by default | Built: every channel created under tiers is encrypted except a `public` one (JEP-0014); DMs always. Pre-tier plaintext channels outside `#jig/` are frozen. A passive operator cannot read the encrypted tiers; one that controls a `server` or `shared` channel's membership can add a member, which members see | — |
 | Mandatory signed handshake; clients fail closed and pin | Partial: signed welcome with nonce; CLI pins server DIDs, suites and channel suites; later frames checked against the welcome; refusals close with 4002; the welcome is bound to the TLS session and federation peers prove their DID (#234) | Pins between servers; real reputation (D11) |
 | No backdoors, no scanning, no default escrow | Holds: no backdoor, scanning or escrow exists | Keep it so as reporting is designed |
 | Provable abuse reports from encrypted channels, by participants only (D22) | None: signature exists; no tooling | Delegation or proof mechanism (AB-06) |

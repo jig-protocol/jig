@@ -67,7 +67,7 @@ Line counts are approximate and include in-file unit tests.
 | 2 | The handshake and the TLS DID binding | The client's main defence against a hostile operator; custom signed transcript bound to the TLS exporter | ~9k lines | Mostly. Slices 5 and 10 of the D11 plan remain |
 | 3 | Key links and chains | A wrong link check hands one server's standing to an attacker's key | ~4k lines | Yes |
 | 4 | Keys at rest | Identity seeds, MLS secrets and the plaintext cache on disk | ~6k lines | Yes |
-| 5 | Proof-of-work and admission | Abuse cost at nameservers and servers; request authentication | ~6k lines | Yes: capacity pools at servers shipped (#318, #451) |
+| 5 | Proof-of-work and admission | Abuse cost at nameservers and servers; request authentication | ~6k lines | Partly: write pools at servers shipped (#318, #451); pools for subscriptions and handshakes (JEP-0008 rule 21) and the proof-of-work queue and stamps (R1 Task 5) remain |
 | 6 | The federation contract and the follower stream | Cross-server trust: a follower carries what the owner sequenced | ~9k lines | No: F2 Tasks 9 and 11 and parts of 0c, 7, 8 and 10 remain; F2 ships as v0.2.x |
 | 7 | The Wasm sandbox and receipts | Executes sender-supplied code on the server | ~6k lines | Yes, for the one world that runs (`renderer`) |
 
@@ -345,8 +345,9 @@ Reputation](../../repos/jig-spec/src/identity-and-reputation.md). Rationale:
   finding. Comments on it are welcome.
 - Reputation, tribunals and transparency logs, which are not built (JEP-0009, JEP-0010).
 
-Capacity pools at servers (R1 Task 5) are code-complete: the pools (#318), the aged-proof cap
-(#451) and guest-only joins for members by aged proof (#473).
+Of R1 Task 5, the write pools at servers are built: the pools (#318), the aged-proof cap
+(#451) and guest-only joins for members by aged proof (#473). Pools for subscriptions and
+handshakes (JEP-0008 rule 21) and the proof-of-work queue and stamps are not.
 
 ### 3.6 The federation contract and the follower stream
 

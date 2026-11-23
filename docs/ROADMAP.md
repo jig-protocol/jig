@@ -231,8 +231,10 @@ Still to do in this phase:
   TCP/SNI passthrough proxy. A `config` or `contract` suffix needs passthrough, and today every
   client behind one shares the proxy's limit.
 - Peer-policy quotas on the rest of a peer link. The policy is published in the signed server
-  manifest since #275, and what a peer streams counts against its quota (#311); writes queued
-  while a sequencer is down are not capped yet (F2 Task 10).
+  manifest since #275, and what a peer streams counts against its quota at the follower that
+  receives it (#311). Nothing is queued while a sequencer is down: the follower answers
+  `OWNER_UNREACHABLE` or `RELAY_PENDING`, and the client retries. The rest of F2 Task 10
+  remains.
 - An external security audit (D27): one firm in two phases. Phase 1 runs before G3 on the code
   that is already complete, and Phase 2 after v0.2 is code-complete. It does not block development.
 

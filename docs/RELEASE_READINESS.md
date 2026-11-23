@@ -10,7 +10,7 @@ checklist for changing that. Every "current state" row below was checked against
 the code at merge commit `1fa5681`; §1.3, §1.5, §1.8 and §4 were re-checked
 against `d16f26a` on 2026-10-18; §1.1, §1.6, §1.7, the binary install row, §3,
 §6 and the verdict were re-checked against `a740fa8` on 2026-10-25; the gaps in
-§1.2 and §1.3, §1.6's wasmtime version, §1.7, §2's release cadence and the verdict
+§1.2 and §1.3, §1.6's wasmtime version, §1.7, §4's `jig-spec` book row, §6's release cadence and the verdict
 were brought up to date against `f9cdc2da` on 2026-11-23. Where a claim could not
 be verified from the tree it says so.
 
@@ -195,7 +195,7 @@ compatibility promise is still a BLOCKER for the day one is made.
 | `SECURITY.md` (root) | Yes | See §1.8. |
 | Deployment docs | Yes | [`deploy/README.md`](../deploy/README.md): systemd units, the security model with a private network as defence in depth, install, TLS, backups, restore, sealing and rotating the server key, the nameserver, and gotchas. [`deployment/install-benchmark.md`](deployment/install-benchmark.md) measures the 60-second install. |
 | Per-crate rustdoc | Partial | Module- and item-level doc comments are dense and unusually good (the `//!` headers carry real rationale). But **no crate sets `#![warn(missing_docs)]`** and none carries `[package.metadata.docs.rs]`, so there is no rendered API reference anywhere. Only `integration-tests` sets `publish = false`; the rest are publishable-by-accident. |
-| `jig-spec` book | Yes | mdbook under `repos/jig-spec/`. Describes much unshipped behaviour. Each chapter's banner, and the threat register's status column, say what the reference implementation does (re-checked 2026-10-18); `message-format.md` is bannered as historical, not the wire format. |
+| `jig-spec` book | Yes | mdbook under `repos/jig-spec/`. Describes much unshipped behaviour. Each chapter's banner, and the threat register's status column, say what the reference implementation does (re-checked 2026-11-23, #482); `message-format.md` is bannered as historical, not the wire format. |
 | Riverdance | Not in this repo | The unfinished GUI is not part of this repository. Its licence is undecided, and it is not a working client. |
 
 **Verdict: GAP.** The front-door files exist and the spec is bannered; what
@@ -299,7 +299,7 @@ and install through the verified `curl | bash` path. What decides it now:
 | ~~3~~ | ~~**Root `LICENSE` + consistent per-crate SPDX ids**~~ | **DONE 2026-08-06** — dual-licensed MIT OR Apache-2.0, root licence pair added, every protocol crate aligned. `jig-spec` moved to CC-BY-4.0 on 2026-10-05. |
 | ~~4~~ | ~~**Publish a release the installer can install**~~ | **DONE 2026-10-19** — `v0.2.0-alpha.1`, then `v0.2.0-alpha.2` on 2026-10-25: built, signed and published by `release.yml`, and installed by `install.sh` against the published release on Ubuntu and macOS in the same run. |
 | ~~5~~ | ~~**Say plainly that v0.x has no compatibility guarantee**~~ | **DONE** — README and spec 2026-10-05; every release's notes since `v0.2.0-alpha.1` ([`.github/release/notes/`](../.github/release/notes/)). `Envelope.v`, the manifest `schema`, the encryption suite and the receipt domain are gates (§3). |
-| ~~6~~ | ~~**Implementation-status banner on `jig-spec`**~~ | **DONE 2026-10-05**, re-checked 2026-10-18 — every chapter's banner and the threat register's status column match `main`. |
+| ~~6~~ | ~~**Implementation-status banner on `jig-spec`**~~ | **DONE 2026-10-05**, re-checked 2026-11-23 (#482) — every chapter's banner and the threat register's status column match `main`. |
 | ~~7~~ | ~~**Clear the reachable advisory suppressions**~~ | **DONE** — four ignores left: one build-time only, one linked where no secret reaches it, and two unmaintained crates with no vulnerability (§1.7). |
 | 8 | **Publish a support channel** | DJ is the named triage owner for security reports, and dev@jig.onl takes everything else. No public discussion channel, and no SLA for ordinary issues. |
 

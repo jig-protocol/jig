@@ -35,15 +35,19 @@ loopback and private tailnets.
   encryption suite are checked, and anything unsupported is rejected
   ([`repos/jig-spec/src/versioning.md`](repos/jig-spec/src/versioning.md)).
 
-- **End-to-end encryption is per channel.** Every channel is one MLS group (RFC 9420) except
-  one created `public` ([JEP-0014](repos/jig-spec/jep/jep-0014-channel-tiers.md) tiers):
-  `private` (the default), `server` and `shared` channels and every DM. The server stores and
-  relays ciphertext it cannot read, and validates every membership change without holding
-  any group secret. A `public` channel is signed, not encrypted — the server stores its
-  plaintext. Restricted channels are always MLS, with no opt-out ([D25](docs/ROADMAP.md));
-  one created plaintext before that rule is frozen and takes no new content. Only a `shared`
-  channel crosses servers, as ciphertext under a share; `private` and `server` channels stay
-  on their server. Metadata (who, when,
+- **End-to-end encryption is per channel.** Every channel created under tiers is one MLS
+  group (RFC 9420) except one created `public`
+  ([JEP-0014](repos/jig-spec/jep/jep-0014-channel-tiers.md) tiers): `private` (the default),
+  `server` and `shared` channels and every DM. The server stores and relays ciphertext, and
+  validates every membership change without holding any group secret, so a passive operator
+  cannot read it. In a `server` or `shared` channel the server decides who may join: an
+  operator who controls membership can add a member and read what follows, and members see
+  the add. A `public` channel is signed, not encrypted — the server stores its plaintext.
+  Restricted channels are always MLS, with no opt-out ([D25](docs/ROADMAP.md)). A plaintext
+  channel created before tiers is frozen and takes no new content, except an open `#jig/`
+  server channel, which becomes `public`. Only `shared` and `public` channels cross servers,
+  under a share, and a `shared` one as ciphertext; `private` and `server` channels stay on
+  their server. Metadata (who, when,
   how much, who joined) is visible to the server either way. See
   [`docs/security/encryption.md`](docs/security/encryption.md).
 - **Authentication, authorization, admission and rate limits.** Every read
@@ -79,7 +83,7 @@ loopback and private tailnets.
 | History backfill on joining a channel (the client asks for the last 100 blocks; the server caps a request at 200; `?before=<cid>` pages further back) | Works. On an encrypted channel, only messages sent after you joined decrypt; a member who was away pages back to where it left off |
 | `GET /api/v1/channels/:slug/blocks`, `/healthz`, `/metrics` | Works |
 | Nameserver: alias register / resolve / rotate / renew | Works (`jig-nameserver`, `jig ns …`). `jig ns resolve` prints only verified answers, so the suffix needs a `[naming.delegations]` entry in `cli.toml` or a DNS-rooted delegation |
-| Server-to-server federation over WSS | Implemented: a channel reaches another server only by a share (`jig channel share`), and a `shared` channel is carried as ciphertext; covered by the share tests in [`v0_0_2_contract.rs`](repos/jig-server/src/v0_0_2_contract.rs) (`a_post_crosses_by_a_share_and_runs_only_on_its_owner`). No end-to-end integration test of the contract yet (F2 Task 11) |
+| Server-to-server federation over WSS | Implemented: a channel reaches another server only by a share (`jig channel share`), and a `shared` channel is carried as ciphertext; covered by the share tests in [`v0_0_2_contract.rs`](repos/jig-server/src/v0_0_2_contract.rs) (`a_post_crosses_by_a_share_and_runs_only_on_its_owner`, and for ciphertext `a_shared_mls_channel_is_written_through_its_follower_and_read_at_its_owner`). No end-to-end integration test of the contract yet (F2 Task 11) |
 | Email bridge (Resend) | Implemented in-process, but inbound mail is refused until the bridge can join a thread's MLS group (D25); see [`bridges/email/README.md`](repos/bridges/email/README.md) |
 | Wasm block execution **on the server** | `text-render` executes for real on plaintext channels: the server runs its canonical module and signs the `render_hash` ([`jig-pipeline/src/ingest.rs`](repos/jig-pipeline/src/ingest.rs), step 4). Encrypted content is never executed and gets a `sealed` receipt; control-plane kinds take a synthetic one |
 | Wasm block execution in the CLI (`jig block run`, `jig block test`) | Works for `jig:block` components, through the same component path as the server and client. A core module is refused; `jig block build` makes a component |
