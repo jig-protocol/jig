@@ -19,7 +19,9 @@
 # wrote. After the last step jig-server declares a ruleset (JEP-0009 rule 4):
 # every client still reads everything, and so does a new user on the previous
 # step's `jig`, which predates declarations and must still verify the welcome
-# and the manifest of a server that makes one. Then jig-server rotates its key,
+# and the manifest of a server that makes one. A previous step's `jig` from
+# before jig-request-auth-v2 is instead refused as PROOF_VERSION_UNSUPPORTED
+# (JEP-0015 rule 28). Then jig-server rotates its key,
 # and every client, pinned on the old DID, must follow the key link and keep
 # working.
 #
@@ -546,10 +548,24 @@ if "$BIN/jig-server" --init-config "$sandbox/template.toml" >/dev/null 2>&1 &&
     as_prev init dave >/dev/null || fail "dave could not create an identity on the previous step's jig"
     as_prev server set "https://127.0.0.1:$server_port" >/dev/null
     out="$sandbox/prev-read.out"
-    as_prev read '#open' --limit 500 > "$out" 2>&1 || {
-      cat "$out" >&2; fail "the previous step's jig (${prev_step:-?}) cannot read from a server that declares a ruleset"; }
-    grep -qF -- "open from step 0" "$out" || { cat "$out" >&2; fail "the previous step's jig does not see #open's history"; }
-    note "the previous step's jig (${prev_step:-?}) verifies the welcome and manifest of a server that declares a ruleset"
+    server_log="$ALICE_JIG_HOME/logs/jig-server.log"
+    if grep -aqF -- "jig-request-auth-v2" "$sandbox/jig.prev"; then
+      as_prev read '#open' --limit 500 > "$out" 2>&1 || {
+        cat "$out" >&2; fail "the previous step's jig (${prev_step:-?}) cannot read from a server that declares a ruleset"; }
+      grep -qF -- "open from step 0" "$out" || { cat "$out" >&2; fail "the previous step's jig does not see #open's history"; }
+      note "the previous step's jig (${prev_step:-?}) verifies the welcome and manifest of a server that declares a ruleset"
+    else
+      # A jig from before jig-request-auth-v2 signs request proofs bound to no
+      # server, which this build refuses by name (JEP-0015 rule 28): server
+      # and CLI upgrade together. It must be refused, and as that.
+      seen="$(wc -l < "$server_log")"
+      if as_prev read '#open' --limit 500 > "$out" 2>&1; then
+        fail "the previous step's jig (${prev_step:-?}), which signs unbound request proofs, was not refused"
+      fi
+      tail -n +"$((seen + 1))" "$server_log" | grep -qF "outcome=AuthProofVersionUnsupported" || {
+        cat "$out" >&2; fail "the previous step's jig (${prev_step:-?}) was refused, but not as PROOF_VERSION_UNSUPPORTED"; }
+      note "the previous step's jig (${prev_step:-?}) predates jig-request-auth-v2 and is refused as PROOF_VERSION_UNSUPPORTED"
+    fi
   fi
 else
   note "the last step's jig-server cannot declare a ruleset; skipped"
