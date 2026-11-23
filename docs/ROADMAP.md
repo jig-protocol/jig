@@ -1,13 +1,15 @@
 # jig roadmap
 
 Where jig is going, in phases from a public alpha (`v0.1`) to a distributed OS (`v1+`), and the
-decisions that shape the path. Last updated 2026-10-25.
+decisions that shape the path. Last updated 2026-11-23.
 
-**Status in one line:** two signed v0.2 prereleases are published and install through
-`install.sh` (`v0.2.0-alpha.1` and `v0.2.0-alpha.2`), and on `main` v0.2 has per-channel MLS
+**Status in one line:** five signed v0.2 prereleases are published and install through
+`install.sh` (`v0.2.0-alpha.1`, `alpha.2`, `alpha.4`, `alpha.5` and `alpha.6`; the `alpha.3`
+tag has no published release), and on `main` v0.2 has per-channel MLS
 encryption with restricted channels always encrypted, TLS by default bound to the server's DID, a
 signed handshake bound to the TLS session, clients that pin servers, names and each channel's
-suite, rate limits and proof-of-work at admission. The federation contract is half built. For what
+suite, rate limits and proof-of-work at admission. `v0.2.0` is tagged at gate G2, and the
+federation contract, which is partly built, ships as v0.2.x (D35). For what
 works today, gate by gate, see [`RELEASE_READINESS.md`](RELEASE_READINESS.md). This doc is the
 direction, not the status page.
 
@@ -110,7 +112,7 @@ reserve the hooks for encryption so that turning it on in v0.2 changes a value, 
 | # | Item | Status |
 | --- | --- | --- |
 | 1 | Green `main`: patch advisories, pinned toolchain (`rust-toolchain.toml`), daily advisory check | Done |
-| 2 | Release pipeline: static musl x86_64/aarch64 + Apple Silicon, checksums, signatures | Done: `v0.1.0-alpha.1` never shipped binaries; `v0.2.0-alpha.1` (2026-10-19) and `v0.2.0-alpha.2` (2026-10-25) are published, signed, and install-smoked against the published release on Linux and macOS |
+| 2 | Release pipeline: static musl x86_64/aarch64 + Apple Silicon, checksums, signatures | Done: `v0.1.0-alpha.1` never shipped binaries; `v0.2.0-alpha.1` (2026-10-19) and `v0.2.0-alpha.2` (2026-10-25) were the first published, signed, and install-smoked against the published release on Linux and macOS, and `alpha.4` to `alpha.6` followed |
 | 3 | 60-second default path: working `install.sh`, channel ops out of `[debug]`, CI smoke test | Done (`install-smoke.yml`, Linux + macOS) |
 | 4 | Security communication: root `SECURITY.md`, private vulnerability reporting, "not implemented" banners on the spec | Done |
 | 5 | Scrub history, go public with full history, archive the pre-monorepo repos | Done |
@@ -208,17 +210,16 @@ Since then, each in one or more PRs:
 | 2 | The operator cannot read restricted content | Met (D25) |
 | 3 | A hostile operator's downgrade or false handshake is detected | Largely met: the slices the D11 plan names for it (1, 3, 4a, 4b, 6, 7) are merged, as are 0, 2, 8 and 9. Slice 5 (`seen` and head gossip, so members compare chains) is not built, slice 10 (`sequencer-set`) lands with F2, and OP-01, OP-02 and TM-01 still read Partial |
 | 4 | Suites are pluggable, shown through the registry with conformance vectors | Met (#165) |
-| 5 | The federation contract is specified, and two jig servers federate an encrypted channel through it | Not met: relayed writes are merged (Task 6, #316); Tasks 7 to 11 remain (MLS across servers, custodians, sequencer moves, abuse defences, end to end), and Task 0c (clients address channels by `channel_id`) |
+| 5 | The federation contract is specified, and two jig servers federate an encrypted channel through it | Not a `v0.2.0` gate: it ships as v0.2.x (D35, DJ, 2026-11-23). Not met: F2 Tasks 0a, 0b and 1 to 6 are merged. Task 0c is mostly done (#430; `jig:<cid>` is not parsed yet). Task 7 is partly done: a follower carries an MLS channel through its mirror of the group (#378), but a `contract-end` removes no one. Task 8 is partly done (#440, #461, #463): DID-signed release policies, held requests, the Welcome mailbox and one package per device remain. Task 10 is partly done: per-peer quotas are enforced before ingest. Task 9 (the contract half of a sequencer move) and Task 11 (the end-to-end test, JEP-0005 out of Draft) are not started |
 | 6 | An external audit is scoped | Scoped (D27, decided 2026-10-25): Phase 1 before G3, Phase 2 after code-complete |
 
 Still to do in this phase:
 
-- **Federation (D12, D24), F2 Task 0c and Tasks 7 to 11:** clients that address channels by
-  `channel_id`, encrypted channels
-  across servers, key-package custodians, the contract half of a sequencer move, abuse defences
-  on federation links, and the end-to-end test. Nameserver-led shared contracts for trusted
-  subnets and ruleset groups follow. Federating with a differently built server comes after the
-  MVP.
+- **Federation (D12, D24), in v0.2.x (D35):** the rest of F2 Task 0c (`jig:<cid>`), member
+  removal after a `contract-end` (Task 7), the rest of custody (Task 8), the contract half of a
+  sequencer move (Task 9), the rest of the abuse defences on federation links (Task 10), and
+  the end-to-end test (Task 11). Nameserver-led shared contracts for trusted subnets and
+  ruleset groups follow. Federating with a differently built server comes after the MVP.
 - **Handshake slices 5 and 10:** `seen` and head gossip, so members compare chains and detect
   omission (OP-06); `sequencer-set`, with F2. Then the threat-register rows the D11 design
   proposes for OP-01, OP-02 and TM-01. Reputation in the welcome stays `null` until the
@@ -345,6 +346,11 @@ Settled on 2026-10-05 unless noted. Open items follow the table.
 | D32 | Who does mechanical useful work? | Established clients, under a new JEP after the tag: log witnessing and checkpoint gossip, evidence validation, copies and retrievability, and receipt re-execution. Work is assigned from a public beacon, results are committed then revealed and accepted on k-of-n agreement, and credit is a ruleset event. It raises detection, not flood capacity. Settled 2026-10-26. |
 | D33 | Who sits on tribunals? | Nameserver-held panels (JEP-0010). Client juries are a later high-sec option. Settled 2026-10-26. |
 | D34 | Can anyone check a server's standing figures? | Yes, from R2 on. Standing R = f(ruleset, evidence log, epoch), where `f` is a deterministic ruleset block. The server publishes R with signed checkpoints, anyone can recompute it, and a mismatch is portable proof against the server. Private evidence enters only as committed verdicts; log witnessing is client useful work (D32); thresholds stay local policy; there is no global score. Evidence commitments (log heads and inclusion receipts) are public. Evidence bodies are readable only by the DID they concern and by auditors the system assigns at random, gated on retrievability, so auditors cannot choose whose trail they see. The auditor role is not worth seeking or corrupting: auditors never see message content; assignment is secret, random and verifiable; each sample has several independent auditors whose verdicts can be checked by re-execution; pay is flat useful-work credit whatever the audit found, and the role carries no status. R′ designs it in the post-tag reference rulesets. Settled 2026-10-27. |
+| D35 | What does `v0.2.0` require? | Gate G2 of the [v0.2-close plan](superpowers/plans/2026-10-18-v0.2-close-and-m3-start.md): exit criteria 1 to 3, plus keys and the MLS plaintext cache encrypted at rest. The federation contract (criterion 5, F2) ships as v0.2.x, and D11 slices 5 (`seen` and head gossip) and 10 (`sequencer-set`) move with it. The D11 plan counted them, with slices 8 and 9, as part of v0.2 under B′; together they close OP-06, OP-08 and OP-09. The audit and v0.2 code-complete stay at G3. Decided (DJ, 2026-11-23). |
+| D36 | How does a node treat a block kind it does not know? | Unknown kinds get a critical/non-critical convention before `v0.2.0`, so a later release can add a kind that older nodes skip or refuse by design. Lane A8-compat builds it and writes the normative text. Decided (DJ, 2026-11-23). |
+| D37 | How does a share offer prove the owner rotated keys (#375)? | The owner's key-link chain, from the DID the channel's creation block names to the offer's signer, travels in its own peer frame beside the `contract-offer`, not inside it. Servers ignore peer frame kinds they do not know, so the frame is additive. Decided (DJ, 2026-11-23). |
+| D38 | What does a `v0.2.0` node do when a channel's sequencer moves? | It fails closed on that channel. The expected-sequencer rule (D11 slice 10, `sequencer-set`) arrives with F2 in v0.2.x. Decided (DJ, 2026-11-23). |
+| D39 | How does multi-device arrive? | As one MLS leaf per device, under a new suite or channel term. `v0.2.0` allows one leaf per DID, so a `v0.2.0` node refuses such a channel as an unsupported suite rather than misreading it. Decided (DJ, 2026-11-23). |
 
 D3, D14, D16 and D17 concern the Riverdance GUI's licence and internal hosting and are tracked
 outside this repo.
