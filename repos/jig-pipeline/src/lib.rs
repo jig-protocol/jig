@@ -5,9 +5,6 @@
 //! ([`hlc`]), the identity resolver ([`identity`]), and the unified
 //! `ingest()` entry point that flows blocks through validation → execution
 //! → effect application → persistence → fanout.
-//!
-//! Modules are stubbed in this initial commit; subsequent Phase B tasks
-//! (B3 through B8) populate them.
 
 pub mod authorize_write;
 pub mod contracts;
