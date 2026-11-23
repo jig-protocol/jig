@@ -96,7 +96,12 @@ async fn post(server: &TestJigServer, path: &str, block: &BuiltBlock) {
 /// `owner` adds `did` to `slug`: an MLS commit, posted as a member-add.
 async fn add(server: &TestJigServer, owner: &Member, slug: &str, did: &str) {
     let url = format!("{}/api/v1/mls/key-packages/{did}", server.http_url());
-    let proof = ReadProof::sign(&owner.id, "GET", signable_path(&url));
+    let proof = ReadProof::sign(
+        &owner.id,
+        &server.server_did_string,
+        "GET",
+        signable_path(&url),
+    );
     let mut req = reqwest::Client::new().get(&url);
     for (name, value) in proof.headers() {
         req = req.header(name, value);

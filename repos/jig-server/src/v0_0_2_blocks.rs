@@ -606,8 +606,16 @@ pub(crate) fn admit_caller(
         .lock()
         .expect("replay guard mutex poisoned");
 
-    let did = crate::auth::authenticate(&proof, method, path, b"", now_ms, &mut guard)
-        .map_err(|outcome| refuse(state, &outcome, started))?;
+    let did = crate::auth::authenticate(
+        &proof,
+        &state.server_did,
+        method,
+        path,
+        b"",
+        now_ms,
+        &mut guard,
+    )
+    .map_err(|outcome| refuse(state, &outcome, started))?;
     drop(guard);
 
     // Gate 2, on the identity gate 1 just VERIFIED. Before any channel is
@@ -661,6 +669,7 @@ pub(crate) fn verify_proof(
         use jig_core::request_auth::headers as h;
         let offered = [
             h::DID,
+            h::AUDIENCE,
             h::HLC_WALL_MS,
             h::HLC_LOGICAL,
             h::NONCE,
@@ -686,8 +695,16 @@ pub(crate) fn verify_proof(
         .replay_guard
         .lock()
         .expect("replay guard mutex poisoned");
-    let did = crate::auth::authenticate(&proof, method, path, body, now_ms, &mut guard)
-        .map_err(|outcome| refuse(state, &outcome, started))?;
+    let did = crate::auth::authenticate(
+        &proof,
+        &state.server_did,
+        method,
+        path,
+        body,
+        now_ms,
+        &mut guard,
+    )
+    .map_err(|outcome| refuse(state, &outcome, started))?;
     Ok(Some(did))
 }
 

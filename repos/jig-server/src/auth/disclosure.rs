@@ -61,6 +61,21 @@ fn truthful(outcome: &GateOutcome) -> (u16, &'static str, String) {
             "INVALID_SIG",
             "signature verification failed".to_string(),
         ),
+        // The codes a client acts on: re-handshake and sign afresh, or
+        // upgrade. Named in `jig_core::request_auth::refusal`.
+        GateOutcome::AuthWrongAudience => (
+            401,
+            jig_core::request_auth::refusal::WRONG_AUDIENCE,
+            "request proof is addressed to another server".to_string(),
+        ),
+        GateOutcome::AuthProofVersionUnsupported => (
+            401,
+            jig_core::request_auth::refusal::PROOF_VERSION_UNSUPPORTED,
+            format!(
+                "request proof version is not accepted; this server accepts {}. Upgrade the client",
+                jig_core::request_auth::VERSION
+            ),
+        ),
         GateOutcome::AuthReplayed => (401, "REPLAYED", "this request was already seen".to_string()),
         GateOutcome::AuthStale => (
             401,

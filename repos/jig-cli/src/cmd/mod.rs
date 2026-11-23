@@ -24,6 +24,7 @@ pub mod ns_pow;
 pub mod passphrase;
 pub mod reader;
 pub mod receipt;
+pub mod request_proof;
 pub mod secure;
 pub mod send;
 pub mod server;

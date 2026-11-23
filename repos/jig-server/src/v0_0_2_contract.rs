@@ -2594,7 +2594,13 @@ mod tests {
             &rand::random(),
         ));
         let mut headers = axum::http::HeaderMap::new();
-        for (name, value) in jig_client::read_auth::ReadProof::sign(&reader, "GET", &path).headers()
+        for (name, value) in jig_client::read_auth::ReadProof::sign(
+            &reader,
+            &p.follower.server_did.to_did_jig_string(),
+            "GET",
+            &path,
+        )
+        .headers()
         {
             headers.insert(name, value.parse().unwrap());
         }

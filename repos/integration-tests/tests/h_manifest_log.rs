@@ -7,7 +7,8 @@ use jig_client::manifest::{LOG_SLUG, ManifestCheck, check_cited};
 use jig_client::read_auth::{ReadProof, signable_path};
 
 async fn get_json(who: &jig_client::Identity, url: &str) -> serde_json::Value {
-    let proof = ReadProof::sign(who, "GET", signable_path(url));
+    let audience = integration_tests::harness::audience_for(url).await;
+    let proof = ReadProof::sign(who, &audience, "GET", signable_path(url));
     let mut req = reqwest::Client::new().get(url);
     for (name, value) in proof.headers() {
         req = req.header(name, value);

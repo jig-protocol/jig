@@ -357,9 +357,14 @@ mod tests {
             let identity = jig_client::identity::Identity::from_signing_key(
                 ed25519_dalek::SigningKey::from_bytes(&[seed; 32]),
             );
-            for (name, value) in
-                jig_client::read_auth::ReadProof::sign_body(&identity, "POST", path, &signed)
-                    .headers()
+            for (name, value) in jig_client::read_auth::ReadProof::sign_body(
+                &identity,
+                &state.server_did.to_did_jig_string(),
+                "POST",
+                path,
+                &signed,
+            )
+            .headers()
             {
                 headers.insert(name, value.parse().unwrap());
             }

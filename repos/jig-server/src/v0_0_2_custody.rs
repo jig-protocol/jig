@@ -786,7 +786,13 @@ mod tests {
         let path = format!("/api/v1/mls/key-packages/{did}/stock");
         let reader = jig_client::identity::Identity::from_signing_key(key(seed));
         let mut headers = axum::http::HeaderMap::new();
-        for (name, value) in jig_client::read_auth::ReadProof::sign(&reader, "GET", &path).headers()
+        for (name, value) in jig_client::read_auth::ReadProof::sign(
+            &reader,
+            &state.server_did.to_did_jig_string(),
+            "GET",
+            &path,
+        )
+        .headers()
         {
             headers.insert(name, value.parse().unwrap());
         }
@@ -852,8 +858,13 @@ mod tests {
         let path = format!("/api/v1/reach/{}", did_of(did));
         let identity = jig_client::identity::Identity::from_signing_key(key(reader));
         let mut headers = axum::http::HeaderMap::new();
-        for (name, value) in
-            jig_client::read_auth::ReadProof::sign(&identity, "GET", &path).headers()
+        for (name, value) in jig_client::read_auth::ReadProof::sign(
+            &identity,
+            &state.server_did.to_did_jig_string(),
+            "GET",
+            &path,
+        )
+        .headers()
         {
             headers.insert(name, value.parse().unwrap());
         }
@@ -933,8 +944,13 @@ mod tests {
         // A proof that does not verify is refused, not read as anonymous.
         let mut forged = axum::http::HeaderMap::new();
         let identity = jig_client::identity::Identity::from_signing_key(key(4));
-        for (name, value) in
-            jig_client::read_auth::ReadProof::sign(&identity, "GET", "/somewhere/else").headers()
+        for (name, value) in jig_client::read_auth::ReadProof::sign(
+            &identity,
+            &state.server_did.to_did_jig_string(),
+            "GET",
+            "/somewhere/else",
+        )
+        .headers()
         {
             forged.insert(name, value.parse().unwrap());
         }

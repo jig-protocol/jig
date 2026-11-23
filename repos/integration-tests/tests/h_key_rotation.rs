@@ -137,7 +137,8 @@ async fn booted(server: TestJigServer) -> TestJigServer {
 }
 
 async fn get(who: &Identity, url: &str) -> serde_json::Value {
-    let proof = ReadProof::sign(who, "GET", signable_path(url));
+    let audience = integration_tests::harness::audience_for(url).await;
+    let proof = ReadProof::sign(who, &audience, "GET", signable_path(url));
     let mut req = reqwest::Client::new().get(url);
     for (name, value) in proof.headers() {
         req = req.header(name, value);

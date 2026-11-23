@@ -10,7 +10,6 @@
 use anyhow::{Context, Result};
 use jig_client::Identity;
 use jig_client::admission::{AdmissionProof, PowAdmissionProof};
-use jig_client::read_auth::{ReadProof, signable_path};
 use jig_client::tls::TlsError;
 use serde::Deserialize;
 
@@ -101,12 +100,21 @@ pub async fn ensure_for(server: &str, identity: &Identity) -> Result<()> {
     };
 
     let url = format!("{}/api/v1/admission", base_http_url(server));
-    let proof = ReadProof::sign(identity, "GET", signable_path(&url));
-    let mut req = http.get(&url);
-    for (name, value) in proof.headers() {
-        req = req.header(name, value);
-    }
-    match req.send().await {
+    // Best effort, like the rest of this check: a server that cannot be
+    // handshaken with is reported by the command that follows. Unpinned: the
+    // server is asked whether it wants work, and trusted with nothing else.
+    // `ensure_for` also runs for a custodian that is never to be pinned.
+    match crate::cmd::request_proof::send_as(
+        server,
+        crate::cmd::request_proof::Trust::Unpinned,
+        identity,
+        "GET",
+        &url,
+        b"",
+        || http.get(&url),
+    )
+    .await
+    {
         Ok(resp) if resp.status().is_success() => {
             if jig_client::limits::json_capped::<Status>(
                 resp,

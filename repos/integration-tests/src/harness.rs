@@ -32,8 +32,12 @@ use tokio::task::JoinHandle;
 /// unsigned frame is refused. Tests that are about delivery rather than about
 /// authentication still need a valid one — this is the one place that knows how
 /// to mint it, so the ceremony is not copied into every test.
+///
+/// `audience` is the DID of the server the frame is sent to
+/// ([`TestJigServer::server_did_string`]).
 pub fn signed_subscribe(
     identity: &Identity,
+    audience: &str,
     scope: jig_pipeline::envelope::Scope,
 ) -> jig_pipeline::envelope::Envelope {
     use base64::Engine as _;
@@ -50,6 +54,8 @@ pub fn signed_subscribe(
     let nonce = format!("test-{hlc_wall_ms}-{}", SEQ.fetch_add(1, Ordering::Relaxed));
 
     let hash = jig_core::request_auth::canonical_request_hash(
+        audience,
+        &identity.did_string(),
         "SUBSCRIBE",
         &scope.canonical_string(),
         b"",
@@ -61,6 +67,7 @@ pub fn signed_subscribe(
     jig_pipeline::envelope::Envelope::new(jig_pipeline::envelope::Frame::Subscribe {
         auth: Some(jig_pipeline::envelope::SubscribeAuth {
             did: identity.did_string(),
+            audience: Some(audience.to_string()),
             hlc_wall_ms,
             hlc_logical: 0,
             nonce,
@@ -69,6 +76,22 @@ pub fn signed_subscribe(
         }),
         scope,
     })
+}
+
+/// The DID the server serving `url` signs as, from its `/.well-known/jig`:
+/// the audience a request proof to it is addressed to. For helpers that hold
+/// a URL and not the [`TestJigServer`]; a client takes it from a signed
+/// welcome instead.
+pub async fn audience_for(url: &str) -> String {
+    let parsed = reqwest::Url::parse(url).expect("a URL");
+    let origin = parsed.origin().ascii_serialization();
+    let info: serde_json::Value = reqwest::get(format!("{origin}/.well-known/jig"))
+        .await
+        .expect("GET /.well-known/jig")
+        .json()
+        .await
+        .expect("server info");
+    info["server_did"].as_str().expect("server_did").to_string()
 }
 
 /// A `jig-server` running on `127.0.0.1:<random>` for tests. Owns the

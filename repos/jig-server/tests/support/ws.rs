@@ -58,16 +58,22 @@ impl TestServer {
 
 pub struct WsClient {
     ws: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    /// The DID the server's welcome proved: the audience of every proof
+    /// this client signs.
+    pub server_did: String,
 }
 
 impl WsClient {
     pub async fn connect(url: &str) -> Self {
         let (mut ws, _) = connect_async(url).await.expect("ws connect");
         // The server refuses every frame until this welcome is in hand.
-        jig_server::v0_0_2_federation::complete_client_handshake(&mut ws, None)
+        let welcome = jig_server::v0_0_2_federation::complete_client_handshake(&mut ws, None)
             .await
             .expect("handshake");
-        Self { ws }
+        Self {
+            ws,
+            server_did: welcome.server_did,
+        }
     }
 
     /// Send a signed Subscribe for `slug` as `who`. A successful subscribe
@@ -87,7 +93,10 @@ impl WsClient {
     pub async fn subscribe_scope(&mut self, who: &Identity, scope: Scope) -> Option<Frame> {
         let hlc_wall_ms = now_ms();
         let nonce = format!("ws-{hlc_wall_ms}-{}", scope.canonical_string().len());
+        let did = who.did().to_did_jig_string();
         let hash = jig_core::request_auth::canonical_request_hash(
+            &self.server_did,
+            &did,
             "SUBSCRIBE",
             &scope.canonical_string(),
             b"",
@@ -97,7 +106,8 @@ impl WsClient {
         );
         let frame = Envelope::new(Frame::Subscribe {
             auth: Some(SubscribeAuth {
-                did: who.did().to_did_jig_string(),
+                did,
+                audience: Some(self.server_did.clone()),
                 hlc_wall_ms,
                 hlc_logical: 0,
                 nonce,

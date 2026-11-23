@@ -51,6 +51,9 @@ thiserror = "2.0"
 
 # HTTP client
 reqwest = { workspace = true }
+# A refusal read to tell it apart is rebuilt into a response (request_proof.rs).
+# Already in the graph through reqwest.
+http = "1.3"
 
 # Base64 for alias-registration proof-of-control signatures
 base64 = "0.23"

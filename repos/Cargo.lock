@@ -2928,6 +2928,7 @@ dependencies = [
  "dirs 7.0.0",
  "ed25519-dalek 3.0.0",
  "hex",
+ "http",
  "integration-tests",
  "jig-client",
  "jig-config",

@@ -67,7 +67,12 @@ fn person(home: &Path, server: &TestJigServer) -> String {
 
 async fn available(server: &TestJigServer, did: &str) -> u64 {
     let url = format!("{}/api/v1/mls/key-packages/{did}/stock", server.http_url());
-    let proof = ReadProof::sign(&test_identity(), "GET", signable_path(&url));
+    let proof = ReadProof::sign(
+        &test_identity(),
+        &server.server_did_string,
+        "GET",
+        signable_path(&url),
+    );
     let mut req = reqwest::Client::new().get(&url);
     for (name, value) in proof.headers() {
         req = req.header(name, value);
@@ -81,7 +86,12 @@ async fn available(server: &TestJigServer, did: &str) -> u64 {
 /// The status of a stranger's read of `did`'s reachability record at `server`.
 async fn reach_status(server: &TestJigServer, did: &str) -> u16 {
     let url = format!("{}/api/v1/reach/{did}", server.http_url());
-    let proof = ReadProof::sign(&test_identity(), "GET", signable_path(&url));
+    let proof = ReadProof::sign(
+        &test_identity(),
+        &server.server_did_string,
+        "GET",
+        signable_path(&url),
+    );
     let mut req = reqwest::Client::new().get(&url);
     for (name, value) in proof.headers() {
         req = req.header(name, value);

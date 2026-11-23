@@ -317,7 +317,7 @@ control).
 - [`jig-server/src/v0_0_2_admission.rs`](../../repos/jig-server/src/v0_0_2_admission.rs): the
   admission challenge route.
 - [`jig-core/src/request_auth.rs`](../../repos/jig-core/src/request_auth.rs): the signed request
-  hash (`jig-request-auth-v1`).
+  hash (`jig-request-auth-v2`, bound to the audience server's DID; JEP-0015 §8).
 - [`jig-pipeline/src/authorize_write.rs`](../../repos/jig-pipeline/src/authorize_write.rs): the
   write gate, run inside `ingest` for every surface.
 - [`jig-nameserver/src/v0_0_2_pow_policy.rs`](../../repos/jig-nameserver/src/v0_0_2_pow_policy.rs)

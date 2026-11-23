@@ -243,6 +243,9 @@ impl ServerManifest {
                 // Likewise: the declaration rides beside the document, under
                 // [`RULESET_METADATA_KEY`].
                 ruleset: false,
+                // Not in the document either, for the same reason as
+                // `tiers`: a welcome carries it.
+                request_auth: Vec::new(),
             },
             peer_policy: PeerPolicy {
                 relayed_kinds: text_list(&doc, "relayed_kinds")?,
@@ -408,6 +411,7 @@ mod tests {
                 max_future_skew_ms: 300_000,
                 tiers: false,
                 ruleset: false,
+                request_auth: Vec::new(),
             },
             peer_policy: PeerPolicy::default(),
         }

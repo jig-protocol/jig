@@ -59,7 +59,7 @@ fn person(home: &Path, server: &TestJigServer) -> String {
 
 async fn get(server: &TestJigServer, who: &Identity, path: &str) -> (u16, Value) {
     let url = format!("{}{path}", server.http_url());
-    let proof = ReadProof::sign(who, "GET", signable_path(&url));
+    let proof = ReadProof::sign(who, &server.server_did_string, "GET", signable_path(&url));
     let mut req = reqwest::Client::new().get(&url);
     for (name, value) in proof.headers() {
         req = req.header(name, value);

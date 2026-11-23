@@ -31,7 +31,8 @@ It also sets the rollout.
 
 **Writes should be bound to the session that makes them.** jig already binds reads this
 way. A subscription carries a proof by the reader's DID (JEP-0002 rule 4), and a REST read
-carries a request proof (`jig-request-auth-v1`) over its method, path, body, time and nonce.
+carries a request proof (`jig-request-auth-v2`, §8) over the server it is sent to, its signer,
+method, path, body, time and nonce.
 Writes carry only the block's own signature. That signature is a fact about the block, not
 about the submission: it holds whoever holds the bytes and wherever they are sent.
 
@@ -155,7 +156,7 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
 ## 4. REST
 
 10. `POST /api/v1/blocks` and the REST channel operations MUST carry a request proof (the
-    `jig-request-auth-v1` headers, as reads use).
+    `jig-request-auth-v2` headers of §8, as reads use).
     - The proof covers the request's method, path and body. The body holds the block, so
       the proof is bound to this block.
     - The proof's DID is the submitter. The replay guard and freshness window are those of
@@ -235,11 +236,76 @@ The key words MUST, MUST NOT, SHOULD and MAY are as in RFC 2119.
 21. Operators of servers that are not open to the public SHOULD meanwhile set
     `[auth.admission] unknown_dids` to `"proof-of-work"` or `"refuse"`.
 
+## 8. Request proofs
+
+A request proof is the caller's signature over one request to one server. It is used by
+REST reads and writes (rule 10) and by WebSocket subscriptions (JEP-0002 rule 4). This
+section specifies `jig-request-auth-v2`, which binds the proof to the server it is sent to
+(#464). A proof made for one server does not verify at another, even on the same path
+within the freshness window.
+
+22. **The signed hash.** The caller signs, with raw ed25519, the 32-byte BLAKE3 digest of
+    these parts, in this order. Each part is its label's bytes, then its value's length as a
+    little-endian `u64`, then its value (`jig_core::crypto::hash_labeled_parts`):
+
+    | Label | Value |
+    | --- | --- |
+    | `domain` | `jig-request-auth-v2` |
+    | `audience` | the DID of the server the request is sent to, canonical |
+    | `did` | the signer's DID, canonical |
+    | `method` | the HTTP method, or `SUBSCRIBE` for a subscription |
+    | `path` | the path as sent, percent-encoding kept and query excluded; for a subscription, the scope's canonical string |
+    | `body` | the body's exact bytes; empty for none |
+    | `hlc_wall_ms` | `u64`, little-endian |
+    | `hlc_logical` | `u32`, little-endian |
+    | `nonce` | the nonce's bytes |
+
+    A canonical DID is the lowercase spelling its key encodes to (`Did::from_did_jig_string`).
+23. **Carriage.** Over HTTP the proof is six headers: `x-jig-did`, `x-jig-audience`,
+    `x-jig-hlc-wall-ms`, `x-jig-hlc-logical`, `x-jig-nonce` and `x-jig-signature` (base64).
+    A subscription carries the same values in its `auth` object, with the audience as
+    `audience`. A proof without an audience is a `jig-request-auth-v1` proof.
+24. **The audience a client signs for.** The audience is the DID of a signed `welcome` the
+    client verified on a handshake with the server at that URL. A client that pinned the
+    server signs for the pinned DID, which the handshake holds the `welcome` to. A client
+    MUST NOT sign for a DID it took from an unsigned answer, and MUST NOT sign a request
+    proof for a server whose `welcome` does not list `jig-request-auth-v2` (rule 27). It
+    tells the user to upgrade the server, and never falls back to `v1`.
+25. **What a server verifies.** A server MUST:
+    - refuse a proof without an audience with `PROOF_VERSION_UNSUPPORTED`;
+    - refuse a proof whose audience is not its current DID, in canonical form, with
+      `WRONG_AUDIENCE`. A DID the server signed as before a key link (JEP-0012) is not its
+      audience: the key may no longer be the server's alone;
+    - recompute the hash from the request it received, with its own DID as the audience
+      and the canonical DID of the key the proof claims as `did`;
+    - verify the signature strictly (JEP-0013 §1 rule 4), refusing small-order keys and
+      non-canonical encodings, with `INVALID_SIG`;
+    - then check freshness and record the nonce, as before.
+
+    Neither refusal records the nonce. The server's DID is public, so `WRONG_AUDIENCE`
+    discloses nothing a client could not already learn.
+26. **A stale pin.** A client refused with `WRONG_AUDIENCE` SHOULD handshake again, which
+    moves its pin along the server's key links (JEP-0012), and MAY retry once with a newly
+    signed proof under a fresh nonce. It MUST NOT resend the refused proof.
+27. **Advertising.** A server lists the request-proof versions it accepts in its `welcome`
+    capabilities as `request_auth`, and unsigned at `/.well-known/jig`.
+    - A client lists the versions it signs in its `hello`. The `welcome` lists those that both
+      sides speak, and only when there are any, under tag 6 in the signed bytes (JEP-0002
+      rule 2, `sig`), so a client that predates it checks the bytes it always did (rule 18).
+    - A `welcome` that lists a version the `hello` did not list is outside the offer, and
+      the client refuses it.
+    - Like `authenticated-writes`, it is never in the server manifest.
+28. **Transition.** `jig-request-auth-v1` is no longer accepted, with no option to accept it.
+    Servers and clients from v0.2.0-alpha.8 on are upgraded together. A client from before
+    alpha.8 is refused by an alpha.8 server with `PROOF_VERSION_UNSUPPORTED`. An alpha.8
+    client refuses an older server before signing, because that server's `welcome` lists no
+    `request_auth`.
+
 # Security Considerations (Zero-Trust)
 
 Threat-register rows: AB-03 (relay and bridge quota abuse), AB-07 (delegated admission),
-OP-09 (federation abuse), GV-03 (penalty propagation without consent or evidence), PV-03
-(identity cross-linking).
+OP-09 (federation abuse), OP-12 (request proof presented at another server), GV-03 (penalty
+propagation without consent or evidence), PV-03 (identity cross-linking).
 
 - **What it binds.** A local submission is attributed to the DID that made it, by a proof
   the server verifies, so admission, limits and penalties fall on that DID (rule 5).
@@ -254,6 +320,10 @@ OP-09 (federation abuse), GV-03 (penalty propagation without consent or evidence
   it sends a PROXY protocol v2 header, which fails closed (rule 5, #423).
   - A hostile follower can still relay what it should not. It answers for that through its
     share (AB-07).
+- **Audience binding.** A request proof names the server it is for, and a server verifies
+  it against its own current DID (§8). A server that receives a proof, or anyone who sees
+  that server's traffic, cannot present it to another server. Within that server, the
+  replay guard and the freshness window still apply.
 - **Transcript binding.** `client_proof` signs over `tls_exporter`, so a TLS terminator in
   the middle cannot replay one client's proof on another session (the same reasoning as
   `peer_proof`).
@@ -277,19 +347,32 @@ OP-09 (federation abuse), GV-03 (penalty propagation without consent or evidence
   `authenticated-writes` (rule 18). It submits to such a server as it does today.
 - **Bridges** are unchanged. The email bridge runs in-process, and its shadow DIDs are
   already registered with the server (rule 15).
-- **Subscriptions** are unchanged (rule 9).
+- **Subscriptions** are unchanged (rule 9), except that their proof is `jig-request-auth-v2`
+  like every other (§8).
+- **Request proofs.** `jig-request-auth-v1` is refused (rule 28): old clients get
+  `PROOF_VERSION_UNSUPPORTED`, and new clients sign nothing for a server whose `welcome`
+  lists no `request_auth`.
 
 # Reference Implementation
 
 None yet. The pieces that exist:
-- request proofs (`jig_core::request_auth`, `jig-server/src/auth/authenticate.rs`);
+- request proofs, `jig-request-auth-v2` (§8: `jig_core::request_auth`,
+  `jig-server/src/auth/authenticate.rs`, `jig_client::read_auth`);
 - the transcript hash and `peer_proof` (`jig-pipeline/src/handshake.rs`);
 - `IngestSource`, which already tells local, relayed, peer, bridge and server submissions
   apart (`jig-pipeline/src/ingest.rs`).
 
 # Test Vectors
 
-To be added with the implementation:
+`vectors/0015/request-auth-v2.json` holds `jig-request-auth-v2` proofs (§8) for fixed keys:
+the signer's seed is 32 bytes of `0x01` and the audience server's is 32 bytes of `0x02`. It
+covers a GET with no body, a POST with a body, and a `SUBSCRIBE`. Each case gives its inputs,
+the hash, the signature, and the `v1` hash of the same request, to show that the two differ.
+`jig_core::request_auth` checks the file in its tests. `vectors/0015/welcome-request-auth.json`
+gives the bytes a `welcome` listing `jig-request-auth-v2` appends to its signed bytes under
+tag 6 (rule 27); `jig_pipeline::handshake` checks it.
+
+Still to be added with the rest of the implementation:
 - a `client_proof` over a known transcript;
 - a REST write proof over a known request;
 - a `submit` refused for no submitter, and one refused for a signer mismatch;

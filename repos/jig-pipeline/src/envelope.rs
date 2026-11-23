@@ -313,7 +313,7 @@ pub enum Frame {
 
 /// Tier-0 proof of possession carried on a [`Frame::Subscribe`].
 ///
-/// The transport-specific envelope for the same five values the REST path sends
+/// The transport-specific envelope for the same six values the REST path sends
 /// as headers. Only the carriage differs; verification is shared, which is what
 /// keeps the design transport-agnostic.
 ///
@@ -326,6 +326,10 @@ pub enum Frame {
 pub struct SubscribeAuth {
     /// The identity the caller claims. Untrusted until verified.
     pub did: String,
+    /// The server DID the proof is addressed to (`jig-request-auth-v2`). A
+    /// proof without it is a v1 proof, which is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
     pub hlc_wall_ms: u64,
     pub hlc_logical: u32,
     pub nonce: String,
@@ -633,6 +637,7 @@ mod tests {
             },
             auth: Some(SubscribeAuth {
                 did: "did:jig:zabc".into(),
+                audience: Some("did:jig:zserver".into()),
                 hlc_wall_ms: 7,
                 hlc_logical: 0,
                 nonce: "n1".into(),

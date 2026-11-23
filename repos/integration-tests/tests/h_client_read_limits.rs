@@ -56,6 +56,7 @@ async fn the_largest_block_is_delivered_under_the_clients_ws_limit() {
         .expect("handshake");
     let sub = signed_subscribe(
         &alice,
+        &server.server_did_string,
         Scope::Channel {
             slug: "#big".to_string(),
         },
