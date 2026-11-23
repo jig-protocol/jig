@@ -96,7 +96,10 @@ pub struct ChannelNotice {
     pub message: String,
 }
 
-type NoticeSender = mpsc::UnboundedSender<ChannelNotice>;
+/// Where a subscription is sent its notices, each with the id of the
+/// subscription it is for: a connection that replaced its subscription tells
+/// a stale notice by the id.
+type NoticeSender = mpsc::UnboundedSender<(u64, ChannelNotice)>;
 
 type Delivery = (StoredBlock, StoredReceipt);
 type DeliverySender = mpsc::UnboundedSender<Delivery>;
@@ -194,7 +197,7 @@ impl Fanout {
         let notices = self.notices.read().expect("notices poisoned");
         for id in ids {
             if let Some(tx) = notices.get(&id) {
-                let _ = tx.send(notice.clone());
+                let _ = tx.send((id, notice.clone()));
             }
         }
     }

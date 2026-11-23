@@ -472,8 +472,14 @@ async fn handle_socket(
 
                 // --- A notice about the subscribed channel → Client, as the
                 // existing error frame (a channel stopped for an upgrade) ---
-                Some(notice) = notice_rx.recv() => {
+                Some((sub_id, notice)) = notice_rx.recv() => {
                     let notice: jig_pipeline::fanout::ChannelNotice = notice;
+                    // Only for the subscription this connection holds now: one
+                    // queued for a subscription it has since replaced would
+                    // end the new one.
+                    if session.sub_id != Some(sub_id) {
+                        continue;
+                    }
                     if send_error(
                         &mut socket,
                         Some(notice.status),
@@ -574,7 +580,7 @@ struct ConnState {
     sub_id: Option<u64>,
     /// Where fanout sends this connection's subscription the notices about
     /// its channel ([`jig_pipeline::fanout::Fanout::watch_notices`]).
-    notice_tx: Option<mpsc::UnboundedSender<jig_pipeline::fanout::ChannelNotice>>,
+    notice_tx: Option<mpsc::UnboundedSender<(u64, jig_pipeline::fanout::ChannelNotice)>>,
     did: Option<jig_core::did::Did>,
     handshaken: bool,
     close: Option<(u16, &'static str)>,
@@ -1006,6 +1012,8 @@ async fn handle_client_frame(
                 }
                 Scope::ChannelId { channel_id } => SubscriptionScope::Channel(channel_id),
             };
+            let SubscriptionScope::Channel(sub_key) = &sub_scope;
+            let sub_key = sub_key.clone();
             // A connection holds ONE subscription. A re-Subscribe replaces it,
             // and the old one must actually go: left in the fanout map it
             // would keep delivering its old scope under its old identity for
@@ -1025,6 +1033,11 @@ async fn handle_client_frame(
             session.sub_id = Some(id);
             if let Some(tx) = &session.notice_tx {
                 state.ingest_ctx.fanout.watch_notices(id, tx.clone());
+                // A stop kept between the check above and this registration
+                // was told to no one: tell this subscription now.
+                if let Ok(Some(stop)) = state.ingest_ctx.store.carried_upgrade(&sub_key) {
+                    let _ = tx.send((id, stop.notice()));
+                }
             }
             tracing::debug!(conn_id, sub_id = id, "ws subscription registered");
             Ok(())

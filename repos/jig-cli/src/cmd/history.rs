@@ -64,6 +64,16 @@ pub fn decode_history(blocks: &[DeliveredBlock]) -> Vec<DecodedBlock> {
         .collect()
 }
 
+/// The first critical block of a kind this build does not implement in
+/// `blocks` (JEP-0005 rule 14c): a reader shows nothing at or past it.
+pub fn first_stop(blocks: &[DeliveredBlock]) -> Option<jig_client::open::OpenError> {
+    blocks.iter().find_map(|b| {
+        jig_client::open::open(b)
+            .err()
+            .filter(|e| e.needs_upgrade())
+    })
+}
+
 /// Fetch the last `limit` blocks of a channel, as `who`.
 ///
 /// Signed: the server requires proof of possession on every read, and a
@@ -140,11 +150,7 @@ pub async fn backfill(
             crate::cmd::trust::check_history(who, base_url, channel, &blocks).await?;
             // Nothing at or past a critical block of a kind this build does
             // not implement is shown: the caller stops the channel there.
-            if let Some(e) = blocks.iter().find_map(|b| {
-                jig_client::open::open(b)
-                    .err()
-                    .filter(|e| e.needs_upgrade())
-            }) {
+            if let Some(e) = first_stop(&blocks) {
                 return Err(e.into());
             }
             let deliveries = blocks.iter().map(|b| b.delivery_cid.clone()).collect();

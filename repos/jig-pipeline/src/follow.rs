@@ -2535,7 +2535,7 @@ mod tests {
     async fn watch(
         follower: &IngestContext,
         channel: &str,
-    ) -> tokio::sync::mpsc::UnboundedReceiver<crate::fanout::ChannelNotice> {
+    ) -> tokio::sync::mpsc::UnboundedReceiver<(u64, crate::fanout::ChannelNotice)> {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let id = follower
             .fanout
@@ -2611,7 +2611,7 @@ mod tests {
         );
 
         // Its subscribers are told once, as the existing error frame would.
-        let notice = notices.try_recv().unwrap();
+        let (_, notice) = notices.try_recv().unwrap();
         assert_eq!(notice.code, crate::fanout::CHANNEL_NEEDS_UPGRADE);
         assert_eq!(notice.channel_id, owner.channel);
         assert!(

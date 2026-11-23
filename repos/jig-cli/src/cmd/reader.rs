@@ -197,7 +197,9 @@ impl Reader {
         upgrade::server_stop(&self.slug, e)
     }
 
-    fn stop_at(&self, e: &jig_client::open::OpenError) -> anyhow::Error {
+    /// Stop this channel at the critical block `e` names, keeping the stop
+    /// for the next session, and say so.
+    pub fn stop_at(&self, e: &jig_client::open::OpenError) -> anyhow::Error {
         upgrade::stop_at(&self.stops, &self.server, &self.slug, e)
     }
 

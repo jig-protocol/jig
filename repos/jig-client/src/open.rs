@@ -50,7 +50,8 @@ pub enum OpenError {
     #[error("forged block: the signature is not {claimed}'s")]
     Forged { claimed: String },
     /// The block checks out, but is of a kind this build does not implement
-    /// (JEP-0005 rule 14c). A non-critical one is skipped: it is in the
+    /// (JEP-0005 rule 14c). One delivered without a signature is always
+    /// critical: its `opt-` marker is the author's word only once verified. A non-critical one is skipped: it is in the
     /// channel's chain, and nothing in it is for this reader. A critical one
     /// stops the channel here: reading past it would read the channel wrong.
     #[error(
@@ -114,19 +115,21 @@ pub fn open(d: &DeliveredBlock) -> Result<OpenedBlock, OpenError> {
         .map(|a| a.did.clone())
         .ok_or_else(|| OpenError::Malformed("no author".to_string()))?;
 
-    let unknown_kind = |cid: String| {
+    // `verified` is whether the author's signature held. Without it the
+    // marker is unauthenticated, and only fails closed: critical.
+    let unknown_kind = |cid: String, verified: bool| {
         unknown
             .clone()
             .map(|(kind, critical)| OpenError::UnknownKind {
                 cid,
                 kind,
-                critical,
+                critical: critical || !verified,
                 channel_id: d.ingest.as_ref().map(|r| r.channel_id.clone()),
                 seq: d.ingest.as_ref().map(|r| r.seq),
             })
     };
     let Some(sig_b64) = d.sig_b64.as_deref() else {
-        if let Some(e) = unknown_kind(cid.clone()) {
+        if let Some(e) = unknown_kind(cid.clone(), false) {
             return Err(e);
         }
         return Ok(OpenedBlock {
@@ -151,7 +154,7 @@ pub fn open(d: &DeliveredBlock) -> Result<OpenedBlock, OpenError> {
     let canonical = serde_json::to_vec(&(&manifest_bytes, &code_bytes))
         .map_err(|e| OpenError::Malformed(e.to_string()))?;
     verifying.verify(&canonical, &sig).map_err(|_| forged())?;
-    if let Some(e) = unknown_kind(cid.clone()) {
+    if let Some(e) = unknown_kind(cid.clone(), true) {
         return Err(e);
     }
     Ok(OpenedBlock {
@@ -291,5 +294,10 @@ mod tests {
             .into_bytes();
         renamed.bundle_b64 = STANDARD.encode(serde_json::to_vec(&(&m, &c)).unwrap());
         assert!(matches!(open(&renamed), Err(OpenError::Forged { .. })));
+
+        // Unsigned, a skippable marker is not the author's word: critical.
+        let mut unsigned = delivered_unknown(&id, "opt-reaction", serde_json::json!({}));
+        unsigned.sig_b64 = None;
+        assert!(open(&unsigned).unwrap_err().needs_upgrade());
     }
 }

@@ -14,7 +14,6 @@ use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use jig_client::open::open;
 use jig_client::{Client, DeliveredBlock};
 
 use crate::cmd::blocks_decode::{DecodedBlock, SYSTEM};
@@ -302,11 +301,11 @@ impl<F: Feed> Follower<F> {
             if pages == MAX_CATCH_UP_PAGES {
                 return Ok((blocks, false));
             }
-            let Some(oldest) = blocks.first().and_then(|d| open(d).ok()) else {
+            let Some(oldest) = blocks.first().and_then(crate::cmd::secure::placed_cid) else {
                 // Nothing older, or nothing to page back from.
                 return Ok((blocks, true));
             };
-            let mut older = self.feed.page(MAX_HISTORY_PAGE, Some(&oldest.cid)).await?;
+            let mut older = self.feed.page(MAX_HISTORY_PAGE, Some(&oldest)).await?;
             if older.is_empty() {
                 return Ok((blocks, true));
             }
@@ -360,6 +359,7 @@ mod tests {
 
     use base64::Engine as _;
     use jig_client::blocks::build_text_render;
+    use jig_client::open::open;
     use jig_core::HlcTimestamp;
 
     use super::*;
@@ -644,7 +644,7 @@ mod tests {
     }
 
     /// A block of a kind this build does not implement (JEP-0005 rule 14c),
-    /// delivered as a server older than signed deliveries sends it.
+    /// signed by `id`.
     fn unknown(id: &jig_client::Identity, kind: &str, n: u64) -> DeliveredBlock {
         let mut d = text(id, &format!("u{n}"), 1_747_690_000_000 + n);
         let raw = base64::engine::general_purpose::STANDARD
@@ -654,8 +654,12 @@ mod tests {
         let mut manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
         manifest["kind"] = serde_json::json!(kind);
         let manifest = serde_json::to_vec(&manifest).unwrap();
-        d.bundle_b64 = base64::engine::general_purpose::STANDARD
-            .encode(serde_json::to_vec(&(&manifest, &code)).unwrap());
+        let canonical = serde_json::to_vec(&(&manifest, &code)).unwrap();
+        d.bundle_b64 = base64::engine::general_purpose::STANDARD.encode(&canonical);
+        // Signed: unsigned, an unknown kind's `opt-` marker is not the
+        // author's word, and every unknown kind is critical.
+        d.sig_b64 =
+            Some(base64::engine::general_purpose::STANDARD.encode(id.sign(&canonical).to_bytes()));
         d.delivery_cid = format!("delivery:unknown-{n}");
         d
     }
@@ -719,5 +723,25 @@ mod tests {
             "{ended}"
         );
         assert!(ended.contains("block kind `k` at seq 2"), "{ended}");
+    }
+
+    /// A head, cursor or page bound may be a non-critical block of an unknown
+    /// kind: its CID places it. A critical one, or an unsigned one, does not.
+    #[test]
+    fn a_skippable_unknown_block_is_placed_and_a_critical_one_is_not() {
+        let id = test_identity();
+        let skippable = unknown(&id, "opt-reaction", 1);
+        let cid = match open(&skippable) {
+            Err(jig_client::open::OpenError::UnknownKind { cid, .. }) => cid,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(crate::cmd::secure::placed_cid(&skippable), Some(cid));
+        assert_eq!(
+            crate::cmd::secure::placed_cid(&unknown(&id, "sequencer-set", 2)),
+            None
+        );
+        let mut unsigned = skippable;
+        unsigned.sig_b64 = None;
+        assert_eq!(crate::cmd::secure::placed_cid(&unsigned), None);
     }
 }

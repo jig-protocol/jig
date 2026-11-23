@@ -84,6 +84,10 @@ pub async fn read(ctx: &CliContext, channel: String, limit: usize, json: bool) -
     // something to degrade around.
     let lines = if let Some(secure) = reader.secure() {
         let synced = secure.recent(&channel, limit).await?;
+        // Nothing at or past a critical block of an unknown kind is shown.
+        if let Some(stop) = &synced.stopped {
+            return Err(reader.stop_at(stop));
+        }
         // Awaited, not spawned: this process exits as soon as it has printed.
         for did in &synced.tidy {
             let _ = secure.tidy(&channel, did).await;
@@ -96,6 +100,10 @@ pub async fn read(ctx: &CliContext, channel: String, limit: usize, json: bool) -
     } else {
         let blocks = history::fetch_history(&id, &server_url, &channel, limit).await?;
         crate::cmd::trust::check_history(&id, &server_url, &channel, &blocks).await?;
+        // Nothing at or past a critical block of an unknown kind is shown.
+        if let Some(stop) = history::first_stop(&blocks) {
+            return Err(reader.stop_at(&stop));
+        }
         history::decode_history(&blocks)
     };
     let skip = lines.len().saturating_sub(limit);

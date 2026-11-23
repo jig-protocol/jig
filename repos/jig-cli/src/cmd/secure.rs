@@ -385,7 +385,7 @@ fn continues(chain: &mut ChannelChain, page: &[DeliveredBlock]) -> Result<(), St
         let Some(record) = &d.ingest else {
             return Err(format!("block {} has no sequencer record", d.delivery_cid));
         };
-        let cid = open(d).ok().map(|o| o.cid);
+        let cid = placed_cid(d);
         match chain.accept(record, cid.as_deref()) {
             Ok(Step::Next) => {}
             Ok(Step::Gap { from, to }) => {
@@ -428,7 +428,23 @@ fn sequencers_for(
 /// Where the block `cid` is in `page`, if it is.
 fn position_of(page: &[DeliveredBlock], cid: &str) -> Option<usize> {
     page.iter()
-        .position(|d| open(d).is_ok_and(|o| o.cid == cid))
+        .position(|d| placed_cid(d).is_some_and(|c| c == cid))
+}
+
+/// The CID of a delivered block this reader can place in its channel: one it
+/// opens, or a non-critical block of a kind this build does not implement
+/// (JEP-0005 rule 14c), which is in the chain all the same though nothing in
+/// it is read. A head, a cursor or a page bound may be either.
+pub(crate) fn placed_cid(d: &DeliveredBlock) -> Option<String> {
+    match open(d) {
+        Ok(opened) => Some(opened.cid),
+        Err(jig_client::open::OpenError::UnknownKind {
+            cid,
+            critical: false,
+            ..
+        }) => Some(cid),
+        Err(_) => None,
+    }
 }
 
 /// The reachability record a server keeps for us ([`Secure::kept_record`]).
@@ -1861,6 +1877,17 @@ impl Secure {
         Ok(synced)
     }
 
+    /// The error for `slug` stopped at the critical block `stop`, kept as
+    /// [`crate::cmd::upgrade::stop_at`] keeps a reader's.
+    fn stopped_at(&self, slug: &str, stop: &jig_client::open::OpenError) -> anyhow::Error {
+        crate::cmd::upgrade::stop_at(
+            &jig_client::upgrade_stops::UpgradeStops::default_path(),
+            &self.server,
+            slug,
+            stop,
+        )
+    }
+
     /// Move the head to the newest block of `delivered`, with its record.
     fn move_head(&self, slug: &str, delivered: &[DeliveredBlock]) -> Result<()> {
         // Never past a block this reader stopped at.
@@ -1868,14 +1895,10 @@ impl Secure {
         if let Some((d, newest)) = delivered
             .iter()
             .rev()
-            .find_map(|d| open(d).ok().map(|o| (d, o)))
+            .find_map(|d| placed_cid(d).map(|cid| (d, cid)))
         {
-            self.session.set_head(
-                &self.server,
-                &self.key(slug),
-                &newest.cid,
-                d.ingest.as_ref(),
-            )?;
+            self.session
+                .set_head(&self.server, &self.key(slug), &newest, d.ingest.as_ref())?;
         }
         Ok(())
     }
@@ -1967,11 +1990,13 @@ impl Secure {
                 self.move_head(slug, &page)?;
                 return Ok(Forwarded::Done(replayed));
             }
-            let Some(last) = page.iter().rev().find_map(|d| open(d).ok()) else {
+            // A page of only non-critical blocks of unknown kinds moves the
+            // cursor past them too, or the blocks after them are never reached.
+            let Some(last) = page.iter().rev().find_map(placed_cid) else {
                 return Ok(Forwarded::Done(replayed));
             };
             self.move_head(slug, &page)?;
-            cursor = last.cid;
+            cursor = last;
             if chain.is_none() {
                 chain = self.chain_from_head(slug)?;
             }
@@ -2005,10 +2030,10 @@ impl Secure {
         cursor: &str,
         page: &[DeliveredBlock],
     ) -> Result<Result<Option<ChannelChain>, String>> {
-        let Some(first) = page.first().and_then(|d| open(d).ok()) else {
+        let Some(first) = page.first().and_then(placed_cid) else {
             return Ok(Err("a page's first block does not open".into()));
         };
-        let before = match self.history_page(slug, 1, Page::Before(&first.cid)).await {
+        let before = match self.history_page(slug, 1, Page::Before(&first)).await {
             Ok(before) => before,
             Err(e)
                 if e.downcast_ref::<Refused>()
@@ -2087,11 +2112,11 @@ impl Secure {
                 );
                 return Ok((delivered, false));
             }
-            let Some(oldest) = delivered.first().and_then(|d| open(d).ok()) else {
+            let Some(oldest) = delivered.first().and_then(placed_cid) else {
                 return Ok((delivered, false));
             };
             let mut older = self
-                .history_page(slug, MAX_HISTORY_PAGE, Page::Before(&oldest.cid))
+                .history_page(slug, MAX_HISTORY_PAGE, Page::Before(&oldest))
                 .await?;
             if older.is_empty() {
                 // The head is not in this history: the server dropped it, or
@@ -2152,11 +2177,11 @@ impl Secure {
                 );
                 break;
             }
-            let Some(oldest) = delivered.first().and_then(|d| open(d).ok()) else {
+            let Some(oldest) = delivered.first().and_then(placed_cid) else {
                 break;
             };
             let mut older = self
-                .history_page(slug, MAX_HISTORY_PAGE, Page::Before(&oldest.cid))
+                .history_page(slug, MAX_HISTORY_PAGE, Page::Before(&oldest))
                 .await?;
             more = !older.is_empty();
             older.append(&mut delivered);
@@ -2172,18 +2197,23 @@ impl Secure {
     /// Departed members to tidy come from the sync.
     pub async fn recent(&self, slug: &str, limit: usize) -> Result<Synced> {
         let synced = self.sync(slug).await?;
+        // Stopped at a critical block of an unknown kind: nothing past it is
+        // shown, and the newest window may well be past it.
+        if synced.stopped.is_some() {
+            return Ok(synced);
+        }
         let mut delivered = self
             .history_page(slug, limit.min(MAX_HISTORY_PAGE), Page::Newest)
             .await?;
         while delivered.len() < limit {
-            let Some(oldest) = delivered.first().and_then(|d| open(d).ok()) else {
+            let Some(oldest) = delivered.first().and_then(placed_cid) else {
                 break;
             };
             let mut older = self
                 .history_page(
                     slug,
                     (limit - delivered.len()).min(MAX_HISTORY_PAGE),
-                    Page::Before(&oldest.cid),
+                    Page::Before(&oldest),
                 )
                 .await?;
             if older.is_empty() {
@@ -2341,7 +2371,11 @@ impl Secure {
     ) -> Result<String> {
         let _held = self.hold(slug).await?;
         for attempt in 0..2 {
-            self.sync(slug).await?;
+            // A group this device could not read to its head must not be
+            // committed from: the block it stopped at may change it.
+            if let Some(stop) = self.sync(slug).await?.stopped {
+                return Err(self.stopped_at(slug, &stop));
+            }
             // Still pending after a sync: an earlier commit whose answer never
             // came, and which did not land (had it, its echo would have
             // merged it). It would block this one.
@@ -2384,6 +2418,13 @@ impl Secure {
         if synced.cids.contains(&block.cid()) {
             self.session.confirm(&self.server, &key)?;
             return Ok(block.cid());
+        }
+        // A sync that stopped short says nothing of whether the commit landed
+        // past where it stopped: keep it until one that reads that far.
+        if let Some(stop) = &synced.stopped {
+            return Err(self.stopped_at(slug, stop).context(format!(
+                "{sent:#}; the commit is kept until a sync past the stop shows whether it landed"
+            )));
         }
         // Best effort: a commit still pending is dropped by the next one.
         self.session.abandon(&self.server, &key).ok();

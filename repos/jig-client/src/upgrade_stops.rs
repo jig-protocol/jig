@@ -57,7 +57,7 @@ pub enum UpgradeStopsError {
 #[derive(Debug, Default)]
 pub struct UpgradeStops {
     path: PathBuf,
-    stops: BTreeMap<String, BTreeMap<String, UpgradeStop>>,
+    stops: Stops,
 }
 
 impl UpgradeStops {
@@ -70,25 +70,9 @@ impl UpgradeStops {
 
     /// Load the store at `path`; a missing file is an empty store.
     pub fn load(path: &Path) -> Result<Self, UpgradeStopsError> {
-        let shown = || path.display().to_string();
-        let stops = match std::fs::read(path) {
-            Ok(bytes) => {
-                serde_json::from_slice(&bytes).map_err(|source| UpgradeStopsError::Parse {
-                    path: shown(),
-                    source,
-                })?
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
-            Err(source) => {
-                return Err(UpgradeStopsError::Read {
-                    path: shown(),
-                    source,
-                });
-            }
-        };
         Ok(Self {
             path: path.to_path_buf(),
-            stops,
+            stops: read(path)?,
         })
     }
 
@@ -105,16 +89,19 @@ impl UpgradeStops {
         channel: &str,
         stop: UpgradeStop,
     ) -> Result<(), UpgradeStopsError> {
-        let server = self.stops.entry(server_key(server)).or_default();
-        if server.contains_key(channel) {
-            return Ok(());
-        }
-        server.insert(channel.to_string(), stop);
-        self.save()
+        let key = server_key(server);
+        self.update(|stops| {
+            let server = stops.entry(key).or_default();
+            if server.contains_key(channel) {
+                return ((), false);
+            }
+            server.insert(channel.to_string(), stop);
+            ((), true)
+        })
     }
 
     /// Drop the stop of `channel` on `server` when `implemented` says this
-    /// build implements its kind now. Returns whether one is still in force.
+    /// build implements its kind now. Returns the stop still in force, if any.
     pub fn release_known(
         &mut self,
         server: &str,
@@ -122,22 +109,65 @@ impl UpgradeStops {
         implemented: impl Fn(&str) -> bool,
     ) -> Result<Option<UpgradeStop>, UpgradeStopsError> {
         let key = server_key(server);
-        let Some(stop) = self.stops.get(&key).and_then(|s| s.get(channel)).cloned() else {
-            return Ok(None);
-        };
-        if !implemented(&stop.kind) {
-            return Ok(Some(stop));
-        }
-        if let Some(server) = self.stops.get_mut(&key) {
-            server.remove(channel);
-            if server.is_empty() {
-                self.stops.remove(&key);
+        self.update(|stops| {
+            let Some(stop) = stops.get(&key).and_then(|s| s.get(channel)).cloned() else {
+                return (None, false);
+            };
+            if !implemented(&stop.kind) {
+                return (Some(stop), false);
             }
-        }
-        self.save()?;
-        Ok(None)
+            if let Some(server) = stops.get_mut(&key) {
+                server.remove(channel);
+                if server.is_empty() {
+                    stops.remove(&key);
+                }
+            }
+            (None, true)
+        })
     }
 
+    /// Apply `change` to the store as it is on disk now, holding an exclusive
+    /// lock from the read to the write, and save when it reports a change.
+    /// Two processes for one device (a `jig chat` beside a `jig tail`) would
+    /// otherwise each write back their own copy, and the later one would
+    /// erase the other's stop.
+    fn update<T>(
+        &mut self,
+        change: impl FnOnce(&mut Stops) -> (T, bool),
+    ) -> Result<T, UpgradeStopsError> {
+        let _lock = self.lock()?;
+        self.stops = read(&self.path)?;
+        let (out, changed) = change(&mut self.stops);
+        if changed {
+            self.save()?;
+        }
+        Ok(out)
+    }
+
+    /// The store's lock file, locked exclusively until the returned handle
+    /// drops. Blocks while another process holds it.
+    fn lock(&self) -> Result<std::fs::File, UpgradeStopsError> {
+        let path = self.path.with_extension("json.lock");
+        let fail = |source| UpgradeStopsError::Write {
+            path: path.display().to_string(),
+            source,
+        };
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(fail)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(fail)?;
+        file.lock().map_err(fail)?;
+        Ok(file)
+    }
+
+    /// Write the store through a temporary file and a rename, so a crash
+    /// leaves the old store or the new one, never half of either. Called only
+    /// under [`Self::lock`], so no two writers share the temporary file.
     fn save(&self) -> Result<(), UpgradeStopsError> {
         let fail = |source| UpgradeStopsError::Write {
             path: self.path.display().to_string(),
@@ -147,10 +177,27 @@ impl UpgradeStops {
             std::fs::create_dir_all(dir).map_err(fail)?;
         }
         let bytes = serde_json::to_vec_pretty(&self.stops).expect("a map of strings serializes");
-        // Written whole, then moved into place: a crash leaves the old file.
         let tmp = self.path.with_extension("json.tmp");
         std::fs::write(&tmp, bytes).map_err(fail)?;
         std::fs::rename(&tmp, &self.path).map_err(fail)
+    }
+}
+
+type Stops = BTreeMap<String, BTreeMap<String, UpgradeStop>>;
+
+/// The store at `path`; a missing file is an empty one.
+fn read(path: &Path) -> Result<Stops, UpgradeStopsError> {
+    let shown = || path.display().to_string();
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|source| UpgradeStopsError::Parse {
+            path: shown(),
+            source,
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(source) => Err(UpgradeStopsError::Read {
+            path: shown(),
+            source,
+        }),
     }
 }
 
@@ -210,6 +257,21 @@ mod tests {
                 .get("wss://a", "#x")
                 .is_none()
         );
+    }
+
+    /// Two stores loaded from one file each record a stop: neither erases
+    /// the other's, as a stale snapshot written back would.
+    #[test]
+    fn two_stores_on_one_file_keep_each_others_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stops.json");
+        let mut a = UpgradeStops::load(&path).unwrap();
+        let mut b = UpgradeStops::load(&path).unwrap();
+        a.record("wss://a", "#x", stop("sequencer-set")).unwrap();
+        b.record("wss://a", "#y", stop("key-link")).unwrap();
+        let both = UpgradeStops::load(&path).unwrap();
+        assert!(both.get("wss://a", "#x").is_some());
+        assert!(both.get("wss://a", "#y").is_some());
     }
 
     #[test]
