@@ -1115,13 +1115,17 @@ impl Secure {
         if !self.publish_reachability {
             return Ok(());
         }
-        let server_did = self.server_did().await?;
-        let here = (server_did.clone(), self.base.clone());
         let kept = match self.kept_record().await? {
             Kept::Unsupported => return Ok(()),
             Kept::None => None,
             Kept::Record(r) => Some(r),
         };
+        // After the read, not before: a WRONG_AUDIENCE retry moves the pin
+        // along the server's key link, and the record is held to the DID that
+        // answered it. Against the DID before the move, a record listing the
+        // server would read as a withdrawal.
+        let server_did = self.server_did().await?;
+        let here = (server_did.clone(), self.base.clone());
         let path = self.server_states_path();
         let mine = ServerStates::load(&path)?
             .get(&server_did)

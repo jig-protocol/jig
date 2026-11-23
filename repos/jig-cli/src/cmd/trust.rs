@@ -751,22 +751,9 @@ async fn check_manifest_in(
 /// chain held to the pin.
 pub async fn show(who: &jig_client::Identity, server: &str) -> Result<()> {
     use jig_client::manifest::{LOG_SLUG, read_entry};
-    let pins = Pins::load(&Pins::default_path())?;
-    let Some(pin) = pins.server(server).cloned() else {
+    if Pins::load(&Pins::default_path())?.server(server).is_none() {
         println!("{server}: nothing pinned yet. Connect once to pin it.");
         return Ok(());
-    };
-    println!("server:    {server}");
-    println!("DID:       {}", pin.server_did);
-    println!(
-        "suites:    {}",
-        pin.suites.iter().cloned().collect::<Vec<_>>().join(", ")
-    );
-    if let Some(m) = &pin.manifest {
-        println!(
-            "manifest:  {} (entry {} of its log, last checked)",
-            m.cid, m.seq
-        );
     }
     #[derive(serde::Deserialize)]
     struct Entry {
@@ -782,6 +769,24 @@ pub async fn show(who: &jig_client::Identity, server: &str) -> Result<()> {
     let client = http(server, std::time::Duration::from_secs(10)).await?;
     let resp =
         crate::cmd::request_proof::send(server, who, "GET", &url, b"", || client.get(&url)).await?;
+    // Read only now: proving the request's audience handshakes, which can
+    // move the pin along a key link, and everything below is held to it.
+    let pin = Pins::load(&Pins::default_path())?
+        .server(server)
+        .cloned()
+        .with_context(|| format!("{server} is no longer pinned"))?;
+    println!("server:    {server}");
+    println!("DID:       {}", pin.server_did);
+    println!(
+        "suites:    {}",
+        pin.suites.iter().cloned().collect::<Vec<_>>().join(", ")
+    );
+    if let Some(m) = &pin.manifest {
+        println!(
+            "manifest:  {} (entry {} of its log, last checked)",
+            m.cid, m.seq
+        );
+    }
     anyhow::ensure!(
         resp.status().is_success(),
         "GET {url} returned {}",

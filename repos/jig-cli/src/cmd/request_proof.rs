@@ -36,6 +36,16 @@ pub enum Trust {
 /// [`jig_client::secure::server_key`]: one handshake per server per process.
 static AUDIENCES: Mutex<BTreeMap<(Trust, String), String>> = Mutex::new(BTreeMap::new());
 
+/// How long proving a server's audience may take: the handshake, connection
+/// and WebSocket upgrade included. A server that accepts the connection and
+/// never answers must not hang a command that only meant to make a request.
+const DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The most of a 401's body read to tell a `WRONG_AUDIENCE` refusal apart. A
+/// refusal is a short JSON object; a longer body is no refusal this module
+/// acts on, and is reported as an error rather than read as one.
+const REFUSAL_BYTES: usize = 16 * 1024;
+
 fn key(server: &str) -> String {
     jig_client::secure::server_key(&crate::cmd::channel::base_http_url(server))
 }
@@ -43,6 +53,16 @@ fn key(server: &str) -> String {
 /// The DID to address request proofs to `server` to: the one its signed
 /// welcome proved, as `trust` says.
 pub async fn audience(server: &str, identity: &Identity, trust: Trust) -> Result<String> {
+    audience_within(server, identity, trust, DISCOVERY_TIMEOUT).await
+}
+
+/// [`audience`], given up on after `within`.
+async fn audience_within(
+    server: &str,
+    identity: &Identity,
+    trust: Trust,
+    within: std::time::Duration,
+) -> Result<String> {
     if let Some(did) = AUDIENCES
         .lock()
         .expect("audiences")
@@ -53,19 +73,28 @@ pub async fn audience(server: &str, identity: &Identity, trust: Trust) -> Result
     // Boxed: pinning checks the server's manifest log, which can fill a gap
     // with a signed read. That read is handed this welcome's audience, so it
     // never comes back here, but the futures still name each other.
-    let client = match trust {
-        Trust::Pinned => {
-            Box::pin(crate::cmd::secure::connect_pinned(
-                server,
-                identity.duplicate(),
-            ))
-            .await
+    let connect = async {
+        match trust {
+            Trust::Pinned => {
+                Box::pin(crate::cmd::secure::connect_pinned(
+                    server,
+                    identity.duplicate(),
+                ))
+                .await
+            }
+            Trust::Unpinned => {
+                crate::cmd::secure::connect_unpinned(server, identity.duplicate()).await
+            }
         }
-        Trust::Unpinned => crate::cmd::secure::connect_unpinned(server, identity.duplicate()).await,
-    }
-    // The handshake comes before the request, so its failure names the
-    // server, as the request's would have.
-    .with_context(|| format!("handshaking with {server} to sign a request to it"))?;
+    };
+    // Bounded as a whole, and before anything is signed. The handshake comes
+    // before the request, so its failure names the server, as the request's
+    // would have.
+    let client = tokio::time::timeout(within, connect)
+        .await
+        .map_err(|_| anyhow::anyhow!("{server} did not complete a handshake within {:?}", within))
+        .and_then(|r| r)
+        .with_context(|| format!("handshaking with {server} to sign a request to it"))?;
     let welcome = client
         .welcome()
         .with_context(|| format!("{server} sent no welcome"))?;
@@ -162,11 +191,13 @@ async fn wrong_audience(
     }
     let status = resp.status();
     let headers = resp.headers().clone();
-    let bytes = resp.bytes().await.context("reading a refusal")?;
+    let bytes = jig_client::limits::read_capped(resp, REFUSAL_BYTES)
+        .await
+        .context("reading a refusal")?;
     let code = serde_json::from_slice::<serde_json::Value>(&bytes)
         .ok()
         .and_then(|v| v["code"].as_str().map(str::to_string));
-    let mut rebuilt = http::Response::new(bytes.to_vec());
+    let mut rebuilt = http::Response::new(bytes);
     *rebuilt.status_mut() = status;
     *rebuilt.headers_mut() = headers;
     let rebuilt = reqwest::Response::from(rebuilt);
@@ -218,6 +249,40 @@ mod tests {
                 .cloned(),
             Some(server.server_did_string.clone()),
             "the audience the welcome proved replaces the stale one"
+        );
+    }
+
+    /// A 401 too long to be a refusal is an error, never read as one.
+    #[tokio::test]
+    async fn an_oversized_refusal_is_an_error() {
+        let mut r = http::Response::new("x".repeat(REFUSAL_BYTES + 1));
+        *r.status_mut() = reqwest::StatusCode::UNAUTHORIZED;
+        let err = wrong_audience(reqwest::Response::from(r))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("reading a refusal"), "{err:#}");
+    }
+
+    /// A server that accepts the connection and never answers is given up on
+    /// before anything is signed.
+    #[tokio::test]
+    async fn a_server_that_never_answers_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        // Accept, and hold the socket open without a word.
+        let _held = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+            drop(socket);
+        });
+        let who = integration_tests::harness::test_identity();
+        let within = std::time::Duration::from_millis(300);
+        let err = audience_within(&url, &who, Trust::Unpinned, within)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("did not complete a handshake"),
+            "{err:#}"
         );
     }
 

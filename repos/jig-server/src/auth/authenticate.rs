@@ -221,10 +221,12 @@ pub fn proof_from_headers(headers: &axum::http::HeaderMap) -> Option<AuthProof> 
         // its key, so a re-cased spelling is read as its key (see
         // `authenticate`).
         did: Did::canonicalize(get(headers::DID)?).ok()?,
-        audience: match headers.get(headers::AUDIENCE) {
-            None => None,
-            Some(v) => Some(v.to_str().ok()?.to_string()),
-        },
+        // Absent is v1. Present but not text is still an audience, and not
+        // this server's: refused as WRONG_AUDIENCE, not read as no proof.
+        // Lossy decoding cannot turn it into a DID, which is ASCII.
+        audience: headers
+            .get(headers::AUDIENCE)
+            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned()),
         hlc_wall_ms: get(headers::HLC_WALL_MS)?.parse().ok()?,
         hlc_logical: get(headers::HLC_LOGICAL)?.parse().ok()?,
         nonce: get(headers::NONCE)?.to_string(),
@@ -771,6 +773,26 @@ mod tests {
         let mut guard = ReplayGuard::new(30_000, 128);
         assert_eq!(
             authenticate(&proof, &server(), "GET", "/x", b"", 5_000, &mut guard),
+            Err(GateOutcome::AuthWrongAudience)
+        );
+    }
+
+    /// An audience header that is present but not text is still an audience,
+    /// refused as another server's, not read as no proof at all.
+    #[test]
+    fn an_unreadable_audience_is_a_wrong_audience() {
+        let (signing, did) = identity(1);
+        let proof = proof_for(&signing, &did, "GET", "/x", b"", 5_000, "n1");
+        let mut h = headers_for(&proof);
+        h.insert(
+            headers::AUDIENCE,
+            axum::http::HeaderValue::from_bytes(b"did:jig:z\xff").unwrap(),
+        );
+        let parsed = proof_from_headers(&h).expect("the proof is still read");
+        assert!(parsed.audience.is_some());
+        let mut guard = ReplayGuard::new(30_000, 128);
+        assert_eq!(
+            authenticate(&parsed, &server(), "GET", "/x", b"", 5_000, &mut guard),
             Err(GateOutcome::AuthWrongAudience)
         );
     }
