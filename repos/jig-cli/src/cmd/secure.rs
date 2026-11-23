@@ -431,6 +431,18 @@ fn position_of(page: &[DeliveredBlock], cid: &str) -> Option<usize> {
         .position(|d| placed_cid(d).is_some_and(|c| c == cid))
 }
 
+/// Keep of `window` (oldest first) only what a sync read up to `head`, the
+/// block it left its head at: a block past it landed since, and is the next
+/// sync's to read in order, through the stop rule. A window with no head in
+/// it lies wholly past it (more blocks landed since than it holds), and no
+/// head means the sync placed nothing; either way nothing is shown.
+fn bound_to_head(window: &mut Vec<DeliveredBlock>, head: Option<&str>) {
+    match head.and_then(|head| position_of(window, head)) {
+        Some(at) => window.truncate(at + 1),
+        None => window.clear(),
+    }
+}
+
 /// The CID of a delivered block this reader can place in its channel: one it
 /// opens, or a non-critical block of a kind this build does not implement
 /// (JEP-0005 rule 14c), which is in the chain all the same though nothing in
@@ -2225,14 +2237,7 @@ impl Secure {
             older.append(&mut delivered);
             delivered = older;
         }
-        // Only what the sync read is shown. A window entirely past the head
-        // (more blocks landed since than it holds) shows nothing.
-        if let Some(head) = &head {
-            match position_of(&delivered, head) {
-                Some(at) => delivered.truncate(at + 1),
-                None => delivered.clear(),
-            }
-        }
+        bound_to_head(&mut delivered, head.as_deref());
         let shown = self.replay(slug, &delivered);
         Ok(Synced {
             tidy: synced.tidy,
@@ -2627,6 +2632,54 @@ mod tests {
         sequencers_for, settle_local_adds, shadow_note, split_unchecked, walk_release_log,
     };
     use std::cell::RefCell;
+
+    /// Signed text blocks, as a history window delivers them, oldest first.
+    fn window(n: usize) -> (Vec<jig_client::DeliveredBlock>, Vec<String>) {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let id = jig_client::Identity::generate_for_tests(&dir.keep());
+        let blocks: Vec<_> = (0..n)
+            .map(|i| {
+                let hlc = jig_core::HlcTimestamp::now_wall(id.did().clone());
+                let block = jig_client::blocks::build_text_render(&id, "#c", &format!("m{i}"), hlc);
+                jig_client::DeliveredBlock {
+                    bundle_b64: base64::engine::general_purpose::STANDARD
+                        .encode(block.canonical_bytes()),
+                    sig_b64: Some(
+                        base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
+                    ),
+                    receipts: vec![],
+                    delivery_cid: format!("delivery:{i}"),
+                    ingest: None,
+                }
+            })
+            .collect();
+        let cids = blocks
+            .iter()
+            .map(|d| super::placed_cid(d).unwrap())
+            .collect();
+        (blocks, cids)
+    }
+
+    /// `recent` shows only what the sync read: up to its head, and nothing
+    /// when the sync placed nothing (no head) or the window lies past it.
+    #[test]
+    fn the_shown_window_ends_at_the_synced_head() {
+        let (blocks, cids) = window(4);
+        let mut w = blocks.clone();
+        super::bound_to_head(&mut w, Some(&cids[1]));
+        assert_eq!(w.len(), 2, "cut after the head");
+
+        // The sync placed nothing, then blocks landed: none of them is shown.
+        let mut w = blocks.clone();
+        super::bound_to_head(&mut w, None);
+        assert!(w.is_empty(), "no head: nothing the sync read");
+
+        // A window wholly past the head.
+        let mut w = blocks[2..].to_vec();
+        super::bound_to_head(&mut w, Some(&cids[0]));
+        assert!(w.is_empty(), "head not in the window");
+    }
 
     fn refusal(status: u16, code: &str) -> anyhow::Error {
         Refused {
