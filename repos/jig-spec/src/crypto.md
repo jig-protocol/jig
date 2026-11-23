@@ -2,8 +2,8 @@
 
 > **Encryption is per channel since v0.2.** This chapter's signature, hashing and key
 > management sections describe the protocol. Confidentiality is specified in
-> [Encryption](encryption.md): channels created under `mls` are end-to-end encrypted;
-> others are signed, not encrypted. Keys are sealed at rest (see Storage below), and
+> [Encryption](encryption.md): every channel is end-to-end encrypted under `mls` except a
+> `public` one, which is signed, not encrypted. Keys are sealed at rest (see Storage below), and
 > rotation and revocation are not yet implemented; those sections are marked.
 
 **Audience:** This chapter is primarily for **protocol implementers** and **developers building on Jig**. If you're an **end user** or **server operator**, you don't need to understand the cryptographic details—just know that Jig uses modern, audited crypto that's the same stuff Signal, SSH, and WireGuard use.

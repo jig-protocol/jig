@@ -155,8 +155,10 @@ server holds no group secret (`jig_mls::delivery` tracks public state only).
 `integration-tests/tests/h12_encrypted_channels.rs` searches every file the server wrote
 after a conversation and finds none of it. A restricted channel is always `mls`; ingest
 refuses a plaintext one, and one created plaintext before that rule is frozen
-(`CHANNEL_FROZEN` on new content) with its history still readable to the operator. Open
-channels created without a suite remain plaintext, and encrypted channels do not federate.
+(`CHANNEL_FROZEN` on new content) with its history still readable to the operator. Only a
+`public` channel is plaintext (JEP-0014 tiers). A `shared` channel crosses servers as
+ciphertext under a share, and the follower checks each commit against its public copy of the
+group (JEP-0005 rule 19); `private` and `server` channels stay on their server.
 
 ### OP-06: dropping, reordering, delaying, replaying, selective censorship
 

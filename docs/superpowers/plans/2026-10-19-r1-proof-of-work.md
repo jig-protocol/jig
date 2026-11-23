@@ -2,6 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Status (2026-11-23).** The checkboxes below were not kept up to date. Merged: the puzzle,
+> nameserver registration, the client's solve, the registration pool and server admission on
+> the same puzzle (#248, #264, #266, #272), `h14_registration_pow`, and capacity pools at
+> servers (#318, #451, #473). This plan's "admission on by default" is superseded by D26 in
+> [`ROADMAP.md`](../../ROADMAP.md): admission proof-of-work stays off by default. The text
+> below is the plan as written.
+
 **Goal:** registration under a suffix can be opened to strangers without letting one party take
 the namespace. That needs three things:
 - every binding request at a nameserver carries proof-of-work that anyone can solve and verify;
@@ -573,4 +580,5 @@ before the `jig` entry's `registration` changes to `"open"`.
 - `h14_registration_pow` passes in CI.
 - `@jig` can be switched to `open` with every box above checked.
 - No nameserver binding endpoint accepts a request without valid, signed-effort proof-of-work.
-- Server admission is on by default and free when idle (D26), on the same puzzle.
+- Server admission is on by default and free when idle (D26), on the same puzzle. *Superseded
+  by D26 as settled: admission stays off by default; it runs on the same puzzle when on.*

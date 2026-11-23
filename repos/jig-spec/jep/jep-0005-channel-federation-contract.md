@@ -115,6 +115,12 @@ Non-goals for v0.2:
    `manifest.cid` are CIDs as rule 0 states. `creation_block` and `ingest_head` are byte
    strings carrying the block and the record as they travel, and the receiver checks that
    the block's CID is `channel_id`.
+
+   *Note (D37, #375):* when the owner's key has rotated since the creation block named it,
+   the owner sends its key-link chain, from the DID the creation block names to the offer's
+   signer, in its own peer frame beside the `contract-offer`, not inside the offer. A server
+   MUST ignore a peer frame kind it does not know, so this frame is additive; a receiver
+   that does not verify the chain refuses the offer as it does today.
 7a. A grant is one of:
     - `read`: the follower relays only protocol traffic (MLS self-updates, self-leave) and
       no content;
@@ -192,6 +198,9 @@ Non-goals for v0.2:
 
 11a. The owner moves the sequencer with a `sequencer-set` block. In v0.2 only
      the `owner` role holds that right.
+     - *Note (D38):* a `v0.2.0` node does not implement this rule. It MUST fail closed on a
+       channel whose chain holds a `sequencer-set`, rather than accept records from either
+       sequencer. The expected-sequencer rule arrives in v0.2.x.
      - The new sequencer MUST have accepted the contract before its first record.
      - The record for the `sequencer-set` block itself MUST be signed by the new
        sequencer, with `seq` = cited head + 1 and `prev` = the cited head's hash, whether

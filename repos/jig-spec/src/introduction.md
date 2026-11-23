@@ -6,9 +6,9 @@
 
 Welcome to the Jig Protocol spec!
 
-> **Status.** Messages are always signed. End-to-end encryption (MLS) is per channel: DMs
-> and restricted channels are always encrypted, and an open channel is encrypted if created
-> `--encrypted`; every other open channel is plaintext to its server. See
+> **Status.** Messages are always signed. End-to-end encryption (MLS) is per channel, and
+> every channel and DM is encrypted except a `public` channel, which is plaintext to its
+> server ([JEP-0014](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0014-channel-tiers.md) tiers). See
 > [Encryption](encryption.md). Chapters describing unbuilt features say so in a banner. v0.x makes **no compatibility guarantee**; see
 > [Versioning](versioning.md). Server operators are treated as untrusted; see the
 > [Threat Register](threat-register.md).
@@ -29,7 +29,7 @@ Messages aren't just text—they can contain **blocks** (WebAssembly modules) th
 
 ### It's Zero-Trust
 
-You sure _seem_ friendly, but... we're not going to take your word for it. We assume networks are hostile and metadata leaks. Every operation requires cryptographic proof. Capabilities are explicitly granted, never assumed. Encryption is on by default *(a goal: today DMs and restricted channels are always encrypted, and open channels only when created encrypted)*. Fail closed, not open.
+You sure _seem_ friendly, but... we're not going to take your word for it. We assume networks are hostile and metadata leaks. Every operation requires cryptographic proof. Capabilities are explicitly granted, never assumed. Encryption is on by default *(today every channel and DM is end-to-end encrypted except a `public` channel, which its creator chooses explicitly; see the status note above)*. Fail closed, not open.
 
 ### It's Designed to Scale
 

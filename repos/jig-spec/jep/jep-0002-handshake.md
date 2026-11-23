@@ -241,7 +241,14 @@ v0.1 scope (roadmap P1): version, capabilities and suite (`none`) in `jig-server
 suites follow in v0.2. *(Done in v0.2: the welcome advertises `none` and `mls`, and the CLI
 pins the server's DID and advertised suites; reputation is still `null`.)*
 
-v0.2 scope (D11): rules 1–17, except the optional handshake-transcript channel in rule 12.
+`v0.2.0` scope (D11, D35): rules 1–17, except these, which come in v0.2.x with the federation
+contract (JEP-0005):
+- the `sequencer-set` part of rule 9: a `v0.2.0` node fails closed on a channel whose sequencer
+  has moved (D38);
+- rule 10, `seen` and head gossip;
+- rule 11, `ends` on a `member-remove`;
+- the optional handshake-transcript channel in rule 12.
+
 Reputation stays `null`.
 
 # Open questions
