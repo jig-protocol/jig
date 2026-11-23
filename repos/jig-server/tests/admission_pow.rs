@@ -360,3 +360,33 @@ async fn the_welcome_states_the_effort_that_admits() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["proven"], true);
 }
+
+/// TM-01: the age that makes an aged member runs from this server's clock
+/// when it recorded the proof, never from a time the subject sends. A proof
+/// that also claims to be old is dated now, or not recorded at all.
+#[tokio::test]
+async fn an_admission_proof_is_dated_by_this_server_whatever_it_claims() {
+    let server = pow_server(&[]);
+    let alice = Identity::new(1);
+    let did = alice.did().to_did_jig_string();
+
+    let proof = PowAdmissionProof::solve(&alice.as_client(), &server.server_did(), effort());
+    let mut body = proof_json(&proof);
+    for (field, old) in [("proven_at", 0), ("ts", 0), ("issued_at", 1)] {
+        body[field] = old.into();
+    }
+    let before = chrono::Utc::now().timestamp();
+    let (status, reply) = server.post_json("/api/v1/admission", &body).await;
+    let after = chrono::Utc::now().timestamp();
+
+    let at = server.store().admission_proven_at(&did).unwrap();
+    if status == StatusCode::OK {
+        let at = at.expect("an accepted proof is recorded");
+        assert!(
+            (before..=after).contains(&at),
+            "{before} <= {at} <= {after}: {reply}"
+        );
+    } else {
+        assert_eq!(at, None, "a refused proof is not recorded: {reply}");
+    }
+}
