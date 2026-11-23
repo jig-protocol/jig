@@ -14,8 +14,6 @@
 //! `jig-request-auth-v2`: an older one would hash the request without the
 //! audience, and this client never signs the older version.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use base64::Engine as _;
 use jig_core::Did;
 use jig_core::request_auth::{VERSION, canonical_request_hash, headers};
@@ -23,27 +21,27 @@ use jig_pipeline::handshake::VerifiedWelcome;
 
 use crate::identity::Identity;
 
-/// Nonces need only be UNIQUE among one DID's requests inside the server's
-/// acceptance window, not unpredictable — the signature already provides
-/// unforgeability, and the server records nonces per verified DID. A process
-/// counter does that without a `rand` dependency, which `jig-client`
-/// deliberately does not carry; the process id keeps two processes signing as
-/// the same identity (a `jig chat` beside a `jig history`) from colliding in
-/// the same millisecond.
-///
-/// One counter for every proof this process signs — REST reads and WSS
-/// subscribes alike — so the two transports cannot hand the server the same
-/// nonce in the same millisecond.
-static NONCE_SEQ: AtomicU64 = AtomicU64::new(0);
+/// The bytes of randomness in a request-proof nonce.
+const NONCE_BYTES: usize = 16;
 
-/// A nonce no other proof from this process, or from another process on this
-/// host, will repeat: wall-clock millisecond, process id, sequence number.
-pub(crate) fn fresh_nonce(hlc_wall_ms: u64) -> String {
-    format!(
-        "{hlc_wall_ms}-{}-{}",
-        std::process::id(),
-        NONCE_SEQ.fetch_add(1, Ordering::Relaxed)
-    )
+/// A nonce for one request proof: 16 bytes from the OS CSPRNG, as 32 lowercase
+/// hex characters.
+///
+/// A nonce need only be unique among one DID's proofs inside the server's
+/// acceptance window, not unpredictable: the signature covers it, and the
+/// server records nonces per DID. It must be unique across every process and
+/// host signing as that DID, though, which a clock, process id or counter does
+/// not give: two containers sharing a key can agree on all three. 128 random
+/// bits do, and depend on nothing but the source `jig_core` already uses for
+/// handshake nonces, so this crate still carries no `rand`. Hex keeps the
+/// nonce header-safe and well inside the server's
+/// [`jig_core::request_auth::MAX_NONCE_LEN`].
+///
+/// REST proofs and WebSocket subscribe proofs both take theirs from here.
+pub(crate) fn fresh_nonce() -> String {
+    let mut buf = [0u8; NONCE_BYTES];
+    jig_core::crypto::ed25519::fill_random(&mut buf);
+    hex::encode(buf)
 }
 
 /// A server this client will not sign a request proof for.
@@ -125,7 +123,7 @@ impl ReadProof {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let nonce = fresh_nonce(hlc_wall_ms);
+        let nonce = fresh_nonce();
         let did = identity.did_string();
         let hash =
             canonical_request_hash(audience, &did, method, path, body, hlc_wall_ms, 0, &nonce);
@@ -214,15 +212,25 @@ mod tests {
         assert_ne!(a.nonce, b.nonce);
     }
 
-    /// Two processes on one host signing in the same millisecond must not
-    /// mint the same nonce, so the process id is part of it.
+    /// Nonces are unique across many calls, with no clock or process state
+    /// in them: 32 lowercase hex characters, header-safe and within the
+    /// server's bound.
     #[test]
-    fn a_nonce_carries_the_process_id() {
-        let nonce = fresh_nonce(1_000);
-        assert!(
-            nonce.starts_with(&format!("1000-{}-", std::process::id())),
-            "{nonce}"
-        );
+    fn nonces_are_random_hex_within_the_bound() {
+        let nonces: std::collections::HashSet<String> =
+            (0..10_000).map(|_| fresh_nonce()).collect();
+        assert_eq!(nonces.len(), 10_000, "every nonce is distinct");
+        for nonce in &nonces {
+            assert_eq!(nonce.len(), 2 * NONCE_BYTES);
+            assert!(nonce.len() <= jig_core::request_auth::MAX_NONCE_LEN);
+            assert!(
+                nonce
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "{nonce}"
+            );
+            assert!(nonce.parse::<reqwest::header::HeaderValue>().is_ok());
+        }
     }
 
     #[test]

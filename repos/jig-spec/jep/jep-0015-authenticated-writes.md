@@ -273,6 +273,8 @@ within the freshness window.
     tells the user to upgrade the server, and never falls back to `v1`.
 25. **What a server verifies.** A server MUST:
     - refuse a proof without an audience with `PROOF_VERSION_UNSUPPORTED`;
+    - refuse a proof whose nonce is longer than 64 bytes, as admission and PoW nonces are
+      bounded (JEP-0008), with `INVALID_SIG`, before verifying the signature, and not record it;
     - refuse a proof whose audience is not its current DID, in canonical form, with
       `WRONG_AUDIENCE`. A DID the server signed as before a key link (JEP-0012) is not its
       audience: the key may no longer be the server's alone;
