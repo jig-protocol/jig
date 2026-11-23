@@ -162,7 +162,7 @@ The manifest is a JSON file describing the block. Here's what's in it:
 - **`execution_timeout_ms`**: Wall-clock limit. Even if fuel remains, execution stops after 250ms (prevents blocks from sleeping forever).
 - **`deterministic`**: If true, re-running the block with the same inputs MUST produce identical outputs (required for receipt verification).
 
-**For implementers:** Enforce these limits strictly. If a block exceeds fuel, emit a v0.3 receipt with an `incomplete` outcome and reason `fuel-exhausted` (JEP-0006).
+**For implementers:** Enforce these limits strictly. A server that runs a block before it lands MUST refuse one whose run is `incomplete`, such as one that exceeds fuel (JEP-0006). Only a run after landing can still end `incomplete`, in practice a deadline missed under load; that block keeps a v0.3 receipt with an `incomplete` outcome and its reason, such as `deadline-exceeded`.
 
 ### Resources
 

@@ -235,7 +235,7 @@ Here are the specific attacks Jig is designed to resist:
 - Rate limiting (federated peers get quotas)
 - Cryptographic attestations (useful-work proofs can't be forged)
 
-*(partial: servers relay no blocks between them. A follower checks a carried block's author signature and the owner's signed record chain but does not re-execute it; the owner runs its full gate on writes a follower relays. Per-peer quotas cap what a peer streams. There is no peer reputation and no useful-work proof.)*
+*(partial: blocks cross servers only under a share: a follower relays its users' writes to the owner, and the owner streams the channel's blocks to its followers. A follower checks a carried block's author signature and the owner's signed record chain but does not re-execute it; the owner runs its full gate on writes a follower relays. Per-peer quotas cap what a peer streams. There is no peer reputation and no useful-work proof.)*
 
 **Example attack:** Malicious server sends you receipts claiming blocks used 1M fuel when they actually used 100k (billing fraud). You replay locally, detect mismatch, and downgrade that peer's reputation. After repeated violations, you stop federating with them. *(not yet implemented: see above.)*
 
