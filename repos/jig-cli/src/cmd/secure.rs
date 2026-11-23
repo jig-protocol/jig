@@ -2202,6 +2202,9 @@ impl Secure {
         if synced.stopped.is_some() {
             return Ok(synced);
         }
+        // The head the sync read to: blocks past it landed since, and are the
+        // next sync's to read in order, through the stop rule.
+        let head = self.session.head(&self.server, &self.key(slug))?;
         let mut delivered = self
             .history_page(slug, limit.min(MAX_HISTORY_PAGE), Page::Newest)
             .await?;
@@ -2221,6 +2224,14 @@ impl Secure {
             }
             older.append(&mut delivered);
             delivered = older;
+        }
+        // Only what the sync read is shown. A window entirely past the head
+        // (more blocks landed since than it holds) shows nothing.
+        if let Some(head) = &head {
+            match position_of(&delivered, head) {
+                Some(at) => delivered.truncate(at + 1),
+                None => delivered.clear(),
+            }
         }
         let shown = self.replay(slug, &delivered);
         Ok(Synced {

@@ -83,7 +83,12 @@ pub async fn read(ctx: &CliContext, channel: String, limit: usize, json: bool) -
     // Unlike chat and tail, a failed fetch is this command's failure, not
     // something to degrade around.
     let lines = if let Some(secure) = reader.secure() {
-        let synced = secure.recent(&channel, limit).await?;
+        // A server that stopped the channel refuses its history: that is the
+        // stop, not a failed read.
+        let synced = secure
+            .recent(&channel, limit)
+            .await
+            .map_err(|e| crate::cmd::upgrade::server_stop(&channel, e))?;
         // Nothing at or past a critical block of an unknown kind is shown.
         if let Some(stop) = &synced.stopped {
             return Err(reader.stop_at(stop));
