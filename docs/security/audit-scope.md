@@ -67,8 +67,8 @@ Line counts are approximate and include in-file unit tests.
 | 2 | The handshake and the TLS DID binding | The client's main defence against a hostile operator; custom signed transcript bound to the TLS exporter | ~9k lines | Mostly. Slices 5 and 10 of the D11 plan remain |
 | 3 | Key links and chains | A wrong link check hands one server's standing to an attacker's key | ~4k lines | Yes |
 | 4 | Keys at rest | Identity seeds, MLS secrets and the plaintext cache on disk | ~6k lines | Yes |
-| 5 | Proof-of-work and admission | Abuse cost at nameservers and servers; request authentication | ~6k lines | Yes, except capacity pools at servers |
-| 6 | The federation contract and the follower stream | Cross-server trust: a follower carries what the owner sequenced | ~9k lines | No: F2 Tasks 0c and 7 to 11 remain |
+| 5 | Proof-of-work and admission | Abuse cost at nameservers and servers; request authentication | ~6k lines | Partly: write pools at servers shipped (#318, #451); pools for subscriptions and handshakes (JEP-0008 rule 21) and the proof-of-work queue and stamps (R1 Task 5) remain |
+| 6 | The federation contract and the follower stream | Cross-server trust: a follower carries what the owner sequenced | ~9k lines | No: F2 Tasks 9 and 11 and parts of 0c, 7, 8 and 10 remain; F2 ships as v0.2.x |
 | 7 | The Wasm sandbox and receipts | Executes sender-supplied code on the server | ~6k lines | Yes, for the one world that runs (`renderer`) |
 
 ### 3.1 MLS integration and the ciphersuite gate
@@ -139,8 +139,9 @@ reviewed now.
   requests (JEP-0005 rule 21a), hourly limits, the release log, and the operator's interim
   release policy (rule 21b). Still missing: release policies that DIDs sign, held requests and
   approvals, the Welcome mailbox, and one package per device (rule 21b).
-- **Leaving a server (JEP-0017)** is specified. Of its three requests, only R1's server side
-  exists (#440).
+- **Leaving a server (JEP-0017)** is specified. R1, ending custody, is built: the server side
+  in #440, and `jig server custody off|on` with its key rotation in #461. R2, ending local
+  adds, is built in #463 (`jig server local-adds off|on`). R3, erasure, is not built.
 
 ### 3.2 The handshake and the TLS DID binding
 
@@ -344,8 +345,9 @@ Reputation](../../repos/jig-spec/src/identity-and-reputation.md). Rationale:
   finding. Comments on it are welcome.
 - Reputation, tribunals and transparency logs, which are not built (JEP-0009, JEP-0010).
 
-**Must be code-complete first:** capacity pools at servers (R1 Task 5), if the review is to
-cover them.
+Of R1 Task 5, the write pools at servers are built: the pools (#318), the aged-proof cap
+(#451) and guest-only joins for members by aged proof (#473). Pools for subscriptions and
+handshakes (JEP-0008 rule 21) and the proof-of-work queue and stamps are not.
 
 ### 3.6 The federation contract and the follower stream
 
@@ -376,7 +378,8 @@ cover them.
   - `v0_0_2_stream.rs`: the follower stream and its per-peer limits;
   - `v0_0_2_relay.rs`: writes a follower relays to the owner (JEP-0005 rule 15), and their
     per-follower, per-channel limit;
-  - `v0_0_2_federation.rs`: the older relay of open channels to listed peers.
+  - `v0_0_2_federation.rs`: the peer dialer and its configured peers. The older relay of open
+    channels is gone (#439, #453, #470).
 
 **Spec:** [JEP-0005](../../repos/jig-spec/jep/jep-0005-channel-federation-contract.md),
 [Federation](../../repos/jig-spec/src/federation.md). Design:
@@ -386,8 +389,9 @@ Build plan:
 
 **Existing tests:**
 - Unit tests in `follow.rs` and `contracts.rs`, and vectors in `jep/vectors/0005/`.
-- `integration-tests/tests/h3_federation.rs`, which covers the older relay only.
-- No end-to-end test of the contract yet; that is F2 Task 11.
+- In-process tests of two servers in `v0_0_2_contract.rs`, including a post crossing by a share
+  and a shared MLS channel written through its follower and read at its owner.
+- No end-to-end integration test of the contract yet; that is F2 Task 11.
 
 **Out of scope:** federation with an implementation other than jig's. That comes after the MVP.
 

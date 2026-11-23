@@ -23,9 +23,11 @@ Every channel belongs to one of four **tiers**, fixed when it is created:
 | `shared` | as `server`, across servers under a federation contract | yes, MLS |
 | `public` | anyone | **no**: signed, readable by anyone, the server operator included |
 
-Three tiers are encrypted, and the operator cannot read them. `public` is the only plaintext
-tier. Choosing it is explicit, it is labelled wherever it is shown, and no existing channel can
-be switched into it.
+Three tiers are encrypted, and a passive operator cannot read them. In a `server` or `shared`
+channel the server decides who may join, so an operator who controls membership can add a
+member and read what follows; members see the add (Security Considerations). `public` is the
+only plaintext tier. Choosing it is explicit, it is labelled wherever it is shown, and no
+existing channel can be switched into it.
 
 This JEP settles the question D25 left open: whether every channel is encrypted by default
 after the v0.2 tag. It is, except a channel created as `public`. The JEP also specifies:

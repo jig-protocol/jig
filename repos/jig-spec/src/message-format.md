@@ -476,12 +476,12 @@ Messages include a timestamp and a unique ID. Servers use these to prevent repla
 
 ## Encryption
 
-> **v0.2:** content on a channel created under `mls` is encrypted; on any other channel
-> it is signed, not encrypted.
+> **v0.2:** content is encrypted on every channel except a `public` one, where it is
+> signed, not encrypted (JEP-0014 tiers).
 
 Encryption is specified in [Encryption](encryption.md): the suite is
-named on every frame and in the manifest, chosen when the channel is created (`none` unless
-the creator selects `mls`), and fixed for the channel's life. Routing metadata stays
+named on every frame and in the manifest, fixed by the channel's tier when it is created
+(`none` only for `public`), and fixed for the channel's life. Routing metadata stays
 visible to the server.
 
 ## Extensions (Top-Level)

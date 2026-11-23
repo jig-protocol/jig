@@ -2701,7 +2701,7 @@ dependencies = [
 
 [[package]]
 name = "integration-tests"
-version = "0.2.0-alpha.6"
+version = "0.2.0-alpha.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2878,7 +2878,7 @@ dependencies = [
 
 [[package]]
 name = "jig-bridge-core"
-version = "0.2.0-alpha.6"
+version = "0.2.0-alpha.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2890,7 +2890,7 @@ dependencies = [
 
 [[package]]
 name = "jig-bridge-email"
-version = "0.2.0-alpha.6"
+version = "0.2.0-alpha.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2916,7 +2916,7 @@ dependencies = [
 
 [[package]]
 name = "jig-cli"
-version = "0.2.0-alpha.6"
+version = "0.2.0-alpha.7"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2957,7 +2957,7 @@ dependencies = [
 
 [[package]]
 name = "jig-client"
-version = "0.2.0-alpha.6"
+version = "0.2.0-alpha.7"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -2992,7 +2992,7 @@ dependencies = [
 
 [[package]]
 name = "jig-config"
-version = "0.2.0-alpha.6"
+version = "0.2.0-alpha.7"
 dependencies = [
  "dirs 7.0.0",
  "rcgen",
@@ -3005,7 +3005,7 @@ dependencies = [
 
 [[package]]
 name = "jig-core"
-version = "0.2.0-alpha.6"
+version = "0.2.0-alpha.7"
 dependencies = [
  "argon2",
  "base64 0.23.1",
@@ -3032,7 +3032,7 @@ dependencies = [
 
 [[package]]
 name = "jig-mls"
-version = "0.2.0-alpha.6"
+version = "0.2.0-alpha.7"
 dependencies = [
  "ed25519-dalek 3.0.0",
  "jig-core",
@@ -3046,7 +3046,7 @@ dependencies = [
 
 [[package]]
 name = "jig-nameserver"
-version = "0.2.0-alpha.6"
+version = "0.2.0-alpha.7"
 dependencies = [
  "anyhow",
  "axum",
@@ -3088,7 +3088,7 @@ dependencies = [
 
 [[package]]
 name = "jig-pipeline"
-version = "0.2.0-alpha.6"
+version = "0.2.0-alpha.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3118,7 +3118,7 @@ dependencies = [
 
 [[package]]
 name = "jig-runtime"
-version = "0.2.0-alpha.6"
+version = "0.2.0-alpha.7"
 dependencies = [
  "blake3",
  "jig-core",
@@ -3134,7 +3134,7 @@ dependencies = [
 
 [[package]]
 name = "jig-server"
-version = "0.2.0-alpha.6"
+version = "0.2.0-alpha.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6044,7 +6044,7 @@ dependencies = [
 
 [[package]]
 name = "text-block"
-version = "0.2.0-alpha.6"
+version = "0.2.0-alpha.7"
 dependencies = [
  "blake3",
  "postcard",

@@ -76,8 +76,8 @@ The surfaces that call it: `POST /api/v1/blocks`
 ([`v0_0_2_ws.rs`](../repos/jig-server/src/v0_0_2_ws.rs)), channel ops under
 `/api/v1/channels` ([`v0_0_2_admin.rs`](../repos/jig-server/src/v0_0_2_admin.rs); user-signed
 bundles, no operator credential), bridges
-([`v0_0_2_bridges.rs`](../repos/jig-server/src/v0_0_2_bridges.rs)) and blocks relayed by a
-listed peer ([`v0_0_2_federation.rs`](../repos/jig-server/src/v0_0_2_federation.rs)).
+([`v0_0_2_bridges.rs`](../repos/jig-server/src/v0_0_2_bridges.rs)) and writes a follower relays
+to the channel's owner ([`v0_0_2_relay.rs`](../repos/jig-server/src/v0_0_2_relay.rs)).
 
 **The one exception, by design:** a channel another server sequences arrives on the follower
 stream ([`v0_0_2_stream.rs`](../repos/jig-server/src/v0_0_2_stream.rs) →
@@ -149,8 +149,9 @@ the DID's ed25519 key ([`credential.rs`](../repos/jig-mls/src/credential.rs) bin
 ## Federation
 
 - **Peers** are listed in config with the DID each must present, and dialled over the mutual
-  handshake ([`v0_0_2_federation.rs`](../repos/jig-server/src/v0_0_2_federation.rs)). A relayed
-  block runs through `ingest` like a local one.
+  handshake ([`v0_0_2_federation.rs`](../repos/jig-server/src/v0_0_2_federation.rs)). The legacy
+  relay of open channels between listed peers is gone (#439, #453, #470): a channel reaches
+  another server only by a share.
 - **The channel contract** ([JEP-0005](../repos/jig-spec/jep/jep-0005-channel-federation-contract.md)):
   each channel has one sequencing server. Another server asks for a share of it with a signed
   offer, and the owner accepts or refuses
