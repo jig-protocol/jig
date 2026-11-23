@@ -6,9 +6,9 @@
 
 Welcome to the Jig Protocol spec!
 
-> **Status.** Messages are always signed. End-to-end encryption (MLS) is per channel: DMs
-> and restricted channels are always encrypted, and an open channel is encrypted if created
-> `--encrypted`; every other open channel is plaintext to its server. See
+> **Status.** Messages are always signed. End-to-end encryption (MLS) is per channel, and
+> every channel and DM is encrypted except a `public` channel, which is plaintext to its
+> server ([JEP-0014](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0014-channel-tiers.md) tiers). See
 > [Encryption](encryption.md). Chapters describing unbuilt features say so in a banner. v0.x makes **no compatibility guarantee**; see
 > [Versioning](versioning.md). Server operators are treated as untrusted; see the
 > [Threat Register](threat-register.md).

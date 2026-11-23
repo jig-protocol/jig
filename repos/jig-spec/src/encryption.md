@@ -1,9 +1,11 @@
 # Encryption
 
-> **v0.2 implements `mls` for single-server channels.** A channel created under `mls` is
-> one MLS group: its content is end-to-end encrypted and the server stores ciphertext it
-> cannot read. A restricted channel is always `mls`; an open channel is `none` unless its
-> creator chooses `mls`. Encrypted channels do not federate in v0.2. Design record:
+> **v0.2 implements `mls`.** A channel created under `mls` is one MLS group: its content is
+> end-to-end encrypted and the server stores ciphertext it cannot read. The channel's tier
+> fixes its suite ([JEP-0014](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0014-channel-tiers.md)):
+> `private`, `server` and `shared` are `mls`, and only `public` is `none`. A `shared`
+> channel crosses servers as ciphertext under a share (JEP-0005); a `contract-end` does not
+> yet remove the follower's members. Design record:
 > [M2 design](https://github.com/jig-protocol/jig/blob/main/docs/superpowers/specs/2026-10-11-m2-mls-and-channel-dynamics-design.md);
 > rationale: [`docs/security/encryption.md`](https://github.com/jig-protocol/jig/blob/main/docs/security/encryption.md);
 > open questions: [JEP-0001](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0001-encryption-suites.md).
@@ -26,7 +28,7 @@ and conformance vectors. It MUST NOT need a wire-format change.
 | Identifier | Scheme | Status |
 | --- | --- | --- |
 | `none` | No encryption. Signatures still apply. | Implemented |
-| `mls` | MLS, [RFC 9420](https://www.rfc-editor.org/rfc/rfc9420), cipher suite `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` | Implemented in v0.2 for single-server channels |
+| `mls` | MLS, [RFC 9420](https://www.rfc-editor.org/rfc/rfc9420), cipher suite `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` | Implemented in v0.2; across servers for `shared` channels |
 | `test-aead` | ChaCha20-Poly1305 under a published key ([JEP-0001](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0001-encryption-suites.md#the-test-suite)) | Reserved for conformance testing |
 
 Identifiers are lowercase ASCII and compared byte for byte. Identifiers starting `test-` are
@@ -172,7 +174,9 @@ A cross-server channel's suite is part of its federation contract, fixed at setu
 server that cannot speak the suite cannot join the channel, the same way a TLS handshake
 with no common cipher suite fails.
 
-v0.2 does not federate encrypted channels: channel and membership state does not replicate
-between servers, so only the home server can validate a channel's commits. A server MUST
-NOT relay an `mls` channel's blocks to peers, and MUST refuse a relayed block for a local
-`mls` channel.
+In v0.2 an `mls` channel crosses servers only as a `shared` channel under a share
+([JEP-0005](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0005-channel-federation-contract.md)).
+Its owner sequences it and validates its commits; a follower checks each commit against its
+mirror of the group's public state (rule 19) and relays its members' writes to the owner
+(rule 15). `private` and `server` channels never leave their server. A follower does not yet
+remove its members after a `contract-end`.

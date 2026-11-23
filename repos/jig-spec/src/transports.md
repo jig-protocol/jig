@@ -74,7 +74,8 @@ signature is refused.
 **Status:** the reference server serves TLS by default, with a self-signed certificate it
 makes on first start unless one is configured, and publishes the binding. The CLI and
 the federation dialer (against a peer's `expected_did`) probe as above. Both sides speak
-TLS 1.3 only. The nameserver still serves plaintext.
+TLS 1.3 only. The nameserver also serves TLS by default, with a self-signed certificate it
+makes on first start, bound to its DID (#262).
 
 ### Minimize Metadata
 

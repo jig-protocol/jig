@@ -2,7 +2,8 @@
 
 > **Not the wire format.** The implemented handshake is the JEP-0002 subset:
 > client `hello`, server-signed `welcome` (version, capabilities, suites `none` and `mls`,
-> reputation `null`). This chapter predates
+> reputation `null`, the TLS exporter binding, the manifest log, key links, the admission
+> offer, and on request the channel tiers and the server's ruleset). This chapter predates
 > [JEP-0002](https://github.com/jig-protocol/jig/blob/main/repos/jig-spec/jep/jep-0002-handshake.md).
 > Where they differ, JEP-0002 is the direction. Encryption suites are specified in
 > [Encryption](encryption.md), not by the `crypto_suites` strings below.

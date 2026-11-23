@@ -8,7 +8,8 @@
 > is implemented, with one exception: a relayed block's author is not asked for admission
 > proof-of-work. Not built: DNS SRV
 > discovery, X.509 mutual TLS, the signed per-message federation envelope, reputation
-> tiers, receipt exchange and billing, retry backoff and per-peer quotas. The `.well-known`
+> tiers, receipt exchange and billing, and jittered retry backoff. Per-peer quotas are
+> published in the server manifest and enforced on what a peer streams. The `.well-known`
 > document below is not the real one (see
 > [Transports](transports.md#server-certificates)). A channel reaches another server
 > only by a share under the channel contract (JEP-0005, JEP-0014): a `shared` channel is

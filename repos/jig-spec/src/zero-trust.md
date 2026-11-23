@@ -29,7 +29,7 @@ So Jig assumes the worst and designs around it. This is called **zero-trust**: v
 
 **For users:**
 
-- Your messages are signed and (optionally) encrypted, even if you trust the server. We don't assume the server stays trustworthy forever.
+- Your messages are signed, and encrypted on every channel except a `public` one, even if you trust the server. We don't assume the server stays trustworthy forever.
 - You can verify any receipt by replaying the execution locally. You don't have to take the host's word for billing.
 - If a server goes rogue, you take your keys to a different server. Your identity is yours, not theirs.
 
@@ -55,7 +55,7 @@ These principles guide every normative requirement in this spec:
 
 This doesn't mean you can't have trusted peers—it means trust is **earned and continuously verified**, not assumed.
 
-**Example:** When federating with another server, you don't just accept their receipts at face value. You replay blocks locally and verify the receipts match. If they diverge repeatedly, you downgrade that peer's reputation or stop federating entirely. *(not yet implemented: a `render_hash` divergence is a warning; there is no peer reputation.)*
+**Example:** When federating with another server, you don't just accept their receipts at face value. You replay blocks locally and verify the receipts match. If they diverge repeatedly, you downgrade that peer's reputation or stop federating entirely. *(not yet implemented: a follower does not re-execute the blocks it carries, so it has no receipt to compare, and there is no peer reputation.)*
 
 **Trade-off:** More verification means higher CPU costs. But it prevents billing fraud and makes trustless federation possible.
 
@@ -140,7 +140,7 @@ See [Message Format § Replay Protection](message-format.md#replay-protection) f
 **MUST ensure authenticity and integrity end-to-end. Transport security alone is insufficient.**
 
 - Messages are signed by the sender's keypair (Ed25519)
-- Content can be encrypted under the channel's [encryption suite](encryption.md) (MLS, on channels created under it) before signing
+- Content is encrypted under the channel's [encryption suite](encryption.md) (MLS on every channel but a `public` one) before signing
 - Relays and servers see routing metadata but can't forge or tamper with content
 
 **Why:** TLS protects you from network attackers but not malicious servers. E2E signatures and encryption mean even the server operator can't forge messages or read encrypted content.
@@ -185,7 +185,7 @@ See [Security Considerations § Operational Security](security.md#operational-se
 - Use proof-of-work challenges for new or low-reputation identities
 - Federation peers get quotas based on reputation scores
 
-*(partial: token buckets are on by default: per verified DID across REST, WebSocket, federation and bridge writes, and per remote address on v0.0.2 HTTP requests and WebSocket frames; proof-of-work for new DIDs exists but is off by default; there are no reputation tiers or per-peer quotas.)*
+*(partial: token buckets are on by default: per verified DID across REST, WebSocket, federation and bridge writes, and per remote address on v0.0.2 HTTP requests and WebSocket frames; proof-of-work for new DIDs exists but is off by default; per-peer quotas cap what a peer streams, and writes a follower relays are limited per peer and channel; there are no reputation tiers.)*
 
 **Why:** Without rate limits, a single attacker can flood the server with garbage and take it offline.
 
@@ -235,7 +235,7 @@ Here are the specific attacks Jig is designed to resist:
 - Rate limiting (federated peers get quotas)
 - Cryptographic attestations (useful-work proofs can't be forged)
 
-*(partial: relayed blocks are re-verified and re-executed by the receiving server, and a `render_hash` divergence is a warning; there is no peer reputation, no per-peer quota and no useful-work proof.)*
+*(partial: servers relay no blocks between them. A follower checks a carried block's author signature and the owner's signed record chain but does not re-execute it; the owner runs its full gate on writes a follower relays. Per-peer quotas cap what a peer streams. There is no peer reputation and no useful-work proof.)*
 
 **Example attack:** Malicious server sends you receipts claiming blocks used 1M fuel when they actually used 100k (billing fraud). You replay locally, detect mismatch, and downgrade that peer's reputation. After repeated violations, you stop federating with them. *(not yet implemented: see above.)*
 
