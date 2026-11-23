@@ -1,5 +1,9 @@
 # Appendix
 
+> **Mostly historical.** The affordances registry, the analytics schema and the v0.1/v0.2
+> receipt vectors below describe designs no code implements; hosts write only v0.3 receipts
+> (see [Receipts](receipts.md)). The change log is history.
+
 **Audience:** This appendix is a reference for **protocol implementers** and **developers** who need canonical definitions, test vectors, or historical context. **Server operators** might consult the affordances registry when configuring pricing policies.
 
 ---

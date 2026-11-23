@@ -1,6 +1,8 @@
 # Reference Rulesets
 
-> **R2.1.** These are four reference rulesets, given as data before any code. They use
+> **R2.1.** These are four reference rulesets, given as data. `jig-core` parses and signs
+> ruleset documents (#452), and a server can declare one and has its pool shares checked
+> against it at boot (#471); nothing computes standing from them yet. They use
 > JEP-0009's verifiable-standing rules 35–52 (#418). Every number here is a starting point, to
 > be tuned against R1's pool metrics.
 

@@ -9,8 +9,10 @@ public address, and has never had a user outside the team. This document is the
 checklist for changing that. Every "current state" row below was checked against
 the code at merge commit `1fa5681`; §1.3, §1.5, §1.8 and §4 were re-checked
 against `d16f26a` on 2026-10-18; §1.1, §1.6, §1.7, the binary install row, §3,
-§6 and the verdict were re-checked against `a740fa8` on 2026-10-25. Where a claim
-could not be verified from the tree it says so.
+§6 and the verdict were re-checked against `a740fa8` on 2026-10-25; the gaps in
+§1.2 and §1.3, §1.6's wasmtime version, §1.7, §4's `jig-spec` book row, §6's release cadence and the verdict
+were brought up to date against `f9cdc2da` on 2026-11-23. Where a claim could not
+be verified from the tree it says so.
 
 **Verdict vocabulary**
 
@@ -53,7 +55,7 @@ fast path, not the absence of a model.
 | --- | --- |
 | **Current state** | `restricted` gates history (`403 NOT_A_MEMBER`), the listing (restricted channels and their `owner_did` are not shown to non-members), live WSS delivery (per block, so removing a membership stops an open subscription) and posting (`403 NOT_A_MEMBER` at ingest, on every surface). Self-join works on open channels only; on restricted ones only the owner adds members. Unknown visibility strings and store errors fail closed. |
 | **Ready means** | `restricted` gates reads (history, WSS delivery) and writes to non-members. |
-| **Gap** | Restricted channels do not federate yet: a relayed block runs the same posting gate, but there is no way to carry membership across servers (see §1.1). Timing still distinguishes a refused read from an unknown channel under a concealing disclosure policy — a stated limitation of the design, and the default policy conceals nothing. |
+| **Gap** | A restricted channel crosses servers only as a `shared` MLS channel under a share: a follower relays its members' writes to the owner, whose posting gate runs on each, and mirrors the group to check membership changes, but a `contract-end` does not yet remove the follower's members (see §1.1). Timing still distinguishes a refused read from an unknown channel under a concealing disclosure policy — a stated limitation of the design, and the default policy conceals nothing. |
 
 The CLI's `restricted` help text (members only, always end-to-end encrypted) is true, and
 `jig channel join` says which channels it can join.
@@ -64,9 +66,9 @@ The CLI's `restricted` help text (members only, always end-to-end encrypted) is 
 
 | | |
 | --- | --- |
-| **Current state** | **Per channel, since v0.2.** A channel created with `suite = "mls"` (`jig channel create --encrypted`, and every `jig dm`) is one MLS group ([`jig-mls`](../repos/jig-mls/), `openmls` 0.9): content is an MLS `PrivateMessage`, the server validates every commit through a public-state `PublicGroup` and holds no group secret, and plaintext into such a channel is refused (`SUITE_MISMATCH`). `integration-tests/tests/h12_encrypted_channels.rs` searches the server's files after a conversation and finds none of it. Channels created without a suite are still signed-not-encrypted and stored in cleartext. |
+| **Current state** | **Per channel, since v0.2; by default since channel tiers (JEP-0014).** Every channel except a `public` one is `mls` (`private`, the CLI's default, `server` and `shared`), as is every `jig dm`, and each is one MLS group ([`jig-mls`](../repos/jig-mls/), `openmls` 0.9): content is an MLS `PrivateMessage`, the server validates every commit through a public-state `PublicGroup` and holds no group secret, and plaintext into such a channel is refused (`SUITE_MISMATCH`). `integration-tests/tests/h12_encrypted_channels.rs` searches the server's files after a conversation and finds none of it. A `public` channel is signed, not encrypted, and stored in cleartext. |
 | **Ready means** | Message bodies are encrypted to recipient keys; the server stores ciphertext it cannot read. |
-| **Gap** | Restricted channels are always MLS (D25), but encryption is opt-in for open channels; restricted channels created plaintext before D25 are frozen, their history still readable to the operator. Encrypted channels do not federate. One device per DID. The client's plaintext cache (`~/.jig/mls/`) is as sensitive as the identity key; it is sealed at rest with the identity (#177), and kept in clear only under `JIG_KEYS_STORAGE=plaintext`. No independent review of the MLS integration. |
+| **Gap** | Plaintext channels created before tiers are frozen, their history still readable to the operator. A `shared` channel crosses servers as ciphertext, but a `contract-end` does not yet remove the follower's members. One device per DID. The client's plaintext cache (`~/.jig/mls/`) is as sensitive as the identity key; it is sealed at rest with the identity (#177), and kept in clear only under `JIG_KEYS_STORAGE=plaintext`. No independent review of the MLS integration. |
 
 `repos/jig-spec/` used to document `age+x25519` E2EE in the present tense. Since
 2026-10-05 it specifies MLS, suite-pluggable, in `src/encryption.md`, whose banner now
@@ -100,18 +102,19 @@ ingest, and the working path needs no `[debug]` flag.
 
 | | |
 | --- | --- |
-| **Current state** | Tighter than the rest of the system. Blocks are `jig:block` components (JEP-0006), and there is one execution path, [`jig-runtime/src/component.rs`](../repos/jig-runtime/src/component.rs); the byte-payload ABI and the WASI path were deleted (#291, #299). A component is checked against jig-core's `jig-det-1` profile before it is compiled, and the linker defines only the imports its grant names; no host interface has a provider yet, so a component that imports anything is refused at link time. There is no WASI: no stdio, filesystem, sockets or clocks. Every run is bounded by fuel, a wall-clock epoch deadline and a memory cap, on a pooling allocator with one memory per module ([`engine.rs`](../repos/jig-runtime/src/engine.rs)). Server defaults: 5,000,000 fuel, 64 MB, 250 ms ([`jig-server/src/config.rs`](../repos/jig-server/src/config.rs)). wasmtime is 49.0.4 (#280), with no wasmtime advisory suppressed in `deny.toml`, including RUSTSEC-2026-0096 (aarch64 Cranelift guest-heap miscompile → sandbox escape). |
+| **Current state** | Tighter than the rest of the system. Blocks are `jig:block` components (JEP-0006), and there is one execution path, [`jig-runtime/src/component.rs`](../repos/jig-runtime/src/component.rs); the byte-payload ABI and the WASI path were deleted (#291, #299). A component is checked against jig-core's `jig-det-1` profile before it is compiled, and the linker defines only the imports its grant names; no host interface has a provider yet, so a component that imports anything is refused at link time. There is no WASI: no stdio, filesystem, sockets or clocks. Every run is bounded by fuel, a wall-clock epoch deadline and a memory cap, on a pooling allocator with one memory per module ([`engine.rs`](../repos/jig-runtime/src/engine.rs)). Server defaults: 5,000,000 fuel, 64 MB, 250 ms ([`jig-server/src/config.rs`](../repos/jig-server/src/config.rs)). wasmtime is 50.0.3 (#447), with no wasmtime advisory suppressed in `deny.toml`, including RUSTSEC-2026-0096 (aarch64 Cranelift guest-heap miscompile → sandbox escape). |
 | **Gap** | None material for external use. This is the strongest part of the security story, and it has had no outside review. |
 
 **Verdict: READY.**
 
 ### 1.7 Advisory suppressions (`deny.toml`)
 
-Two RustSec ignores, and `yanked = "deny"`.
+Four RustSec ignores, and `yanked = "deny"`.
 
 | Category | IDs | Matters to an external user? |
 | --- | --- | --- |
 | Build-time only (proc macro) | RUSTSEC-2026-0173 (`proc-macro-error2`, unmaintained, no vulnerability), reached through `jig-mls` → `openmls_rust_crypto` → `hpke-rs` → `libcrux-sha3` → `hax-lib` | No. Never linked into a shipped binary. |
+| Linked, unmaintained, no vulnerability (#446) | RUSTSEC-2026-0543 (`chrono`) and RUSTSEC-2026-0542 (`humantime`, reached only through `humantime-serde` in `jig-server`'s config) | No. Neither reports a vulnerability, and neither has a safe upgrade; both go when #445 moves to `jiff`. |
 | Linked, unreachable secret (#303) | RUSTSEC-2026-0387 (`crypto-bigint` 0.5, secret-dependent branches), reached through `openmls_rust_crypto` 0.6 → `elliptic-curve` 0.13; no compatible bump exists | No secret reaches it: jig holds no elliptic-curve secret, and `jig-mls` refuses group infos, key packages and welcomes in any other ciphersuite before running their crypto. One path verifies a P-256 signature over public values only. `deny.toml` says when the ignore goes. |
 
 The twelve other ignores this section used to list are gone, resolved rather than
@@ -192,7 +195,7 @@ compatibility promise is still a BLOCKER for the day one is made.
 | `SECURITY.md` (root) | Yes | See §1.8. |
 | Deployment docs | Yes | [`deploy/README.md`](../deploy/README.md): systemd units, the security model with a private network as defence in depth, install, TLS, backups, restore, sealing and rotating the server key, the nameserver, and gotchas. [`deployment/install-benchmark.md`](deployment/install-benchmark.md) measures the 60-second install. |
 | Per-crate rustdoc | Partial | Module- and item-level doc comments are dense and unusually good (the `//!` headers carry real rationale). But **no crate sets `#![warn(missing_docs)]`** and none carries `[package.metadata.docs.rs]`, so there is no rendered API reference anywhere. Only `integration-tests` sets `publish = false`; the rest are publishable-by-accident. |
-| `jig-spec` book | Yes | mdbook under `repos/jig-spec/`. Describes much unshipped behaviour. Each chapter's banner, and the threat register's status column, say what the reference implementation does (re-checked 2026-10-18); `message-format.md` is bannered as historical, not the wire format. |
+| `jig-spec` book | Yes | mdbook under `repos/jig-spec/`. Describes much unshipped behaviour. Each chapter's banner, and the threat register's status column, say what the reference implementation does (re-checked 2026-11-23, #482); `message-format.md` is bannered as historical, not the wire format. |
 | Riverdance | Not in this repo | The unfinished GUI is not part of this repository. Its licence is undecided, and it is not a working client. |
 
 **Verdict: GAP.** The front-door files exist and the spec is bannered; what
@@ -254,7 +257,7 @@ registry, or copied code may appear anywhere under `repos/`. This belongs in
 | `CODEOWNERS` | DJ owns everything, repeated on sensitive paths | READY |
 | Discussion / support channel | dev@jig.onl and issues; security reports go to security@jig.onl or GitHub private reporting. No public chat. | GAP |
 | Triage owner | DJ, named in `SECURITY.md` for vulnerability reports. No rotation or SLA for ordinary issues. | GAP |
-| Release cadence | Two signed prereleases so far, `v0.2.0-alpha.1` (2026-10-19) and `v0.2.0-alpha.2` (2026-10-25), each with notes in [`.github/release/notes/`](../.github/release/notes/). `release.yml` is tag-triggered, waits for a maintainer's approval in the `release` environment, refuses notes that do not list the threat-register entries mitigated, and publishes a tag with a pre-release part (`-alpha.N`) as a prerelease and a bare `vX.Y.Z` as the latest release. No cadence is promised. | GAP |
+| Release cadence | Five signed prereleases published so far, `v0.2.0-alpha.1` (2026-10-19), `alpha.2` (2026-10-25), `alpha.4` (2026-11-11), `alpha.5` (2026-11-14) and `alpha.6` (2026-11-15); the `alpha.3` tag has no published release. Each has notes in [`.github/release/notes/`](../.github/release/notes/). `release.yml` is tag-triggered, waits for a maintainer's approval in the `release` environment, refuses notes that do not list the threat-register entries mitigated, and publishes a tag with a pre-release part (`-alpha.N`) as a prerelease and a bare `vX.Y.Z` as the latest release. No cadence is promised. | GAP |
 | CI coverage | `changes`, `workspace` (fmt, clippy and nextest on every workspace crate), `wasm-build` and `dependency-policy` (also daily at 07:17 UTC against `main`). A `nightly` job on the same schedule runs doc tests, skips nights when nothing under `repos/` (Markdown aside) and not `rust-toolchain.toml` changed, and does not gate merges. Drafts and docs-only PRs skip the build jobs; the merge queue runs everything. Linux only for the workspace job; macOS runs in the install smoke test inside `release.yml` and after each release, and in `block-abi-vectors.yml` on manual dispatch only. | GAP |
 
 **Test counts, measured at `1fa5681`** (`cargo nextest list`, stable 1.97.1): 1,054 tests in
@@ -273,15 +276,16 @@ The sentence that used to decide it, *a jig server has no authentication and
 no authorization*, is no longer true: reads require proof of possession,
 restricted channels are membership-gated on every surface, membership changes
 are owner-signed, and rate limits are on by default. Nor are the next four: DMs,
-restricted channels and `--encrypted` open channels are end-to-end encrypted with
-MLS; `SECURITY.md` gives a disclosure path; and two signed releases are published
+every channel but a `public` one is end-to-end encrypted with
+MLS; `SECURITY.md` gives a disclosure path; and five signed prereleases are published
 and install through the verified `curl | bash` path. What decides it now:
 
-- Encryption is not the default for open channels (restricted channels are always MLS
-  since D25), and the email bridge refuses inbound mail until it can join MLS groups.
-- Encrypted channels do not federate yet: a server can follow an open channel
-  another server sequences (#309) and relay its users' writes to the owner (#316), but MLS
-  across servers and the rest of F2 (Tasks 7 to 11) are still to build.
+- The email bridge refuses inbound mail until it can join MLS groups.
+- The federation contract is partly built and ships as v0.2.x (D35): a server follows a
+  channel another server sequences (#309), relays its users' writes to the owner (#316) and
+  carries a `shared` MLS channel through its mirror of the group (#378), but member removal
+  after a `contract-end`, the sequencer move, the rest of custody and the end-to-end test are
+  still to build.
 - Nothing has had an outside review yet. The audit is scoped (D27, decided 2026-10-25):
   Phase 1 before G3, Phase 2 after code-complete.
 - Admission rests on operator-written config, not earned reputation.
@@ -295,8 +299,8 @@ and install through the verified `curl | bash` path. What decides it now:
 | ~~3~~ | ~~**Root `LICENSE` + consistent per-crate SPDX ids**~~ | **DONE 2026-08-06** — dual-licensed MIT OR Apache-2.0, root licence pair added, every protocol crate aligned. `jig-spec` moved to CC-BY-4.0 on 2026-10-05. |
 | ~~4~~ | ~~**Publish a release the installer can install**~~ | **DONE 2026-10-19** — `v0.2.0-alpha.1`, then `v0.2.0-alpha.2` on 2026-10-25: built, signed and published by `release.yml`, and installed by `install.sh` against the published release on Ubuntu and macOS in the same run. |
 | ~~5~~ | ~~**Say plainly that v0.x has no compatibility guarantee**~~ | **DONE** — README and spec 2026-10-05; every release's notes since `v0.2.0-alpha.1` ([`.github/release/notes/`](../.github/release/notes/)). `Envelope.v`, the manifest `schema`, the encryption suite and the receipt domain are gates (§3). |
-| ~~6~~ | ~~**Implementation-status banner on `jig-spec`**~~ | **DONE 2026-10-05**, re-checked 2026-10-18 — every chapter's banner and the threat register's status column match `main`. |
-| ~~7~~ | ~~**Clear the reachable advisory suppressions**~~ | **DONE** — two ignores left: one build-time only, one linked where no secret reaches it (§1.7). |
+| ~~6~~ | ~~**Implementation-status banner on `jig-spec`**~~ | **DONE 2026-10-05**, re-checked 2026-11-23 (#482) — every chapter's banner and the threat register's status column match `main`. |
+| ~~7~~ | ~~**Clear the reachable advisory suppressions**~~ | **DONE** — four ignores left: one build-time only, one linked where no secret reaches it, and two unmaintained crates with no vulnerability (§1.7). |
 | 8 | **Publish a support channel** | DJ is the named triage owner for security reports, and dev@jig.onl takes everything else. No public discussion channel, and no SLA for ordinary issues. |
 
 Until blocker 8 lands, along with the encryption, federation and review items above, the honest
