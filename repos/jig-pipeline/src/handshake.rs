@@ -115,6 +115,16 @@ pub struct Capabilities {
     /// the bytes it always did.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ruleset: bool,
+    /// Request-proof versions (JEP-0013 §3.3, JEP-0015 §"Request proofs"),
+    /// by domain string. In a hello, the versions the client signs; in a
+    /// welcome, those the server accepts that the hello listed. A client
+    /// signs a request proof only in a version the welcome lists, and never
+    /// falls back to an older one. Like `tiers`, never part of
+    /// [`Capabilities::canonical_bytes`]: a welcome signs it under its own
+    /// tag, and only when non-empty, so a client that predates it checks the
+    /// bytes it always did.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_auth: Vec<String>,
 }
 
 fn default_future_skew_ms() -> u64 {
@@ -130,6 +140,7 @@ impl Default for Capabilities {
             max_future_skew_ms: DEFAULT_FUTURE_SKEW_MS,
             tiers: false,
             ruleset: false,
+            request_auth: Vec::new(),
         }
     }
 }
@@ -218,6 +229,8 @@ impl Default for ClientOffer {
                 tiers: true,
                 // It reads ruleset declarations (JEP-0009 rule 4).
                 ruleset: true,
+                // It signs request proofs bound to their audience.
+                request_auth: vec![jig_core::request_auth::VERSION.to_string()],
                 ..Capabilities::default()
             },
             pinned_server_did: None,
@@ -416,6 +429,13 @@ impl WelcomeStatement {
                     push(&mut out, &ruleset.canonical_bytes());
                 }
             }
+        }
+        // Request-proof versions, signed only when the welcome lists any:
+        // only to a hello that listed them, so a client that predates them
+        // checks the bytes it always did.
+        if !self.capabilities.request_auth.is_empty() {
+            push(&mut out, &[6]);
+            push(&mut out, &canonical_list(&self.capabilities.request_auth));
         }
         out
     }
@@ -706,6 +726,14 @@ pub fn negotiate(
             tiers: server.capabilities.tiers && hello.capabilities.tiers,
             // Likewise: see `Capabilities::ruleset`.
             ruleset: server.capabilities.ruleset && hello.capabilities.ruleset,
+            // The versions both sides speak: see `Capabilities::request_auth`.
+            request_auth: server
+                .capabilities
+                .request_auth
+                .iter()
+                .filter(|v| hello.capabilities.request_auth.contains(v))
+                .cloned()
+                .collect(),
             ..server.capabilities.clone()
         },
         reputation: Reputation::none(),
@@ -1158,6 +1186,14 @@ fn outside_offer(statement: &WelcomeStatement, offer: &ClientOffer) -> Option<&'
     }
     if statement.capabilities.ruleset && !offer.capabilities.ruleset {
         return Some("welcome declares a ruleset, which the client did not ask for");
+    }
+    if statement
+        .capabilities
+        .request_auth
+        .iter()
+        .any(|v| !offer.capabilities.request_auth.contains(v))
+    {
+        return Some("welcome lists a request-proof version the client did not offer");
     }
     None
 }
@@ -1850,6 +1886,124 @@ mod tests {
             panic!("an unrequested tiers grant must fail closed");
         };
         assert!(reason.contains("did not request"), "{reason}");
+    }
+
+    /// JEP-0015 §"Request proofs": a welcome lists the request-proof versions
+    /// both sides speak, signed under their own tag; a client that lists none
+    /// gets a welcome that signs the bytes it always did.
+    #[test]
+    fn request_auth_versions_are_negotiated_and_signed() {
+        let key = generate_signing_key();
+        let v2 = jig_core::request_auth::VERSION.to_string();
+        let server = |versions: Vec<String>| ServerOffer {
+            capabilities: Capabilities {
+                request_auth: versions,
+                ..offer_server().capabilities
+            },
+            ..offer_server()
+        };
+        for (offered, accepted, expect) in [
+            (vec![v2.clone()], vec![v2.clone()], vec![v2.clone()]),
+            (vec![], vec![v2.clone()], vec![]),
+            (vec![v2.clone()], vec![], vec![]),
+            (vec![v2.clone()], vec!["jig-request-auth-v9".into()], vec![]),
+        ] {
+            let (hello, pending) = begin(&ClientOffer {
+                capabilities: Capabilities {
+                    request_auth: offered.clone(),
+                    ..Capabilities::default()
+                },
+                ..ClientOffer::default()
+            });
+            let Frame::Hello { nonce, .. } = hello.frame else {
+                panic!("hello");
+            };
+            let mut view = hello_view(&nonce);
+            view.capabilities.request_auth = offered.clone();
+            let statement = negotiate(&view, &server(accepted.clone())).unwrap();
+            assert_eq!(statement.capabilities.request_auth, expect);
+            let text = serde_json::to_string(&seal(&key, statement)).unwrap();
+            assert_eq!(
+                text.contains("\"request_auth\""),
+                !expect.is_empty(),
+                "{text}"
+            );
+            match pending.interpret(&text) {
+                HandshakeResult::Established(verified) => {
+                    assert_eq!(verified.capabilities.request_auth, expect)
+                }
+                other => panic!("offered {offered:?}, accepted {accepted:?}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_welcome_without_request_auth_signs_what_it_always_did() {
+        let statement = negotiate(&hello_view("bm9uY2U="), &offer_server()).unwrap();
+        assert!(statement.capabilities.request_auth.is_empty());
+        let before = statement.canonical_bytes();
+        let mut with = statement.clone();
+        with.capabilities.request_auth = vec![jig_core::request_auth::VERSION.into()];
+        let after = with.canonical_bytes();
+        assert!(after.len() > before.len() && after.starts_with(&before));
+    }
+
+    /// Stripping the signed versions from a welcome fails its signature, so
+    /// a client cannot be talked out of a version the server signed.
+    #[test]
+    fn request_auth_cannot_be_stripped_or_granted_unasked() {
+        let key = generate_signing_key();
+        let v2 = jig_core::request_auth::VERSION.to_string();
+        let (hello, pending) = begin(&ClientOffer::default());
+        let Frame::Hello {
+            nonce,
+            capabilities,
+            ..
+        } = hello.frame
+        else {
+            panic!("hello");
+        };
+        assert_eq!(
+            capabilities.request_auth,
+            vec![v2.clone()],
+            "this build offers v2"
+        );
+        let mut view = hello_view(&nonce);
+        view.capabilities.request_auth = vec![v2.clone()];
+        let mut server = offer_server();
+        server.capabilities.request_auth = vec![v2.clone()];
+        let mut welcome = seal(&key, negotiate(&view, &server).unwrap());
+        if let Frame::Welcome { capabilities, .. } = &mut welcome.frame {
+            capabilities.request_auth.clear();
+        }
+        let HandshakeResult::FailClosed { reason, .. } =
+            pending.interpret(&serde_json::to_string(&welcome).unwrap())
+        else {
+            panic!("stripped request_auth must fail closed");
+        };
+        assert!(reason.contains("signature does not verify"), "{reason}");
+
+        // A version the hello did not list is outside the offer.
+        let (hello, pending) = begin(&ClientOffer {
+            capabilities: Capabilities::default(),
+            ..ClientOffer::default()
+        });
+        let Frame::Hello { nonce, .. } = hello.frame else {
+            panic!("hello");
+        };
+        let welcome = seal(&key, negotiate(&view_with(&nonce, &v2), &server).unwrap());
+        let HandshakeResult::FailClosed { reason, .. } =
+            pending.interpret(&serde_json::to_string(&welcome).unwrap())
+        else {
+            panic!("an unoffered version must fail closed");
+        };
+        assert!(reason.contains("did not offer"), "{reason}");
+    }
+
+    fn view_with(nonce: &str, version: &str) -> HelloView {
+        let mut view = hello_view(nonce);
+        view.capabilities.request_auth = vec![version.to_string()];
+        view
     }
 
     #[test]

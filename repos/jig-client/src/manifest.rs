@@ -369,6 +369,9 @@ mod tests {
                     max_future_skew_ms: 300_000,
                     tiers: false,
                     ruleset: false,
+                    // Negotiated per hello, not in the manifest, so it must
+                    // not count as a contradiction of it.
+                    request_auth: vec![jig_core::request_auth::VERSION.to_string()],
                 },
                 reputation: Reputation::none(),
                 nonce: String::new(),
@@ -394,6 +397,7 @@ mod tests {
                 max_future_skew_ms: 300_000,
                 tiers: false,
                 ruleset: false,
+                request_auth: Vec::new(),
             },
             peer_policy: PeerPolicy::default(),
         }

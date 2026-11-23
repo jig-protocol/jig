@@ -51,6 +51,7 @@ async fn single_server_two_client_text_render_round_trip() {
     // Signed like any real caller: the server refuses an unsigned subscribe.
     let sub_env = signed_subscribe(
         &alice,
+        &server.server_did_string,
         Scope::Channel {
             slug: "#hello".to_string(),
         },

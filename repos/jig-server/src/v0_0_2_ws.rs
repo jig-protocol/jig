@@ -831,7 +831,11 @@ async fn handle_client_frame(
                             .lock()
                             .expect("replay guard mutex poisoned");
                         match crate::auth::authenticate::authenticate_subscribe(
-                            &a, &scope_str, now_ms, &mut guard,
+                            &a,
+                            &state.server_did,
+                            &scope_str,
+                            now_ms,
+                            &mut guard,
                         ) {
                             // Bind the VERIFIED did, never `a.did` as received —
                             // and only once gate 2 has admitted it, so a refused
@@ -1145,6 +1149,9 @@ pub(crate) fn handshake_capabilities(state: &AppState) -> jig_pipeline::handshak
         // Likewise: declarations are implemented whether or not this server
         // declares one, so a client that asked learns which.
         ruleset: true,
+        // The request-proof versions this server accepts; `negotiate` signs
+        // those the hello listed.
+        request_auth: vec![jig_core::request_auth::VERSION.to_string()],
     }
 }
 
@@ -1435,7 +1442,13 @@ mod tests {
     /// Subscriptions require a proof of possession; a raw frame is refused.
     /// Tests about DELIVERY still need a valid one, so the ceremony lives here
     /// rather than in each test.
-    fn signed_subscribe_frame(identity: &jig_client::Identity, scope: Scope) -> Envelope {
+    ///
+    /// `audience` is the server it is sent to: [`audience`] of its state.
+    fn signed_subscribe_frame(
+        identity: &jig_client::Identity,
+        audience: &str,
+        scope: Scope,
+    ) -> Envelope {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -1446,6 +1459,8 @@ mod tests {
         let nonce = format!("t-{hlc_wall_ms}-{}", SEQ.fetch_add(1, Ordering::Relaxed));
 
         let hash = jig_core::request_auth::canonical_request_hash(
+            audience,
+            &identity.did_string(),
             "SUBSCRIBE",
             &scope.canonical_string(),
             b"",
@@ -1457,6 +1472,7 @@ mod tests {
         Envelope::new(Frame::Subscribe {
             auth: Some(jig_pipeline::envelope::SubscribeAuth {
                 did: identity.did_string(),
+                audience: Some(audience.to_string()),
                 hlc_wall_ms,
                 hlc_logical: 0,
                 nonce,
@@ -1465,6 +1481,11 @@ mod tests {
             }),
             scope,
         })
+    }
+
+    /// The DID a proof to the server running `state` is addressed to.
+    fn audience(state: &AppState) -> String {
+        state.server_did.to_did_jig_string()
     }
 
     fn test_identity() -> jig_client::Identity {
@@ -1732,6 +1753,7 @@ mod tests {
         let mut ws = established(&url).await;
         let sub = signed_subscribe_frame(
             &test_identity(),
+            &audience(&state),
             Scope::Channel {
                 slug: "#team".to_string(),
             },
@@ -1783,7 +1805,7 @@ mod tests {
     /// identity the caller never proved.
     #[tokio::test]
     async fn ws_subscribe_claiming_another_did_is_refused() {
-        let (_state, url) = start_test_server().await;
+        let (state, url) = start_test_server().await;
         let mut ws = established(&url).await;
 
         let attacker = test_identity();
@@ -1792,7 +1814,7 @@ mod tests {
         let scope = Scope::Channel {
             slug: "#hello".into(),
         };
-        let mut frame = signed_subscribe_frame(&attacker, scope);
+        let mut frame = signed_subscribe_frame(&attacker, &audience(&state), scope);
         if let Frame::Subscribe { auth: Some(a), .. } = &mut frame.frame {
             a.did = victim.did_string();
         } else {
@@ -1875,11 +1897,12 @@ mod tests {
     /// A captured Subscribe frame must not be reusable, exactly as for REST.
     #[tokio::test]
     async fn ws_replayed_subscribe_is_refused() {
-        let (_state, url) = start_test_server().await;
+        let (state, url) = start_test_server().await;
         let subscriber = test_identity();
         // A channel with no local row: subscribing to it is not refused.
         let frame = signed_subscribe_frame(
             &subscriber,
+            &audience(&state),
             Scope::Channel {
                 slug: "#anywhere".to_string(),
             },
@@ -1922,6 +1945,7 @@ mod tests {
         let subscriber = test_identity();
         let sub = signed_subscribe_frame(
             &subscriber,
+            &audience(&state),
             Scope::Channel {
                 slug: "#hello".to_string(),
             },

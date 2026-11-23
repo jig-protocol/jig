@@ -31,7 +31,6 @@ use jig_client::blocks::{
     BuiltBlock, build_channel_archive, build_channel_promote, build_member_add,
     build_member_remove, build_with_metadata, merge,
 };
-use jig_client::read_auth::{ReadProof, signable_path};
 use jig_core::tier::{JoinRole, Tier};
 use jig_core::{BlockKind, HlcTimestamp};
 use serde::{Deserialize, Serialize};
@@ -1190,13 +1189,9 @@ pub async fn list(ctx: &CliContext) -> Result<()> {
     let id = ctx.identity()?;
     let base = base_http_url(&ctx.server_url()?);
     let url = format!("{base}/api/v1/channels");
-    let proof = ReadProof::sign(&id, "GET", signable_path(&url));
     let http = crate::cmd::trust::http(&base, std::time::Duration::from_secs(10)).await?;
-    let mut req = http.get(&url);
-    for (name, value) in proof.headers() {
-        req = req.header(name, value);
-    }
-    let resp = req.send().await.with_context(|| format!("GET {url}"))?;
+    let resp =
+        crate::cmd::request_proof::send(&base, &id, "GET", &url, b"", || http.get(&url)).await?;
     if !resp.status().is_success() {
         anyhow::bail!(
             "GET {url} returned {}: {}",

@@ -68,6 +68,7 @@ pub struct SignedRequest {
     pub method: String,
     pub path: String,
     pub did: String,
+    pub audience: String,
     pub hlc_wall_ms: u64,
     pub hlc_logical: u32,
     pub nonce: String,
@@ -250,12 +251,16 @@ impl TestServer {
             "nonce-{now_ms}-{}",
             SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
-        let hash =
-            jig_core::request_auth::canonical_request_hash("GET", path, b"", now_ms, 0, &nonce);
+        let audience = self.state.server_did.to_did_jig_string();
+        let did = who.did.to_did_jig_string();
+        let hash = jig_core::request_auth::canonical_request_hash(
+            &audience, &did, "GET", path, b"", now_ms, 0, &nonce,
+        );
         SignedRequest {
             method: "GET".to_string(),
             path: path.to_string(),
-            did: who.did.to_did_jig_string(),
+            did,
+            audience,
             hlc_wall_ms: now_ms,
             hlc_logical: 0,
             nonce,
@@ -271,6 +276,7 @@ impl TestServer {
             .method(req.method.as_str())
             .uri(&req.path)
             .header(headers::DID, &req.did)
+            .header(headers::AUDIENCE, &req.audience)
             .header(headers::HLC_WALL_MS, req.hlc_wall_ms.to_string())
             .header(headers::HLC_LOGICAL, req.hlc_logical.to_string())
             .header(headers::NONCE, &req.nonce)
@@ -626,6 +632,7 @@ impl TestServer {
             .method(req.method.as_str())
             .uri(&req.path)
             .header(headers::DID, &req.did)
+            .header(headers::AUDIENCE, &req.audience)
             .header(headers::HLC_WALL_MS, req.hlc_wall_ms.to_string())
             .header(headers::HLC_LOGICAL, req.hlc_logical.to_string())
             .header(headers::NONCE, &req.nonce)

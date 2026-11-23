@@ -47,6 +47,14 @@ pub enum GateOutcome {
     /// tell an operator debugging a flood that they were under a replay attack
     /// when in fact they need more capacity.
     AuthCapacityExhausted,
+    /// The proof is addressed to another server: its audience is not this
+    /// server's current DID. Distinct from a bad signature so a client whose
+    /// pin is behind a key change knows to re-handshake and sign afresh.
+    AuthWrongAudience,
+    /// The proof is in a version this server does not accept: a v1 proof,
+    /// which binds no audience. Distinct so an old client is told to
+    /// upgrade, not that its key is wrong.
+    AuthProofVersionUnsupported,
 
     /// The server has no reputation entry for this DID under any ruleset it
     /// consults. **Not** the same as a bad score: this is a caller the server
@@ -81,7 +89,9 @@ impl GateOutcome {
             | GateOutcome::AuthCapabilityExpired
             | GateOutcome::AuthCapabilitySubjectMismatch
             | GateOutcome::AuthMissing
-            | GateOutcome::AuthCapacityExhausted => Gate::Authenticate,
+            | GateOutcome::AuthCapacityExhausted
+            | GateOutcome::AuthWrongAudience
+            | GateOutcome::AuthProofVersionUnsupported => Gate::Authenticate,
 
             GateOutcome::AdmissionUnknownDid
             | GateOutcome::AdmissionBelowRuleset { .. }
@@ -119,6 +129,8 @@ mod tests {
             GateOutcome::AuthCapabilitySubjectMismatch,
             GateOutcome::AuthMissing,
             GateOutcome::AuthCapacityExhausted,
+            GateOutcome::AuthWrongAudience,
+            GateOutcome::AuthProofVersionUnsupported,
             GateOutcome::AdmissionUnknownDid,
             GateOutcome::AdmissionBelowRuleset {
                 ruleset_key: "highsec.v1".to_string(),
@@ -141,7 +153,9 @@ mod tests {
                 | GateOutcome::AuthCapabilityExpired
                 | GateOutcome::AuthCapabilitySubjectMismatch
                 | GateOutcome::AuthMissing
-                | GateOutcome::AuthCapacityExhausted => Gate::Authenticate,
+                | GateOutcome::AuthCapacityExhausted
+                | GateOutcome::AuthWrongAudience
+                | GateOutcome::AuthProofVersionUnsupported => Gate::Authenticate,
                 GateOutcome::AdmissionUnknownDid
                 | GateOutcome::AdmissionBelowRuleset { .. }
                 | GateOutcome::AdmissionBanned
@@ -156,7 +170,7 @@ mod tests {
 
         assert_eq!(
             all.len(),
-            15,
+            17,
             "a variant was added without covering it here"
         );
     }

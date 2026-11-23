@@ -137,6 +137,12 @@ struct ServerInfoResponse {
     /// Absent when the v0.0.2 module, which serves history, is not active.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     history_after: bool,
+    /// The request-proof versions this server accepts (JEP-0015 §"Request
+    /// proofs"), unsigned: the welcome signs them, and a client signs a
+    /// proof only in a version a welcome it verified lists. Absent when the
+    /// v0.0.2 module, which verifies them, is not active.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    request_auth: Vec<&'static str>,
 }
 
 /// [`jig_pipeline::server_manifest::PeerPolicy`] as JSON.
@@ -329,6 +335,10 @@ async fn server_info(State(state): State<AppState>) -> Json<ServerInfoResponse> 
             })
             .unwrap_or_default(),
         history_after: state.v0_0_2.is_some(),
+        request_auth: match state.v0_0_2 {
+            Some(_) => vec![jig_core::request_auth::VERSION],
+            None => Vec::new(),
+        },
     })
 }
 
@@ -502,6 +512,10 @@ mod tests {
         assert!(body.allowed_block_kinds.is_empty());
         assert!(body.peers.is_empty());
         assert!(!body.history_after, "no history is served without v0.0.2");
+        assert!(
+            body.request_auth.is_empty(),
+            "no proofs are verified without v0.0.2"
+        );
     }
 
     #[tokio::test]
@@ -568,6 +582,7 @@ mod tests {
         assert!(body.peers.is_empty());
         // Its history pages forward, and it says so.
         assert!(body.history_after);
+        assert_eq!(body.request_auth, ["jig-request-auth-v2"]);
         // default config has no bridges configured (deny-by-default)
         assert!(body.bridges.is_empty());
     }

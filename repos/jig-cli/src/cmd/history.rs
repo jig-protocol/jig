@@ -16,7 +16,6 @@
 //!     client unusable.
 
 use anyhow::{Context, Result};
-use jig_client::read_auth::{ReadProof, signable_path};
 use jig_client::{DeliveredBlock, Identity};
 
 use crate::cmd::blocks_decode::{DecodedBlock, decode};
@@ -87,15 +86,11 @@ pub async fn fetch_history_page(
     if let Some(cid) = before {
         url.push_str(&format!("&before={cid}"));
     }
-    let proof = ReadProof::sign(who, "GET", signable_path(&url));
     // Short timeout: this runs on the critical path to the first frame, and
     // a slow server should cost a warning, not a hung terminal.
     let http = crate::cmd::trust::http(base_url, std::time::Duration::from_secs(10)).await?;
-    let mut req = http.get(&url);
-    for (name, value) in proof.headers() {
-        req = req.header(name, value);
-    }
-    let resp = req.send().await.with_context(|| format!("GET {url}"))?;
+    let resp =
+        crate::cmd::request_proof::send(base_url, who, "GET", &url, b"", || http.get(&url)).await?;
     let status = resp.status();
     if !status.is_success() {
         // Read the body rather than reporting a bare status: a 404 here is

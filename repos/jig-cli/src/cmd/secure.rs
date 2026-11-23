@@ -248,17 +248,23 @@ async fn prove_server(url: &str, server_did: &str, identity: Identity) -> Result
         .with_context(|| format!("{url} did not prove it is {server_did}"))
 }
 
-/// The server at `url`'s DID, as its signed welcome says.
-async fn server_did_at(url: &str, identity: Identity) -> Result<String> {
+/// A connection to the server at `url`, its welcome verified and held to
+/// nothing this device pinned, and pinning nothing.
+pub async fn connect_unpinned(url: &str, identity: Identity) -> Result<Client> {
     let tls = crate::cmd::trust::server_tls(url).await?;
     let options = jig_client::connection::ConnectOptions {
         tls,
         ..Default::default()
     };
-    let client = Client::connect_with_options(url, identity, options)
+    Client::connect_with_options(url, identity, options)
         .await
-        .with_context(|| format!("connecting to {url}"))?;
-    client
+        .with_context(|| format!("connecting to {url}"))
+}
+
+/// The server at `url`'s DID, as its signed welcome says.
+async fn server_did_at(url: &str, identity: Identity) -> Result<String> {
+    connect_unpinned(url, identity)
+        .await?
         .welcome()
         .map(|w| w.server_did.clone())
         .with_context(|| format!("{url} sent no welcome"))
@@ -275,14 +281,19 @@ pub async fn custodians_via(
     identity: &Identity,
 ) -> Result<ReachabilityRecord> {
     let url = format!("{}/api/v1/reach/{did}", base_http_url(via));
-    let proof = ReadProof::sign(identity, "GET", signable_path(&url));
-    let mut req = crate::cmd::trust::http(via, std::time::Duration::from_secs(15))
-        .await?
-        .get(&url);
-    for (name, value) in proof.headers() {
-        req = req.header(name, value);
-    }
-    let resp = req.send().await.with_context(|| format!("GET {url}"))?;
+    let http = crate::cmd::trust::http(via, std::time::Duration::from_secs(15)).await?;
+    // `via` is asked, not trusted: its welcome proves the audience, and
+    // nothing is pinned.
+    let resp = crate::cmd::request_proof::send_as(
+        via,
+        crate::cmd::request_proof::Trust::Unpinned,
+        identity,
+        "GET",
+        &url,
+        b"",
+        || http.get(&url),
+    )
+    .await?;
     if resp.status().is_success() {
         let body: RecordBody = limits::json_capped(resp, limits::MAX_DOCUMENT_BYTES)
             .await
@@ -648,9 +659,19 @@ impl Secure {
     async fn ensure_pinned(&self) -> Result<()> {
         self.pinned
             .get_or_try_init(|| async {
-                connect_pinned(&self.server, self.identity.duplicate())
-                    .await
-                    .map(drop)
+                let client = connect_pinned(&self.server, self.identity.duplicate()).await?;
+                // The welcome just held to the pin proves the audience for
+                // this server's request proofs; a server that does not list
+                // v2 is refused here, before anything is signed.
+                if let Some(welcome) = client.welcome() {
+                    let did = jig_client::read_auth::audience_of(welcome)?;
+                    crate::cmd::request_proof::remember(
+                        &self.server,
+                        crate::cmd::request_proof::Trust::Pinned,
+                        &did,
+                    );
+                }
+                anyhow::Ok(())
             })
             .await
             .map(|_| ())
@@ -731,12 +752,12 @@ impl Secure {
     pub async fn get_json_capped<T: DeserializeOwned>(&self, path: &str, max: usize) -> Result<T> {
         self.ensure_pinned().await?;
         let url = format!("{}{path}", self.base);
-        let proof = ReadProof::sign(&self.identity, "GET", signable_path(&url));
-        let mut req = self.http().await?.get(&url);
-        for (name, value) in proof.headers() {
-            req = req.header(name, value);
-        }
-        let resp = req.send().await.with_context(|| format!("GET {url}"))?;
+        let http = self.http().await?;
+        let resp =
+            crate::cmd::request_proof::send(&self.server, &self.identity, "GET", &url, b"", || {
+                http.get(&url)
+            })
+            .await?;
         if !resp.status().is_success() {
             return Err(Self::refusal(resp).await.into());
         }
@@ -1213,7 +1234,17 @@ impl Secure {
                 continue;
             }
             let reach = format!("{}/api/v1/reach/{did}", base_http_url(&url));
-            let proof = ReadProof::sign(&self.identity, "GET", signable_path(&reach));
+            // Addressed to the DID `did`'s own signed record names for this
+            // custodian: a proof for it verifies there and nowhere else, so
+            // no handshake is needed to choose it. A custodian answering as
+            // another DID refuses it, and is left unchecked like one that
+            // cannot be reached.
+            let Ok(audience) = jig_client::read_auth::canonical_audience(&server_did) else {
+                unchecked.insert(server_did.clone());
+                out.push((server_did, url));
+                continue;
+            };
+            let proof = ReadProof::sign(&self.identity, &audience, "GET", signable_path(&reach));
             let mut req =
                 match crate::cmd::trust::http(&url, std::time::Duration::from_secs(15)).await {
                     Ok(client) => client.get(&reach),
@@ -1526,17 +1557,20 @@ impl Secure {
         // Signed over the exact body, so the server lets a new last-resort
         // package replace the one it holds (rule 32) and the proof cannot be
         // replayed with other packages; stocking alone would not need it.
-        let proof = ReadProof::sign_body(&self.identity, "POST", signable_path(&url), &body);
-        let mut req = self
-            .http()
-            .await?
-            .post(&url)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body);
-        for (name, value) in proof.headers() {
-            req = req.header(name, value);
-        }
-        let resp = req.send().await.with_context(|| format!("POST {url}"))?;
+        let http = self.http().await?;
+        let resp = crate::cmd::request_proof::send(
+            &self.server,
+            &self.identity,
+            "POST",
+            &url,
+            &body,
+            || {
+                http.post(&url)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body.clone())
+            },
+        )
+        .await?;
         if !resp.status().is_success() {
             let refused = Self::refusal(resp).await;
             if refused.code == "NOT_STOCKED_HERE" {

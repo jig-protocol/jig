@@ -56,7 +56,12 @@ impl Api<'_> {
 
     async fn get(&self, who: &Identity, path: &str) -> (u16, Value) {
         let url = self.url(path);
-        let proof = ReadProof::sign(who, "GET", signable_path(&url));
+        let proof = ReadProof::sign(
+            who,
+            &self.server.server_did_string,
+            "GET",
+            signable_path(&url),
+        );
         let mut req = reqwest::Client::new().get(&url);
         for (name, value) in proof.headers() {
             req = req.header(name, value);
@@ -291,7 +296,11 @@ async fn an_encrypted_channel_round_trip_leaves_no_plaintext_on_the_server() {
     jig_server::v0_0_2_federation::complete_client_handshake(&mut ws, None)
         .await
         .unwrap();
-    let sub = signed_subscribe(&bob.id, Scope::Channel { slug: slug.into() });
+    let sub = signed_subscribe(
+        &bob.id,
+        &server.server_did_string,
+        Scope::Channel { slug: slug.into() },
+    );
     ws.send(Message::Text(serde_json::to_string(&sub).unwrap().into()))
         .await
         .unwrap();

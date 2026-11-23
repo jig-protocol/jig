@@ -429,12 +429,16 @@ pub async fn check_channel_chain(
     slug: &str,
     records: &[jig_client::chain::IngestRecord],
 ) -> Result<ChainCheck> {
-    check_chain_in(&Pins::default_path(), who, server, slug, records).await
+    check_chain_in(&Pins::default_path(), who, None, server, slug, records).await
 }
 
+/// `audience` is the DID gap-filling reads are addressed to, when the caller
+/// holds a welcome that proves it; `None` proves it with a handshake, if a
+/// gap needs filling.
 async fn check_chain_in(
     pins_path: &std::path::Path,
     who: &jig_client::Identity,
+    audience: Option<&str>,
     server: &str,
     slug: &str,
     records: &[jig_client::chain::IngestRecord],
@@ -505,7 +509,22 @@ async fn check_chain_in(
                 Some(_) => channel.create_cid.as_str(),
                 None => slug,
             };
-            match fetch_records(who, server, reference, from, to).await {
+            let proven = match audience {
+                Some(audience) => Ok(audience.to_string()),
+                None => {
+                    crate::cmd::request_proof::audience(
+                        server,
+                        who,
+                        crate::cmd::request_proof::Trust::Pinned,
+                    )
+                    .await
+                }
+            };
+            let filled = match proven {
+                Ok(audience) => fetch_records(who, &audience, server, reference, from, to).await,
+                Err(e) => Err(e),
+            };
+            match filled {
                 Ok(filler) if filler.len() as u64 == to - from => {
                     for missing in &filler {
                         accept(&mut chain, missing, None)?;
@@ -621,10 +640,14 @@ async fn check_manifest_in(
         bundle_b64: String,
         sig_b64: Option<String>,
     }
+    // The welcome being checked proves the audience: this runs inside the
+    // handshake that pins it, so there is no other to ask.
+    let audience = jig_client::read_auth::audience_of(welcome)?;
     let base = crate::cmd::channel::base_http_url(server);
     let url = format!("{base}/api/v1/blocks/{}", cited.cid);
     let proof = jig_client::read_auth::ReadProof::sign(
         who,
+        &audience,
         "GET",
         jig_client::read_auth::signable_path(&url),
     );
@@ -644,7 +667,7 @@ async fn check_manifest_in(
         jig_client::limits::json_capped(resp, jig_client::limits::history_page_bytes(1))
             .await
             .with_context(|| format!("reading {url}"))?;
-    let record = fetch_records(who, server, LOG_SLUG, cited.seq, cited.seq + 1)
+    let record = fetch_records(who, &audience, server, LOG_SLUG, cited.seq, cited.seq + 1)
         .await?
         .into_iter()
         .next()
@@ -712,7 +735,7 @@ async fn check_manifest_in(
         },
     )?;
     if let ChainCheck::Unfilled { from, to } =
-        check_chain_in(pins_path, who, server, LOG_SLUG, &[record]).await?
+        check_chain_in(pins_path, who, Some(&audience), server, LOG_SLUG, &[record]).await?
     {
         eprintln!(
             "warning: {server} did not serve records {from}..{to} of its manifest log; the \
@@ -756,18 +779,9 @@ pub async fn show(who: &jig_client::Identity, server: &str) -> Result<()> {
         "{base}/api/v1/channels/{}/blocks?limit=200",
         crate::cmd::channel::escape_slug_for_url(LOG_SLUG)
     );
-    let proof = jig_client::read_auth::ReadProof::sign(
-        who,
-        "GET",
-        jig_client::read_auth::signable_path(&url),
-    );
-    let mut req = http(server, std::time::Duration::from_secs(10))
-        .await?
-        .get(&url);
-    for (name, value) in proof.headers() {
-        req = req.header(name, value);
-    }
-    let resp = req.send().await.with_context(|| format!("GET {url}"))?;
+    let client = http(server, std::time::Duration::from_secs(10)).await?;
+    let resp =
+        crate::cmd::request_proof::send(server, who, "GET", &url, b"", || client.get(&url)).await?;
     anyhow::ensure!(
         resp.status().is_success(),
         "GET {url} returned {}",
@@ -827,9 +841,10 @@ pub async fn show(who: &jig_client::Identity, server: &str) -> Result<()> {
     Ok(())
 }
 
-/// Records `from..to` of `slug`, signed as `who`.
+/// Records `from..to` of `slug`, signed as `who` for `audience`.
 async fn fetch_records(
     who: &jig_client::Identity,
+    audience: &str,
     server: &str,
     slug: &str,
     from: u64,
@@ -846,6 +861,7 @@ async fn fetch_records(
         );
         let proof = jig_client::read_auth::ReadProof::sign(
             who,
+            audience,
             "GET",
             jig_client::read_auth::signable_path(&url),
         );
@@ -1121,7 +1137,7 @@ mod tests {
         let r2 = sign(&key, 2, "bafyB", r1.hash());
         let path = pinned(dir.path(), &key, Some(&r0));
         // Out of order, with a re-delivery of the pinned head: a page of history.
-        let got = check_chain_in(&path, &who, SERVER, "#ops", &[r2, r0, r1])
+        let got = check_chain_in(&path, &who, None, SERVER, "#ops", &[r2, r0, r1])
             .await
             .unwrap();
         assert_eq!(got, ChainCheck::Verified);
@@ -1152,14 +1168,14 @@ mod tests {
         let r1 = sign(&owner, 1, "bafyA", r0.hash());
         // Read by its id, as a carried channel is on the server carrying it.
         let id = label_cid("bafyCreate");
-        let got = check_chain_in(&path, &who, SERVER, &id, &[r0.clone(), r1.clone()])
+        let got = check_chain_in(&path, &who, None, SERVER, &id, &[r0.clone(), r1.clone()])
             .await
             .unwrap();
         assert_eq!(got, ChainCheck::Verified);
         assert_eq!(head_seq(&path), Some(1));
 
         let forged = sign(&server, 2, "bafyB", r1.hash());
-        let e = check_chain_in(&path, &who, SERVER, "#ops", &[forged])
+        let e = check_chain_in(&path, &who, None, SERVER, "#ops", &[forged])
             .await
             .unwrap_err();
         assert!(e.to_string().contains("contradicted"), "{e}");
@@ -1180,7 +1196,7 @@ mod tests {
         let path = pinned(dir.path(), &key, Some(&r1));
         // The server signs another entry 1 and builds on it.
         let other = sign(&key, 1, "bafyOther", r0.hash());
-        let e = check_chain_in(&path, &who, SERVER, "#ops", &[other])
+        let e = check_chain_in(&path, &who, None, SERVER, "#ops", &[other])
             .await
             .unwrap_err();
         assert!(e.to_string().contains("contradicted"), "{e}");
@@ -1219,7 +1235,7 @@ mod tests {
         let stranger = jig_core::crypto::ed25519::generate_signing_key();
         let forged = sign(&stranger, 1, "bafyA", r0.hash());
         assert!(
-            check_chain_in(&path, &who, SERVER, "#ops", &[forged])
+            check_chain_in(&path, &who, None, SERVER, "#ops", &[forged])
                 .await
                 .is_err()
         );
@@ -1231,7 +1247,7 @@ mod tests {
         pins.advance_chain(SERVER, "#ops", &bare).unwrap();
         let other = sign(&key, 1, "bafyOther", r0.hash());
         assert!(
-            check_chain_in(&path, &who, SERVER, "#ops", &[other])
+            check_chain_in(&path, &who, None, SERVER, "#ops", &[other])
                 .await
                 .is_err()
         );
@@ -1259,7 +1275,7 @@ mod tests {
         let r1 = sign(&key, 1, "bafyA", r0.hash());
         let r2 = sign(&key, 2, "bafyB", r1.hash());
         let path = pinned(dir.path(), &key, Some(&r0));
-        let got = check_chain_in(&path, &who, SERVER, "#ops", &[r2])
+        let got = check_chain_in(&path, &who, None, SERVER, "#ops", &[r2])
             .await
             .unwrap();
         assert_eq!(got, ChainCheck::Unfilled { from: 1, to: 2 });
@@ -1290,7 +1306,7 @@ mod tests {
             },
         )
         .unwrap();
-        let got = check_chain_in(&path, &who, SERVER, "#ops", &[r0, r1])
+        let got = check_chain_in(&path, &who, None, SERVER, "#ops", &[r0, r1])
             .await
             .unwrap();
         assert_eq!(got, ChainCheck::Verified);
@@ -1313,7 +1329,7 @@ mod tests {
         let path = pinned(dir.path(), &key, Some(&r1));
         let rewritten = sign(&key, 1, "bafyOther", r0.hash());
         assert!(
-            check_chain_in(&path, &who, SERVER, "#ops", &[r0, rewritten])
+            check_chain_in(&path, &who, None, SERVER, "#ops", &[r0, rewritten])
                 .await
                 .is_err()
         );
@@ -1327,7 +1343,7 @@ mod tests {
         let key = jig_core::crypto::ed25519::generate_signing_key();
         let r0 = sign(&key, 0, "bafyCreate", GENESIS_PREV);
         let path = dir.path().join("pins.json");
-        let got = check_chain_in(&path, &who, SERVER, "#ops", &[r0])
+        let got = check_chain_in(&path, &who, None, SERVER, "#ops", &[r0])
             .await
             .unwrap();
         assert_eq!(got, ChainCheck::Unpinned);

@@ -72,8 +72,16 @@ async fn status(
             .replay_guard
             .lock()
             .expect("replay guard mutex poisoned");
-        crate::auth::authenticate(&proof, "GET", uri.path(), b"", now_ms, &mut guard)
-            .map_err(|outcome| disclose(&outcome))?
+        crate::auth::authenticate(
+            &proof,
+            &state.server_did,
+            "GET",
+            uri.path(),
+            b"",
+            now_ms,
+            &mut guard,
+        )
+        .map_err(|outcome| disclose(&outcome))?
     }
     .to_did_jig_string();
     // Owing work is the one refusal answered with a status; any other is the

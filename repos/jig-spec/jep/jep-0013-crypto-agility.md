@@ -80,7 +80,7 @@ post-GA.
 | Handshake welcome `jig-handshake-welcome-v2` (`jig-pipeline/src/handshake.rs`) | Raw ed25519 over length-prefixed canonical bytes | No |
 | Peer proof `jig-handshake-peer-v1` | Raw ed25519 over a BLAKE3 digest | No |
 | TLS binding `jig-tls-binding-v1` (`jig-core/src/tls_binding.rs`) | Raw ed25519 over a BLAKE3 digest | No |
-| Request proof `jig-request-auth-v1` (`jig-core/src/request_auth.rs`) | Raw ed25519 over a BLAKE3 digest that does not include the DID | No |
+| Request proof `jig-request-auth-v2` (`jig-core/src/request_auth.rs`) | Raw ed25519, verified strictly, over a BLAKE3 digest that includes the signer's DID and the audience server's DID (JEP-0015 §8); `v1`, which included neither, is refused | No |
 | Block signature (`jig-pipeline/src/ingest.rs`) | Raw ed25519 over a JSON array of the manifest and code bytes, with **no domain string** | No |
 | Admission proof `jig-admission-v2` (`jig-core/src/admission_pow.rs`) | Raw ed25519 | No |
 | Proof-of-work `jig-pow-v1` (`jig-core/src/pow.rs`) | BLAKE3 over the verifier and subject **DID strings** | Not a signature; no algorithm depends on the key |
@@ -126,9 +126,10 @@ Rules:
    takes a JEP and a release note; it is never a flag day for reading history.
 4. **Strict verification.** Every algorithm's verification MUST be its strict form. For
    ed25519 that means refusing non-canonical points and S values (`verify_strict` in
-   ed25519-dalek). Today the welcome, peer-proof, block, TLS-binding, request-proof and
-   admission-proof checks use the non-strict form, and they move to strict when their
-   successors land (section 3). Only COSE objects and receipts verify strictly today.
+   ed25519-dalek). Today the welcome, peer-proof, block, TLS-binding and admission-proof
+   checks use the non-strict form, and they move to strict when their successors land
+   (section 3). COSE objects, receipts and request proofs (`jig-request-auth-v2`, JEP-0015
+   §8) verify strictly today.
 5. **Composite keys verify every component.** A composite signature verifies only if every
    component signature verifies over the same message (AND, never OR).
 
@@ -212,7 +213,7 @@ use the successor.
 | Welcome `jig-handshake-welcome-v2` | `jig-handshake-welcome-v3`, the same fields as a CBOR map | strict verification |
 | Peer proof `jig-handshake-peer-v1` | `jig-handshake-peer-v2` | strict verification |
 | TLS binding `jig-tls-binding-v1` | `jig-tls-binding-v2` | strict verification |
-| Request proof `jig-request-auth-v1` | `jig-request-auth-v2`, with the DID inside the signed hash | binds the proof to its claimed signer, and does not rely on the header alone; strict verification |
+| Request proof `jig-request-auth-v2` | `jig-request-auth-v3`, a COSE_Sign1 of the same fields | `v2` (JEP-0015 §8) already binds the signer's DID and the audience, and is verified strictly; `v3` moves it to COSE |
 | Block signature (no domain) | `jig-block-sig-v1`, signing the bundle's CID | domain separation; strict verification |
 | Admission proof `jig-admission-v2` | `jig-admission-v3` | strict verification |
 

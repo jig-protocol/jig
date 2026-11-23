@@ -58,6 +58,10 @@ pub enum ClientError {
     /// contradicted what this device pinned. The socket is closed (4003).
     #[error("the server contradicted what it signed: {}", .0.reason)]
     Contradiction(Contradiction),
+    /// This client will not sign a request proof for the server: its welcome
+    /// does not list `jig-request-auth-v2`. Nothing was sent.
+    #[error(transparent)]
+    Audience(#[from] crate::read_auth::AudienceError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
@@ -798,13 +802,23 @@ impl Client {
     ///
     /// Servers requiring authentication refuse an unsigned `Subscribe`. The
     /// signature covers the scope's canonical string, so a proof minted for one
-    /// channel cannot subscribe to another.
+    /// channel cannot subscribe to another, and the DID of the server that
+    /// signed this connection's welcome, so it cannot subscribe at another
+    /// server. A server whose welcome does not list `jig-request-auth-v2` is
+    /// refused here, before anything is signed.
     ///
     /// The nonce is random per call rather than derived from anything: a server
     /// refuses a nonce it has already seen inside its acceptance window, so two
     /// subscriptions to the same channel must not collide.
-    fn sign_subscribe(&self, scope: &Scope) -> SubscribeAuth {
+    fn sign_subscribe(&self, scope: &Scope) -> Result<SubscribeAuth, ClientError> {
         use base64::Engine as _;
+
+        let welcome = self.welcome.as_ref().ok_or(ClientError::HandshakeFailed {
+            reason: "no welcome".to_string(),
+            evidence: None,
+        })?;
+        let audience = crate::read_auth::audience_of(welcome)?;
+        let did = self.identity.did_string();
 
         let hlc_wall_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -817,6 +831,8 @@ impl Client {
         let nonce = crate::read_auth::fresh_nonce(hlc_wall_ms);
 
         let hash = jig_core::request_auth::canonical_request_hash(
+            &audience,
+            &did,
             "SUBSCRIBE",
             &scope.canonical_string(),
             b"",
@@ -825,14 +841,15 @@ impl Client {
             &nonce,
         );
 
-        SubscribeAuth {
-            did: self.identity.did_string(),
+        Ok(SubscribeAuth {
+            did,
+            audience: Some(audience),
             hlc_wall_ms,
             hlc_logical: 0,
             nonce,
             sig_b64: base64::engine::general_purpose::STANDARD
                 .encode(self.identity.sign(hash.as_bytes()).to_bytes()),
-        }
+        })
     }
 
     /// Subscribe to a channel by slug. Returns a [`BlockStream`] that
@@ -846,7 +863,7 @@ impl Client {
             slug: slug.to_string(),
         };
         let env = Envelope::new(Frame::Subscribe {
-            auth: Some(self.sign_subscribe(&scope)),
+            auth: Some(self.sign_subscribe(&scope)?),
             scope,
         });
         // Serialize before registering so a serde failure can't leave a
@@ -1210,6 +1227,16 @@ mod tests {
 
     /// A correct welcome for a hello frame, or `None` when `text` is not a hello.
     fn welcome_reply(text: &str, key: &ed25519_dalek::SigningKey) -> Option<String> {
+        welcome_reply_accepting(text, key, vec![jig_core::request_auth::VERSION.to_string()])
+    }
+
+    /// [`welcome_reply`], from a server accepting the request-proof versions
+    /// `request_auth`.
+    fn welcome_reply_accepting(
+        text: &str,
+        key: &ed25519_dalek::SigningKey,
+        request_auth: Vec<String>,
+    ) -> Option<String> {
         let env: Envelope = serde_json::from_str(text).ok()?;
         let Frame::Hello {
             versions,
@@ -1234,6 +1261,7 @@ mod tests {
                     block_kinds: vec!["text-render".to_string()],
                     execution: true,
                     federation: false,
+                    request_auth,
                     ..Default::default()
                 },
                 ..Default::default()
@@ -1463,6 +1491,60 @@ mod tests {
         });
 
         (url, texts, closed)
+    }
+
+    /// A server whose welcome does not list `jig-request-auth-v2` is not
+    /// sent a subscribe at all: the client refuses before signing, and never
+    /// falls back to an unbound proof.
+    #[tokio::test]
+    async fn a_server_without_v2_gets_no_subscribe() {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let seen_by_server = seen.clone();
+        tokio::spawn(async move {
+            let key = test_signing_key();
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = accept_async(stream).await else {
+                return;
+            };
+            while let Some(Ok(msg)) = ws.next().await {
+                if let Message::Text(text) = msg {
+                    match welcome_reply_accepting(&text, &key, Vec::new()) {
+                        Some(reply) => {
+                            let _ = ws.send(Message::Text(reply.into())).await;
+                        }
+                        None => seen_by_server.lock().unwrap().push(text.to_string()),
+                    }
+                }
+            }
+        });
+        let client = Client::connect(&url, test_identity()).await.unwrap();
+        let err = client
+            .subscribe_channel("#hello")
+            .await
+            .err()
+            .expect("refused");
+        assert!(
+            matches!(
+                err,
+                ClientError::Audience(crate::read_auth::AudienceError::Unsupported { .. })
+            ),
+            "{err}"
+        );
+        assert!(err.to_string().contains("upgrade the server"), "{err}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .all(|t| !t.contains("subscribe")),
+            "nothing is sent: {:?}",
+            seen.lock().unwrap()
+        );
     }
 
     /// Regression guard for the "silent zombie" bug: when the server goes
