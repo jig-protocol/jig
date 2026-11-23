@@ -41,10 +41,10 @@ static AUDIENCES: Mutex<BTreeMap<(Trust, String), String>> = Mutex::new(BTreeMap
 /// never answers must not hang a command that only meant to make a request.
 const DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// The most of a 401's body read to tell a `WRONG_AUDIENCE` refusal apart. A
-/// refusal is a short JSON object; a longer body is no refusal this module
-/// acts on, and is reported as an error rather than read as one.
-const REFUSAL_BYTES: usize = 16 * 1024;
+/// The most of a 401's body read to tell a `WRONG_AUDIENCE` refusal apart:
+/// the crate's bound for error bodies. A longer body is no refusal this
+/// module acts on, and is reported as an error rather than read as one.
+const REFUSAL_BYTES: usize = jig_client::limits::MAX_ERROR_BODY_BYTES;
 
 fn key(server: &str) -> String {
     jig_client::secure::server_key(&crate::cmd::channel::base_http_url(server))

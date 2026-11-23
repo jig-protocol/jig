@@ -1,0 +1,7 @@
+{
+  "description": "The bytes a welcome listing these request-proof versions appends to its signed bytes, after every earlier part, under tag 6 (JEP-0002 rule 2, sig; JEP-0015 rule 27). Each part is a little-endian u64 length, then its bytes: the tag is the one byte 6, then the list, which is a u64 count followed by each version's length and bytes.",
+  "request_auth": [
+    "jig-request-auth-v2"
+  ],
+  "appended_hex": "0100000000000000062300000000000000010000000000000013000000000000006a69672d726571756573742d617574682d7632"
+}

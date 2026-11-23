@@ -1948,6 +1948,26 @@ mod tests {
         assert!(after.len() > before.len() && after.starts_with(&before));
     }
 
+    /// The bytes tag 6 appends, as JEP-0002 rule 2 specifies them, match the
+    /// committed vector, so an independent implementation can check them.
+    #[test]
+    fn the_request_auth_tag_matches_the_committed_vector() {
+        let v: serde_json::Value = serde_json::from_str(include_str!(
+            "../../jig-spec/jep/vectors/0015/welcome-request-auth.json"
+        ))
+        .unwrap();
+        let versions: Vec<String> = serde_json::from_value(v["request_auth"].clone()).unwrap();
+        let statement = negotiate(&hello_view("bm9uY2U="), &offer_server()).unwrap();
+        let before = statement.canonical_bytes();
+        let mut with = statement.clone();
+        with.capabilities.request_auth = versions;
+        let after = with.canonical_bytes();
+        let appended = after
+            .strip_prefix(before.as_slice())
+            .expect("appended last");
+        assert_eq!(hex::encode(appended), v["appended_hex"].as_str().unwrap());
+    }
+
     /// Stripping the signed versions from a welcome fails its signature, so
     /// a client cannot be talked out of a version the server signed.
     #[test]

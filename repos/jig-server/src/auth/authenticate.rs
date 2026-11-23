@@ -814,8 +814,9 @@ mod tests {
         assert_eq!(guard.len(), 0);
     }
 
-    /// Strict verification: a signature with S + ℓ (the same point, a
-    /// non-canonical scalar) is refused.
+    /// A signature with S + ℓ (the same point, a non-canonical scalar) is
+    /// refused. ed25519-dalek refuses it under plain verification too, so
+    /// this does not show strictness; `a_small_order_key_is_refused` does.
     #[test]
     fn a_non_canonical_s_is_refused() {
         let (signing, did) = identity(1);

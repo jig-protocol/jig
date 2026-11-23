@@ -18,7 +18,6 @@ use jig_client::open::open;
 use jig_client::pins::{
     ChannelPin, Pins, names_another_server, prove_carried, prove_channel_ordered_by,
 };
-use jig_client::read_auth::{ReadProof, signable_path};
 use jig_client::secure::{CommitLock, ReadIn, Seen, Session, history_reaches, replay_order};
 use jig_client::servers::{LocalAdds, Reach, ServerState, ServerStates};
 use jig_client::{Client, ClientError, DeliveredBlock, Identity};
@@ -1238,30 +1237,31 @@ impl Secure {
                 continue;
             }
             let reach = format!("{}/api/v1/reach/{did}", base_http_url(&url));
-            // Addressed to the DID `did`'s own signed record names for this
-            // custodian: a proof for it verifies there and nowhere else, so
-            // no handshake is needed to choose it. A custodian answering as
-            // another DID refuses it, and is left unchecked like one that
-            // cannot be reached.
-            let Ok(audience) = jig_client::read_auth::canonical_audience(&server_did) else {
-                unchecked.insert(server_did.clone());
-                out.push((server_did, url));
-                continue;
+            let http = match crate::cmd::trust::http(&url, std::time::Duration::from_secs(15)).await
+            {
+                Ok(client) => client,
+                Err(_) => {
+                    unchecked.insert(server_did.clone());
+                    out.push((server_did, url));
+                    continue;
+                }
             };
-            let proof = ReadProof::sign(&self.identity, &audience, "GET", signable_path(&reach));
-            let mut req =
-                match crate::cmd::trust::http(&url, std::time::Duration::from_secs(15)).await {
-                    Ok(client) => client.get(&reach),
-                    Err(_) => {
-                        unchecked.insert(server_did.clone());
-                        out.push((server_did, url));
-                        continue;
-                    }
-                };
-            for (name, value) in proof.headers() {
-                req = req.header(name, value);
-            }
-            let answer = match req.send().await {
+            // Addressed to the DID the custodian's own welcome proves, which
+            // must list jig-request-auth-v2 (JEP-0015 rule 24), and pinned
+            // nowhere: a custodian is asked, and trusted with nothing more. A
+            // custodian that cannot be handshaken with, or refuses, is left
+            // unchecked like one that cannot be reached.
+            let answer = match crate::cmd::request_proof::send_as(
+                &url,
+                crate::cmd::request_proof::Trust::Unpinned,
+                &self.identity,
+                "GET",
+                &reach,
+                b"",
+                || http.get(&reach),
+            )
+            .await
+            {
                 Ok(resp) => {
                     let status = resp.status();
                     let body = if status.is_success() {

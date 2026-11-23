@@ -101,9 +101,19 @@ pub async fn ensure_for(server: &str, identity: &Identity) -> Result<()> {
 
     let url = format!("{}/api/v1/admission", base_http_url(server));
     // Best effort, like the rest of this check: a server that cannot be
-    // handshaken with is reported by the command that follows.
-    match crate::cmd::request_proof::send(server, identity, "GET", &url, b"", || http.get(&url))
-        .await
+    // handshaken with is reported by the command that follows. Unpinned: the
+    // server is asked whether it wants work, and trusted with nothing else.
+    // `ensure_for` also runs for a custodian that is never to be pinned.
+    match crate::cmd::request_proof::send_as(
+        server,
+        crate::cmd::request_proof::Trust::Unpinned,
+        identity,
+        "GET",
+        &url,
+        b"",
+        || http.get(&url),
+    )
+    .await
     {
         Ok(resp) if resp.status().is_success() => {
             if jig_client::limits::json_capped::<Status>(

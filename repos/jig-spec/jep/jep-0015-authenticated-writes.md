@@ -290,8 +290,8 @@ within the freshness window.
 27. **Advertising.** A server lists the request-proof versions it accepts in its `welcome`
     capabilities as `request_auth`, and unsigned at `/.well-known/jig`.
     - A client lists the versions it signs in its `hello`. The `welcome` lists those that both
-      sides speak, and only when there are any, under its own tag in the signed bytes, so a
-      client that predates it checks the bytes it always did (rule 18).
+      sides speak, and only when there are any, under tag 6 in the signed bytes (JEP-0002
+      rule 2, `sig`), so a client that predates it checks the bytes it always did (rule 18).
     - A `welcome` that lists a version the `hello` did not list is outside the offer, and
       the client refuses it.
     - Like `authenticated-writes`, it is never in the server manifest.
@@ -368,7 +368,9 @@ None yet. The pieces that exist:
 the signer's seed is 32 bytes of `0x01` and the audience server's is 32 bytes of `0x02`. It
 covers a GET with no body, a POST with a body, and a `SUBSCRIBE`. Each case gives its inputs,
 the hash, the signature, and the `v1` hash of the same request, to show that the two differ.
-`jig_core::request_auth` checks the file in its tests.
+`jig_core::request_auth` checks the file in its tests. `vectors/0015/welcome-request-auth.json`
+gives the bytes a `welcome` listing `jig-request-auth-v2` appends to its signed bytes under
+tag 6 (rule 27); `jig_pipeline::handshake` checks it.
 
 Still to be added with the rest of the implementation:
 - a `client_proof` over a known transcript;
