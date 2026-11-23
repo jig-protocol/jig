@@ -30,6 +30,7 @@ pub mod send;
 pub mod server;
 pub mod tail;
 pub mod trust;
+pub mod upgrade;
 
 #[cfg(feature = "local-runtime")]
 pub mod block_run;

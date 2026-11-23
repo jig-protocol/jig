@@ -336,8 +336,10 @@ async fn handle_socket(
     metrics::connection_opened();
     // Per-connection channel: fanout delivers (StoredBlock, StoredReceipt) here.
     let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
+    let (notice_tx, mut notice_rx) = mpsc::unbounded_channel();
     let mut session = ConnState {
         tls_exporter,
+        notice_tx: Some(notice_tx),
         ..ConnState::default()
     };
 
@@ -468,6 +470,31 @@ async fn handle_socket(
                     }
                 }
 
+                // --- A notice about the subscribed channel → Client, as the
+                // existing error frame (a channel stopped for an upgrade) ---
+                Some((sub_id, notice)) = notice_rx.recv() => {
+                    let notice: jig_pipeline::fanout::ChannelNotice = notice;
+                    // Only for the subscription this connection holds now: one
+                    // queued for a subscription it has since replaced would
+                    // end the new one.
+                    if session.sub_id != Some(sub_id) || session.noticed == Some(sub_id) {
+                        continue;
+                    }
+                    session.noticed = Some(sub_id);
+                    if send_error(
+                        &mut socket,
+                        Some(notice.status),
+                        notice.code,
+                        Some(notice.channel_id),
+                        &notice.message,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+
                 // --- Fanout delivery → Client ---
                 delivery = sub_rx.recv() => {
                     let Some((block, receipt)) = delivery else {
@@ -552,6 +579,14 @@ async fn handle_socket(
 #[derive(Default)]
 struct ConnState {
     sub_id: Option<u64>,
+    /// Where fanout sends this connection's subscription the notices about
+    /// its channel ([`jig_pipeline::fanout::Fanout::watch_notices`]).
+    notice_tx: Option<mpsc::UnboundedSender<(u64, jig_pipeline::fanout::ChannelNotice)>>,
+    /// The subscription last sent a notice. A stop is told once per
+    /// subscription: the subscribe path's re-check and the stop itself can
+    /// both send one, and a second could reach a subscription the client has
+    /// made since.
+    noticed: Option<u64>,
     did: Option<jig_core::did::Did>,
     handshaken: bool,
     close: Option<(u16, &'static str)>,
@@ -947,6 +982,37 @@ async fn handle_client_frame(
                 }
             }
 
+            // A carried channel stopped at a block kind this server does not
+            // implement (JEP-0005 rule 14c) would take nothing: say why.
+            let stopped_id = match (&channel, &scope) {
+                (Some(channel), _) => Some(channel.id.as_str()),
+                (None, Scope::ChannelId { channel_id }) => Some(channel_id.as_str()),
+                (None, Scope::Channel { .. }) => None,
+            };
+            if let Some(id) = stopped_id {
+                match state.ingest_ctx.store.carried_upgrade(id) {
+                    Ok(None) => {}
+                    Ok(Some(stop)) => {
+                        let notice = stop.notice();
+                        let _ = send_error(
+                            socket,
+                            Some(notice.status),
+                            notice.code,
+                            Some(notice.channel_id),
+                            &notice.message,
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        let _ =
+                            send_error(socket, Some(500), "PERSIST_ERROR", None, &e.to_string())
+                                .await;
+                        return Ok(());
+                    }
+                }
+            }
+
             let sub_scope = match scope {
                 // Fanout keys channels by their id (the channel-create CID).
                 // A slug with no local row yet stays as it is until that
@@ -956,6 +1022,8 @@ async fn handle_client_frame(
                 }
                 Scope::ChannelId { channel_id } => SubscriptionScope::Channel(channel_id),
             };
+            let SubscriptionScope::Channel(sub_key) = &sub_scope;
+            let sub_key = sub_key.clone();
             // A connection holds ONE subscription. A re-Subscribe replaces it,
             // and the old one must actually go: left in the fanout map it
             // would keep delivering its old scope under its old identity for
@@ -973,6 +1041,14 @@ async fn handle_client_frame(
                 .subscribe_local(sub_scope, who, sub_tx.clone())
                 .await;
             session.sub_id = Some(id);
+            if let Some(tx) = &session.notice_tx {
+                state.ingest_ctx.fanout.watch_notices(id, tx.clone());
+                // A stop kept between the check above and this registration
+                // was told to no one: tell this subscription now.
+                if let Ok(Some(stop)) = state.ingest_ctx.store.carried_upgrade(&sub_key) {
+                    let _ = tx.send((id, stop.notice()));
+                }
+            }
             tracing::debug!(conn_id, sub_id = id, "ws subscription registered");
             Ok(())
         }
@@ -2483,6 +2559,125 @@ mod tests {
                 .await
                 .is_err(),
             "and is not answered with an error"
+        );
+    }
+
+    /// A channel this server stopped at a block kind it does not implement
+    /// (JEP-0005 rule 14c) answers a subscribe with the existing error frame,
+    /// `CHANNEL_NEEDS_UPGRADE`, naming the channel, the kind and the `seq`.
+    /// A subscription already open when its channel stops is told once, the
+    /// same way.
+    #[tokio::test]
+    async fn a_channel_stopped_for_an_upgrade_says_so_to_its_subscribers() {
+        let (state, url) = start_test_server().await;
+        let key = jig_core::crypto::ed25519::generate_signing_key();
+        let subscribe = |slug: &str| {
+            let sub = Envelope::new(Frame::Subscribe {
+                scope: Scope::Channel { slug: slug.into() },
+                auth: None,
+            });
+            TMessage::Text(serde_json::to_string(&sub).unwrap().into())
+        };
+        let stop = |slug: &str, seq: u64| jig_pipeline::follow::UpgradeStop {
+            channel_id: jig_pipeline::ingest_record::label_cid(slug),
+            seq,
+            block_cid: "bafkstop".to_string(),
+            kind: "sequencer-set".to_string(),
+            found_at: 0,
+        };
+        let expect_stop = |frame: Envelope, slug: &str, seq: u64| {
+            let Frame::Error {
+                status,
+                code,
+                ref_cid,
+                message,
+                ..
+            } = frame.frame
+            else {
+                panic!("expected an error frame, got {:?}", frame.frame);
+            };
+            assert_eq!(status, Some(409));
+            assert_eq!(code, "CHANNEL_NEEDS_UPGRADE");
+            assert_eq!(ref_cid, Some(jig_pipeline::ingest_record::label_cid(slug)));
+            assert!(
+                message.contains(&format!("`sequencer-set` at seq {seq}")),
+                "{message}"
+            );
+        };
+
+        // Stopped before the subscribe: refused, and nothing registered.
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+        crate::v0_0_2_federation::complete_peer_handshake(
+            &mut ws,
+            &state.server_did.to_did_jig_string(),
+            &[],
+            &key,
+        )
+        .await
+        .unwrap();
+        seed_channel(&state, "#stopped");
+        state
+            .ingest_ctx
+            .store
+            .stop_for_upgrade_for_tests(&stop("#stopped", 4))
+            .unwrap();
+        ws.send(subscribe("#stopped")).await.unwrap();
+        expect_stop(next_frame(&mut ws).await, "#stopped", 4);
+        assert_eq!(state.ingest_ctx.fanout.local_subscription_count().await, 0);
+
+        // Open when it stops: told once.
+        seed_channel(&state, "#open");
+        ws.send(subscribe("#open")).await.unwrap();
+        for _ in 0..100 {
+            if state.ingest_ctx.fanout.local_subscription_count().await == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        state
+            .ingest_ctx
+            .fanout
+            .notify_channel(
+                &jig_pipeline::ingest_record::label_cid("#open"),
+                stop("#open", 9).notice(),
+            )
+            .await;
+        expect_stop(next_frame(&mut ws).await, "#open", 9);
+        let notify = |slug: &'static str, seq: u64| {
+            let state = state.clone();
+            async move {
+                state
+                    .ingest_ctx
+                    .fanout
+                    .notify_channel(
+                        &jig_pipeline::ingest_record::label_cid(slug),
+                        stop(slug, seq).notice(),
+                    )
+                    .await;
+            }
+        };
+        // Told once: a second notice for the same subscription (the subscribe
+        // path's re-check racing the stop) is not sent, so it cannot reach a
+        // subscription the client makes in between.
+        notify("#open", 9).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), next_frame(&mut ws))
+                .await
+                .is_err(),
+            "a second notice for one subscription"
+        );
+        // Nor one for the subscription it replaced, nor another channel's.
+        seed_channel(&state, "#later");
+        ws.send(subscribe("#later")).await.unwrap();
+        // The replacement keeps the count at one; give the server the frame.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        notify("#open", 9).await;
+        notify("#stopped", 4).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), next_frame(&mut ws))
+                .await
+                .is_err(),
+            "a notice for another subscription"
         );
     }
 

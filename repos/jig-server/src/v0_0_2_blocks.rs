@@ -837,6 +837,19 @@ pub async fn get_channel_history(
             ),
         ));
     }
+    // A carried channel stopped at a block kind this server does not
+    // implement (JEP-0005 rule 14c): its history here ends short of the
+    // owner's, and a reader must be told why rather than read it as whole.
+    if let Some(channel) = channel.as_ref()
+        && let Some(stop) = store.carried_upgrade(&channel.id).map_err(persist_err)?
+    {
+        let notice = stop.notice();
+        return Err(err(
+            StatusCode::from_u16(notice.status).unwrap_or(StatusCode::CONFLICT),
+            notice.code,
+            notice.message,
+        ));
+    }
     // A reference that names no channel has no history, as the slug
     // wrappers answer: an empty page, or a cursor that is none of its blocks.
     let limit = query.limit.unwrap_or(MAX_HISTORY_LIMIT);
@@ -1882,6 +1895,48 @@ mod tests {
         let message = body["message"].as_str().unwrap();
         assert!(message.contains(&id), "{message}");
         assert!(message.contains("did:jig:zowner"), "{message}");
+    }
+
+    /// A carried channel stopped at a block kind this server does not
+    /// implement (JEP-0005 rule 14c): its history read says so, with the kind
+    /// and the `seq`, rather than serve a history that ends short.
+    #[tokio::test]
+    async fn channel_history_of_a_channel_stopped_for_an_upgrade_says_so() {
+        let state = Arc::new(unauthenticated_state());
+        let id = jig_pipeline::ingest_record::label_cid("a carried channel");
+        let store = &state.ingest_ctx.store;
+        store
+            .upsert_channel(&jig_pipeline::persist::StoredChannel {
+                id: id.clone(),
+                slug: "#team".to_string(),
+                visibility: "open".to_string(),
+                created_at: 0,
+                owner_did: "did:jig:zuser".to_string(),
+                suite: "none".to_string(),
+                sequencer_did: "did:jig:zowner".to_string(),
+                co_owners: Vec::new(),
+                tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
+            })
+            .unwrap();
+        let router = build_blocks_router(state.clone());
+        let path = format!("/api/v1/channels/{id}/blocks");
+        let (status, _) = get_path(router.clone(), &path).await;
+        assert_eq!(status, StatusCode::OK);
+
+        store
+            .stop_for_upgrade_for_tests(&jig_pipeline::follow::UpgradeStop {
+                channel_id: id.clone(),
+                seq: 7,
+                block_cid: "bafkstop".to_string(),
+                kind: "sequencer-set".to_string(),
+                found_at: 0,
+            })
+            .unwrap();
+        let (status, body) = get_path(router, &path).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "CHANNEL_NEEDS_UPGRADE");
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains("`sequencer-set` at seq 7"), "{message}");
     }
 
     #[tokio::test]

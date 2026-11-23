@@ -264,6 +264,32 @@ Non-goals for v0.2:
 14b. A nameserver's list of abandoned or compromised servers (post-MVP) is advisory. A
      server MAY refuse new shares involving a listed server, and MUST NOT treat a listing
      as moving or unseating the sequencer the owner names.
+14c. **Block kinds a reader does not implement.** A follower or client meets blocks of
+     kinds added after it was built. Such a block is **critical** unless its kind name
+     starts with `opt-`. A block whose metadata carries any key that starts with `mls_`,
+     other than `mls_message` and `mls_epoch`, is critical whatever its name. The v0.2
+     keys this covers are `mls_commit`, `mls_welcome`, `mls_group_info` and
+     `mls_ratchet_tree`, and any `mls_` key added later is covered too. The kind name is
+     in the manifest, so the author's signature covers it, and no relay can add or remove
+     the marker. Kind names that start with `opt-` are reserved for non-critical kinds,
+     and no kind defined in v0.2 uses the prefix.
+     - A reader MUST verify the author's signature and the owner's record before it acts
+       on a block's criticality.
+     - A follower MUST store a non-critical block of an unknown kind as the next link of
+       the chain, without executing it or applying any effect, and MUST deliver it like
+       any other block. Clients MUST skip its content. The chain stays continuous.
+     - On a critical block of an unknown kind, a follower or client MUST stop that channel
+       at that `seq`. It MUST NOT apply the block, read past it, or request it again
+       while it cannot implement the kind. It MUST surface that the channel needs an
+       upgrade, and MUST NOT stop any other channel. A follower answers its clients'
+       subscriptions and history reads of the channel with the error code
+       `CHANNEL_NEEDS_UPGRADE`, naming the kind and the `seq`. It sends that error once
+       to a subscription already open when the channel stops.
+     - Once upgraded to implement the kind, a reader takes the channel up again from the
+       block it stopped at.
+     - A server still refuses a block of a kind it does not implement when the block is
+       submitted to it as the channel's sequencer. This rule covers only blocks a reader
+       receives already sequenced.
 
 ## Writes through followers
 
@@ -413,6 +439,13 @@ Non-goals for v0.2:
   its init key until the DID updates its leaf. Signed release policies (21b) are what
   close this.
 
+- **Unknown block kinds** (14c). A hostile owner can sequence a critical block of an
+  invented kind to stop a channel at readers that do not implement it. That is no more
+  than it can already do (it can stop the channel). It cannot make a reader skip a block
+  that changes the group, because any group key makes a block critical. No one else can
+  turn a critical block into a skippable one, because the marker is part of the signed
+  kind name.
+
 **Threat register rows:** OP-06, OP-09, AB-03, AB-07, PV-01 and PV-05 are updated in
 implementation PRs.
 
@@ -421,6 +454,9 @@ implementation PRs.
 - v0.x makes no compatibility guarantee.
 - Open, unencrypted channels keep today's relay until F2 replaces it.
 - Slug-keyed channels without `sequencer` stay local.
+- Rule 14c lets later releases add block kinds without stalling v0.2 readers. A new kind
+  is skippable by them only if it is named `opt-*` from the start. Changing a kind's
+  criticality means naming a new kind.
 
 # Reference Implementation
 
@@ -436,6 +472,12 @@ deterministic payload and its `COSE_Sign1`, in hex, under fixed test keys. The o
 
 `vectors/0005/kp-request.json`: a `jig-kp-request-v1` (21a) under fixed test keys, as its
 deterministic payload and its `COSE_Sign1`, in hex.
+
+`vectors/0005/unknown-kinds.json` (14c): manifests of kinds that no v0.2 build implements,
+each signed under a fixed test key. For each it gives whether the block is critical and
+whether the author's signature verifies. The cases are: no marker; the `opt-` prefix; the
+prefix with `mls_commit`; the prefix with only `mls_message` and `mls_epoch`; the prefix
+with an `mls_` key not yet named; and the prefix added after signing.
 
 To be added with F2:
 

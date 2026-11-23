@@ -6,6 +6,39 @@
 //! per the v0.0.2 hello-world design.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
+
+/// A kind name with this prefix is non-critical (JEP-0005 rule 14c): a
+/// follower or client that does not implement it keeps it in the chain and
+/// skips its content. Every other kind name is critical. No kind this build
+/// implements uses it.
+pub const NON_CRITICAL_PREFIX: &str = "opt-";
+
+/// The metadata keys that change an MLS group: a block that carries any of
+/// them is critical whatever its kind name, since skipping it would leave the
+/// reader in the wrong epoch.
+pub const MLS_GROUP_KEYS: &[&str] = &[
+    "mls_commit",
+    "mls_welcome",
+    "mls_group_info",
+    "mls_ratchet_tree",
+];
+
+/// The `mls_`-prefixed metadata keys that change no group: an application
+/// message and the epoch it was sealed in. Any other `mls_` key, named in
+/// [`MLS_GROUP_KEYS`] or not, makes a block critical (fail closed).
+pub const MLS_CONTENT_KEYS: &[&str] = &["mls_message", "mls_epoch"];
+
+/// Whether a block of kind `name`, which this build does not implement, is
+/// critical (JEP-0005 rule 14c): its name lacks [`NON_CRITICAL_PREFIX`], or
+/// its metadata carries an MLS key other than [`MLS_CONTENT_KEYS`].
+pub fn is_critical(name: &str, metadata: &BTreeMap<String, Value>) -> bool {
+    !name.starts_with(NON_CRITICAL_PREFIX)
+        || metadata
+            .keys()
+            .any(|key| key.starts_with("mls_") && !MLS_CONTENT_KEYS.contains(&key.as_str()))
+}
 
 /// v0.0.2+ block kinds.
 ///
@@ -81,6 +114,33 @@ pub enum BlockKind {
 }
 
 impl BlockKind {
+    /// Every kind this build implements.
+    pub const ALL: [BlockKind; 23] = [
+        Self::TextRender,
+        Self::ChannelCreate,
+        Self::MemberAdd,
+        Self::MemberRemove,
+        Self::ChannelPromote,
+        Self::ChannelArchive,
+        Self::RoleAssign,
+        Self::RoleUnassign,
+        Self::FedHello,
+        Self::NsRegister,
+        Self::NsRotate,
+        Self::NsRenew,
+        Self::NsAttestation,
+        Self::TimeAttestation,
+        Self::EmailRender,
+        Self::EmailEncrypted,
+        Self::Receipt,
+        Self::ServerManifest,
+        Self::ChannelShare,
+        Self::ChannelUnshare,
+        Self::ContractAccept,
+        Self::ContractRefuse,
+        Self::ContractEnd,
+    ];
+
     /// Stable wire-format string (kebab-case).
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -222,6 +282,50 @@ mod tests {
 
         let parsed: BlockKind = serde_json::from_str("\"channel-create\"").unwrap();
         assert_eq!(parsed, BlockKind::ChannelCreate);
+    }
+
+    #[test]
+    fn all_lists_every_kind_once() {
+        let names: std::collections::BTreeSet<_> =
+            BlockKind::ALL.iter().map(|k| k.as_str()).collect();
+        assert_eq!(names.len(), BlockKind::ALL.len());
+        for k in BlockKind::ALL {
+            assert_eq!(BlockKind::from_str(k.as_str()).unwrap(), k);
+        }
+    }
+
+    #[test]
+    fn no_implemented_kind_is_non_critical_by_name() {
+        for k in BlockKind::ALL {
+            assert!(
+                !k.as_str().starts_with(NON_CRITICAL_PREFIX),
+                "{}",
+                k.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn criticality_fails_closed() {
+        let none = BTreeMap::new();
+        let meta = |key: &str| BTreeMap::from([(key.to_string(), Value::from("x"))]);
+        assert!(is_critical("sequencer-set", &none));
+        assert!(
+            is_critical("optional-thing", &none),
+            "only the exact prefix counts"
+        );
+        assert!(!is_critical("opt-reaction", &none));
+        assert!(!is_critical("opt-reaction", &meta("body")));
+        for key in MLS_CONTENT_KEYS {
+            assert!(!is_critical("opt-reaction", &meta(key)), "{key}");
+        }
+        for key in MLS_GROUP_KEYS {
+            assert!(is_critical("opt-reaction", &meta(key)), "{key}");
+        }
+        assert!(
+            is_critical("opt-reaction", &meta("mls_proposal")),
+            "an MLS key not yet named"
+        );
     }
 
     #[test]

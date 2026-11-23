@@ -209,6 +209,9 @@ struct Subscription {
     tx: mpsc::Sender<DeliveredBlock>,
     /// Set when the reader dropped this subscription because it was full.
     lagged: Arc<AtomicBool>,
+    /// Set when the server ended it: the channel stopped there, at a block
+    /// kind the server does not implement (JEP-0005 rule 14c).
+    stopped: Arc<StdMutex<Option<String>>>,
 }
 
 /// A request the server has yet to answer.
@@ -369,6 +372,7 @@ pub struct DeliveredBlock {
 pub struct BlockStream {
     rx: mpsc::Receiver<DeliveredBlock>,
     lagged: Arc<AtomicBool>,
+    stopped: Arc<StdMutex<Option<String>>>,
 }
 
 impl BlockStream {
@@ -385,6 +389,17 @@ impl BlockStream {
     /// is still up: subscribe again, and fill the gap from history.
     pub fn lagged(&self) -> bool {
         self.lagged.load(Ordering::SeqCst)
+    }
+
+    /// Why the server ended the stream, when the channel stopped there at a
+    /// block kind the server does not implement (`CHANNEL_NEEDS_UPGRADE`,
+    /// JEP-0005 rule 14c): the server's message, naming the kind and `seq`.
+    /// Subscribing again draws the same answer until the server upgrades.
+    pub fn server_needs_upgrade(&self) -> Option<String> {
+        self.stopped
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 }
 
@@ -735,6 +750,29 @@ impl Client {
                                 },
                             );
                         }
+                        // The subscription's channel stopped at this server, at
+                        // a block kind it does not implement: refused at
+                        // subscribe, or ended mid-stream. A connection holds one
+                        // subscription, so it ends, with the reason.
+                        Frame::Error { code, message, .. }
+                            if code == jig_pipeline::fanout::CHANNEL_NEEDS_UPGRADE =>
+                        {
+                            let mut subs = lock_subscriptions(&pending_subs_for_reader);
+                            for sub in subs.values() {
+                                *sub.stopped
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                    Some(message.clone());
+                            }
+                            subs.clear();
+                            drop(subs);
+                            // A refused subscribe is answered; an accepted one
+                            // left open is closed. Never a submit's answer.
+                            let mut asked = lock_asked(&asked_for_reader);
+                            if matches!(asked.front(), Some(Asked::Subscribe)) {
+                                asked.pop_front();
+                            }
+                        }
                         other => answer(&mut lock_asked(&asked_for_reader), other),
                     }
                 }
@@ -872,6 +910,7 @@ impl Client {
 
         let (delivery_tx, delivery_rx) = mpsc::channel(SUBSCRIPTION_QUEUE);
         let lagged = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(StdMutex::new(None));
         {
             let mut subs = lock_subscriptions(&self.pending_subscriptions);
             if self.closed.load(Ordering::SeqCst) {
@@ -882,6 +921,7 @@ impl Client {
                 Subscription {
                     tx: delivery_tx,
                     lagged: lagged.clone(),
+                    stopped: stopped.clone(),
                 },
             );
         }
@@ -901,6 +941,7 @@ impl Client {
         Ok(BlockStream {
             rx: delivery_rx,
             lagged,
+            stopped,
         })
     }
 
@@ -1756,6 +1797,39 @@ mod tests {
         ));
         client.submit_ack_timeout_seconds = 5;
         let block = text_block(&client, "on time");
+        let expected = block.cid();
+        assert_eq!(client.submit(block).await.unwrap(), expected);
+    }
+
+    /// A server that stopped the channel at a block kind it does not
+    /// implement answers the subscribe with `CHANNEL_NEEDS_UPGRADE`: the
+    /// stream ends with its message, and the answer is not taken for a
+    /// submit's.
+    #[tokio::test]
+    async fn a_channel_the_server_stopped_ends_its_stream_with_the_reason() {
+        let (url, _) = start_test_server(|env| async move {
+            match env.frame {
+                Frame::Subscribe { .. } => vec![Envelope::new(Frame::Error {
+                    status: Some(409),
+                    code: jig_pipeline::fanout::CHANNEL_NEEDS_UPGRADE.to_string(),
+                    ref_cid: Some("bafkchannel".to_string()),
+                    message: "block kind `sequencer-set` at seq 4".to_string(),
+                    retry_after_ms: None,
+                })],
+                Frame::Submit { bundle_b64, .. } => vec![ack(&bundle_b64)],
+                _ => vec![],
+            }
+        })
+        .await;
+        let client = Client::connect(&url, test_identity()).await.unwrap();
+        let mut stream = client.subscribe_channel("#stopped").await.unwrap();
+        assert!(stream.next().await.is_none());
+        assert!(!stream.lagged());
+        assert_eq!(
+            stream.server_needs_upgrade().as_deref(),
+            Some("block kind `sequencer-set` at seq 4")
+        );
+        let block = text_block(&client, "still answered");
         let expected = block.cid();
         assert_eq!(client.submit(block).await.unwrap(), expected);
     }

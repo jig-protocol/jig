@@ -52,12 +52,25 @@ pub fn decode_history(blocks: &[DeliveredBlock]) -> Vec<DecodedBlock> {
             // same timeline; replaying them as chat lines is noise.
             Ok(d) if !d.is_message() => None,
             Ok(d) => Some(d),
+            // A block of a kind this build does not implement, marked
+            // non-critical: in the chain, and nothing in it to show.
+            Err(e) if crate::cmd::upgrade::unknown_kind(&e).is_some_and(|o| o.skippable()) => None,
             Err(e) => {
                 eprintln!("[skip history block {}: {e}]", b.delivery_cid);
                 None
             }
         })
         .collect()
+}
+
+/// The first critical block of a kind this build does not implement in
+/// `blocks` (JEP-0005 rule 14c): a reader shows nothing at or past it.
+pub fn first_stop(blocks: &[DeliveredBlock]) -> Option<jig_client::open::OpenError> {
+    blocks.iter().find_map(|b| {
+        jig_client::open::open(b)
+            .err()
+            .filter(|e| e.needs_upgrade())
+    })
 }
 
 /// Fetch the last `limit` blocks of a channel, as `who`.
@@ -97,6 +110,11 @@ pub async fn fetch_history_page(
         // most likely a server that predates the history endpoint, and the
         // body is what says so.
         let body = jig_client::limits::error_text(resp).await;
+        // A channel this server stopped at a block kind it does not
+        // implement (JEP-0005 rule 14c): the reader stops, and says why.
+        if let Some(stop) = crate::cmd::upgrade::from_error_body(channel, &body) {
+            return Err(stop);
+        }
         anyhow::bail!("GET {url} returned {status}: {body}");
     }
     let body = jig_client::limits::read_capped(resp, jig_client::limits::history_page_bytes(limit))
@@ -125,9 +143,15 @@ pub async fn backfill(
     match fetch_history(who, base_url, channel, limit).await {
         Ok(blocks) => {
             crate::cmd::trust::check_history(who, base_url, channel, &blocks).await?;
+            // Nothing at or past a critical block of a kind this build does
+            // not implement is shown: the caller stops the channel there.
+            if let Some(e) = first_stop(&blocks) {
+                return Err(e.into());
+            }
             let deliveries = blocks.iter().map(|b| b.delivery_cid.clone()).collect();
             Ok((decode_history(&blocks), deliveries))
         }
+        Err(e) if crate::cmd::upgrade::is_needs_upgrade(&e) => Err(e),
         Err(e) => {
             eprintln!("warning: could not load history for {channel}: {e:#}");
             eprintln!("warning: opening with an empty pane.");

@@ -5,6 +5,7 @@
 //! `suite`), falling back to whether this device holds a group for it. Plain
 //! channels take the same path they always did, plus signature verification.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -15,9 +16,15 @@ use crate::cmd::blocks_decode::{DecodedBlock, decode, present};
 use crate::cmd::common::CliContext;
 use crate::cmd::history;
 use crate::cmd::secure::Secure;
+use crate::cmd::upgrade;
 
 pub struct Reader {
     slug: String,
+    /// The server read through, as the channel's stops are kept under it.
+    server: String,
+    /// Where the channels this device stopped at an unknown critical kind
+    /// are kept ([`jig_client::upgrade_stops`]).
+    stops: PathBuf,
     secure: Option<Arc<Secure>>,
     /// Who can read the channel, for an unencrypted one (JEP-0014 rule 5).
     notice: Option<String>,
@@ -45,14 +52,30 @@ impl Reader {
     /// A reader that never decrypts.
     #[cfg(test)]
     pub fn plain(slug: &str) -> Self {
+        Self::plain_with_stops(
+            slug,
+            std::env::temp_dir().join("jig-test-unused-stops.json"),
+        )
+    }
+
+    /// [`Self::plain`], keeping its stops at `stops`.
+    #[cfg(test)]
+    pub fn plain_with_stops(slug: &str, stops: PathBuf) -> Self {
         Self {
             slug: slug.to_string(),
+            server: "ws://test".to_string(),
+            stops,
             secure: None,
             notice: None,
         }
     }
 
     pub async fn open(ctx: &CliContext, slug: &str) -> Result<Self> {
+        // A channel this device stopped at a block kind it does not
+        // implement stays stopped until a build that does.
+        let server = ctx.server_url()?;
+        let stops = jig_client::upgrade_stops::UpgradeStops::default_path();
+        upgrade::check_open(&stops, &server, slug)?;
         // Without local MLS state there is no telling an encrypted channel
         // from one the server relabelled, and a plain reader sends in the
         // clear; so it is an error, not a fallback.
@@ -70,6 +93,8 @@ impl Reader {
         let (encrypted, tier) = secure.encrypted_with_tier(slug).await?;
         Ok(Self {
             slug: slug.to_string(),
+            server,
+            stops,
             notice: readability_notice(encrypted, tier.as_deref()),
             secure: encrypted.then(|| Arc::new(secure)),
         })
@@ -91,7 +116,8 @@ impl Reader {
         let Some(secure) = &self.secure else {
             let (lines, deliveries) =
                 history::backfill(who, server_url, &self.slug, history::DEFAULT_HISTORY_LIMIT)
-                    .await?;
+                    .await
+                    .map_err(|e| self.stopped(e))?;
             return Ok(Backlog {
                 lines,
                 tidy: Vec::new(),
@@ -103,6 +129,9 @@ impl Reader {
             .await
         {
             Ok(synced) => {
+                if let Some(stop) = &synced.stopped {
+                    return Err(self.stop_at(stop));
+                }
                 // A catch-up can replay many pages; the pane shows the tail.
                 let mut lines: Vec<DecodedBlock> = synced
                     .lines
@@ -117,6 +146,10 @@ impl Reader {
                 })
             }
             Err(e) => {
+                let e = self.stopped(e);
+                if upgrade::is_needs_upgrade(&e) {
+                    return Err(e);
+                }
                 eprintln!("warning: could not load history for {}: {e:#}", self.slug);
                 Ok(Backlog::default())
             }
@@ -129,24 +162,73 @@ impl Reader {
     /// messages that need it.
     pub fn read_missed(&self, blocks: &[DeliveredBlock]) -> Vec<Result<DecodedBlock>> {
         let Some(secure) = &self.secure else {
-            return blocks
-                .iter()
-                .filter_map(|d| self.read(d).map(|r| r.line).transpose())
-                .collect();
+            let mut read = Vec::new();
+            for d in blocks {
+                match self.read(d) {
+                    Ok(r) => read.extend(r.line.map(Ok)),
+                    // Nothing past the block the channel stopped at.
+                    Err(e) if upgrade::is_needs_upgrade(&e) => {
+                        read.push(Err(e));
+                        break;
+                    }
+                    Err(e) => read.push(Err(e)),
+                }
+            }
+            return read;
         };
         let synced = secure.replay(&self.slug, blocks);
         self.tidy(synced.tidy);
-        synced.lines.into_iter().map(Ok).collect()
+        let mut read: Vec<Result<DecodedBlock>> = synced.lines.into_iter().map(Ok).collect();
+        if let Some(stop) = &synced.stopped {
+            read.push(Err(self.stop_at(stop)));
+        }
+        read
+    }
+
+    /// `e`, as the stop it is when it is one: a critical block of a kind this
+    /// build does not implement (kept, so the next session stops too), or the
+    /// server's word that it stopped the channel. Anything else is `e`.
+    fn stopped(&self, e: anyhow::Error) -> anyhow::Error {
+        if let Some(open) = upgrade::unknown_kind(&e)
+            && open.needs_upgrade()
+        {
+            return self.stop_at(open);
+        }
+        upgrade::server_stop(&self.slug, e)
+    }
+
+    /// Stop this channel at the critical block `e` names, keeping the stop
+    /// for the next session, and say so.
+    pub fn stop_at(&self, e: &jig_client::open::OpenError) -> anyhow::Error {
+        upgrade::stop_at(&self.stops, &self.server, &self.slug, e)
+    }
+
+    /// What reading `d` came to: a line, nothing (a non-critical block of a
+    /// kind this build does not implement), or the stop.
+    fn unread(&self, e: anyhow::Error) -> Result<Read> {
+        if upgrade::unknown_kind(&e).is_some_and(|open| open.skippable()) {
+            return Ok(Read {
+                line: None,
+                tidy: None,
+            });
+        }
+        Err(self.stopped(e))
     }
 
     pub fn read(&self, d: &DeliveredBlock) -> Result<Read> {
         let Some(secure) = &self.secure else {
-            return Ok(Read {
-                line: Some(decode(d)?),
-                tidy: None,
-            });
+            return match decode(d) {
+                Ok(line) => Ok(Read {
+                    line: Some(line),
+                    tidy: None,
+                }),
+                Err(e) => self.unread(e),
+            };
         };
-        let opened = open(d)?;
+        let opened = match open(d) {
+            Ok(opened) => opened,
+            Err(e) => return self.unread(e.into()),
+        };
         let seen = secure.observe(&self.slug, &opened);
         let tidy = match &seen {
             jig_client::secure::Seen::Left { member, tidy: true } => Some(member.clone()),

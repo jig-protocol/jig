@@ -326,6 +326,10 @@ pub struct Synced {
     pub cids: std::collections::HashSet<String>,
     /// The same blocks by delivery CID, the key a live delivery carries.
     pub deliveries: Vec<String>,
+    /// The critical block of an unknown kind the replay stopped at, if any
+    /// (JEP-0005 rule 14c): nothing at or after it was read, and the head
+    /// stays before it.
+    pub stopped: Option<jig_client::open::OpenError>,
 }
 
 /// Which page of a channel's history to fetch.
@@ -347,6 +351,23 @@ struct Replayed {
     left: Vec<String>,
     cids: std::collections::HashSet<String>,
     deliveries: Vec<String>,
+    stopped: Option<jig_client::open::OpenError>,
+}
+
+/// The blocks of `delivered` (oldest first) before the first critical block
+/// of a kind this build does not implement, and that block's error: a reader
+/// reads nothing at or past it (JEP-0005 rule 14c).
+fn before_stop(
+    delivered: &[DeliveredBlock],
+) -> (&[DeliveredBlock], Option<jig_client::open::OpenError>) {
+    for (at, d) in delivered.iter().enumerate() {
+        if let Err(e) = open(d)
+            && e.needs_upgrade()
+        {
+            return (&delivered[..at], Some(e));
+        }
+    }
+    (delivered, None)
 }
 
 /// How a forward walk through history ended.
@@ -374,7 +395,7 @@ fn continues(chain: &mut ChannelChain, page: &[DeliveredBlock]) -> Result<(), St
         let Some(record) = &d.ingest else {
             return Err(format!("block {} has no sequencer record", d.delivery_cid));
         };
-        let cid = open(d).ok().map(|o| o.cid);
+        let cid = placed_cid(d);
         match chain.accept(record, cid.as_deref()) {
             Ok(Step::Next) => {}
             Ok(Step::Gap { from, to }) => {
@@ -417,7 +438,35 @@ fn sequencers_for(
 /// Where the block `cid` is in `page`, if it is.
 fn position_of(page: &[DeliveredBlock], cid: &str) -> Option<usize> {
     page.iter()
-        .position(|d| open(d).is_ok_and(|o| o.cid == cid))
+        .position(|d| placed_cid(d).is_some_and(|c| c == cid))
+}
+
+/// Keep of `window` (oldest first) only what a sync read up to `head`, the
+/// block it left its head at: a block past it landed since, and is the next
+/// sync's to read in order, through the stop rule. A window with no head in
+/// it lies wholly past it (more blocks landed since than it holds), and no
+/// head means the sync placed nothing; either way nothing is shown.
+fn bound_to_head(window: &mut Vec<DeliveredBlock>, head: Option<&str>) {
+    match head.and_then(|head| position_of(window, head)) {
+        Some(at) => window.truncate(at + 1),
+        None => window.clear(),
+    }
+}
+
+/// The CID of a delivered block this reader can place in its channel: one it
+/// opens, or a non-critical block of a kind this build does not implement
+/// (JEP-0005 rule 14c), which is in the chain all the same though nothing in
+/// it is read. A head, a cursor or a page bound may be either.
+pub(crate) fn placed_cid(d: &DeliveredBlock) -> Option<String> {
+    match open(d) {
+        Ok(opened) => Some(opened.cid),
+        Err(jig_client::open::OpenError::UnknownKind {
+            cid,
+            critical: false,
+            ..
+        }) => Some(cid),
+        Err(_) => None,
+    }
 }
 
 /// The reachability record a server keeps for us ([`Secure::kept_record`]).
@@ -1878,19 +1927,28 @@ impl Secure {
         Ok(synced)
     }
 
+    /// The error for `slug` stopped at the critical block `stop`, kept as
+    /// [`crate::cmd::upgrade::stop_at`] keeps a reader's.
+    fn stopped_at(&self, slug: &str, stop: &jig_client::open::OpenError) -> anyhow::Error {
+        crate::cmd::upgrade::stop_at(
+            &jig_client::upgrade_stops::UpgradeStops::default_path(),
+            &self.server,
+            slug,
+            stop,
+        )
+    }
+
     /// Move the head to the newest block of `delivered`, with its record.
     fn move_head(&self, slug: &str, delivered: &[DeliveredBlock]) -> Result<()> {
+        // Never past a block this reader stopped at.
+        let (delivered, _) = before_stop(delivered);
         if let Some((d, newest)) = delivered
             .iter()
             .rev()
-            .find_map(|d| open(d).ok().map(|o| (d, o)))
+            .find_map(|d| placed_cid(d).map(|cid| (d, cid)))
         {
-            self.session.set_head(
-                &self.server,
-                &self.key(slug),
-                &newest.cid,
-                d.ingest.as_ref(),
-            )?;
+            self.session
+                .set_head(&self.server, &self.key(slug), &newest, d.ingest.as_ref())?;
         }
         Ok(())
     }
@@ -1978,11 +2036,17 @@ impl Secure {
                 ));
             }
             self.replay_into(slug, &mut replayed, &page);
-            let Some(last) = page.iter().rev().find_map(|d| open(d).ok()) else {
+            if replayed.stopped.is_some() {
+                self.move_head(slug, &page)?;
+                return Ok(Forwarded::Done(replayed));
+            }
+            // A page of only non-critical blocks of unknown kinds moves the
+            // cursor past them too, or the blocks after them are never reached.
+            let Some(last) = page.iter().rev().find_map(placed_cid) else {
                 return Ok(Forwarded::Done(replayed));
             };
             self.move_head(slug, &page)?;
-            cursor = last.cid;
+            cursor = last;
             if chain.is_none() {
                 chain = self.chain_from_head(slug)?;
             }
@@ -2016,10 +2080,10 @@ impl Secure {
         cursor: &str,
         page: &[DeliveredBlock],
     ) -> Result<Result<Option<ChannelChain>, String>> {
-        let Some(first) = page.first().and_then(|d| open(d).ok()) else {
+        let Some(first) = page.first().and_then(placed_cid) else {
             return Ok(Err("a page's first block does not open".into()));
         };
-        let before = match self.history_page(slug, 1, Page::Before(&first.cid)).await {
+        let before = match self.history_page(slug, 1, Page::Before(&first)).await {
             Ok(before) => before,
             Err(e)
                 if e.downcast_ref::<Refused>()
@@ -2098,11 +2162,11 @@ impl Secure {
                 );
                 return Ok((delivered, false));
             }
-            let Some(oldest) = delivered.first().and_then(|d| open(d).ok()) else {
+            let Some(oldest) = delivered.first().and_then(placed_cid) else {
                 return Ok((delivered, false));
             };
             let mut older = self
-                .history_page(slug, MAX_HISTORY_PAGE, Page::Before(&oldest.cid))
+                .history_page(slug, MAX_HISTORY_PAGE, Page::Before(&oldest))
                 .await?;
             if older.is_empty() {
                 // The head is not in this history: the server dropped it, or
@@ -2163,11 +2227,11 @@ impl Secure {
                 );
                 break;
             }
-            let Some(oldest) = delivered.first().and_then(|d| open(d).ok()) else {
+            let Some(oldest) = delivered.first().and_then(placed_cid) else {
                 break;
             };
             let mut older = self
-                .history_page(slug, MAX_HISTORY_PAGE, Page::Before(&oldest.cid))
+                .history_page(slug, MAX_HISTORY_PAGE, Page::Before(&oldest))
                 .await?;
             more = !older.is_empty();
             older.append(&mut delivered);
@@ -2183,18 +2247,26 @@ impl Secure {
     /// Departed members to tidy come from the sync.
     pub async fn recent(&self, slug: &str, limit: usize) -> Result<Synced> {
         let synced = self.sync(slug).await?;
+        // Stopped at a critical block of an unknown kind: nothing past it is
+        // shown, and the newest window may well be past it.
+        if synced.stopped.is_some() {
+            return Ok(synced);
+        }
+        // The head the sync read to: blocks past it landed since, and are the
+        // next sync's to read in order, through the stop rule.
+        let head = self.session.head(&self.server, &self.key(slug))?;
         let mut delivered = self
             .history_page(slug, limit.min(MAX_HISTORY_PAGE), Page::Newest)
             .await?;
         while delivered.len() < limit {
-            let Some(oldest) = delivered.first().and_then(|d| open(d).ok()) else {
+            let Some(oldest) = delivered.first().and_then(placed_cid) else {
                 break;
             };
             let mut older = self
                 .history_page(
                     slug,
                     (limit - delivered.len()).min(MAX_HISTORY_PAGE),
-                    Page::Before(&oldest.cid),
+                    Page::Before(&oldest),
                 )
                 .await?;
             if older.is_empty() {
@@ -2203,6 +2275,7 @@ impl Secure {
             older.append(&mut delivered);
             delivered = older;
         }
+        bound_to_head(&mut delivered, head.as_deref());
         let shown = self.replay(slug, &delivered);
         Ok(Synced {
             tidy: synced.tidy,
@@ -2275,6 +2348,12 @@ impl Secure {
 
     /// Process `delivered`, in MLS order, into what a replay has found.
     fn replay_into(&self, reference: &str, r: &mut Replayed, delivered: &[DeliveredBlock]) {
+        // Nothing past a critical block of an unknown kind is read.
+        if r.stopped.is_some() {
+            return;
+        }
+        let (delivered, stopped) = before_stop(delivered);
+        r.stopped = stopped;
         let mut opened = Vec::with_capacity(delivered.len());
         let mut receipts = std::collections::HashMap::new();
         for d in delivered {
@@ -2283,6 +2362,8 @@ impl Secure {
                     receipts.insert(o.cid.clone(), d.receipts.clone());
                     opened.push(o);
                 }
+                // In the chain, and nothing in it for this reader.
+                Err(e) if e.skippable() => {}
                 Err(e) => eprintln!("[dropped history block {}: {e}]", d.delivery_cid),
             }
         }
@@ -2325,6 +2406,7 @@ impl Secure {
             tidy,
             cids: r.cids,
             deliveries: r.deliveries,
+            stopped: r.stopped,
         }
     }
 
@@ -2343,7 +2425,11 @@ impl Secure {
     ) -> Result<String> {
         let _held = self.hold(slug).await?;
         for attempt in 0..2 {
-            self.sync(slug).await?;
+            // A group this device could not read to its head must not be
+            // committed from: the block it stopped at may change it.
+            if let Some(stop) = self.sync(slug).await?.stopped {
+                return Err(self.stopped_at(slug, &stop));
+            }
             // Still pending after a sync: an earlier commit whose answer never
             // came, and which did not land (had it, its echo would have
             // merged it). It would block this one.
@@ -2386,6 +2472,13 @@ impl Secure {
         if synced.cids.contains(&block.cid()) {
             self.session.confirm(&self.server, &key)?;
             return Ok(block.cid());
+        }
+        // A sync that stopped short says nothing of whether the commit landed
+        // past where it stopped: keep it until one that reads that far.
+        if let Some(stop) = &synced.stopped {
+            return Err(self.stopped_at(slug, stop).context(format!(
+                "{sent:#}; the commit is kept until a sync past the stop shows whether it landed"
+            )));
         }
         // Best effort: a commit still pending is dropped by the next one.
         self.session.abandon(&self.server, &key).ok();
@@ -2577,6 +2670,54 @@ mod tests {
         sequencers_for, settle_local_adds, shadow_note, split_unchecked, walk_release_log,
     };
     use std::cell::RefCell;
+
+    /// Signed text blocks, as a history window delivers them, oldest first.
+    fn window(n: usize) -> (Vec<jig_client::DeliveredBlock>, Vec<String>) {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let id = jig_client::Identity::generate_for_tests(&dir.keep());
+        let blocks: Vec<_> = (0..n)
+            .map(|i| {
+                let hlc = jig_core::HlcTimestamp::now_wall(id.did().clone());
+                let block = jig_client::blocks::build_text_render(&id, "#c", &format!("m{i}"), hlc);
+                jig_client::DeliveredBlock {
+                    bundle_b64: base64::engine::general_purpose::STANDARD
+                        .encode(block.canonical_bytes()),
+                    sig_b64: Some(
+                        base64::engine::general_purpose::STANDARD.encode(&block.sender_sig),
+                    ),
+                    receipts: vec![],
+                    delivery_cid: format!("delivery:{i}"),
+                    ingest: None,
+                }
+            })
+            .collect();
+        let cids = blocks
+            .iter()
+            .map(|d| super::placed_cid(d).unwrap())
+            .collect();
+        (blocks, cids)
+    }
+
+    /// `recent` shows only what the sync read: up to its head, and nothing
+    /// when the sync placed nothing (no head) or the window lies past it.
+    #[test]
+    fn the_shown_window_ends_at_the_synced_head() {
+        let (blocks, cids) = window(4);
+        let mut w = blocks.clone();
+        super::bound_to_head(&mut w, Some(&cids[1]));
+        assert_eq!(w.len(), 2, "cut after the head");
+
+        // The sync placed nothing, then blocks landed: none of them is shown.
+        let mut w = blocks.clone();
+        super::bound_to_head(&mut w, None);
+        assert!(w.is_empty(), "no head: nothing the sync read");
+
+        // A window wholly past the head.
+        let mut w = blocks[2..].to_vec();
+        super::bound_to_head(&mut w, Some(&cids[0]));
+        assert!(w.is_empty(), "head not in the window");
+    }
 
     fn refusal(status: u16, code: &str) -> anyhow::Error {
         Refused {

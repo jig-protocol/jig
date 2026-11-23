@@ -642,7 +642,12 @@ impl Stream {
                 .store()
                 .chain_evidence(&share.channel_id)
                 .map(|e| !e.is_empty())
-                .unwrap_or(true);
+                .unwrap_or(true)
+                || self
+                    .store()
+                    .carried_upgrade(&share.channel_id)
+                    .map(|stop| stop.is_some())
+                    .unwrap_or(true);
             if stopped {
                 continue;
             }
@@ -652,6 +657,11 @@ impl Stream {
 
     /// Ask `peer` for `channel_id`'s records past this server's head.
     fn pull_from_head(&self, peer: &str, channel_id: &str) {
+        // Stopped for an upgrade (JEP-0005 rule 14c): asked for nothing, on
+        // the periodic pull or on a retry the owner scheduled before the stop.
+        if !matches!(self.store().carried_upgrade(channel_id), Ok(None)) {
+            return;
+        }
         match self.store().latest_ingest_record(channel_id) {
             Ok(head) => self.pull(peer, channel_id, head.map_or(0, |h| h.seq + 1)),
             Err(e) => tracing::warn!(channel_id, "reading the head: {e}"),
@@ -724,6 +734,10 @@ impl Stream {
                     self.pull(&sequencer, &channel_id, head.map_or(0, |h| h + 1));
                     return;
                 }
+                // Stopped until this server is upgraded: asking again would
+                // only bring the same block (JEP-0005 rule 14c). Logged once,
+                // where the channel stopped.
+                Err(FollowError::NeedsUpgrade { .. }) => return,
                 Err(e) => {
                     tracing::warn!(
                         peer = sequencer,

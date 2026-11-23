@@ -62,6 +62,7 @@ pub use hlc::HlcTimestamp;
 pub use manifest::{
     Attestation, Author, BlockManifest, BlockManifestBuilder, Capability, Constraints,
     ManifestGateError, MetadataVisibility, Privacy, Provenance, RenderDescriptor, Resource,
+    UnknownKindManifest,
 };
 pub use signing::BlockSignature;
 pub use suite::{EncryptionSuite, SuiteNotImplemented, UnknownSuite};

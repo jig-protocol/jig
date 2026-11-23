@@ -49,6 +49,41 @@ pub enum OpenError {
     /// block was altered after signing, or never signed by that author.
     #[error("forged block: the signature is not {claimed}'s")]
     Forged { claimed: String },
+    /// The block checks out, but is of a kind this build does not implement
+    /// (JEP-0005 rule 14c). One delivered without a signature is always
+    /// critical: its `opt-` marker is the author's word only once verified. A non-critical one is skipped: it is in the
+    /// channel's chain, and nothing in it is for this reader. A critical one
+    /// stops the channel here: reading past it would read the channel wrong.
+    #[error(
+        "block {cid} is of kind `{kind}`, which this version does not implement{}",
+        if *critical { "; the channel needs an upgrade to read past it" } else { "" }
+    )]
+    UnknownKind {
+        cid: String,
+        kind: String,
+        critical: bool,
+        /// Its place in its channel, from the record it was delivered with.
+        channel_id: Option<String>,
+        seq: Option<u64>,
+    },
+}
+
+impl OpenError {
+    /// Whether this is a block of an unknown kind that stops its channel.
+    pub fn needs_upgrade(&self) -> bool {
+        matches!(self, Self::UnknownKind { critical: true, .. })
+    }
+
+    /// Whether this is a block of an unknown kind to skip.
+    pub fn skippable(&self) -> bool {
+        matches!(
+            self,
+            Self::UnknownKind {
+                critical: false,
+                ..
+            }
+        )
+    }
 }
 
 pub fn open(d: &DeliveredBlock) -> Result<OpenedBlock, OpenError> {
@@ -57,8 +92,15 @@ pub fn open(d: &DeliveredBlock) -> Result<OpenedBlock, OpenError> {
         .map_err(|e| OpenError::Malformed(format!("bundle_b64: {e}")))?;
     let (manifest_bytes, code_bytes): (Vec<u8>, Vec<u8>) = serde_json::from_slice(&raw)
         .map_err(|e| OpenError::Malformed(format!("bundle tuple: {e}")))?;
-    let manifest: BlockManifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(|e| OpenError::Malformed(format!("manifest: {e}")))?;
+    // A kind this build does not implement is read as rule 14c reads it, and
+    // checked as any block is before it is reported.
+    let (manifest, unknown) = match serde_json::from_slice::<BlockManifest>(&manifest_bytes) {
+        Ok(manifest) => (manifest, None),
+        Err(e) => match jig_core::UnknownKindManifest::parse(&manifest_bytes) {
+            Some(read) => (read.manifest, Some((read.kind, read.critical))),
+            None => return Err(OpenError::Malformed(format!("manifest: {e}"))),
+        },
+    };
     let cid = BlockBundle {
         manifest_bytes: &manifest_bytes,
         code_bytes: &code_bytes,
@@ -73,7 +115,23 @@ pub fn open(d: &DeliveredBlock) -> Result<OpenedBlock, OpenError> {
         .map(|a| a.did.clone())
         .ok_or_else(|| OpenError::Malformed("no author".to_string()))?;
 
+    // `verified` is whether the author's signature held. Without it the
+    // marker is unauthenticated, and only fails closed: critical.
+    let unknown_kind = |cid: String, verified: bool| {
+        unknown
+            .clone()
+            .map(|(kind, critical)| OpenError::UnknownKind {
+                cid,
+                kind,
+                critical: critical || !verified,
+                channel_id: d.ingest.as_ref().map(|r| r.channel_id.clone()),
+                seq: d.ingest.as_ref().map(|r| r.seq),
+            })
+    };
     let Some(sig_b64) = d.sig_b64.as_deref() else {
+        if let Some(e) = unknown_kind(cid.clone(), false) {
+            return Err(e);
+        }
         return Ok(OpenedBlock {
             cid,
             sender: claimed.to_did_jig_string(),
@@ -96,6 +154,9 @@ pub fn open(d: &DeliveredBlock) -> Result<OpenedBlock, OpenError> {
     let canonical = serde_json::to_vec(&(&manifest_bytes, &code_bytes))
         .map_err(|e| OpenError::Malformed(e.to_string()))?;
     verifying.verify(&canonical, &sig).map_err(|_| forged())?;
+    if let Some(e) = unknown_kind(cid.clone(), true) {
+        return Err(e);
+    }
     Ok(OpenedBlock {
         cid,
         sender: jig_core::Did::from_ed25519_pubkey(&key).to_did_jig_string(),
@@ -171,5 +232,72 @@ mod tests {
         let mut d = delivered(&id, "hi");
         d.sig_b64 = None;
         assert_eq!(open(&d).unwrap().authenticity, Authenticity::Unsigned);
+    }
+
+    /// A block of a kind this build does not implement (JEP-0005 rule 14c),
+    /// as `id` signs it.
+    fn delivered_unknown(id: &Identity, kind: &str, meta: serde_json::Value) -> DeliveredBlock {
+        let hlc = HlcTimestamp::now_wall(id.did().clone());
+        let block = build_text_render(id, "#hello", "x", hlc);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&block.manifest_bytes).unwrap();
+        manifest["kind"] = serde_json::json!(kind);
+        manifest["metadata"] = meta;
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let canonical = serde_json::to_vec(&(&manifest_bytes, &Vec::<u8>::new())).unwrap();
+        DeliveredBlock {
+            bundle_b64: STANDARD.encode(&canonical),
+            sig_b64: Some(STANDARD.encode(id.sign(&canonical).to_bytes())),
+            receipts: vec![],
+            delivery_cid: "delivery:x".to_string(),
+            ingest: None,
+        }
+    }
+
+    #[test]
+    fn an_unknown_kind_is_checked_then_reported_with_its_criticality() {
+        let id = identity();
+        let critical = open(&delivered_unknown(
+            &id,
+            "sequencer-set",
+            serde_json::json!({}),
+        ))
+        .unwrap_err();
+        assert!(critical.needs_upgrade(), "{critical}");
+        assert!(
+            matches!(&critical, OpenError::UnknownKind { kind, .. } if kind == "sequencer-set")
+        );
+
+        let skippable = open(&delivered_unknown(
+            &id,
+            "opt-reaction",
+            serde_json::json!({}),
+        ))
+        .unwrap_err();
+        assert!(skippable.skippable(), "{skippable}");
+
+        let commit = open(&delivered_unknown(
+            &id,
+            "opt-reaction",
+            serde_json::json!({"mls_commit": "AAAA"}),
+        ))
+        .unwrap_err();
+        assert!(commit.needs_upgrade());
+
+        // Renamed after signing: forged, not skippable.
+        let mut renamed = delivered_unknown(&id, "sequencer-set", serde_json::json!({}));
+        let raw = STANDARD.decode(&renamed.bundle_b64).unwrap();
+        let (m, c): (Vec<u8>, Vec<u8>) = serde_json::from_slice(&raw).unwrap();
+        let m = String::from_utf8(m)
+            .unwrap()
+            .replace("\"sequencer-set\"", "\"opt-sequencer-set\"")
+            .into_bytes();
+        renamed.bundle_b64 = STANDARD.encode(serde_json::to_vec(&(&m, &c)).unwrap());
+        assert!(matches!(open(&renamed), Err(OpenError::Forged { .. })));
+
+        // Unsigned, a skippable marker is not the author's word: critical.
+        let mut unsigned = delivered_unknown(&id, "opt-reaction", serde_json::json!({}));
+        unsigned.sig_b64 = None;
+        assert!(open(&unsigned).unwrap_err().needs_upgrade());
     }
 }

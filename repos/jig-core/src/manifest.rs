@@ -207,6 +207,76 @@ pub struct BlockManifest {
     pub kind: Option<BlockKind>,
 }
 
+/// A manifest whose `kind` this build does not implement (JEP-0005 rule
+/// 14c), read with that kind set aside: [`BlockManifest::kind`] is `None` and
+/// the name is in [`Self::kind`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownKindManifest {
+    /// The kind name exactly as the author signed it.
+    pub kind: String,
+    /// Every other field, as a known kind's manifest is read.
+    pub manifest: BlockManifest,
+    /// Whether a reader that does not implement the kind must stop at it
+    /// ([`crate::block_kind::is_critical`]).
+    pub critical: bool,
+}
+
+impl UnknownKindManifest {
+    /// Read `bytes` as a manifest of a kind this build does not implement.
+    /// `None` when the bytes are not that: not a manifest, a manifest of a
+    /// known kind or of none, a `kind` that is not a string, a top-level key
+    /// given twice, or any other field that does not parse. Those are read,
+    /// and refused, as they always were.
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        let mut value: Value = serde_json::from_slice(bytes).ok()?;
+        // One reading only: a key given twice would let this reader and a
+        // known-kind reader see different manifests in the same bytes.
+        if has_duplicate_top_level_key(bytes) {
+            return None;
+        }
+        let fields = value.as_object_mut()?;
+        let kind = fields.get("kind")?.as_str()?.to_string();
+        if kind.parse::<BlockKind>().is_ok() {
+            return None;
+        }
+        fields.remove("kind");
+        let manifest: BlockManifest = serde_json::from_value(value).ok()?;
+        let critical = crate::block_kind::is_critical(&kind, &manifest.metadata);
+        Some(Self {
+            kind,
+            manifest,
+            critical,
+        })
+    }
+}
+
+/// Whether the JSON object in `bytes` names one key twice at its top level.
+/// `true` when it is not an object, so a caller refuses it.
+fn has_duplicate_top_level_key(bytes: &[u8]) -> bool {
+    struct Keys;
+    impl<'de> serde::de::Visitor<'de> for Keys {
+        type Value = bool;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a JSON object")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<bool, A::Error> {
+            let mut seen = std::collections::BTreeSet::new();
+            while let Some(key) = map.next_key::<String>()? {
+                map.next_value::<serde::de::IgnoredAny>()?;
+                if !seen.insert(key) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+    }
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    serde::Deserializer::deserialize_map(&mut de, Keys).unwrap_or(true)
+}
+
 fn default_schema() -> String {
     DEFAULT_SCHEMA.to_string()
 }
@@ -435,6 +505,54 @@ impl BlockManifestBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unknown_manifest(kind: &str, metadata: Value) -> Vec<u8> {
+        let mut m = serde_json::to_value(minimal_manifest()).unwrap();
+        m["kind"] = Value::from(kind);
+        m["metadata"] = metadata;
+        serde_json::to_vec(&m).unwrap()
+    }
+
+    #[test]
+    fn an_unknown_kind_is_read_with_its_name_set_aside() {
+        let bytes = unknown_manifest("opt-reaction", serde_json::json!({"channel_id": "c"}));
+        assert!(serde_json::from_slice::<BlockManifest>(&bytes).is_err());
+        let read = UnknownKindManifest::parse(&bytes).unwrap();
+        assert_eq!(read.kind, "opt-reaction");
+        assert!(!read.critical);
+        assert_eq!(read.manifest.kind, None);
+        assert_eq!(read.manifest.metadata["channel_id"], "c");
+
+        let plain = unknown_manifest("sequencer-set", serde_json::json!({}));
+        assert!(UnknownKindManifest::parse(&plain).unwrap().critical);
+        let commit = unknown_manifest("opt-reaction", serde_json::json!({"mls_commit": "AA"}));
+        assert!(UnknownKindManifest::parse(&commit).unwrap().critical);
+    }
+
+    #[test]
+    fn only_an_unknown_kind_takes_the_unknown_reading() {
+        let known = unknown_manifest("text-render", serde_json::json!({}));
+        assert!(UnknownKindManifest::parse(&known).is_none());
+        let not_a_string = String::from_utf8(unknown_manifest("x", serde_json::json!({})))
+            .unwrap()
+            .replacen("\"kind\":\"x\"", "\"kind\":7", 1)
+            .into_bytes();
+        assert!(UnknownKindManifest::parse(&not_a_string).is_none());
+        // Another field that does not parse stays refused.
+        let bad = String::from_utf8(unknown_manifest("opt-x", serde_json::json!({})))
+            .unwrap()
+            .replacen("\"version\":\"0.1.0\"", "\"version\":7", 1);
+        assert!(UnknownKindManifest::parse(bad.as_bytes()).is_none());
+        let none = serde_json::to_vec(&minimal_manifest()).unwrap();
+        assert!(UnknownKindManifest::parse(&none).is_none());
+    }
+
+    #[test]
+    fn a_key_given_twice_is_not_read_as_an_unknown_kind() {
+        let bytes = String::from_utf8(unknown_manifest("opt-x", serde_json::json!({}))).unwrap();
+        let twice = bytes.replacen('{', "{\"kind\":\"member-add\",", 1);
+        assert!(UnknownKindManifest::parse(twice.as_bytes()).is_none());
+    }
     use crate::hlc::HlcTimestamp;
 
     fn test_author() -> Author {

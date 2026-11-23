@@ -1,0 +1,53 @@
+{
+  "cases": [
+    {
+      "critical": true,
+      "kind": "sequencer-set",
+      "manifest": "{\"attestations\":[],\"attested_by\":[],\"authors\":[{\"did\":\"did:jig:zecbix5ofxxfmw2cimmzwyibpwvmz3jel4vmwmfluefyhaw7mvh3q\",\"public_key\":null,\"roles\":[]}],\"capabilities\":[],\"constraints\":{\"deterministic\":true,\"execution_timeout_ms\":250,\"fuel_max\":5000000,\"memory_max_mb\":32},\"kind\":\"sequencer-set\",\"metadata\":{\"channel_id\":\"bafkreiaxnnnb7qz2focittuqq3ya25q7rcv3bqynnczfzao65fdpjsbv4i\"},\"parents\":[],\"resources\":[],\"schema\":\"https://jig.dev/schema/block-manifest/v0.1\",\"version\":\"0.1.0\"}",
+      "name": "no marker: critical",
+      "sig_hex": "cdf8833c1941e2d7fd17d743b694b220ac65277663b64af2781c4f2df2fd75834878af52d1d2b3d0de8856846f7e6b104507c2173da71ba75ef55e7fb41b0208",
+      "verifies": true
+    },
+    {
+      "critical": false,
+      "kind": "opt-reaction",
+      "manifest": "{\"attestations\":[],\"attested_by\":[],\"authors\":[{\"did\":\"did:jig:zecbix5ofxxfmw2cimmzwyibpwvmz3jel4vmwmfluefyhaw7mvh3q\",\"public_key\":null,\"roles\":[]}],\"capabilities\":[],\"constraints\":{\"deterministic\":true,\"execution_timeout_ms\":250,\"fuel_max\":5000000,\"memory_max_mb\":32},\"kind\":\"opt-reaction\",\"metadata\":{\"channel_id\":\"bafkreiaxnnnb7qz2focittuqq3ya25q7rcv3bqynnczfzao65fdpjsbv4i\",\"to\":\"x\"},\"parents\":[],\"resources\":[],\"schema\":\"https://jig.dev/schema/block-manifest/v0.1\",\"version\":\"0.1.0\"}",
+      "name": "opt- prefix: non-critical",
+      "sig_hex": "9576b1c231a7cd47240754d6545f5154631799cbd5431ce8089b10086e76c6409f341483e9ba44cc1189ba123844a0a273e3f39d36c5f8a09edcde19c9ae9408",
+      "verifies": true
+    },
+    {
+      "critical": true,
+      "kind": "opt-reaction",
+      "manifest": "{\"attestations\":[],\"attested_by\":[],\"authors\":[{\"did\":\"did:jig:zecbix5ofxxfmw2cimmzwyibpwvmz3jel4vmwmfluefyhaw7mvh3q\",\"public_key\":null,\"roles\":[]}],\"capabilities\":[],\"constraints\":{\"deterministic\":true,\"execution_timeout_ms\":250,\"fuel_max\":5000000,\"memory_max_mb\":32},\"kind\":\"opt-reaction\",\"metadata\":{\"channel_id\":\"bafkreiaxnnnb7qz2focittuqq3ya25q7rcv3bqynnczfzao65fdpjsbv4i\",\"mls_commit\":\"AAAA\"},\"parents\":[],\"resources\":[],\"schema\":\"https://jig.dev/schema/block-manifest/v0.1\",\"version\":\"0.1.0\"}",
+      "name": "opt- prefix carrying mls_commit: critical",
+      "sig_hex": "835e1cc0a7b3fa794bd8df1b91eeafb8f0d880a84ecb01ddef55fbfcda659afbf97eb6f0dd2af2593f177538fc25f74c554bb040edf1e3db3f9d7100515fdc0c",
+      "verifies": true
+    },
+    {
+      "critical": false,
+      "kind": "opt-reaction",
+      "manifest": "{\"attestations\":[],\"attested_by\":[],\"authors\":[{\"did\":\"did:jig:zecbix5ofxxfmw2cimmzwyibpwvmz3jel4vmwmfluefyhaw7mvh3q\",\"public_key\":null,\"roles\":[]}],\"capabilities\":[],\"constraints\":{\"deterministic\":true,\"execution_timeout_ms\":250,\"fuel_max\":5000000,\"memory_max_mb\":32},\"kind\":\"opt-reaction\",\"metadata\":{\"channel_id\":\"bafkreiaxnnnb7qz2focittuqq3ya25q7rcv3bqynnczfzao65fdpjsbv4i\",\"mls_epoch\":3,\"mls_message\":\"AAAA\"},\"parents\":[],\"resources\":[],\"schema\":\"https://jig.dev/schema/block-manifest/v0.1\",\"version\":\"0.1.0\"}",
+      "name": "opt- prefix carrying only mls_message and mls_epoch: non-critical",
+      "sig_hex": "52096de3e8c1b741726d36a3855e43741225c52e8fb2eb39773f43affc4a280cc4e3b5709325eb8378577f9f60290ecdf7d983f4e9df9bdf64084fc0d980bc0e",
+      "verifies": true
+    },
+    {
+      "critical": true,
+      "kind": "opt-reaction",
+      "manifest": "{\"attestations\":[],\"attested_by\":[],\"authors\":[{\"did\":\"did:jig:zecbix5ofxxfmw2cimmzwyibpwvmz3jel4vmwmfluefyhaw7mvh3q\",\"public_key\":null,\"roles\":[]}],\"capabilities\":[],\"constraints\":{\"deterministic\":true,\"execution_timeout_ms\":250,\"fuel_max\":5000000,\"memory_max_mb\":32},\"kind\":\"opt-reaction\",\"metadata\":{\"channel_id\":\"bafkreiaxnnnb7qz2focittuqq3ya25q7rcv3bqynnczfzao65fdpjsbv4i\",\"mls_proposal\":\"AAAA\"},\"parents\":[],\"resources\":[],\"schema\":\"https://jig.dev/schema/block-manifest/v0.1\",\"version\":\"0.1.0\"}",
+      "name": "opt- prefix carrying an mls_ key not yet named: critical",
+      "sig_hex": "ff07a0e87a70e8126ee3a5bb3ef7620ca1290683e57312aa0a9e589fea380cd27fa75e71f58c6cec604b4cc24a8a086fb7411daee6e6866a2c9fc7beec406704",
+      "verifies": true
+    },
+    {
+      "critical": false,
+      "kind": "opt-sequencer-set",
+      "manifest": "{\"attestations\":[],\"attested_by\":[],\"authors\":[{\"did\":\"did:jig:zecbix5ofxxfmw2cimmzwyibpwvmz3jel4vmwmfluefyhaw7mvh3q\",\"public_key\":null,\"roles\":[]}],\"capabilities\":[],\"constraints\":{\"deterministic\":true,\"execution_timeout_ms\":250,\"fuel_max\":5000000,\"memory_max_mb\":32},\"kind\":\"opt-sequencer-set\",\"metadata\":{\"channel_id\":\"bafkreiaxnnnb7qz2focittuqq3ya25q7rcv3bqynnczfzao65fdpjsbv4i\"},\"parents\":[],\"resources\":[],\"schema\":\"https://jig.dev/schema/block-manifest/v0.1\",\"version\":\"0.1.0\"}",
+      "name": "marker added after signing: the signature fails",
+      "sig_hex": "cdf8833c1941e2d7fd17d743b694b220ac65277663b64af2781c4f2df2fd75834878af52d1d2b3d0de8856846f7e6b104507c2173da71ba75ef55e7fb41b0208",
+      "verifies": false
+    }
+  ],
+  "description": "JEP-0005 rule 14c. Each manifest is of a kind no v0.2 build implements, signed by the Ed25519 key whose 32-byte seed is all 0x14, over the JSON array [manifest bytes, code bytes] with empty code. `critical` is the rule's verdict on the manifest's bytes; `verifies` whether the author's signature holds. A follower refuses a block whose signature fails before judging it."
+}
