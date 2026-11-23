@@ -176,7 +176,7 @@ disagree are surfaced to the reader as a warning, not refused
 encryption suite, the manifest schema and the receipt domain are gates. The
 README (*"v0.x makes no compatibility guarantee"*) and every release's notes
 say that pre-1.0 releases make no wire, receipt or storage compatibility
-guarantee, and `release.yml` publishes every `-alpha` tag as a prerelease. A
+guarantee, and `release.yml` publishes every pre-release tag (`-alpha.N`, `-rc.N`) as a prerelease. A
 compatibility promise is still a BLOCKER for the day one is made.
 
 ---

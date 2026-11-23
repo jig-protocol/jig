@@ -10,8 +10,10 @@
 #   2. lets cargo move the workspace crates in repos/Cargo.lock
 #      (`cargo update --workspace`; the lockfile is never edited by hand and
 #      no dependency is upgraded);
-#   3. checks with `cargo metadata --locked` that every workspace crate now
-#      carries VERSION and that the lockfile needs no further change;
+#   3. checks that the lockfile needs no further change (a full
+#      `cargo metadata --locked`; with --no-deps it would not resolve, so
+#      --locked would never fire) and that every workspace crate carries
+#      VERSION;
 #   4. prints the diff stat. It does not commit or tag.
 set -euo pipefail
 
@@ -42,7 +44,10 @@ cat "$tmp" > "$manifest"
 
 cargo update --workspace --quiet
 
-versions="$(cargo metadata --no-deps --format-version 1 --locked \
+cargo metadata --format-version 1 --locked >/dev/null \
+  || { echo "bump-version: repos/Cargo.lock is still stale after cargo update --workspace" >&2; exit 1; }
+
+versions="$(cargo metadata --no-deps --format-version 1 \
   | jq -r '[.packages[].version] | unique | .[]')"
 if [ "$versions" != "$version" ]; then
   echo "bump-version: workspace crates carry ${versions//$'\n'/ }, not only $version" >&2
