@@ -15,8 +15,9 @@
 #   4. If a terminal is attached, exec `jig chat #hello`.
 #
 # Knobs (environment):
-#   JIG_VERSION           release tag, or "latest" (newest non-draft, prereleases
-#                         included). Default: latest.
+#   JIG_VERSION           release tag, or "latest": the latest final release,
+#                         or, while there is none, the newest non-draft
+#                         prerelease. Default: latest.
 #   JIG_REPO              GitHub owner/repo. Default: jig-protocol/jig.
 #   JIG_GITHUB_TOKEN      token for a private repo (falls back to GITHUB_TOKEN).
 #   JIG_RELEASES_BASE     mirror base URL; files are fetched as $BASE/<file> and
@@ -93,6 +94,18 @@ fetch() {
   curl "${args[@]}" "$1"
 }
 
+# fetch_status <url> <dest> [accept]: fetch, but print the HTTP status
+# instead of failing on one ("000" when no response arrived).
+fetch_status() {
+  local args=(-sSL --retry 3 --connect-timeout 10 -o "$2" -w '%{http_code}')
+  if [ -n "${3:-}" ]; then args+=(-H "Accept: $3"); fi
+  case "$1" in
+    https://api.github.com/*|https://github.com/*)
+      if [ -n "$JIG_GITHUB_TOKEN" ]; then args+=(-H "Authorization: Bearer $JIG_GITHUB_TOKEN"); fi ;;
+  esac
+  curl "${args[@]}" "$1" || true
+}
+
 # -----------------------------------------------------------------------------
 # Release resolution. Sets RELEASE_TAG and, with a token, ASSET_IDS (name=id
 # lines) so private-repo assets can be fetched through the API.
@@ -106,18 +119,30 @@ API="https://api.github.com/repos/$JIG_REPO"
 resolve_release() {
   local tmp="$1" json="$1/release.json"
   if [ "$JIG_VERSION" = "latest" ]; then
-    # /releases/latest skips prereleases, and most v0.x tags are one, so
-    # "latest" is the newest non-draft release, prerelease or not. Each
-    # release object has exactly one top-level tag_name and draft, so the
-    # two lists pair up by index.
-    fetch "$API/releases?per_page=20" "$tmp/releases.json" application/vnd.github+json \
-      || die "could not list releases of $JIG_REPO (private repo? set JIG_GITHUB_TOKEN)"
-    local tags drafts
-    tags=$(grep -oE '"tag_name": *"[^"]*"' "$tmp/releases.json" | sed -E 's/.*"([^"]*)"$/\1/')
-    drafts=$(grep -oE '"draft": *(true|false)' "$tmp/releases.json" | sed -E 's/.*: *//')
-    RELEASE_TAG=$(paste -d' ' <(printf '%s\n' "$tags") <(printf '%s\n' "$drafts") \
-      | awk '$2 == "false" { print $1; exit }')
-    [ -n "$RELEASE_TAG" ] || die "no published release found in $JIG_REPO"
+    # Prefer the latest final release. /releases/latest never returns a
+    # prerelease or a draft, and answers 404 when there is no final release
+    # (or, without a token, when the repo is private).
+    local code
+    code=$(fetch_status "$API/releases/latest" "$tmp/latest.json" application/vnd.github+json)
+    case "$code" in
+      200)
+        RELEASE_TAG=$(grep -oE '"tag_name": *"[^"]*"' "$tmp/latest.json" | head -1 | sed -E 's/.*"([^"]*)"$/\1/')
+        [ -n "$RELEASE_TAG" ] || die "the latest release of $JIG_REPO names no tag" ;;
+      404)
+        # No final release yet: the newest non-draft release, prerelease or
+        # not. Each release object has exactly one top-level tag_name and
+        # draft, so the two lists pair up by index.
+        fetch "$API/releases?per_page=20" "$tmp/releases.json" application/vnd.github+json \
+          || die "could not list releases of $JIG_REPO (private repo? set JIG_GITHUB_TOKEN)"
+        local tags drafts
+        tags=$(grep -oE '"tag_name": *"[^"]*"' "$tmp/releases.json" | sed -E 's/.*"([^"]*)"$/\1/')
+        drafts=$(grep -oE '"draft": *(true|false)' "$tmp/releases.json" | sed -E 's/.*: *//')
+        RELEASE_TAG=$(paste -d' ' <(printf '%s\n' "$tags") <(printf '%s\n' "$drafts") \
+          | awk '$2 == "false" { print $1; exit }')
+        [ -n "$RELEASE_TAG" ] || die "no published release found in $JIG_REPO" ;;
+      *)
+        die "could not read the latest release of $JIG_REPO (HTTP $code)" ;;
+    esac
   else
     RELEASE_TAG="$JIG_VERSION"
   fi

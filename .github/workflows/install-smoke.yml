@@ -48,6 +48,7 @@ on:
       - repos/jig-cli/src/cmd/init.rs
       - repos/jig-cli/src/cmd/passphrase.rs
       - scripts/test-install-key-fallback.sh
+      - scripts/test-install-resolve.sh
 
 permissions:
   contents: read
@@ -91,6 +92,9 @@ jobs:
       - name: install.sh key fallback (stub jig; terminal and headless)
         shell: bash
         run: scripts/test-install-key-fallback.sh
+      - name: install.sh release resolution (stub curl)
+        shell: bash
+        run: scripts/test-install-resolve.sh
       - name: Install Rust toolchain
         shell: bash
         working-directory: repos
