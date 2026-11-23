@@ -477,9 +477,10 @@ async fn handle_socket(
                     // Only for the subscription this connection holds now: one
                     // queued for a subscription it has since replaced would
                     // end the new one.
-                    if session.sub_id != Some(sub_id) {
+                    if session.sub_id != Some(sub_id) || session.noticed == Some(sub_id) {
                         continue;
                     }
+                    session.noticed = Some(sub_id);
                     if send_error(
                         &mut socket,
                         Some(notice.status),
@@ -581,6 +582,11 @@ struct ConnState {
     /// Where fanout sends this connection's subscription the notices about
     /// its channel ([`jig_pipeline::fanout::Fanout::watch_notices`]).
     notice_tx: Option<mpsc::UnboundedSender<(u64, jig_pipeline::fanout::ChannelNotice)>>,
+    /// The subscription last sent a notice. A stop is told once per
+    /// subscription: the subscribe path's re-check and the stop itself can
+    /// both send one, and a second could reach a subscription the client has
+    /// made since.
+    noticed: Option<u64>,
     did: Option<jig_core::did::Did>,
     handshaken: bool,
     close: Option<(u16, &'static str)>,
@@ -2613,19 +2619,41 @@ mod tests {
             )
             .await;
         expect_stop(next_frame(&mut ws).await, "#open", 9);
-        // A notice about another channel is not this subscription's.
-        state
-            .ingest_ctx
-            .fanout
-            .notify_channel(
-                &jig_pipeline::ingest_record::label_cid("#stopped"),
-                stop("#stopped", 4).notice(),
-            )
-            .await;
+        let notify = |slug: &'static str, seq: u64| {
+            let state = state.clone();
+            async move {
+                state
+                    .ingest_ctx
+                    .fanout
+                    .notify_channel(
+                        &jig_pipeline::ingest_record::label_cid(slug),
+                        stop(slug, seq).notice(),
+                    )
+                    .await;
+            }
+        };
+        // Told once: a second notice for the same subscription (the subscribe
+        // path's re-check racing the stop) is not sent, so it cannot reach a
+        // subscription the client makes in between.
+        notify("#open", 9).await;
         assert!(
             tokio::time::timeout(Duration::from_millis(200), next_frame(&mut ws))
                 .await
-                .is_err()
+                .is_err(),
+            "a second notice for one subscription"
+        );
+        // Nor one for the subscription it replaced, nor another channel's.
+        seed_channel(&state, "#later");
+        ws.send(subscribe("#later")).await.unwrap();
+        // The replacement keeps the count at one; give the server the frame.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        notify("#open", 9).await;
+        notify("#stopped", 4).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), next_frame(&mut ws))
+                .await
+                .is_err(),
+            "a notice for another subscription"
         );
     }
 
