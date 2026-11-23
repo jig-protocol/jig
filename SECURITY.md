@@ -1,13 +1,13 @@
 # Security policy
 
-jig is pre-alpha. **Restricted channels, DMs and open channels created with `--encrypted`
-are end-to-end encrypted.** Each is one MLS group (RFC 9420), and the server holds no group
-secret. Open channels are plaintext to their server's operator unless created encrypted.
-A restricted channel created plaintext before restricted channels became always-MLS
-([D25](docs/ROADMAP.md)) is frozen: its history stays readable to the operator, and it takes
-no new content. Encrypted channels do not federate yet, and the email bridge refuses inbound
-mail until it can join a thread's MLS group. Do not use jig for anything confidential yet: it has not been
-audited.
+jig is pre-alpha. **Every channel and DM is end-to-end encrypted except a `public`
+channel.** Each is one MLS group (RFC 9420), and the server holds no group secret. A `public`
+channel is plaintext to its server's operator. A restricted channel created plaintext before
+restricted channels became always-MLS ([D25](docs/ROADMAP.md)) is frozen: its history stays
+readable to the operator, and it takes no new content. A `shared` channel crosses servers as
+ciphertext; a `contract-end` does not yet remove the follower's members. The email bridge
+refuses inbound mail until it can join a thread's MLS group. Do not use jig for anything
+confidential yet: it has not been audited.
 
 ## Reporting a vulnerability
 

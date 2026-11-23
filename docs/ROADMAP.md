@@ -230,8 +230,9 @@ Still to do in this phase:
 - PROXY protocol v2 on the nameserver listener, so its per-client rate limits still apply behind a
   TCP/SNI passthrough proxy. A `config` or `contract` suffix needs passthrough, and today every
   client behind one shares the proxy's limit.
-- Peer-policy quotas. The policy is published in the signed server manifest since #275; its
-  quotas are not enforced yet.
+- Peer-policy quotas on the rest of a peer link. The policy is published in the signed server
+  manifest since #275, and what a peer streams counts against its quota (#311); writes queued
+  while a sequencer is down are not capped yet (F2 Task 10).
 - An external security audit (D27): one firm in two phases. Phase 1 runs before G3 on the code
   that is already complete, and Phase 2 after v0.2 is code-complete. It does not block development.
 
@@ -239,7 +240,9 @@ Still to do in this phase:
 
 - The **Wasm Component Model + WIT** as the block ABI.
 - Host functions granted strictly through manifest capabilities (the capability names, scopes and
-  attenuation order are defined in `jig-core/src/grant.rs`, #205, but nothing checks them yet):
+  attenuation order are defined in `jig-core/src/grant.rs`, #205; the runtime links one
+  component per grant, so an import outside the grant is absent (#222), but no host interface
+  has a provider yet):
   storage, fetch-block-by-CID, post-message, timer.
 - Per-block persistent state, CID-addressed.
 - The client runs the same runtime (`jig-client` embeds `jig-runtime`).
