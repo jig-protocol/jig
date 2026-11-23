@@ -273,19 +273,19 @@ within the freshness window.
     tells the user to upgrade the server, and never falls back to `v1`.
 25. **What a server verifies.** A server MUST:
     - refuse a proof without an audience with `PROOF_VERSION_UNSUPPORTED`;
-    - refuse a proof whose nonce is longer than 64 bytes, as admission and PoW nonces are
-      bounded (JEP-0008), with `INVALID_SIG`, before verifying the signature, and not record it;
     - refuse a proof whose audience is not its current DID, in canonical form, with
       `WRONG_AUDIENCE`. A DID the server signed as before a key link (JEP-0012) is not its
       audience: the key may no longer be the server's alone;
+    - then refuse a proof whose nonce is longer than 64 bytes, as admission and PoW nonces
+      are bounded (JEP-0008), with `INVALID_SIG`, before any key or signature work;
     - recompute the hash from the request it received, with its own DID as the audience
       and the canonical DID of the key the proof claims as `did`;
     - verify the signature strictly (JEP-0013 §1 rule 4), refusing small-order keys and
       non-canonical encodings, with `INVALID_SIG`;
     - then check freshness and record the nonce, as before.
 
-    Neither refusal records the nonce. The server's DID is public, so `WRONG_AUDIENCE`
-    discloses nothing a client could not already learn.
+    No refusal before the last step records the nonce. The server's DID is public, so
+    `WRONG_AUDIENCE` discloses nothing a client could not already learn.
 26. **A stale pin.** A client refused with `WRONG_AUDIENCE` SHOULD handshake again, which
     moves its pin along the server's key links (JEP-0012), and MAY retry once with a newly
     signed proof under a fresh nonce. It MUST NOT resend the refused proof.
