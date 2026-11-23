@@ -1076,6 +1076,14 @@ fn list(store: &SqliteStore) -> anyhow::Result<String> {
             .iter()
             .map(|stall| format!("stalled: {stall}")),
     );
+    // A carried channel stopped at a block kind this version does not
+    // implement (JEP-0005 rule 14c): upgrading takes it on again.
+    lines.extend(
+        store
+            .carried_upgrades()?
+            .iter()
+            .map(|stop| format!("needs upgrade: {stop}")),
+    );
     Ok(lines.join("\n"))
 }
 
@@ -2747,6 +2755,76 @@ mod tests {
         p.follows.stream.pull_all();
         let head = p.caught_up(&channel).await;
         assert!(head as usize > crate::v0_0_2_stream::MAX_ENTRIES);
+    }
+
+    /// A carried channel stopped at a block kind this server does not
+    /// implement (JEP-0005 rule 14c) asks its owner for nothing: what the
+    /// owner sends past its head is not a gap to fill, and the periodic pull
+    /// skips it. Before the stop, the same pull asks.
+    #[tokio::test]
+    async fn a_channel_stopped_for_an_upgrade_is_not_pulled_again() {
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.shared(1).await;
+        p.follows.stream.pull_all();
+        let head = p.caught_up(&channel).await;
+        // Whatever the follower asks the owner for from here comes to `rx`.
+        let (out, mut rx) = PeerSender::new(p.owner.server_did.clone());
+        let _registration = p.follower.peers.register(out);
+        let asked = |rx: &mut tokio::sync::mpsc::Receiver<jig_pipeline::envelope::Envelope>| {
+            sent(rx)
+                .into_iter()
+                .filter(|(k, _)| k == crate::v0_0_2_stream::RECORDS_FROM_FRAME)
+                .filter_map(|(_, body)| {
+                    let value = jig_core::dcbor::decode(&body).ok()?;
+                    Some((
+                        value.get("channel_id")?.as_text()?.to_string(),
+                        value.get("from_seq")?.as_u64()?,
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+        p.follows.stream.pull_all();
+        assert_eq!(asked(&mut rx), vec![(channel.clone(), head + 1)]);
+
+        // Stopped at the next record, as a critical block of an unknown kind
+        // stops it.
+        p.follower
+            .ingest_ctx
+            .store
+            .stop_for_upgrade_for_tests(&jig_pipeline::follow::UpgradeStop {
+                channel_id: channel.clone(),
+                seq: head + 1,
+                block_cid: "bafkstop".to_string(),
+                kind: "sequencer-set".to_string(),
+                found_at: 0,
+            })
+            .unwrap();
+        for i in 0..3 {
+            p.text(&channel, &format!("after {i}")).await;
+        }
+        // The owner's records from two past the head: before rule 14c, a gap
+        // that asked for the block it stopped at, again and again.
+        let past_head = Contracts::new(&p.owner)
+            .stream
+            .records_from(&channel, head + 2)
+            .unwrap()
+            .unwrap();
+        p.follows.stream.land(&p.owner.server_did, past_head).await;
+        p.follows.stream.pull_all();
+        assert!(
+            asked(&mut rx).is_empty(),
+            "nothing asked for the stopped channel"
+        );
+        assert_eq!(Pair::head(&p.follower, &channel), Some(head));
+        // And the operator's listing says why.
+        let listing = list(&p.follower.ingest_ctx.store).unwrap();
+        assert!(
+            listing.contains(&format!(
+                "needs upgrade: channel {channel} at seq {} uses block kind `sequencer-set`",
+                head + 1
+            )),
+            "{listing}"
+        );
     }
 
     #[tokio::test]

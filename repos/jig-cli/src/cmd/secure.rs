@@ -316,6 +316,10 @@ pub struct Synced {
     pub cids: std::collections::HashSet<String>,
     /// The same blocks by delivery CID, the key a live delivery carries.
     pub deliveries: Vec<String>,
+    /// The critical block of an unknown kind the replay stopped at, if any
+    /// (JEP-0005 rule 14c): nothing at or after it was read, and the head
+    /// stays before it.
+    pub stopped: Option<jig_client::open::OpenError>,
 }
 
 /// Which page of a channel's history to fetch.
@@ -337,6 +341,23 @@ struct Replayed {
     left: Vec<String>,
     cids: std::collections::HashSet<String>,
     deliveries: Vec<String>,
+    stopped: Option<jig_client::open::OpenError>,
+}
+
+/// The blocks of `delivered` (oldest first) before the first critical block
+/// of a kind this build does not implement, and that block's error: a reader
+/// reads nothing at or past it (JEP-0005 rule 14c).
+fn before_stop(
+    delivered: &[DeliveredBlock],
+) -> (&[DeliveredBlock], Option<jig_client::open::OpenError>) {
+    for (at, d) in delivered.iter().enumerate() {
+        if let Err(e) = open(d)
+            && e.needs_upgrade()
+        {
+            return (&delivered[..at], Some(e));
+        }
+    }
+    (delivered, None)
 }
 
 /// How a forward walk through history ended.
@@ -1842,6 +1863,8 @@ impl Secure {
 
     /// Move the head to the newest block of `delivered`, with its record.
     fn move_head(&self, slug: &str, delivered: &[DeliveredBlock]) -> Result<()> {
+        // Never past a block this reader stopped at.
+        let (delivered, _) = before_stop(delivered);
         if let Some((d, newest)) = delivered
             .iter()
             .rev()
@@ -1940,6 +1963,10 @@ impl Secure {
                 ));
             }
             self.replay_into(slug, &mut replayed, &page);
+            if replayed.stopped.is_some() {
+                self.move_head(slug, &page)?;
+                return Ok(Forwarded::Done(replayed));
+            }
             let Some(last) = page.iter().rev().find_map(|d| open(d).ok()) else {
                 return Ok(Forwarded::Done(replayed));
             };
@@ -2237,6 +2264,12 @@ impl Secure {
 
     /// Process `delivered`, in MLS order, into what a replay has found.
     fn replay_into(&self, reference: &str, r: &mut Replayed, delivered: &[DeliveredBlock]) {
+        // Nothing past a critical block of an unknown kind is read.
+        if r.stopped.is_some() {
+            return;
+        }
+        let (delivered, stopped) = before_stop(delivered);
+        r.stopped = stopped;
         let mut opened = Vec::with_capacity(delivered.len());
         let mut receipts = std::collections::HashMap::new();
         for d in delivered {
@@ -2245,6 +2278,8 @@ impl Secure {
                     receipts.insert(o.cid.clone(), d.receipts.clone());
                     opened.push(o);
                 }
+                // In the chain, and nothing in it for this reader.
+                Err(e) if e.skippable() => {}
                 Err(e) => eprintln!("[dropped history block {}: {e}]", d.delivery_cid),
             }
         }
@@ -2287,6 +2322,7 @@ impl Secure {
             tidy,
             cids: r.cids,
             deliveries: r.deliveries,
+            stopped: r.stopped,
         }
     }
 

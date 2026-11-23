@@ -91,6 +91,18 @@ pub enum FollowError {
         seq: u64,
         reason: String,
     },
+    /// The owner sequenced a critical block of a kind this build does not
+    /// implement (JEP-0005 rule 14c). Nothing of it is kept but the stop: the
+    /// channel takes nothing more, and asks for nothing more, until this
+    /// server is upgraded. Other channels go on.
+    #[error(
+        "channel {channel_id} needs an upgrade at seq {seq}: block kind `{kind}` is unknown to this version"
+    )]
+    NeedsUpgrade {
+        channel_id: String,
+        seq: u64,
+        kind: String,
+    },
     /// Not followed in this slice.
     #[error("{0}")]
     Unsupported(&'static str),
@@ -151,7 +163,76 @@ impl std::fmt::Display for CarriedStall {
     }
 }
 
-/// The `chain_evidence`, `carried_stalls` and `carried_records` tables and
+/// A carried channel stopped at a critical block of a kind this build does
+/// not implement (JEP-0005 rule 14c): the owner's record at `seq` names
+/// `block_cid`, of kind `kind`. Nothing of the block is kept. A build that
+/// implements the kind drops the stop when it opens the store
+/// (`clear_known_upgrades`, run by the store's migration), and the channel then takes the
+/// block again from the owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpgradeStop {
+    pub channel_id: String,
+    pub seq: u64,
+    pub block_cid: String,
+    pub kind: String,
+    pub found_at: i64,
+}
+
+impl std::fmt::Display for UpgradeStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "channel {} at seq {} uses block kind `{}`, unknown to this version",
+            self.channel_id, self.seq, self.kind
+        )
+    }
+}
+
+impl UpgradeStop {
+    /// What a client of this server is told about the channel: on a refused
+    /// subscribe or history read, and once to a live subscription when the
+    /// channel stops.
+    pub fn notice(&self) -> crate::fanout::ChannelNotice {
+        crate::fanout::ChannelNotice {
+            status: 409,
+            code: crate::fanout::CHANNEL_NEEDS_UPGRADE,
+            channel_id: self.channel_id.clone(),
+            message: format!(
+                "this channel needs this server to upgrade: block kind `{}` at seq {} is unknown \
+                 to it, so it carries nothing of the channel past seq {}",
+                self.kind,
+                self.seq,
+                self.seq.saturating_sub(1)
+            ),
+        }
+    }
+}
+
+/// The kind of a carried block: one this build implements, or one it does
+/// not (JEP-0005 rule 14c).
+enum CarriedKind {
+    Known(BlockKind),
+    Unknown { name: String, critical: bool },
+}
+
+impl CarriedKind {
+    fn known(&self) -> Option<BlockKind> {
+        match self {
+            Self::Known(kind) => Some(*kind),
+            Self::Unknown { .. } => None,
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Self::Known(kind) => kind.as_str(),
+            Self::Unknown { name, .. } => name,
+        }
+    }
+}
+
+/// The `chain_evidence`, `carried_stalls`, `carried_upgrades` and
+/// `carried_records` tables and
 /// the `chain_records` view, created by [`SqliteStore`]'s migration.
 ///
 /// `ingest_records` holds one record per block, under the block's own
@@ -178,6 +259,13 @@ pub(crate) fn migrate(conn: &rusqlite::Connection) -> crate::persist::Result<()>
             holder     TEXT NOT NULL,
             found_at   INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS carried_upgrades (
+            channel_id TEXT PRIMARY KEY,
+            seq        INTEGER NOT NULL,
+            block_cid  TEXT NOT NULL,
+            kind       TEXT NOT NULL,
+            found_at   INTEGER NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS carried_records (
             channel_id TEXT NOT NULL,
             seq        INTEGER NOT NULL,
@@ -191,7 +279,41 @@ pub(crate) fn migrate(conn: &rusqlite::Connection) -> crate::persist::Result<()>
             SELECT block_cid, channel_id, seq, record FROM carried_records;
         "#,
     )?;
+    clear_known_upgrades(conn)
+}
+
+/// Drop the stops at kinds this build implements, each time the store opens:
+/// an upgraded server takes those channels again from the block they stopped
+/// at, since their head never moved past it.
+fn clear_known_upgrades(conn: &rusqlite::Connection) -> crate::persist::Result<()> {
+    let kinds: Vec<(String, String)> = conn
+        .prepare("SELECT channel_id, kind FROM carried_upgrades")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (channel_id, kind) in kinds {
+        if kind.parse::<BlockKind>().is_ok() {
+            tracing::info!(
+                channel_id,
+                kind,
+                "this version implements the block kind a carried channel stopped at; taking it again"
+            );
+            conn.execute(
+                "DELETE FROM carried_upgrades WHERE channel_id = ?1",
+                [&channel_id],
+            )?;
+        }
+    }
     Ok(())
+}
+
+fn upgrade_stop(r: &rusqlite::Row<'_>) -> rusqlite::Result<UpgradeStop> {
+    Ok(UpgradeStop {
+        channel_id: r.get(0)?,
+        seq: r.get::<_, i64>(1)? as u64,
+        block_cid: r.get(2)?,
+        kind: r.get(3)?,
+        found_at: r.get(4)?,
+    })
 }
 
 /// How a landing attempt ended, inside its transaction.
@@ -201,6 +323,9 @@ enum Landing {
     Gap(Option<u64>),
     Fork,
     Stopped,
+    /// The block is the next link, but critical and of a kind this build does
+    /// not implement: the stop is kept, the block is not.
+    NeedsUpgrade,
     /// The block's effect failed; nothing was kept.
     EffectFailed(anyhow::Error),
 }
@@ -272,6 +397,51 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    /// The stop kept for `channel_id` at a block it needs an upgrade for, if
+    /// any.
+    pub fn carried_upgrade(&self, channel_id: &str) -> crate::persist::Result<Option<UpgradeStop>> {
+        let conn = self.conn.lock().expect("poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT channel_id, seq, block_cid, kind, found_at FROM carried_upgrades
+                 WHERE channel_id = ?1",
+                [channel_id],
+                upgrade_stop,
+            )
+            .optional()?)
+    }
+
+    /// Keep `stop` as though a critical block of an unknown kind had stopped
+    /// its channel, for other crates' tests of what a stopped channel answers.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn stop_for_upgrade_for_tests(&self, stop: &UpgradeStop) -> crate::persist::Result<()> {
+        self.conn.lock().expect("poisoned").execute(
+            "INSERT OR REPLACE INTO carried_upgrades (channel_id, seq, block_cid, kind, found_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                stop.channel_id,
+                stop.seq as i64,
+                stop.block_cid,
+                stop.kind,
+                stop.found_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every carried channel stopped at a block it needs an upgrade for.
+    pub fn carried_upgrades(&self) -> crate::persist::Result<Vec<UpgradeStop>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT channel_id, seq, block_cid, kind, found_at FROM carried_upgrades
+             ORDER BY found_at, channel_id",
+        )?;
+        let rows = stmt
+            .query_map([], upgrade_stop)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// The stored bytes of `channel_id`'s record at `seq`, as they arrived.
     pub fn ingest_record_bytes(
         &self,
@@ -291,11 +461,16 @@ impl SqliteStore {
     /// Store `block` with the owner's `record`, verified already, as the next
     /// link of its chain, in one transaction: or keep the evidence that it
     /// cannot be one.
+    ///
+    /// With `needs_upgrade`, the block is critical and of that kind, which
+    /// this build does not implement: where it would land, the channel is
+    /// stopped there instead, and the block is not stored.
     fn land_carried(
         &self,
         block: &StoredBlock,
         record: &IngestRecord,
         record_bytes: &[u8],
+        needs_upgrade: Option<&str>,
         effect: impl FnOnce(&rusqlite::Connection) -> anyhow::Result<()>,
     ) -> crate::persist::Result<Landing> {
         let mut conn = self.conn.lock().expect("poisoned");
@@ -308,6 +483,14 @@ impl SqliteStore {
         )?;
         if stopped {
             return Ok(Landing::Stopped);
+        }
+        let upgrading: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM carried_upgrades WHERE channel_id = ?1)",
+            [channel_id],
+            |r| r.get(0),
+        )?;
+        if upgrading {
+            return Ok(Landing::NeedsUpgrade);
         }
         let held_at = |seq: u64| -> crate::persist::Result<Option<Vec<u8>>> {
             Ok(tx
@@ -368,6 +551,21 @@ impl SqliteStore {
                 }
             }
             None => {}
+        }
+        if let Some(kind) = needs_upgrade {
+            tx.execute(
+                "INSERT OR IGNORE INTO carried_upgrades (channel_id, seq, block_cid, kind, found_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    channel_id,
+                    record.seq as i64,
+                    record.block_cid,
+                    kind,
+                    chrono::Utc::now().timestamp()
+                ],
+            )?;
+            tx.commit()?;
+            return Ok(Landing::NeedsUpgrade);
         }
         // A block held already in a relayed copy of this channel, set aside
         // ([`SqliteStore::quarantine_relayed_copy`]): one CID is one block, so
@@ -454,11 +652,10 @@ pub async fn ingest_sequenced(
             max: MAX_RECORD_BYTES,
         });
     }
-    let manifest = crate::ingest::parse_manifest(bundle.manifest_bytes)?;
+    let (manifest, kind) = carried_manifest(bundle.manifest_bytes)?;
     crate::ingest::check_manifest_dids(&manifest)?;
     let sender =
         crate::ingest::verify_sig(bundle.manifest_bytes, bundle.code_bytes, &manifest, &sig)?;
-    let kind = manifest.kind.ok_or(IngestError::KindRequired)?;
 
     let record = IngestRecord::decode(record_bytes)?;
     // The stored form exactly, as the owner stores it: nothing rides along
@@ -483,7 +680,7 @@ pub async fn ingest_sequenced(
 
     // The channel the record puts the block in, and the block's own word for
     // it, must agree.
-    let channel = if kind == BlockKind::ChannelCreate {
+    let channel = if kind.known() == Some(BlockKind::ChannelCreate) {
         if channel_id != block_cid {
             return Err(FollowError::Mismatch(
                 "a channel-create's record names another channel",
@@ -512,7 +709,11 @@ pub async fn ingest_sequenced(
             .and_then(|v| v.as_str())
         {
             Some(id) => id == channel_id,
-            None => crate::ingest::channel_slug_of(kind, &manifest) == Some(chan.slug.as_str()),
+            // A kind this build does not implement names its channel by id,
+            // or names none it can tell.
+            None => kind.known().is_some_and(|kind| {
+                crate::ingest::channel_slug_of(kind, &manifest) == Some(chan.slug.as_str())
+            }),
         };
         if !names_it {
             return Err(FollowError::Mismatch("the block names another channel"));
@@ -532,15 +733,34 @@ pub async fn ingest_sequenced(
     }
     // Rule 12: the owner's signature, exactly, and nothing of this server's.
     record.verify(sequencer)?;
-    let mls = mirror_plan(
-        ctx,
-        kind,
-        &sender,
-        &manifest,
-        channel.as_ref(),
-        &record,
-        record_bytes,
-    )?;
+    // A channel stopped for an upgrade takes nothing more: not a gap to fill.
+    if let Some(stop) = ctx.store.carried_upgrade(&channel_id)? {
+        return Err(FollowError::NeedsUpgrade {
+            channel_id,
+            seq: stop.seq,
+            kind: stop.kind,
+        });
+    }
+    let (mls, needs_upgrade) = match &kind {
+        CarriedKind::Known(known) => (
+            mirror_plan(
+                ctx,
+                *known,
+                &sender,
+                &manifest,
+                channel.as_ref(),
+                &record,
+                record_bytes,
+            )?,
+            None,
+        ),
+        // Rule 14c: a non-critical block changes no group (a group key makes
+        // it critical), and a critical one never lands.
+        CarriedKind::Unknown { name, critical } => (
+            crate::mls_gate::MlsPlan::Nothing,
+            critical.then_some(name.as_str()),
+        ),
+    };
 
     let canonical = crate::ingest::bundle_canonical_bytes(bundle.manifest_bytes, bundle.code_bytes)
         .map_err(IngestError::BundleMalformed)?;
@@ -548,12 +768,13 @@ pub async fn ingest_sequenced(
     let stored = StoredBlock {
         cid: block_cid.clone(),
         channel_id: Some(channel_id.clone()),
-        block_kind: kind.as_str().to_string(),
+        block_kind: kind.name().to_string(),
         sender_did: sender.to_did_jig_string(),
         sender_sig: sig,
         bundle_bytes: canonical,
         // Ciphertext is never executed, here or at the owner.
-        is_synthetic: !kind.is_wasm_executable() || matches!(mls, crate::mls_gate::MlsPlan::Sealed),
+        is_synthetic: !kind.known().is_some_and(|k| k.is_wasm_executable())
+            || matches!(mls, crate::mls_gate::MlsPlan::Sealed),
         hlc_wall_ms: hlc.map(|h| h.wall_ms).unwrap_or(0),
         hlc_logical: hlc.map(|h| h.logical).unwrap_or(0),
         hlc_origin: hlc.map(|h| h.server_did.to_string()).unwrap_or_default(),
@@ -563,18 +784,21 @@ pub async fn ingest_sequenced(
     };
     let seq = record.seq;
     let effect = |conn: &rusqlite::Connection| {
-        crate::effect::apply_carried_effect(
-            conn,
-            &manifest,
-            &block_cid,
-            channel.as_ref(),
-            sequencer,
-        )?;
+        // A kind this build does not implement has no effect it could apply.
+        if kind.known().is_some() {
+            crate::effect::apply_carried_effect(
+                conn,
+                &manifest,
+                &block_cid,
+                channel.as_ref(),
+                sequencer,
+            )?;
+        }
         advance_mirror(conn, &channel_id, mls)
     };
     match ctx
         .store
-        .land_carried(&stored, &record, record_bytes, effect)?
+        .land_carried(&stored, &record, record_bytes, needs_upgrade, effect)?
     {
         Landing::Duplicate => return Ok(Followed::Duplicate { block_cid, seq }),
         Landing::Gap(head) => {
@@ -594,18 +818,68 @@ pub async fn ingest_sequenced(
             return Err(FollowError::Fork { channel_id, seq });
         }
         Landing::Stopped => return Err(FollowError::Stopped { channel_id }),
+        Landing::NeedsUpgrade => {
+            let stop = ctx
+                .store
+                .carried_upgrade(&channel_id)?
+                .unwrap_or(UpgradeStop {
+                    channel_id: channel_id.clone(),
+                    seq,
+                    block_cid: block_cid.clone(),
+                    kind: kind.name().to_string(),
+                    found_at: 0,
+                });
+            tracing::warn!(
+                channel_id,
+                seq = stop.seq,
+                kind = stop.kind,
+                "the owner sequenced a critical block of a kind this version does not \
+                 implement; the channel is stopped until this server is upgraded"
+            );
+            ctx.fanout.notify_channel(&channel_id, stop.notice()).await;
+            return Err(FollowError::NeedsUpgrade {
+                channel_id,
+                seq: stop.seq,
+                kind: stop.kind,
+            });
+        }
         Landing::EffectFailed(e) => return Err(FollowError::Other(e)),
         Landing::Landed => {}
     }
     // A removed member still receives its own removal, as from the owner
     // (`ingest`): on an MLS channel it carries the commit that tells its
     // client the group is gone.
-    let removed = (kind == BlockKind::MemberRemove)
+    let removed = (kind.known() == Some(BlockKind::MemberRemove))
         .then(|| manifest.metadata.get("member_did").and_then(|v| v.as_str()))
         .flatten()
         .map(crate::effect::canonical_did_string);
     deliver(ctx, &stored, &channel_id, removed).await;
     Ok(Followed::Landed { block_cid, seq })
+}
+
+/// Read a carried block's manifest: of a kind this build implements, or, as
+/// JEP-0005 rule 14c reads it, of one it does not. A manifest that is neither
+/// is refused as it always was.
+fn carried_manifest(bytes: &[u8]) -> Result<(jig_core::BlockManifest, CarriedKind), IngestError> {
+    match crate::ingest::parse_manifest(bytes) {
+        Ok(manifest) => {
+            let kind = manifest.kind.ok_or(IngestError::KindRequired)?;
+            Ok((manifest, CarriedKind::Known(kind)))
+        }
+        Err(refused) => {
+            let Some(unknown) = jig_core::UnknownKindManifest::parse(bytes) else {
+                return Err(refused);
+            };
+            unknown.manifest.check_gates()?;
+            Ok((
+                unknown.manifest,
+                CarriedKind::Unknown {
+                    name: unknown.kind,
+                    critical: unknown.critical,
+                },
+            ))
+        }
+    }
 }
 
 const UNFOLLOWED_SUITE: &str = "only plaintext and MLS channels are followed";
@@ -1639,7 +1913,9 @@ mod tests {
             let too_large = matches!(got, Err(IngestError::BundleTooLarge { .. }));
             assert_eq!(too_large, refused, "a local post of {len} bytes: {got:?}");
         }
-        // A kind this build does not know is refused as the manifest it is.
+        // A kind this build does not know is read as JEP-0005 rule 14c reads
+        // it, and checked like any block: renamed after signing, it fails the
+        // author's signature.
         let mut manifest: serde_json::Value = serde_json::from_slice(&sent.parts.0).unwrap();
         manifest["kind"] = serde_json::json!("not-a-kind");
         let manifest = serde_json::to_vec(&manifest).unwrap();
@@ -1657,7 +1933,7 @@ mod tests {
                 &owner.did()
             )
             .await,
-            Err(FollowError::Block(IngestError::BundleMalformed(_)))
+            Err(FollowError::Block(IngestError::InvalidSignature))
         ));
         // None of it was kept, and the real block still lands.
         assert!(
@@ -2202,5 +2478,487 @@ mod tests {
         };
         let got = take(&follower, &o.owner, &sent).await;
         assert!(matches!(got, Err(FollowError::Unapplied { .. })), "{got:?}");
+    }
+
+    // --- JEP-0005 rule 14c: blocks of a kind this build does not implement ---
+
+    /// A block of kind `name`, which this build does not implement, signed by
+    /// `key`. Built as JSON: no `BlockKind` names it.
+    fn unknown(
+        key: &SigningKey,
+        name: &str,
+        meta: serde_json::Value,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let (manifest_bytes, _, _) = signed(key, BlockKind::TextRender, meta);
+        let mut manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+        manifest["kind"] = serde_json::json!(name);
+        manifest["metadata"].as_object_mut().unwrap().remove("body");
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let code_bytes = Vec::new();
+        let sig = key
+            .sign(&serde_json::to_vec(&(&manifest_bytes, &code_bytes)).unwrap())
+            .to_bytes()
+            .to_vec();
+        (manifest_bytes, code_bytes, sig)
+    }
+
+    impl Owner {
+        /// Sequence `parts` as the next link after `after` (the record sent
+        /// last), as an owner that implements its kind would.
+        fn next_after(&self, after: &[u8], parts: (Vec<u8>, Vec<u8>, Vec<u8>)) -> Sent {
+            let last = IngestRecord::decode(after).unwrap();
+            Sent {
+                record: self.sign_at(&parts, last.seq + 1, last.hash()),
+                parts,
+            }
+        }
+
+        fn unknown(&self, name: &str, extra: serde_json::Value) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+            let mut meta = serde_json::json!({"channel_id": self.channel});
+            if let serde_json::Value::Object(extra) = extra {
+                meta.as_object_mut().unwrap().extend(extra);
+            }
+            unknown(&self.user, name, meta)
+        }
+
+        fn text_parts(&self, body: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+            let meta = serde_json::json!({"channel_id": self.channel, "body": body});
+            signed(&self.user, BlockKind::TextRender, meta)
+        }
+    }
+
+    fn cid_of(sent: &Sent) -> String {
+        bundle(&sent.parts).block_cid().unwrap().to_string()
+    }
+
+    /// A local subscription to `channel` on `follower` that takes notices.
+    async fn watch(
+        follower: &IngestContext,
+        channel: &str,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<crate::fanout::ChannelNotice> {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let id = follower
+            .fanout
+            .subscribe_local(
+                crate::fanout::SubscriptionScope::Channel(channel.to_string()),
+                crate::fanout::SubscriberIdentity::Unchecked,
+                tx,
+            )
+            .await;
+        let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
+        follower.fanout.watch_notices(id, notice_tx);
+        std::mem::forget(_rx);
+        notice_rx
+    }
+
+    #[tokio::test]
+    async fn a_critical_unknown_kind_stops_its_channel_and_only_it() {
+        let mut owner = Owner::new().await;
+        owner.text("before").await;
+        let follower = owner.follower();
+        let mut other = Owner::new().await;
+        share(&follower, &other.channel, &other.did());
+        for sent in &owner.sent {
+            take(&follower, &owner, sent).await.unwrap();
+        }
+        take(&follower, &other, &other.sent[0]).await.unwrap();
+        let mut notices = watch(&follower, &owner.channel).await;
+
+        let critical = owner.next_after(
+            &owner.sent[1].record,
+            owner.unknown("sequencer-set", serde_json::json!({})),
+        );
+        match take(&follower, &owner, &critical).await {
+            Err(FollowError::NeedsUpgrade {
+                channel_id,
+                seq,
+                kind,
+            }) => {
+                assert_eq!(
+                    (channel_id.as_str(), seq, kind.as_str()),
+                    (owner.channel.as_str(), 2, "sequencer-set")
+                );
+            }
+            got => panic!("{got:?}"),
+        }
+        // Nothing of the block is kept but the stop; the head stays before it.
+        assert!(
+            follower
+                .store
+                .get_block(&cid_of(&critical))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            follower
+                .store
+                .ingest_record_bytes(&owner.channel, 2)
+                .unwrap()
+                .is_none()
+        );
+        let stop = follower
+            .store
+            .carried_upgrade(&owner.channel)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (stop.seq, stop.block_cid.as_str()),
+            (2, cid_of(&critical).as_str())
+        );
+        assert_eq!(
+            follower.store.carried_upgrades().unwrap(),
+            vec![stop.clone()]
+        );
+
+        // Its subscribers are told once, as the existing error frame would.
+        let notice = notices.try_recv().unwrap();
+        assert_eq!(notice.code, crate::fanout::CHANNEL_NEEDS_UPGRADE);
+        assert_eq!(notice.channel_id, owner.channel);
+        assert!(
+            notice.message.contains("`sequencer-set` at seq 2"),
+            "{}",
+            notice.message
+        );
+
+        // What comes after is the same stop, never a gap to fill: the next
+        // link, one further on, and the block itself again.
+        let after = owner.next_after(&critical.record, owner.text_parts("after"));
+        let further = owner.next_after(&after.record, owner.text_parts("further"));
+        for sent in [&after, &further, &critical] {
+            let got = take(&follower, &owner, sent).await;
+            assert!(
+                matches!(got, Err(FollowError::NeedsUpgrade { seq: 2, .. })),
+                "{got:?}"
+            );
+        }
+        assert!(
+            notices.try_recv().is_err(),
+            "told once, not once per record"
+        );
+
+        // The other channel goes on.
+        let text = other.text("still here").await;
+        assert!(matches!(
+            take(&follower, &other, other.sent.last().unwrap()).await,
+            Ok(Followed::Landed { seq: 1, .. })
+        ));
+        assert!(follower.store.get_block(&text).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_non_critical_unknown_kind_lands_and_the_chain_goes_on() {
+        let owner = Owner::new().await;
+        let follower = owner.follower();
+        take(&follower, &owner, &owner.sent[0]).await.unwrap();
+
+        let reaction = owner.next_after(
+            &owner.sent[0].record,
+            owner.unknown("opt-reaction", serde_json::json!({"to": "x"})),
+        );
+        assert!(matches!(
+            take(&follower, &owner, &reaction).await,
+            Ok(Followed::Landed { seq: 1, .. })
+        ));
+        let stored = follower
+            .store
+            .get_block(&cid_of(&reaction))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.block_kind, "opt-reaction");
+        assert!(stored.is_synthetic, "never executed");
+        assert_eq!(
+            follower
+                .store
+                .ingest_record_bytes(&owner.channel, 1)
+                .unwrap()
+                .unwrap(),
+            reaction.record
+        );
+
+        let next = owner.next_after(&reaction.record, owner.text_parts("next"));
+        assert!(matches!(
+            take(&follower, &owner, &next).await,
+            Ok(Followed::Landed { seq: 2, .. })
+        ));
+        // Again is a duplicate, as any block is.
+        assert!(matches!(
+            take(&follower, &owner, &reaction).await,
+            Ok(Followed::Duplicate { seq: 1, .. })
+        ));
+        assert!(follower.store.carried_upgrades().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_kind_carrying_an_mls_group_key_is_critical_whatever_its_name() {
+        let owner = Owner::new().await;
+        let follower = owner.follower();
+        take(&follower, &owner, &owner.sent[0]).await.unwrap();
+        let commit = owner.next_after(
+            &owner.sent[0].record,
+            owner.unknown("opt-reaction", serde_json::json!({"mls_commit": "AAAA"})),
+        );
+        assert!(matches!(
+            take(&follower, &owner, &commit).await,
+            Err(FollowError::NeedsUpgrade { seq: 1, .. })
+        ));
+        assert!(
+            follower
+                .store
+                .get_block(&cid_of(&commit))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// The marker is the kind name, in the bytes the author signed: one put
+    /// there afterwards, by a relay or anyone, breaks the signature, so the
+    /// block is refused before anything of it is kept.
+    #[tokio::test]
+    async fn a_marker_added_after_signing_fails_the_signature() {
+        let owner = Owner::new().await;
+        let follower = owner.follower();
+        take(&follower, &owner, &owner.sent[0]).await.unwrap();
+        let (manifest, code, sig) = owner.unknown("sequencer-set", serde_json::json!({}));
+        let relabelled = String::from_utf8(manifest)
+            .unwrap()
+            .replace("\"sequencer-set\"", "\"opt-sequencer-set\"")
+            .into_bytes();
+        let forged = owner.next_after(&owner.sent[0].record, (relabelled, code, sig));
+        assert!(matches!(
+            take(&follower, &owner, &forged).await,
+            Err(FollowError::Block(IngestError::InvalidSignature))
+        ));
+        assert!(
+            follower
+                .store
+                .get_block(&cid_of(&forged))
+                .unwrap()
+                .is_none()
+        );
+        assert!(follower.store.carried_upgrades().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_kind_must_name_the_records_channel_and_be_its_authors() {
+        let owner = Owner::new().await;
+        let follower = owner.follower();
+        take(&follower, &owner, &owner.sent[0]).await.unwrap();
+        let after = &owner.sent[0].record;
+
+        // No channel id: a kind this build does not know names no channel it
+        // can tell by slug.
+        let unnamed = owner.next_after(
+            after,
+            unknown(&owner.user, "opt-reaction", serde_json::json!({})),
+        );
+        assert!(matches!(
+            take(&follower, &owner, &unnamed).await,
+            Err(FollowError::Mismatch(_))
+        ));
+        // Another channel's id.
+        let elsewhere = owner.next_after(
+            after,
+            unknown(
+                &owner.user,
+                "opt-reaction",
+                serde_json::json!({"channel_id": "bafkother"}),
+            ),
+        );
+        assert!(matches!(
+            take(&follower, &owner, &elsewhere).await,
+            Err(FollowError::Mismatch(_))
+        ));
+        // The right channel, signed by another key than its author's: refused
+        // before anything is kept, critical or not.
+        for name in ["opt-reaction", "sequencer-set"] {
+            let (manifest, code, _) = owner.unknown(name, serde_json::json!({}));
+            let stranger = SigningKey::from_bytes(&rand::random());
+            let sig = stranger
+                .sign(&serde_json::to_vec(&(&manifest, &code)).unwrap())
+                .to_bytes()
+                .to_vec();
+            let forged = owner.next_after(after, (manifest, code, sig));
+            assert!(matches!(
+                take(&follower, &owner, &forged).await,
+                Err(FollowError::Block(IngestError::InvalidSignature))
+            ));
+            assert!(
+                follower
+                    .store
+                    .get_block(&cid_of(&forged))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        for sent in [&unnamed, &elsewhere] {
+            assert!(follower.store.get_block(&cid_of(sent)).unwrap().is_none());
+        }
+        assert!(follower.store.carried_upgrades().unwrap().is_empty());
+        assert!(
+            follower
+                .store
+                .ingest_record_bytes(&owner.channel, 1)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_critical_unknown_kind_past_a_gap_is_the_gap_first() {
+        let owner = Owner::new().await;
+        let follower = owner.follower();
+        take(&follower, &owner, &owner.sent[0]).await.unwrap();
+        let skipped = owner.next_after(&owner.sent[0].record, owner.text_parts("skipped"));
+        let critical = owner.next_after(
+            &skipped.record,
+            owner.unknown("sequencer-set", serde_json::json!({})),
+        );
+        assert!(matches!(
+            take(&follower, &owner, &critical).await,
+            Err(FollowError::Gap {
+                head: Some(0),
+                got: 2,
+                ..
+            })
+        ));
+        assert!(follower.store.carried_upgrades().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_build_that_implements_the_kind_drops_the_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        {
+            let store = SqliteStore::open(&path).unwrap();
+            let conn = store.conn.lock().unwrap();
+            for (channel, kind) in [("a", "member-add"), ("b", "sequencer-set")] {
+                conn.execute(
+                    "INSERT INTO carried_upgrades (channel_id, seq, block_cid, kind, found_at)
+                     VALUES (?1, 3, 'bafy', ?2, 0)",
+                    params![channel, kind],
+                )
+                .unwrap();
+            }
+        }
+        let store = SqliteStore::open(&path).unwrap();
+        assert!(store.carried_upgrade("a").unwrap().is_none());
+        assert_eq!(
+            store.carried_upgrade("b").unwrap().unwrap().kind,
+            "sequencer-set"
+        );
+    }
+
+    /// `vectors/0005/unknown-kinds.json` (JEP-0005 rule 14c): each case's
+    /// signature and criticality, as a follower reads them. With
+    /// `JIG_BLESS_VECTORS` set, the file is written instead: the key and
+    /// manifests are fixed, and Ed25519 signs deterministically.
+    #[test]
+    fn unknown_kind_vectors() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../jig-spec/jep/vectors/0005/unknown-kinds.json");
+        if std::env::var_os("JIG_BLESS_VECTORS").is_some() {
+            std::fs::write(&path, bless_unknown_kind_vectors()).unwrap();
+        }
+        let vectors: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let cases = vectors["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 6);
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let manifest = case["manifest"].as_str().unwrap().as_bytes();
+            let sig = hex::decode(case["sig_hex"].as_str().unwrap()).unwrap();
+            let read = jig_core::UnknownKindManifest::parse(manifest).expect(name);
+            assert_eq!(read.kind, case["kind"].as_str().unwrap(), "{name}");
+            assert_eq!(read.critical, case["critical"].as_bool().unwrap(), "{name}");
+            let verifies = crate::ingest::verify_sig(manifest, &[], &read.manifest, &sig).is_ok();
+            assert_eq!(verifies, case["verifies"].as_bool().unwrap(), "{name}");
+        }
+    }
+
+    fn bless_unknown_kind_vectors() -> String {
+        let key = SigningKey::from_bytes(&[0x14; 32]);
+        let author = Did::from_ed25519_pubkey(key.verifying_key().as_bytes());
+        let manifest = |kind: &str, metadata: serde_json::Value| -> Vec<u8> {
+            let mut m = serde_json::to_value(
+                BlockManifest::builder()
+                    .version(Version::new(0, 1, 0))
+                    .author(Author {
+                        did: author.clone(),
+                        public_key: None,
+                        roles: vec![],
+                    })
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+            m["kind"] = serde_json::json!(kind);
+            m["metadata"] = metadata;
+            serde_json::to_vec(&m).unwrap()
+        };
+        let sign = |m: &[u8]| {
+            hex::encode(
+                key.sign(&serde_json::to_vec(&(m, &[] as &[u8])).unwrap())
+                    .to_bytes(),
+            )
+        };
+        let channel = "bafkreiaxnnnb7qz2focittuqq3ya25q7rcv3bqynnczfzao65fdpjsbv4i";
+        let case = |name: &str, kind: &str, meta: serde_json::Value, critical: bool| {
+            let m = manifest(kind, meta);
+            serde_json::json!({
+                "name": name,
+                "manifest": String::from_utf8(m.clone()).unwrap(),
+                "sig_hex": sign(&m),
+                "kind": kind,
+                "critical": critical,
+                "verifies": true,
+            })
+        };
+        let plain = manifest("sequencer-set", serde_json::json!({"channel_id": channel}));
+        let relabelled = String::from_utf8(plain.clone())
+            .unwrap()
+            .replace("\"sequencer-set\"", "\"opt-sequencer-set\"");
+        let vectors = serde_json::json!({
+            "description": "JEP-0005 rule 14c. Each manifest is of a kind no v0.2 build implements, signed by the Ed25519 key whose 32-byte seed is all 0x14, over the JSON array [manifest bytes, code bytes] with empty code. `critical` is the rule's verdict on the manifest's bytes; `verifies` whether the author's signature holds. A follower refuses a block whose signature fails before judging it.",
+            "cases": [
+                case("no marker: critical", "sequencer-set", serde_json::json!({"channel_id": channel}), true),
+                case("opt- prefix: non-critical", "opt-reaction", serde_json::json!({"channel_id": channel, "to": "x"}), false),
+                case("opt- prefix carrying mls_commit: critical", "opt-reaction", serde_json::json!({"channel_id": channel, "mls_commit": "AAAA"}), true),
+                case("opt- prefix carrying only mls_message and mls_epoch: non-critical", "opt-reaction", serde_json::json!({"channel_id": channel, "mls_message": "AAAA", "mls_epoch": 3}), false),
+                case("opt- prefix carrying an mls_ key not yet named: critical", "opt-reaction", serde_json::json!({"channel_id": channel, "mls_proposal": "AAAA"}), true),
+                {
+                    "name": "marker added after signing: the signature fails",
+                    "manifest": relabelled,
+                    "sig_hex": sign(&plain),
+                    "kind": "opt-sequencer-set",
+                    "critical": false,
+                    "verifies": false,
+                },
+            ],
+        });
+        serde_json::to_string_pretty(&vectors).unwrap() + "\n"
+    }
+
+    /// Every `mls_` key the gate reads is named by rule 14c as a group key
+    /// or as content, so the override does not rest on the prefix alone.
+    #[test]
+    fn every_mls_key_the_gate_reads_is_named_by_rule_14c() {
+        use crate::mls_gate::keys;
+        for key in [
+            keys::GROUP_INFO,
+            keys::RATCHET_TREE,
+            keys::COMMIT,
+            keys::WELCOME,
+            keys::MESSAGE,
+            keys::EPOCH,
+        ] {
+            assert!(
+                jig_core::block_kind::MLS_GROUP_KEYS.contains(&key)
+                    || jig_core::block_kind::MLS_CONTENT_KEYS.contains(&key),
+                "{key}"
+            );
+        }
+        for key in jig_core::block_kind::MLS_GROUP_KEYS {
+            assert!(!jig_core::block_kind::MLS_CONTENT_KEYS.contains(key));
+        }
     }
 }

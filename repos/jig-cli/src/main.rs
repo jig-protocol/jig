@@ -11,7 +11,15 @@ use std::path::PathBuf;
 use std::{io, io::IsTerminal};
 
 #[derive(Parser, Debug)]
-#[command(name = "jig", version, about = "Command-line client for Jig blocks")]
+#[command(
+    name = "jig",
+    version,
+    about = "Command-line client for Jig blocks",
+    after_help = "Exit status: 0 on success, 1 on an error, 78 when no key slot can seal a \
+                  new identity key, 79 when a channel needs an upgrade to read further (this \
+                  jig, or the server it reads through, does not implement a block kind the \
+                  channel uses)."
+)]
 struct Cli {
     /// Config file to use instead of ~/.jig/cli.toml (must exist)
     #[arg(long)]
@@ -787,6 +795,8 @@ async fn main() -> std::process::ExitCode {
             });
             if no_slot {
                 std::process::ExitCode::from(EXIT_NO_KEY_SLOT)
+            } else if cmd::upgrade::is_needs_upgrade(&e) {
+                std::process::ExitCode::from(cmd::upgrade::EXIT_NEEDS_UPGRADE)
             } else {
                 std::process::ExitCode::FAILURE
             }

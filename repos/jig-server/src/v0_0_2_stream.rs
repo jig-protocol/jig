@@ -642,7 +642,12 @@ impl Stream {
                 .store()
                 .chain_evidence(&share.channel_id)
                 .map(|e| !e.is_empty())
-                .unwrap_or(true);
+                .unwrap_or(true)
+                || self
+                    .store()
+                    .carried_upgrade(&share.channel_id)
+                    .map(|stop| stop.is_some())
+                    .unwrap_or(true);
             if stopped {
                 continue;
             }
@@ -724,6 +729,10 @@ impl Stream {
                     self.pull(&sequencer, &channel_id, head.map_or(0, |h| h + 1));
                     return;
                 }
+                // Stopped until this server is upgraded: asking again would
+                // only bring the same block (JEP-0005 rule 14c). Logged once,
+                // where the channel stopped.
+                Err(FollowError::NeedsUpgrade { .. }) => return,
                 Err(e) => {
                     tracing::warn!(
                         peer = sequencer,

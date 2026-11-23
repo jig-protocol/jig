@@ -40,6 +40,12 @@ pub trait BlockSource {
     fn lagged(&self) -> bool {
         false
     }
+
+    /// The server's message, when it ended because the server stopped the
+    /// channel at a block kind it does not implement.
+    fn server_needs_upgrade(&self) -> Option<String> {
+        None
+    }
 }
 
 impl BlockSource for jig_client::BlockStream {
@@ -49,6 +55,10 @@ impl BlockSource for jig_client::BlockStream {
 
     fn lagged(&self) -> bool {
         jig_client::BlockStream::lagged(self)
+    }
+
+    fn server_needs_upgrade(&self) -> Option<String> {
+        jig_client::BlockStream::server_needs_upgrade(self)
     }
 }
 
@@ -166,6 +176,9 @@ pub struct Follower<F: Feed> {
     channel: String,
     seen: Seen,
     ready: VecDeque<Event>,
+    /// The stop to end with once `ready` is shown: the channel needs an
+    /// upgrade to read past where a catch-up stopped.
+    stop: Option<anyhow::Error>,
 }
 
 impl<F: Feed> Follower<F> {
@@ -189,6 +202,7 @@ impl<F: Feed> Follower<F> {
             channel: channel.to_string(),
             seen,
             ready: VecDeque::new(),
+            stop: None,
         }
     }
 
@@ -199,7 +213,17 @@ impl<F: Feed> Follower<F> {
             if let Some(event) = self.ready.pop_front() {
                 return Ok(event);
             }
+            if let Some(stop) = self.stop.take() {
+                return Err(stop);
+            }
             let Some(d) = self.source.next_block().await else {
+                if let Some(message) = self.source.server_needs_upgrade() {
+                    return Err(crate::cmd::upgrade::NeedsUpgrade::Server {
+                        channel: self.channel.clone(),
+                        message,
+                    }
+                    .into());
+                }
                 if !self.source.lagged() {
                     return Err(connection_lost(&self.channel));
                 }
@@ -219,6 +243,8 @@ impl<F: Feed> Follower<F> {
                         return Ok(Event::Line(line));
                     }
                 }
+                // The channel stops here: nothing after this block is read.
+                Err(e) if crate::cmd::upgrade::is_needs_upgrade(&e) => return Err(e),
                 Err(e) => return Ok(Event::Unreadable(format!("{e:#}"))),
             }
         }
@@ -248,6 +274,10 @@ impl<F: Feed> Follower<F> {
         for read in self.reader.read_missed(&missed) {
             self.ready.push_back(match read {
                 Ok(line) => Event::Line(line),
+                Err(e) if crate::cmd::upgrade::is_needs_upgrade(&e) => {
+                    self.stop = Some(e);
+                    break;
+                }
                 Err(e) => Event::Unreadable(format!("{e:#}")),
             });
         }
@@ -368,6 +398,7 @@ mod tests {
     struct Stream {
         items: VecDeque<DeliveredBlock>,
         lagged: bool,
+        server_stop: Option<String>,
     }
 
     impl BlockSource for Stream {
@@ -378,6 +409,10 @@ mod tests {
 
         fn lagged(&self) -> bool {
             self.lagged
+        }
+
+        fn server_needs_upgrade(&self) -> Option<String> {
+            self.server_stop.clone()
         }
     }
 
@@ -429,6 +464,7 @@ mod tests {
         Stream {
             items: blocks.iter().cloned().collect(),
             lagged,
+            server_stop: None,
         }
     }
 
@@ -605,5 +641,83 @@ mod tests {
         assert!(caught_up.is_empty());
         assert!(shown[0].starts_with("<unreadable: "), "{shown:?}");
         assert_eq!(shown[1], "m1");
+    }
+
+    /// A block of a kind this build does not implement (JEP-0005 rule 14c),
+    /// delivered as a server older than signed deliveries sends it.
+    fn unknown(id: &jig_client::Identity, kind: &str, n: u64) -> DeliveredBlock {
+        let mut d = text(id, &format!("u{n}"), 1_747_690_000_000 + n);
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&d.bundle_b64)
+            .unwrap();
+        let (manifest, code): (Vec<u8>, Vec<u8>) = serde_json::from_slice(&raw).unwrap();
+        let mut manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+        manifest["kind"] = serde_json::json!(kind);
+        let manifest = serde_json::to_vec(&manifest).unwrap();
+        d.bundle_b64 = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&(&manifest, &code)).unwrap());
+        d.delivery_cid = format!("delivery:unknown-{n}");
+        d
+    }
+
+    /// A non-critical block of an unknown kind is skipped without a word; a
+    /// critical one stops the channel there, says so, and is kept so the
+    /// next session stops too.
+    #[tokio::test]
+    async fn a_critical_unknown_kind_stops_the_follower_and_a_skippable_one_does_not() {
+        let id = test_identity();
+        let history = channel(3);
+        let stream = vec![
+            history[0].clone(),
+            unknown(&id, "opt-reaction", 1),
+            history[1].clone(),
+            unknown(&id, "sequencer-set", 2),
+            history[2].clone(),
+        ];
+        let server = Server::new(history.clone(), vec![]);
+        let dir = tempfile::tempdir().unwrap();
+        let stops = dir.path().join("stops.json");
+        let f = Follower::new(
+            &server,
+            live(&stream, false),
+            Arc::new(Reader::plain_with_stops("#busy", stops.clone())),
+            "#busy",
+            Vec::<String>::new(),
+        );
+        let (shown, ended, _) = shown(f).await;
+        assert_eq!(
+            shown,
+            bodies(0..2),
+            "nothing shown past the stop, nothing for the skipped"
+        );
+        assert!(ended.contains("#busy needs an upgrade"), "{ended}");
+        assert!(ended.contains("`sequencer-set`"), "{ended}");
+        let again = crate::cmd::upgrade::check_open(&stops, "ws://test", "#busy").unwrap_err();
+        assert!(crate::cmd::upgrade::is_needs_upgrade(&again));
+        crate::cmd::upgrade::check_open(&stops, "ws://test", "#other").unwrap();
+    }
+
+    /// A stream the server ended because it stopped the channel says that the
+    /// server needs the upgrade, not that the connection was lost.
+    #[tokio::test]
+    async fn a_stream_the_server_stopped_says_the_server_needs_an_upgrade() {
+        let history = channel(2);
+        let server = Server::new(history.clone(), vec![]);
+        let mut stream = live(&history, false);
+        stream.server_stop = Some("block kind `k` at seq 2".to_string());
+        let f = Follower::new(
+            &server,
+            stream,
+            Arc::new(Reader::plain("#busy")),
+            "#busy",
+            Vec::<String>::new(),
+        );
+        let (shown, ended, _) = shown(f).await;
+        assert_eq!(shown, bodies(0..2));
+        assert!(
+            ended.contains("this channel needs your server to upgrade"),
+            "{ended}"
+        );
+        assert!(ended.contains("block kind `k` at seq 2"), "{ended}");
     }
 }

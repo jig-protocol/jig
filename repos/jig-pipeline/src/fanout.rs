@@ -81,6 +81,23 @@ impl DeliveryPolicy {
     }
 }
 
+/// The error code a client is told a channel stopped with, at a block of a
+/// kind this server does not implement (JEP-0005 rule 14c).
+pub const CHANNEL_NEEDS_UPGRADE: &str = "CHANNEL_NEEDS_UPGRADE";
+
+/// Something a subscription is told about its channel that is not a block:
+/// sent as the existing `error` frame, never as a new one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelNotice {
+    pub status: u16,
+    pub code: &'static str,
+    /// The channel it is about, sent as the frame's `ref_cid`.
+    pub channel_id: String,
+    pub message: String,
+}
+
+type NoticeSender = mpsc::UnboundedSender<ChannelNotice>;
+
 type Delivery = (StoredBlock, StoredReceipt);
 type DeliverySender = mpsc::UnboundedSender<Delivery>;
 
@@ -116,6 +133,9 @@ pub struct Fanout {
     /// The server's own watchers, by block kind ([`Fanout::watch_kinds`]), or
     /// of every block (`None`, [`Fanout::watch_all`]).
     server_watchers: StdRwLock<Vec<(Option<Vec<String>>, DeliverySender)>>,
+    /// Where each local subscription that takes notices is sent them
+    /// ([`Fanout::watch_notices`]), by its id.
+    notices: StdRwLock<HashMap<u64, NoticeSender>>,
 }
 
 impl Fanout {
@@ -145,6 +165,38 @@ impl Fanout {
 
     pub async fn unsubscribe_local(&self, id: u64) {
         self.local.write().await.remove(&id);
+        self.notices.write().expect("notices poisoned").remove(&id);
+    }
+
+    /// Send local subscription `id` the notices about its channel
+    /// ([`Fanout::notify_channel`]) on `tx`, until it unsubscribes.
+    pub fn watch_notices(&self, id: u64, tx: NoticeSender) {
+        self.notices
+            .write()
+            .expect("notices poisoned")
+            .insert(id, tx);
+    }
+
+    /// Tell every local subscription to `channel_id` that watches notices.
+    /// No policy check: a notice carries nothing of the channel's content,
+    /// only that it stopped, and goes only to subscriptions already admitted.
+    pub async fn notify_channel(&self, channel_id: &str, notice: ChannelNotice) {
+        let ids: Vec<u64> = self
+            .local
+            .read()
+            .await
+            .iter()
+            .filter(|(_, sub)| {
+                matches!(&sub.scope, SubscriptionScope::Channel(key) if key == channel_id)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        let notices = self.notices.read().expect("notices poisoned");
+        for id in ids {
+            if let Some(tx) = notices.get(&id) {
+                let _ = tx.send(notice.clone());
+            }
+        }
     }
 
     /// Point every channel subscription still waiting under `slug` at the

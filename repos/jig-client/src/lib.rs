@@ -25,6 +25,7 @@ pub mod secure;
 pub mod server_key;
 pub mod servers;
 pub mod tls;
+pub mod upgrade_stops;
 #[cfg(feature = "verify")]
 pub mod verify;
 
