@@ -845,9 +845,9 @@ impl Client {
     /// server. A server whose welcome does not list `jig-request-auth-v2` is
     /// refused here, before anything is signed.
     ///
-    /// The nonce is random per call rather than derived from anything: a server
-    /// refuses a nonce it has already seen inside its acceptance window, so two
-    /// subscriptions to the same channel must not collide.
+    /// The nonce is fresh randomness per call ([`crate::read_auth::fresh_nonce`]):
+    /// a server refuses a nonce it has already seen inside its acceptance
+    /// window, so two subscriptions to the same channel must not collide.
     fn sign_subscribe(&self, scope: &Scope) -> Result<SubscribeAuth, ClientError> {
         use base64::Engine as _;
 
@@ -862,11 +862,9 @@ impl Client {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        // Shared with the REST read proofs: one nonce sequence per process,
-        // so a backfill and a subscribe in the same millisecond never carry
-        // the same nonce. See `read_auth::fresh_nonce` for why a counter and
-        // not randomness.
-        let nonce = crate::read_auth::fresh_nonce(hlc_wall_ms);
+        // The same source as the REST proofs: random, so no two proofs from
+        // any process or host signing as this DID share a nonce.
+        let nonce = crate::read_auth::fresh_nonce();
 
         let hash = jig_core::request_auth::canonical_request_hash(
             &audience,

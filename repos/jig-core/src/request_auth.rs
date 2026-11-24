@@ -36,6 +36,11 @@ pub const DOMAIN: &str = "jig-request-auth-v2";
 /// string as [`DOMAIN`]: the version is the domain.
 pub const VERSION: &str = DOMAIN;
 
+/// The most bytes a request-proof nonce may have, as for admission and PoW
+/// nonces ([`crate::pow::MAX_NONCE_LEN`]). A server refuses a longer one
+/// before verifying anything, so it is never recorded.
+pub const MAX_NONCE_LEN: usize = 64;
+
 /// Header names carrying a proof over HTTP: the six values the server
 /// verifies, exactly as [`canonical_request_hash`] consumes them.
 ///
