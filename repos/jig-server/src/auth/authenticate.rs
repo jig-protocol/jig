@@ -12,7 +12,7 @@
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use jig_core::did::Did;
-use jig_core::request_auth::canonical_request_hash;
+use jig_core::request_auth::{MAX_NONCE_LEN, canonical_request_hash};
 
 use crate::auth::{GateOutcome, ReplayGuard, ReplayRejection};
 
@@ -81,6 +81,12 @@ pub fn authenticate(
     // Every malformed-input path collapses to one refusal: a caller who cannot
     // authenticate has not earned a breakdown of which part was wrong. The DID
     // string is attacker-controlled, so this must refuse rather than panic.
+    //
+    // A nonce over the bound (JEP-0015 rule 25) is malformed too. Checked
+    // before any key work, so it costs nothing and is never recorded.
+    if proof.nonce.len() > MAX_NONCE_LEN {
+        return Err(GateOutcome::AuthSignatureInvalid);
+    }
     //
     // The DID header is transient: nothing below stores or forwards it, only
     // the canonical DID rebuilt from its key, which is also what the hash
@@ -926,5 +932,68 @@ mod tests {
             ),
             Ok(did)
         );
+    }
+
+    /// A nonce is at most [`MAX_NONCE_LEN`] bytes. One byte over is refused
+    /// though correctly signed, and takes no guard capacity; at the bound it
+    /// is accepted.
+    #[test]
+    fn a_nonce_over_the_bound_is_refused_and_not_recorded() {
+        let (signing, did) = identity(1);
+        let mut guard = ReplayGuard::new(30_000, 128);
+        let check = |nonce: &str, guard: &mut ReplayGuard| {
+            let proof = proof_for(&signing, &did, "GET", "/api/v1/channels", b"", 5_000, nonce);
+            authenticate(
+                &proof,
+                &server(),
+                "GET",
+                "/api/v1/channels",
+                b"",
+                5_000,
+                guard,
+            )
+        };
+
+        let over = "n".repeat(MAX_NONCE_LEN + 1);
+        assert_eq!(
+            check(&over, &mut guard),
+            Err(GateOutcome::AuthSignatureInvalid)
+        );
+        assert_eq!(guard.len(), 0, "a refused nonce takes no capacity");
+
+        let at = "n".repeat(MAX_NONCE_LEN);
+        assert_eq!(check(&at, &mut guard), Ok(did.clone()));
+        assert_eq!(guard.len(), 1);
+    }
+
+    /// The bound holds for subscriptions too: they share the verifier.
+    #[test]
+    fn a_subscribe_nonce_over_the_bound_is_refused() {
+        use base64::Engine as _;
+        let (signing, did) = identity(1);
+        let nonce = "n".repeat(MAX_NONCE_LEN + 1);
+        let hash = canonical_subscribe_hash(
+            server().as_str(),
+            did.as_str(),
+            "channel:x",
+            5_000,
+            0,
+            &nonce,
+        );
+        let auth = jig_pipeline::envelope::SubscribeAuth {
+            did: did.as_str().to_string(),
+            audience: Some(server().as_str().to_string()),
+            hlc_wall_ms: 5_000,
+            hlc_logical: 0,
+            nonce,
+            sig_b64: base64::engine::general_purpose::STANDARD
+                .encode(signing.sign(hash.as_bytes()).to_bytes()),
+        };
+        let mut guard = ReplayGuard::new(30_000, 128);
+        assert_eq!(
+            authenticate_subscribe(&auth, &server(), "channel:x", 5_000, &mut guard),
+            Err(GateOutcome::AuthSignatureInvalid)
+        );
+        assert_eq!(guard.len(), 0);
     }
 }
