@@ -47,9 +47,11 @@ reports.
 
 ## Supported versions
 
-Only the latest v0.x release and `main` receive fixes. v0.x makes **no compatibility
-guarantee**: a fix may change the wire format, the receipt format or the configuration
-without a migration path.
+Only the latest v0.2.x release and `main` receive security fixes. Prereleases
+(`-alpha.N`, `-rc.N`) are not supported once a final release of their line exists: from
+`v0.2.0`, upgrade from any `v0.2.0-alpha.N` to the latest v0.2.x. v0.x makes **no
+compatibility guarantee**: a fix may change the wire format, the receipt format or the
+configuration without a migration path.
 
 ## Scope
 
