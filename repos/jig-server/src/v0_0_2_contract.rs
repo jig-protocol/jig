@@ -531,6 +531,11 @@ impl Contracts {
                         }),
                     )
                     .await?;
+                    // The follower carries nothing of the channel yet, so a
+                    // block pushed from here on is not one it can land: send
+                    // it the chain from its start. The pull on its timer
+                    // stays the fallback.
+                    self.stream.push_from(to, &channel.id, 0)?;
                 } else if matches!(
                     kept.state,
                     OfferState::Withdrawn | OfferState::Ending | OfferState::Ended
@@ -2990,6 +2995,29 @@ mod tests {
                 .verifying_key()
                 .as_bytes(),
         )
+    }
+
+    /// Once the owner records a follower's accept, it sends the follower the
+    /// channel from its start, so the follower carries it at once: the pair
+    /// runs no pull timer, and nothing here pulls.
+    #[tokio::test]
+    async fn an_accepted_share_is_carried_without_waiting_for_a_pull() {
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.shared(3).await;
+        let want = p.caught_up(&channel).await;
+        assert_eq!(
+            want,
+            4 + 1,
+            "the create, three posts, the share and the accept"
+        );
+        let row = p
+            .follower
+            .ingest_ctx
+            .store
+            .get_channel_by_id(&channel)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.sequencer_did, p.owner.server_did.to_did_jig_string());
     }
 
     #[tokio::test(start_paused = true)]

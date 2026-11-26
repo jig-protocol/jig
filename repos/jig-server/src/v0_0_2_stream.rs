@@ -514,6 +514,23 @@ impl Stream {
         Ok(())
     }
 
+    /// Send `peer` `channel_id`'s records from `from_seq`, one frame of
+    /// them, unasked: what a follower whose share was just accepted lacks,
+    /// so it carries the channel at once rather than on its next pull. A
+    /// frame with more to come makes the follower ask for the rest. Through
+    /// [`Self::send`], like every frame this server starts on a stream.
+    pub(crate) fn push_from(
+        &self,
+        peer: &str,
+        channel_id: &str,
+        from_seq: u64,
+    ) -> anyhow::Result<()> {
+        if let Some(records) = self.records_from(channel_id, from_seq)? {
+            self.send(peer, RECORDS_FRAME, records.encode());
+        }
+        Ok(())
+    }
+
     /// `channel_id`'s blocks from `from_seq`, as many as one frame holds, or
     /// `None` when there are none.
     pub(crate) fn records_from(
