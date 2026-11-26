@@ -26,7 +26,7 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use jig_client::{Client, blocks::build_text_render};
+use jig_client::{Client, blocks::build_text_render_seen};
 use jig_core::HlcTimestamp;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
@@ -339,7 +339,11 @@ fn handle_submit(
             }
         };
         let hlc = HlcTimestamp::now_wall(id.did().clone());
-        let block = build_text_render(&id, &channel, &body, hlc);
+        let seen = ctx
+            .server_url()
+            .ok()
+            .and_then(|server| crate::cmd::secure::seen_for(&server, &channel));
+        let block = build_text_render_seen(&id, &channel, &body, hlc, seen.as_ref());
         if let Err(e) = client.submit(block).await {
             let _ = status_tx.send(submit_failure_status(&body, &format!("{e}")));
         }

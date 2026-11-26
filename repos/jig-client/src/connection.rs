@@ -674,6 +674,57 @@ impl Client {
                                     tracing::warn!("{defect}");
                                     lock_defects(&defects_for_reader).push(defect);
                                 }
+                                // The block's `seen` (JEP-0002 rule 10), where
+                                // this session can judge it without fetching:
+                                // a record at the head's `seq` with other
+                                // contents, or the block placed before it.
+                                // The rest is the history check's to fetch.
+                                let seen_break = step.as_ref().ok().and_then(|_| {
+                                    let seen = crate::chain::seen_of_block(&bundle_b64)?.ok()?;
+                                    match chain.check_seen(&seen, Some(record)) {
+                                        crate::chain::SeenCheck::Forked(proof) => Some((
+                                            "chain-seen-forked",
+                                            format!(
+                                                "a block carries record {} of its channel as seen, \
+                                                 and it is not the one this session verified",
+                                                seen.seq
+                                            ),
+                                            crate::evidence::Proof::Chain(proof),
+                                        )),
+                                        crate::chain::SeenCheck::Reordered {
+                                            record: at,
+                                            seen: s,
+                                        } => crate::chain::ReorderProof::of(&bundle_b64, record)
+                                            .map(|p| {
+                                                (
+                                                    "chain-reordered",
+                                                    format!(
+                                                        "a block placed at record {at} carries \
+                                                             record {s} as seen"
+                                                    ),
+                                                    crate::evidence::Proof::Reordered(Box::new(p)),
+                                                )
+                                            }),
+                                        crate::chain::SeenCheck::Differs { seq } => {
+                                            // Proven only with this device's
+                                            // record there: the next history
+                                            // read fetches it.
+                                            tracing::warn!(
+                                                channel = %record.channel_id,
+                                                seq,
+                                                "a block's seen is not the record this \
+                                                 session verified at that seq"
+                                            );
+                                            None
+                                        }
+                                        _ => None,
+                                    }
+                                });
+                                if let Some((code, reason, proof)) = seen_break {
+                                    drop(chains);
+                                    contradict_with(code, reason, &text, Some(Box::new(proof)));
+                                    break;
+                                }
                                 match step {
                                     Ok(crate::chain::Step::Gap { from, to }) => {
                                         lock_gaps(&gaps_for_reader).push(ChainGap {

@@ -416,6 +416,11 @@ pub enum IngestError {
     /// needs, or whose signed messages do not check out.
     #[error("`{kind}` refused: {detail}")]
     BadContractBlock { kind: String, detail: String },
+    /// A block's `seen` (JEP-0002 rule 10) that is not a record of the
+    /// block's channel: malformed, for another channel, or on a
+    /// `channel-create`, which has none.
+    #[error("the block's `seen` is refused: {detail}")]
+    BadSeen { detail: String },
     /// A `channel-create` whose slug is outside the slug grammar, or in a
     /// reserved namespace its author may not create in
     /// ([`jig_core::slug::check_create`]).
@@ -660,6 +665,24 @@ pub async fn ingest(
         return Err(IngestError::UnknownChannel {
             slug: named.to_string(),
         });
+    }
+    // A block's `seen` must at least be a record of the block's channel
+    // (JEP-0002 rule 10). Parsed only: whether its sequencer signed it is
+    // for readers to check, against the sequencer at its `seq`, and a
+    // conflict with this server's own chain is evidence, never refused.
+    if let Some(seen) = crate::ingest_record::read_seen(&manifest) {
+        let detail = match seen {
+            _ if kind == BlockKind::ChannelCreate => {
+                Some("a channel-create carries no seen".to_string())
+            }
+            Err(e) => Some(e.to_string()),
+            Ok(seen) => channel_id
+                .filter(|id| *id != seen.channel_id)
+                .map(|id| format!("it is a record of {}, not of {id}", seen.channel_id)),
+        };
+        if let Some(detail) = detail {
+            return Err(IngestError::BadSeen { detail });
+        }
     }
     // A relayed block goes only into the channel its share covers, and only
     // as a kind its grant carries (JEP-0005 rules 7a, 15). A channel-create
@@ -4483,6 +4506,90 @@ mod tests {
         assert!(
             matches!(err, IngestError::ChannelExists { .. }),
             "got {err:?}"
+        );
+    }
+
+    /// JEP-0002 rule 10: a block's `seen` must be a record of its channel.
+    /// It is parsed, not verified: whatever key signed it, it lands.
+    #[tokio::test]
+    async fn a_seen_is_parsed_and_must_name_the_blocks_channel() {
+        let ctx = test_ctx_allowing(&["text-render", "channel-create"]);
+        let author = random_signing_key();
+        let channel_id = seed_channel_owned_by(&ctx, "#hello", &did_of(&author));
+        let anyone = random_signing_key();
+        let record_of = |channel: &str| {
+            let r = crate::ingest_record::RecordSigner {
+                channel_id: channel.to_string(),
+                key: &anyone,
+                ingest_wall_ms: 1,
+                ingest_logical: 0,
+            }
+            .sign(0, channel, crate::ingest_record::GENESIS_PREV)
+            .unwrap();
+            crate::ingest_record::seen_value(&r)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let post = |seen: String, body: &'static str| {
+            let (m, c, sig) = build_bundle_parts_with_meta(
+                &author,
+                BlockKind::TextRender,
+                &[
+                    ("channel", "#hello"),
+                    ("body", body),
+                    (crate::ingest_record::SEEN_KEY, &seen),
+                ],
+            );
+            do_ingest(
+                &ctx,
+                m,
+                c,
+                sig,
+                IngestSource::LocalClient {
+                    conn_id: 1,
+                    tiers: true,
+                },
+            )
+        };
+        post(record_of(&channel_id), "fine").await.unwrap();
+        for (seen, body) in [
+            (
+                record_of(&crate::ingest_record::label_cid("elsewhere")),
+                "other channel",
+            ),
+            ("not a record".to_string(), "malformed"),
+        ] {
+            let refused = post(seen, body).await;
+            assert!(
+                matches!(refused, Err(IngestError::BadSeen { .. })),
+                "{body}: {refused:?}"
+            );
+        }
+        let (m, c, sig) = build_bundle_parts_with_meta(
+            &author,
+            BlockKind::ChannelCreate,
+            &[
+                ("slug", "#fresh"),
+                ("visibility", "open"),
+                (crate::ingest_record::SEEN_KEY, &record_of(&channel_id)),
+            ],
+        );
+        let create = do_ingest(
+            &ctx,
+            m,
+            c,
+            sig,
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await;
+        assert!(
+            matches!(create, Err(IngestError::BadSeen { .. })),
+            "{create:?}"
         );
     }
 

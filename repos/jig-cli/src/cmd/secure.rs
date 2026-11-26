@@ -2512,12 +2512,13 @@ impl Secure {
             .session
             .encrypt(&self.server, &self.key(slug), text)
             .with_context(|| format!("encrypting for {slug}"))?;
-        let block = jig_client::blocks::build_sealed_text(
+        let block = jig_client::blocks::build_sealed_text_seen(
             &self.identity,
             slug,
             &message,
             epoch,
             jig_core::HlcTimestamp::now_wall(self.identity.did().clone()),
+            seen_for(&self.server, slug).as_ref(),
         );
         // Filed before submitting: MLS will never decrypt our own message
         // for us, and the echo may arrive before the submit returns.
@@ -2525,6 +2526,16 @@ impl Secure {
             .remember(&block.cid(), self.session.did(), text)?;
         self.submit(&block).await
     }
+}
+
+/// What a block this device writes into `reference` on `server` carries as
+/// `seen` (JEP-0002 rule 10): the last record of the channel it verified, as
+/// pinned. `None` when it has verified none, or the pins do not load; the
+/// block is then sent without, as a client before `seen` sends it.
+pub(crate) fn seen_for(server: &str, reference: &str) -> Option<jig_client::chain::IngestRecord> {
+    Pins::load(&Pins::default_path())
+        .ok()?
+        .seen(server, reference)
 }
 
 /// [`Secure::key`] against `pins`: the id of the channel `reference` names on

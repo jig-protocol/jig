@@ -28,7 +28,7 @@ use jig_core::key_link::{self, SignedKeyLink};
 use jig_pipeline::handshake::{HandshakeResult, same_did, verify_offline};
 use serde::{Deserialize, Serialize};
 
-use crate::chain::ChainProof;
+use crate::chain::{ChainProof, ReorderProof};
 use crate::manifest::{ManifestCheck, check_cited};
 use jig_pipeline::ingest_record::IngestRecord;
 
@@ -70,6 +70,9 @@ pub struct Bundle {
 pub enum Proof {
     /// Two `ingest` records that cannot both hold, or a bad record 0.
     Chain(Box<ChainProof>),
+    /// A block whose own `ingest` record is not after the record it carries
+    /// as `seen` (JEP-0002 rule 10).
+    Reordered(Box<ReorderProof>),
     /// A welcome that advertised `suite`, and a signed refusal that does not
     /// list it. Neither is dated, so this shows the server signed both, not
     /// which came first: the client that kept them saw the order.
@@ -139,6 +142,16 @@ pub fn verify(bundle: &Bundle) -> Result<Checked, BundleError> {
             }
             let broke = proof.verify().map_err(BundleError::Proof)?;
             Some(format!("channel {}: {broke}", proof.channel_id))
+        }
+        Some(Proof::Reordered(proof)) => {
+            if !same_did(&proof.record.sequencer, &bundle.server_did) {
+                return Err(BundleError::Proof(format!(
+                    "the records are {}'s, not {}'s",
+                    proof.record.sequencer, bundle.server_did
+                )));
+            }
+            let shown = proof.verify().map_err(BundleError::Proof)?;
+            Some(format!("channel {}: {shown}", proof.record.channel_id))
         }
         Some(Proof::Downgrade {
             pinned_welcome,
