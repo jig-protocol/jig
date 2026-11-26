@@ -2005,6 +2005,7 @@ mod tests {
                     slug: String::new(),
                     suite: "mls".into(),
                     owner_did: "did:jig:zowner".into(),
+                    co_owners: Vec::new(),
                     chain_head: None,
                     sequencer: None,
                 },

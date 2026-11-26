@@ -998,9 +998,14 @@ pub fn record_moved_away(
     if record.block_cid != block_cid {
         return Err(FollowError::Mismatch("the record is for another block"));
     }
-    if !chan.is_root_owner(&crate::effect::canonical_did_string(
-        &sender.to_did_jig_string(),
-    )) {
+    if !crate::roles::rights_at_channel(
+        store,
+        &chan,
+        &crate::effect::canonical_did_string(&sender.to_did_jig_string()),
+        record.seq,
+    )?
+    .owner
+    {
         return Err(FollowError::Mismatch(
             "a sequencer move signed by a DID that is not the channel's owner",
         ));
@@ -1309,9 +1314,16 @@ pub async fn ingest_sequenced(
         if set.channel_id != channel_id {
             return Err(FollowError::Mismatch("the move names another channel"));
         }
-        if !chan.is_root_owner(&crate::effect::canonical_did_string(
-            &sender.to_did_jig_string(),
-        )) {
+        // An owner as of the move's place in the chain, the creator rule
+        // carried across its key links (rule 7b).
+        if !crate::roles::rights_at_channel(
+            &ctx.store,
+            chan,
+            &crate::effect::canonical_did_string(&sender.to_did_jig_string()),
+            record.seq,
+        )?
+        .owner
+        {
             return Err(FollowError::Mismatch(
                 "a sequencer move signed by a DID that is not the channel's owner",
             ));

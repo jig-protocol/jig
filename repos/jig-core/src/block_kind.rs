@@ -153,11 +153,17 @@ pub enum BlockKind {
     /// rule 11a); its metadata is [`crate::sequencer_move::SequencerSet`]'s.
     /// Its record is signed by the new sequencer. Critical: no `opt-` prefix.
     SequencerSet,
+    /// A DID's channel-scoped key link (JEP-0005 rule 7b): authored by the
+    /// new DID, carrying a link whose audience is this channel. From its
+    /// `seq`, the old DID's roles and membership are the new DID's; its
+    /// metadata is [`crate::sequencer_move::KeyLinkBlock`]'s. Critical: no
+    /// `opt-` prefix.
+    KeyLink,
 }
 
 impl BlockKind {
     /// Every kind this build implements.
-    pub const ALL: [BlockKind; 24] = [
+    pub const ALL: [BlockKind; 25] = [
         Self::TextRender,
         Self::ChannelCreate,
         Self::MemberAdd,
@@ -182,6 +188,7 @@ impl BlockKind {
         Self::ContractRefuse,
         Self::ContractEnd,
         Self::SequencerSet,
+        Self::KeyLink,
     ];
 
     /// Stable wire-format string (kebab-case).
@@ -211,6 +218,7 @@ impl BlockKind {
             Self::ContractRefuse => "contract-refuse",
             Self::ContractEnd => "contract-end",
             Self::SequencerSet => "sequencer-set",
+            Self::KeyLink => "key-link",
         }
     }
 
@@ -250,6 +258,7 @@ impl std::str::FromStr for BlockKind {
             "contract-refuse" => Ok(Self::ContractRefuse),
             "contract-end" => Ok(Self::ContractEnd),
             "sequencer-set" => Ok(Self::SequencerSet),
+            "key-link" => Ok(Self::KeyLink),
             _ => Err(BlockKindError::Unknown(s.to_string())),
         }
     }
@@ -267,7 +276,7 @@ mod tests {
 
     /// The `v0.2.0` set is pinned: adding a kind to [`BlockKind`] does not
     /// change it, and every kind added since gates older readers unless it
-    /// is `opt-`. Today that is `sequencer-set` alone.
+    /// is `opt-`. Today those are `sequencer-set` and `key-link`.
     #[test]
     fn the_v0_2_0_kinds_are_pinned_and_every_later_kind_gates_older_readers() {
         assert_eq!(V0_2_0_KINDS.len(), 23);
@@ -280,7 +289,7 @@ mod tests {
             .map(BlockKind::as_str)
             .filter(|k| !V0_2_0_KINDS.contains(k))
             .collect();
-        assert_eq!(later, ["sequencer-set"]);
+        assert_eq!(later, ["sequencer-set", "key-link"]);
         assert!(later.iter().all(|k| gates_older_readers(k)));
         assert!(gates_older_readers("key-link"));
         assert!(!gates_older_readers("opt-reaction"));

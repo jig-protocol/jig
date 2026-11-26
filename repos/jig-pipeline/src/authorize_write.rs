@@ -104,6 +104,7 @@ pub fn changes_the_channel(kind: BlockKind) -> bool {
             | BlockKind::ContractRefuse
             | BlockKind::ContractEnd
             | BlockKind::SequencerSet
+            | BlockKind::KeyLink
     )
 }
 
@@ -231,7 +232,7 @@ pub fn authorize_block_with(
                 return refuse(sender);
             };
             if target == sender {
-                if channel.is_root_owner(&sender) {
+                if rights.owner {
                     return Err(WriteRefusal::OwnerCannotLeave {
                         slug: channel.slug.clone(),
                     });
@@ -276,6 +277,10 @@ pub fn authorize_block_with(
                 })
             }
         }
+        // JEP-0005 rule 7b: the link's two signatures are its authority, and
+        // what it may move is checked before this gate
+        // (`roles::check_key_link`). Its author holds nothing yet.
+        BlockKind::KeyLink => Ok(()),
         BlockKind::RoleAssign | BlockKind::RoleUnassign => {
             if !rights.owner {
                 return Err(WriteRefusal::MissingRight {

@@ -321,6 +321,8 @@ impl Default for ServerSection {
                 // server (JEP-0005 rule 11a). Listed in the welcome, it also
                 // tells a client this server can take a channel over.
                 "sequencer-set".to_string(),
+                // A member's channel-scoped key link (JEP-0005 rule 7b).
+                "key-link".to_string(),
             ],
             max_future_skew_ms: DEFAULT_MAX_FUTURE_SKEW_MS,
             proxy_protocol: ProxyProtocolSection::default(),

@@ -1106,7 +1106,7 @@ fn role_blocks_before_on(
             "SELECT b.block_kind, b.bundle_bytes
                FROM chain_records r JOIN blocks b ON b.cid = r.block_cid
               WHERE r.channel_id = ?1 AND r.seq < ?2
-                AND b.block_kind IN ('role-assign', 'role-unassign')
+                AND b.block_kind IN ('role-assign', 'role-unassign', 'key-link')
               ORDER BY r.seq ASC",
         )?;
         let before = i64::try_from(before_seq).unwrap_or(i64::MAX);
@@ -1807,9 +1807,10 @@ impl SqliteStore {
         Ok(written)
     }
 
-    /// The `role-assign` and `role-unassign` blocks of `channel_id` whose
-    /// ingest record `seq` is strictly below `before_seq`, in chain order,
-    /// with their manifests. What [`crate::roles::rights_at`] folds.
+    /// The `role-assign`, `role-unassign` and `key-link` blocks of
+    /// `channel_id` whose ingest record `seq` is strictly below `before_seq`,
+    /// in chain order, with their manifests. What [`crate::roles::rights_at`]
+    /// folds.
     pub fn list_role_blocks_before(
         &self,
         channel_id: &str,
@@ -3740,6 +3741,25 @@ pub(crate) fn upsert_channel_on(conn: &Connection, c: &StoredChannel) -> Result<
 }
 
 /// [`SqliteStore::remove_membership_by_id`] on `conn`.
+/// Move `old`'s membership of `channel_id` to `new` (JEP-0005 rule 7b): the
+/// row keeps its role, join time and the block that made it. A DID that is
+/// not a member moves nothing. Returns whether a row moved.
+pub(crate) fn move_membership_on(
+    conn: &Connection,
+    channel_id: &str,
+    old: &str,
+    new: &str,
+) -> Result<bool> {
+    let moved = conn.execute(
+        "UPDATE memberships SET member_did = ?3
+          WHERE channel_id = ?1 AND member_did = ?2
+            AND NOT EXISTS (SELECT 1 FROM memberships
+                             WHERE channel_id = ?1 AND member_did = ?3)",
+        [channel_id, old, new],
+    )?;
+    Ok(moved > 0)
+}
+
 pub(crate) fn remove_membership_by_id_on(
     conn: &Connection,
     channel_id: &str,

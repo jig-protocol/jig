@@ -3171,6 +3171,7 @@ mod tests {
                     slug: String::new(),
                     suite: "mls".to_string(),
                     owner_did: "did:jig:zuser".to_string(),
+                    co_owners: Vec::new(),
                     chain_head: None,
                     sequencer: None,
                 },
@@ -3322,6 +3323,7 @@ mod tests {
                 slug: String::new(),
                 suite: "mls".to_string(),
                 owner_did: "did:jig:zuser".to_string(),
+                co_owners: Vec::new(),
                 chain_head: None,
                 sequencer: None,
             },
@@ -3351,6 +3353,7 @@ mod tests {
             slug: String::new(),
             suite: "mls".to_string(),
             owner_did: "did:jig:zuser".to_string(),
+            co_owners: Vec::new(),
             chain_head: None,
             sequencer: sequencer.map(str::to_string),
         };

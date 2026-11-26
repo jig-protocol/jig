@@ -60,6 +60,20 @@ pub struct ChainHead {
     /// moved, and in a pin written before moves.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub moves: Vec<HeadMove>,
+    /// The channel-scoped key links this client verified in the chain up to
+    /// here (JEP-0005 rule 7b), oldest first: what carries a root owner to
+    /// its new key ([`jig_core::sequencer_move::root_owners`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_links: Vec<HeadKeyLink>,
+}
+
+/// A `key-link` in a channel's chain, as a client keeps it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeadKeyLink {
+    /// The `seq` of its record: it is in force for the records after it.
+    pub seq: u64,
+    pub old: String,
+    pub new: String,
 }
 
 /// The features a request outside a connection declares in its
@@ -96,6 +110,7 @@ impl ChainHead {
             record: Some(record.clone()),
             high: None,
             moves: Vec::new(),
+            key_links: Vec::new(),
         }
     }
 
@@ -127,6 +142,7 @@ impl ChainHead {
             next.high = self.high_record().cloned();
         }
         next.moves = self.moves.clone();
+        next.key_links = self.key_links.clone();
         next
     }
 }
@@ -634,8 +650,11 @@ impl ChannelChain {
         sig_b64: Option<&str>,
         step: impl FnOnce(&mut Self) -> Result<Step, ChainBreak>,
     ) -> Result<Step, ChainBreak> {
+        let link = self.key_link_in(record, bundle_b64, sig_b64);
         let Some(moved) = self.move_in(record, bundle_b64, sig_b64)? else {
-            return step(self);
+            let result = step(self);
+            self.keep_key_link(record, link);
+            return result;
         };
         let saved = self.head.clone();
         if let Some(head) = self.head.as_mut()
@@ -653,6 +672,67 @@ impl ChannelChain {
             self.head = saved;
         }
         result
+    }
+
+    /// The `(old, new)` DIDs of `bundle_b64`, if it is the verified block of
+    /// `record` and a key link for this channel (JEP-0005 rule 7b).
+    fn key_link_in(
+        &self,
+        record: &IngestRecord,
+        bundle_b64: &str,
+        sig_b64: Option<&str>,
+    ) -> Option<(String, String)> {
+        let opened = crate::open::open(&crate::DeliveredBlock {
+            bundle_b64: bundle_b64.to_string(),
+            sig_b64: sig_b64.map(str::to_string),
+            receipts: Vec::new(),
+            delivery_cid: String::new(),
+            ingest: None,
+        })
+        .ok()?;
+        if opened.manifest.kind != Some(jig_core::BlockKind::KeyLink)
+            || opened.authenticity != crate::open::Authenticity::Verified
+            || opened.cid != record.block_cid
+        {
+            return None;
+        }
+        jig_core::sequencer_move::key_link_dids(
+            &opened.manifest.metadata,
+            &opened.sender,
+            &self.channel_id,
+        )
+    }
+
+    /// Keep `link`, `record`'s key link, once the head is `record`.
+    fn keep_key_link(&mut self, record: &IngestRecord, link: Option<(String, String)>) {
+        let Some((old, new)) = link else {
+            return;
+        };
+        if let Some(head) = self.head.as_mut()
+            && head.seq == record.seq
+            && head.hash == hex::encode(record.hash())
+            && !head.key_links.iter().any(|l| l.seq == record.seq)
+        {
+            head.key_links.push(HeadKeyLink {
+                seq: record.seq,
+                old,
+                new,
+            });
+        }
+    }
+
+    /// The channel's root owners as of `seq`: the owners this client was
+    /// given, carried along the key links it verified before `seq`.
+    pub fn owners_at(&self, seq: u64) -> Vec<String> {
+        let links = self
+            .head
+            .as_ref()
+            .map(|h| h.key_links.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter(|l| l.seq < seq)
+            .map(|l| (l.old.clone(), l.new.clone()));
+        jig_core::sequencer_move::root_owners(self.owners.clone(), links)
     }
 
     /// The move `bundle_b64` makes, if it is an owner's `sequencer-set`.
@@ -690,13 +770,13 @@ impl ChannelChain {
         set.check_record(record.seq, &record.prev, &record.sequencer)
             .map_err(|e| bad(e.to_string()))?;
         if !self
-            .owners
+            .owners_at(record.seq)
             .iter()
             .any(|o| jig_pipeline::handshake::same_did(o, &opened.sender))
         {
             return Err(bad(format!(
-                "it is signed by {}, a key that is not the channel's creation-block owner; \
-                 owner key links are not yet followed",
+                "it is signed by {}, which is not an owner of the channel as of its place in \
+                 the chain",
                 opened.sender
             )));
         }
@@ -772,6 +852,22 @@ mod tests {
     impl Seq {
         /// The same chain, signed from here on by a new key. Returns the
         /// key it signed with before.
+        /// [`Self::push`], for a block named by its real CID.
+        fn push_cid(&mut self, block_cid: &str, wall: u64) -> IngestRecord {
+            let seq = self.records.len() as u64;
+            let prev = self.records.last().map_or(GENESIS_PREV, IngestRecord::hash);
+            let record = RecordSigner {
+                channel_id: label_cid("bafyCreate"),
+                key: &self.key,
+                ingest_wall_ms: wall,
+                ingest_logical: 0,
+            }
+            .sign(seq, block_cid, prev)
+            .unwrap();
+            self.records.push(record.clone());
+            record
+        }
+
         fn rotate(&mut self) -> ed25519_dalek::SigningKey {
             std::mem::replace(&mut self.key, generate_signing_key())
         }
@@ -844,6 +940,123 @@ mod tests {
             b64.encode(block.canonical_bytes()),
             b64.encode(&block.sender_sig),
         )
+    }
+
+    /// `new`'s `key-link` from `old` for the test channel (JEP-0005 rule 7b),
+    /// as a server delivers it: bundle and signature, base64, with its CID
+    /// and manifest.
+    fn key_link_block(
+        old: &ed25519_dalek::SigningKey,
+        new: &ed25519_dalek::SigningKey,
+    ) -> (String, String, String, jig_core::BlockManifest) {
+        use base64::Engine as _;
+        let channel: cid::Cid = label_cid("bafyCreate").parse().unwrap();
+        let link = jig_core::key_link::SignedKeyLink::sign(
+            old,
+            new,
+            jig_core::key_link::Audience::Channel {
+                channel_id: channel.to_bytes(),
+            },
+            1_700_000_000,
+        )
+        .unwrap();
+        let meta = jig_core::sequencer_move::KeyLinkBlock {
+            channel_id: label_cid("bafyCreate"),
+            link,
+        }
+        .to_metadata();
+        let block = crate::blocks::build_with_metadata(
+            &crate::Identity::from_signing_key(new.clone()),
+            jig_core::BlockKind::KeyLink,
+            jig_core::HlcTimestamp::now_wall(jig_core::Did::from_ed25519_pubkey(&[1; 32])),
+            serde_json::Value::Object(meta.into_iter().collect()),
+        );
+        let manifest = serde_json::from_slice(&block.manifest_bytes).unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD;
+        (
+            b64.encode(block.canonical_bytes()),
+            b64.encode(&block.sender_sig),
+            block.cid(),
+            manifest,
+        )
+    }
+
+    /// One reading of "owner" (JEP-0005 rule 7b): the same chain, a creator
+    /// that linked its key and then moved the sequencer with the new key,
+    /// gives the same verdict through the client's chain and the server's
+    /// rights. With the link, the new key's move holds and the old key is no
+    /// owner; without it, the new key is no owner on either side.
+    #[test]
+    fn the_client_and_the_server_read_one_owner_across_a_key_link() {
+        let did = |k: &ed25519_dalek::SigningKey| {
+            jig_core::Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        };
+        let (owner, rotated, new) = (
+            generate_signing_key(),
+            generate_signing_key(),
+            generate_signing_key(),
+        );
+        let mut server = Seq::new();
+        let old = server.did();
+        let create = server.push("bafyCreate", 10);
+        let (link_bundle, link_sig, link_cid, link_manifest) = key_link_block(&owner, &rotated);
+        let linked = server.push_cid(&link_cid, 20);
+        let (set_bundle, set_sig) = move_block(&server, &new, &rotated);
+        server.key = new.clone();
+        let set = server.push("set", 30);
+
+        // The server: the creator's rights folded from the same blocks.
+        let channel = jig_pipeline::persist::StoredChannel {
+            id: label_cid("bafyCreate"),
+            slug: "#team".into(),
+            visibility: "open".into(),
+            created_at: 0,
+            owner_did: did(&owner),
+            suite: "none".into(),
+            sequencer_did: old.clone(),
+            co_owners: Vec::new(),
+            tiering: jig_pipeline::persist::ChannelTiering::legacy("#team", "open", "none"),
+        };
+        let server_owner = |key: &ed25519_dalek::SigningKey, links: bool| {
+            let blocks = links
+                .then(|| (jig_core::BlockKind::KeyLink, link_manifest.clone()))
+                .into_iter();
+            jig_pipeline::roles::standing(&channel, &did(key), blocks).root
+        };
+        // The client: the same chain, told only of the creation block's owner.
+        let client = |links: bool| {
+            let mut chain = ChannelChain::new(&label_cid("bafyCreate"), &old, None)
+                .with_owners(vec![did(&owner)]);
+            assert_eq!(chain.accept(&create, None), Ok(Step::Next));
+            let step = if links {
+                chain.accept_block(&linked, None, &link_bundle, Some(&link_sig))
+            } else {
+                chain.accept(&linked, None)
+            };
+            assert_eq!(step, Ok(Step::Next));
+            chain
+        };
+
+        let mut with_link = client(true);
+        assert_eq!(with_link.owners_at(set.seq), [did(&rotated)]);
+        assert!(server_owner(&rotated, true) && !server_owner(&owner, true));
+        assert_eq!(
+            with_link.accept_block(&set, None, &set_bundle, Some(&set_sig)),
+            Ok(Step::Next),
+            "the rotated owner's move holds"
+        );
+        assert_eq!(with_link.moves().len(), 1);
+        // Kept with the head: a chain picked up from it reads the same owner.
+        let resumed = ChannelChain::new(&label_cid("bafyCreate"), &old, with_link.head().cloned())
+            .with_owners(vec![did(&owner)]);
+        assert_eq!(resumed.owners_at(set.seq + 1), [did(&rotated)]);
+
+        let mut without = client(false);
+        assert!(!server_owner(&rotated, false) && server_owner(&owner, false));
+        assert!(matches!(
+            without.accept_block(&set, None, &set_bundle, Some(&set_sig)),
+            Err(ChainBreak::BadMove { .. })
+        ));
     }
 
     /// The owner moves the channel's sequencer (JEP-0005 rule 11a): its
@@ -922,9 +1135,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(refused, ChainBreak::BadMove { .. }));
         assert!(
-            refused
-                .to_string()
-                .contains("not the channel's creation-block owner"),
+            refused.to_string().contains("not an owner of the channel"),
             "{refused}"
         );
         assert!(matches!(

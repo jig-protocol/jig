@@ -730,6 +730,7 @@ async fn check_manifest_in(
             slug: String::new(),
             suite: "none".into(),
             owner_did: welcome.server_did.clone(),
+            co_owners: Vec::new(),
             chain_head: None,
             sequencer: None,
         },
@@ -1006,6 +1007,7 @@ mod tests {
                 slug: String::new(),
                 suite: "none".into(),
                 owner_did: did,
+                co_owners: Vec::new(),
                 chain_head: None,
                 sequencer: None,
             },
@@ -1309,6 +1311,7 @@ mod tests {
                 record: None,
                 high: None,
                 moves: Vec::new(),
+                key_links: Vec::new(),
             },
         )
         .unwrap();

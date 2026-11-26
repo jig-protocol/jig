@@ -278,11 +278,67 @@ fn base64(meta: &BTreeMap<String, Value>, key: &'static str) -> Result<Vec<u8>, 
         .map_err(|_| MoveError::Field(key))
 }
 
+/// The `(old, new)` DIDs of a `key-link` block authored by `author`, read
+/// and checked as [`KeyLinkBlock::from_metadata`] checks it, for the channel
+/// `channel_id`. `None` for any other block, or a link that does not hold.
+pub fn key_link_dids(
+    meta: &BTreeMap<String, Value>,
+    author: &str,
+    channel_id: &str,
+) -> Option<(String, String)> {
+    let block = KeyLinkBlock::from_metadata(meta, author).ok()?;
+    if block.channel_id != channel_id {
+        return None;
+    }
+    let link = block.link.link();
+    Some((link.old.clone(), link.new.clone()))
+}
+
+/// A channel's root owners after `links` (JEP-0005 rule 7b): the creator
+/// and the co-owners its creation block lists, `roots`, each carried along
+/// the channel-scoped key links that follow it, in chain order. A link from
+/// a DID that is not a root owner at that point moves no root; a root
+/// linked away is no longer one.
+///
+/// The one reading of "owner" for every reader of the chain: the server's
+/// rights and creator rule, the takeover of a move, and a client's check of
+/// who may move the sequencer all ask it, so none can admit what another
+/// refuses. DIDs are compared by key and returned as `roots` and `links`
+/// spell them.
+pub fn root_owners(
+    roots: impl IntoIterator<Item = String>,
+    links: impl IntoIterator<Item = (String, String)>,
+) -> Vec<String> {
+    let mut owners: Vec<String> = roots.into_iter().collect();
+    for (old, new) in links {
+        if let Some(at) = owners.iter().position(|o| same_owner(o, &old))
+            && !owners.iter().any(|o| same_owner(o, &new))
+        {
+            owners[at] = new;
+        }
+    }
+    owners
+}
+
+/// Whether `did` is among [`root_owners`].
+pub fn is_root_owner(
+    roots: impl IntoIterator<Item = String>,
+    links: impl IntoIterator<Item = (String, String)>,
+    did: &str,
+) -> bool {
+    root_owners(roots, links).iter().any(|o| same_owner(o, did))
+}
+
 fn is_canonical_did(did: &str) -> bool {
     Did::from_did_jig_string(did)
         .ok()
         .and_then(|d| d.as_bytes().ok())
         .is_some_and(|key| Did::from_ed25519_pubkey(&key).to_did_jig_string() == did)
+}
+
+/// The two DIDs are one owner: the same text, or one key however spelled.
+fn same_owner(a: &str, b: &str) -> bool {
+    a == b || same_key(a, b)
 }
 
 /// The two DIDs name one key, whatever their spelling.
@@ -298,6 +354,31 @@ fn same_key(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Roots move along links in chain order; a link from a non-root, a
+    /// second link from a DID already linked away, and a link onto a DID
+    /// that is already a root move nothing.
+    #[test]
+    fn root_owners_follow_key_links_in_order() {
+        let [a, b, c, d, x] = [10, 11, 12, 13, 14].map(|i| did_of(&key(i)));
+        let link = |o: &str, n: &str| (o.to_string(), n.to_string());
+        let roots = || vec![a.clone(), b.clone()];
+        assert_eq!(root_owners(roots(), []), [a.clone(), b.clone()]);
+        assert_eq!(root_owners(roots(), [link(&a, &c)]), [c.clone(), b.clone()]);
+        assert_eq!(
+            root_owners(roots(), [link(&a, &c), link(&c, &d)]),
+            [d.clone(), b.clone()]
+        );
+        // Linked away: `a` holds nothing, so its second link moves nothing.
+        assert_eq!(
+            root_owners(roots(), [link(&a, &c), link(&a, &d)]),
+            [c.clone(), b.clone()]
+        );
+        assert_eq!(root_owners(roots(), [link(&x, &d)]), roots());
+        assert_eq!(root_owners(roots(), [link(&a, &b)]), roots());
+        assert!(is_root_owner(roots(), [link(&a, &c)], &c));
+        assert!(!is_root_owner(roots(), [link(&a, &c)], &a));
+    }
     use crate::canonical_cid;
     use crate::contract::{ContractOffer, Grant, ManifestRef};
     use ed25519_dalek::SigningKey;
