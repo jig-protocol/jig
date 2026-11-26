@@ -1251,6 +1251,13 @@ impl SqliteStore {
     /// The gate is in this process's memory. It holds for one server process
     /// writing its own SQLite store, which is every deployment today. Several
     /// writers against one store would need a lock in the database instead.
+    ///
+    /// The map keeps one entry per channel this process has gated and never
+    /// shrinks: a few bytes a channel, which is fine at today's scale.
+    ///
+    /// Taken by [`crate::ingest::ingest`] and by
+    /// [`crate::follow::ingest_sequenced`], so a carried record and a
+    /// takeover of its channel are judged one after the other.
     pub async fn gate_channel(&self, channel_id: &str, exclusive: bool) -> ChannelGate {
         let gate = self
             .channel_gates
