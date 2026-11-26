@@ -794,16 +794,20 @@ pub async fn prune(ctx: &CliContext, slug: String, via: String, yes: bool) -> Re
              `jig channel unshare {} {via}`",
             shell_word(&slug)
         ),
-        Share::Never if complete => {
-            anyhow::bail!("{slug}'s log holds no share with {via}: nobody reached it through {via}")
-        }
+        Share::Never if complete => anyhow::bail!(
+            "{slug}'s log holds no share with {via} accepted by this server ({server_did}); \
+             nothing removed. If this server's key has rotated or the channel has moved, prune \
+             cannot judge its members: remove them with `jig channel kick`"
+        ),
         Share::Never => anyhow::bail!(
-            "no share of {slug} with {via} in the newest {} blocks of its log; nothing removed",
+            "no share of {slug} with {via} accepted by this server in the newest {} blocks of \
+             its log; nothing removed. Prune cannot judge its members: remove them with \
+             `jig channel kick`",
             crate::cmd::secure::MAX_CATCH_UP_PAGES * crate::cmd::secure::MAX_HISTORY_PAGE
         ),
     }
 
-    let verdicts = judge_now(&secure, &slug, &via).await?;
+    let verdicts = judge_now(&secure, &slug, &via, None).await?;
     let contacts = &ctx.effective().contacts;
     let mut removing = Vec::new();
     for (did, verdict) in &verdicts {
@@ -833,11 +837,12 @@ pub async fn prune(ctx: &CliContext, slug: String, via: String, yes: bool) -> Re
         return Ok(());
     }
     for did in removing {
-        // Judged again just before its removal: a member who has since written
-        // here directly, or been listed elsewhere, is kept. The server does
-        // not check this on `member-remove`, so a write that lands between
-        // this check and the removal is not seen.
-        let now = judge_now(&secure, &slug, &via).await?;
+        // Judged again just before its removal, from the membership as it is
+        // now and this member's own reachability record: a member who has
+        // since written here directly, or been listed elsewhere, is kept. The
+        // server does not check this on `member-remove`, so a write that
+        // lands between this check and the removal is not seen.
+        let now = judge_now(&secure, &slug, &via, Some(&did)).await?;
         if !now
             .iter()
             .any(|(d, v)| *d == did && matches!(v, Verdict::Remove(_)))
@@ -861,11 +866,14 @@ pub async fn prune(ctx: &CliContext, slug: String, via: String, yes: bool) -> Re
 }
 
 /// The prune verdict for each member of `slug`, from its membership and
-/// reachability records as this server holds them now.
+/// reachability records as this server holds them now. With `only`, the
+/// reachability record of that member alone is read, so only its verdict is
+/// to be used.
 async fn judge_now(
     secure: &Secure,
     slug: &str,
     via: &str,
+    only: Option<&str>,
 ) -> Result<Vec<(String, crate::cmd::prune::Verdict)>> {
     use crate::cmd::prune::Member;
     let body: MembersResponse = secure
@@ -889,6 +897,7 @@ async fn judge_now(
     for m in members
         .iter()
         .filter(|m| m.last_via.as_deref() == Some(via))
+        .filter(|m| only.is_none_or(|did| m.did == did))
     {
         if let Some(servers) = reach_servers(secure, &m.did).await? {
             reach.insert(m.did.clone(), servers);
