@@ -849,19 +849,25 @@ pub fn ws_caller(conn_id: u64, did: Option<&str>, ip: Option<std::net::IpAddr>) 
     Caller { conn, client }
 }
 
-/// The [`Caller`] for a REST write from `ip`: the caller's address, so a
-/// caller resubmitting someone else's signed block holds its own relay
-/// slots, not the author's. A request with no address (a router driven
-/// without connection info) falls back to the block's `author`. Each REST
-/// request is its own connection, so the address is both.
+/// The [`Caller`] for a REST write from `ip`. The client is the caller's
+/// address, so a caller resubmitting someone else's signed block holds its
+/// own relay slots, not the author's. A request with no address (a router
+/// driven without connection info) falls back to the block's `author`.
+///
+/// Each REST request is its own connection, with a key no other request
+/// shares. A REST client is bounded by [`MAX_CLIENT_IN_FLIGHT`] across its
+/// requests, not by [`MAX_IN_FLIGHT`] at its address.
 pub fn rest_caller(ip: Option<std::net::IpAddr>, author: &str) -> Caller {
-    let key = match ip {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static REQUEST: AtomicU64 = AtomicU64::new(0);
+
+    let client = match ip {
         Some(ip) => format!("rest:ip:{ip}"),
         None => format!("rest:{author}"),
     };
     Caller {
-        conn: key.clone(),
-        client: key,
+        conn: format!("rest:req:{}", REQUEST.fetch_add(1, Ordering::Relaxed)),
+        client,
     }
 }
 
@@ -1184,6 +1190,38 @@ mod tests {
         let counts = relay.in_flight.lock().unwrap();
         assert_eq!(counts.total, MAX_IN_FLIGHT);
         assert_eq!(counts.clients.len(), 1);
+    }
+
+    /// A REST client's writes are separate requests: one address holds up
+    /// to [`MAX_CLIENT_IN_FLIGHT`] relays, not [`MAX_IN_FLIGHT`], and a
+    /// WSS connection keeps its own bound of [`MAX_IN_FLIGHT`].
+    #[tokio::test]
+    async fn rest_writes_from_one_address_are_bounded_as_one_client() {
+        let state = crate::v0_0_2::AppState::for_test().unwrap();
+        let relay = relay_for(&state);
+        let ip = Some(std::net::IpAddr::from([192, 0, 2, 7]));
+
+        let mut held = Vec::new();
+        for _ in 0..MAX_CLIENT_IN_FLIGHT {
+            held.push(relay.hold(&rest_caller(ip, "did:jig:zAuthor")).unwrap());
+        }
+        busy(
+            relay
+                .hold(&rest_caller(ip, "did:jig:zAuthor"))
+                .err()
+                .unwrap(),
+            "this client",
+        );
+        // Another address is another client.
+        let other = Some(std::net::IpAddr::from([192, 0, 2, 8]));
+        held.push(relay.hold(&rest_caller(other, "did:jig:zAuthor")).unwrap());
+
+        // A WSS connection is still bounded on its own.
+        let carol = ws_caller(1, Some("did:jig:zCarol"), None);
+        for _ in 0..MAX_IN_FLIGHT {
+            held.push(relay.hold(&carol).unwrap());
+        }
+        busy(relay.hold(&carol).err().unwrap(), "this connection");
     }
 
     /// The answer `rx` carries next, as the follower would read it.

@@ -736,7 +736,7 @@ mod tests {
                 format!(
                     "ip={} slot={}",
                     ip.map(|ip| ip.to_string()).unwrap_or_default(),
-                    crate::v0_0_2_relay::rest_caller(ip, "did:jig:zauthor").conn
+                    crate::v0_0_2_relay::rest_caller(ip, "did:jig:zauthor").client
                 )
             }),
         )
