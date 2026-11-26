@@ -158,12 +158,21 @@ Non-goals for v0.2:
       - From the block's `seq` on, `old` holds nothing in the channel, and `new` holds
         what `old` held. A root owner (the creator or a co-owner) stays a root owner
         under `new`.
-      - On an MLS channel the link moves the roster and the roles, not the leaf. The
-        new DID joins by an external commit that also removes the old DID's leaf. The
-        owner's gate admits that removal because the link ties the two DIDs.
-      - A refusal is `KEY_LINK_REFUSED`. A sequencer that cannot yet validate the leaf
-        swap MUST refuse every `key-link` on an MLS channel with
-        `MLS_KEY_LINK_UNSUPPORTED`, and MUST NOT move the roster without it.
+      - On an MLS channel the link moves the roster and the roles, not the leaf. It
+        carries no commit. The new DID then joins by its own external commit, which
+        the owner's gate admits because the roster lists it. The old DID's leaf is
+        removed by an ordinary member commit (the tidy-up `member-remove`: the old
+        DID is no longer a member). The new DID's client sends that commit right
+        after its join, before any application message, and any member's client
+        whose tree still holds the old leaf may send it. Whichever lands first
+        removes the leaf; the others are refused as stale. Until then the old leaf
+        can read the join epoch, and no later one.
+      - The atomic form, one external commit by the new DID that also removes the
+        old leaf, is valid MLS: RFC 9420 leaves it to the application which
+        identities a joiner may remove. The openmls version we use can't build an
+        external commit that removes a leaf with a different key, so the old leaf is
+        removed by an ordinary member commit right after the join.
+      - A refusal is `KEY_LINK_REFUSED`.
       - The sequencer MUST judge a block's rights and give it its `seq` as one step
         with respect to the channel's `key-link`s. No link may land between the check
         of a block signed by `old` and that block's `seq`.
