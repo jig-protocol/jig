@@ -266,6 +266,7 @@ type Pending = HashMap<u64, (String, oneshot::Sender<Answer>)>;
 /// One server's side of every write it relays or takes relayed.
 pub struct Relay {
     ctx: Arc<IngestContext>,
+    federation: Arc<FederationSection>,
     peers: Arc<PeerRegistry>,
     /// The owner's limit on each follower's relayed writes.
     writes: RequestLimit,
@@ -356,7 +357,8 @@ impl Relay {
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             in_flight: Arc::new(Mutex::new(InFlightCounts::default())),
-            quotas: Arc::new(PeerQuotas::new(federation)),
+            quotas: Arc::new(PeerQuotas::new(federation.clone())),
+            federation,
             taking: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -523,8 +525,11 @@ impl Relay {
             .contract_offers_for(channel_id, &owner, Side::Follower, OfferState::Accepted)
             .map_err(|e| Refusal::of(&IngestError::Persist(e)))?
             .pop();
-        // No live share: the channel is carried, nothing more.
-        let Some(share) = share else {
+        // No live share, or an owner no longer configured (DJ 2026-11-26):
+        // the channel is carried, nothing more, and nothing is sent to it.
+        let Some(share) = share.filter(|_| {
+            crate::v0_0_2_federation::configured_peer(&self.federation, &owner).is_some()
+        }) else {
             return Err(refusal_of(&self.ctx, refused));
         };
         let relays = kind

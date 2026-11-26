@@ -360,6 +360,7 @@ type Queued = (Did, Records);
 #[derive(Clone)]
 pub struct Stream {
     ctx: Arc<IngestContext>,
+    federation: Arc<FederationSection>,
     peers: Arc<PeerRegistry>,
     queue: mpsc::Sender<Queued>,
     /// The queue's other end, until [`Stream::run`] takes it.
@@ -385,6 +386,7 @@ impl Stream {
         let requests = Arc::new(RequestLimit::new(federation.records_from));
         Stream {
             ctx,
+            federation,
             peers,
             queue,
             frames: Arc::new(Mutex::new(Some(frames))),
@@ -412,9 +414,17 @@ impl Stream {
         &self.ctx.store
     }
 
-    /// Send `body` to `peer`, if it is connected. A frame not sent is not
-    /// lost: the follower's next pull asks for what it lacks.
+    /// Send `body` to `peer`, if it is a configured peer and connected. A
+    /// frame not sent is not lost: the follower's next pull asks for what it
+    /// lacks. Every frame this server starts on a stream goes through here,
+    /// pushes and pulls alike, so a server that is not configured, one
+    /// delisted while its share is accepted included, is sent nothing
+    /// (DJ 2026-11-26); its share stays as it is, for the operator.
     fn send(&self, peer: &str, kind: &str, body: Vec<u8>) {
+        if crate::v0_0_2_federation::configured_peer(&self.federation, peer).is_none() {
+            tracing::debug!(peer, kind, "not a configured peer; nothing sent");
+            return;
+        }
         let Ok(did) = Did::from_did_jig_string(peer) else {
             return;
         };

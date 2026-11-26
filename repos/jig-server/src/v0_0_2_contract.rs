@@ -3115,6 +3115,28 @@ mod tests {
             1,
             "the share is left for the operator"
         );
+
+        // Pushes reach configured peers only: a block posted now goes to the
+        // listed follower's connection, and nothing to the delisted one's,
+        // though both are connected and both shares are accepted.
+        let (listed_out, mut listed_rx) = PeerSender::new(listed.clone());
+        let (delisted_out, mut delisted_rx) = PeerSender::new(delisted.clone());
+        let _listed = owner.peers.register(listed_out);
+        let _delisted = owner.peers.register(delisted_out);
+        let cid = post(
+            &owner,
+            &user,
+            BlockKind::TextRender,
+            serde_json::json!({"channel_id": channel, "body": "after the delisting"}),
+        )
+        .await
+        .unwrap();
+        let block = owner.ingest_ctx.store.get_block(&cid).unwrap().unwrap();
+        contracts.stream.on_block(&block).unwrap();
+        let pushed = sent(&mut listed_rx);
+        assert_eq!(pushed.len(), 1, "{pushed:?}");
+        assert_eq!(pushed[0].0, crate::v0_0_2_stream::RECORDS_FRAME);
+        assert!(sent(&mut delisted_rx).is_empty(), "nothing pushed");
     }
 
     #[tokio::test(start_paused = true)]
@@ -4575,11 +4597,61 @@ mod tests {
         assert_eq!(relay.waiting(), 0, "nothing left waiting");
     }
 
+    /// A follower relays nothing to an owner it no longer lists as a peer,
+    /// though its share is accepted: the write is refused as for a carried
+    /// channel with no live share, and nothing waits on that owner.
     #[tokio::test]
-    async fn a_write_for_an_owner_not_connected_is_refused_with_when_to_retry() {
+    async fn a_write_for_an_owner_no_longer_configured_is_not_relayed() {
         let follower = state_with(vec![], &[]);
         handle(&follower);
         let owner = did_of(&SigningKey::from_bytes(&rand::random()));
+        let channel = jig_pipeline::ingest_record::label_cid("carried");
+        let store = &follower.ingest_ctx.store;
+        store
+            .upsert_channel(&StoredChannel {
+                id: channel.clone(),
+                slug: "#carried".to_string(),
+                visibility: "open".to_string(),
+                created_at: 0,
+                owner_did: owner.clone(),
+                suite: jig_core::EncryptionSuite::Unencrypted.as_str().to_string(),
+                sequencer_did: owner.clone(),
+                co_owners: vec![],
+                tiering: jig_pipeline::persist::ChannelTiering::current(
+                    "open",
+                    jig_core::EncryptionSuite::Unencrypted.as_str(),
+                ),
+            })
+            .unwrap();
+        store
+            .put_contract_offer(&StoredOffer {
+                offer_id: rand::random(),
+                channel_id: channel.clone(),
+                side: Side::Follower,
+                peer_did: owner.clone(),
+                grant: Grant::Write,
+                state: OfferState::Accepted,
+                offer: vec![],
+                answer: None,
+                share_cid: None,
+            })
+            .unwrap();
+        let author = SigningKey::from_bytes(&rand::random());
+        let parts = signed(&author, BlockKind::TextRender, text_in(&channel, "hello"));
+        let refused = client_post(&follower, &parts).await.unwrap_err();
+        assert_eq!(refused.code, "CARRIED_CHANNEL", "{refused:?}");
+        assert_eq!(follower.relay.get().unwrap().waiting(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_write_for_an_owner_not_connected_is_refused_with_when_to_retry() {
+        let owner = did_of(&SigningKey::from_bytes(&rand::random()));
+        // A configured peer, but not connected.
+        let follower = state_with(
+            vec![peer("ws://127.0.0.1:1", owner.clone(), OfferPolicy::Hold)],
+            &[],
+        );
+        handle(&follower);
         let channel = jig_pipeline::ingest_record::label_cid("carried");
         let store = &follower.ingest_ctx.store;
         store
