@@ -83,9 +83,20 @@ pub const KEY_LINKS_FRAME: &str = "owner-key-links";
 /// offers judged without.
 const MAX_PENDING_KEY_LINKS: usize = 64;
 
+/// The most key-link chains held across every peer. A contract frame may come
+/// from a DID that is not a configured peer, so the per-peer bound alone would
+/// grow with the DIDs a sender mints. When full, an incoming chain is dropped,
+/// never another peer's: its offer is judged without it, and the owner's
+/// resend tries again.
+const MAX_PENDING_KEY_LINKS_TOTAL: usize = 1024;
+
+/// How long a chain is held for its offer. The owner sends it just before the
+/// offer, on the same connection, so a chain this old is not coming to use.
+const PENDING_KEY_LINKS_TTL: Duration = Duration::from_secs(60);
+
 /// Key-link chains held for offers to come, by the sending peer's DID and the
-/// `offer_id` each is for.
-type PendingKeyLinks = HashMap<(String, [u8; 32]), Vec<Vec<u8>>>;
+/// `offer_id` each is for, with when each arrived.
+type PendingKeyLinks = HashMap<(String, [u8; 32]), (tokio::time::Instant, Vec<Vec<u8>>)>;
 
 /// How often the owner sends its unanswered offers again. A send fails while
 /// there is no connection to the peer, so an offer made then goes out
@@ -1015,7 +1026,9 @@ impl PeerFrames for Contracts {
                     .pending_key_links
                     .lock()
                     .expect("poisoned")
-                    .remove(&(peer.clone(), offer.offer_id));
+                    .remove(&(peer.clone(), offer.offer_id))
+                    .filter(|(at, _)| at.elapsed() < PENDING_KEY_LINKS_TTL)
+                    .map(|(_, links)| links);
                 if let Err(e) = self.on_offer(offer, links, out) {
                     tracing::warn!(peer, "contract offer not answered: {e:#}");
                 }
@@ -1023,12 +1036,18 @@ impl PeerFrames for Contracts {
             KEY_LINKS_FRAME => {
                 let chain = OwnerKeyLinks::from_bytes(body).map_err(violation)?;
                 let mut pending = self.pending_key_links.lock().expect("poisoned");
+                pending.retain(|_, (at, _)| at.elapsed() < PENDING_KEY_LINKS_TTL);
                 // Bounded per peer: one peer's chains never push out another's.
                 let held = pending.keys().filter(|(from, _)| *from == peer).count();
                 if held >= MAX_PENDING_KEY_LINKS {
                     pending.retain(|(from, _), _| *from != peer);
                 }
-                pending.insert((peer.clone(), chain.offer_id), chain.links);
+                let key = (peer.clone(), chain.offer_id);
+                if pending.len() >= MAX_PENDING_KEY_LINKS_TOTAL && !pending.contains_key(&key) {
+                    tracing::debug!(peer, "key-link chain dropped: too many held");
+                    return Ok(());
+                }
+                pending.insert(key, (tokio::time::Instant::now(), chain.links));
             }
             ANSWER_FRAME => {
                 let answer = match ContractAccept::from_envelope(body) {
@@ -2188,8 +2207,8 @@ mod tests {
 
     /// Held chains are bounded per peer: one peer that fills its share
     /// drops only its own, never another peer's chain for an offer to come.
-    #[test]
-    fn one_peer_filling_its_held_chains_keeps_another_peers() {
+    #[tokio::test]
+    async fn one_peer_filling_its_held_chains_keeps_another_peers() {
         let state = state_with(vec![], &[]);
         let contracts = Contracts::new(&state);
         let (a, b) = (
@@ -2211,6 +2230,78 @@ mod tests {
             .filter(|(from, _)| *from == did_of(&b))
             .count();
         assert!(held_for_b <= MAX_PENDING_KEY_LINKS, "{held_for_b}");
+    }
+
+    /// Chains from many DIDs never hold more than the total, and a full map
+    /// drops the incoming chain, not one already held.
+    #[tokio::test]
+    async fn chains_from_many_dids_stay_within_the_total() {
+        let state = state_with(vec![], &[]);
+        let contracts = Contracts::new(&state);
+        let first = SigningKey::from_bytes(&[3; 32]);
+        let chain = OwnerKeyLinks {
+            offer_id: [0; 32],
+            links: vec![public_link(&first, &SigningKey::from_bytes(&[4; 32]))],
+        };
+        send_key_links(&contracts, &first, &chain).unwrap();
+        for i in 0..(MAX_PENDING_KEY_LINKS_TOTAL + 8) as u32 {
+            let mut seed = [9; 32];
+            seed[..4].copy_from_slice(&i.to_le_bytes());
+            send_key_links(&contracts, &SigningKey::from_bytes(&seed), &chain).unwrap();
+        }
+        let pending = contracts.pending_key_links.lock().unwrap();
+        assert_eq!(pending.len(), MAX_PENDING_KEY_LINKS_TOTAL);
+        assert!(pending.contains_key(&(did_of(&first), [0; 32])));
+    }
+
+    /// A chain held longer than its time is not used for its offer, and is
+    /// swept when the next chain arrives.
+    #[tokio::test(start_paused = true)]
+    async fn a_chain_held_too_long_is_gone() {
+        let (old, new) = (
+            SigningKey::from_bytes(&[3; 32]),
+            SigningKey::from_bytes(&[6; 32]),
+        );
+        let (follower, contracts) = follower_of(&new);
+        crate::v0_0_2_manifest_log::publish(&Arc::new(follower.clone()))
+            .await
+            .unwrap();
+        let offered = |v: u32| {
+            offer_to(
+                &follower,
+                &new,
+                creation(&old, serde_json::json!({ "v": v })),
+                &[],
+            )
+        };
+        let chain = |offer: &ContractOffer| OwnerKeyLinks {
+            offer_id: offer.offer_id,
+            links: vec![public_link(&old, &new)],
+        };
+
+        // Its offer comes after the chain's time: judged without it.
+        let late = offered(1);
+        send_key_links(&contracts, &new, &chain(&late)).unwrap();
+        tokio::time::advance(PENDING_KEY_LINKS_TTL).await;
+        assert_eq!(
+            answer_to(&contracts, &new, &late).as_deref(),
+            Some("POLICY_REFUSED")
+        );
+
+        // A chain past its time is swept when the next arrives; a fresh
+        // chain still proves its offer.
+        let (stale, fresh) = (offered(2), offered(3));
+        send_key_links(&contracts, &new, &chain(&stale)).unwrap();
+        tokio::time::advance(PENDING_KEY_LINKS_TTL).await;
+        send_key_links(&contracts, &new, &chain(&fresh)).unwrap();
+        assert!(
+            !contracts
+                .pending_key_links
+                .lock()
+                .unwrap()
+                .contains_key(&(did_of(&new), stale.offer_id))
+        );
+        assert_eq!(answer_to(&contracts, &new, &fresh), None);
     }
 
     /// The owner sends the links from the DID a channel's creation block
