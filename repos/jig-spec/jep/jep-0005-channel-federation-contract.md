@@ -165,8 +165,15 @@ Non-goals for v0.2:
         DID is no longer a member). The new DID's client sends that commit right
         after its join, before any application message, and any member's client
         whose tree still holds the old leaf may send it. Whichever lands first
-        removes the leaf; the others are refused as stale. Until then the old leaf
-        can read the join epoch, and no later one.
+        removes the leaf; the others are refused as stale. Until it is removed, the
+        old leaf can read every epoch it is still in. A member that has not yet seen
+        the link may still commit (an add, or the removal of someone else), and the
+        old leaf holds that epoch too. Clients that hold the link send nothing, and
+        commit only the new DID's join and the old leaf's removal, so the window ends
+        with the first such client to act.
+      - A client that has verified a `key-link` MUST NOT encrypt to a group whose
+        tree still holds the old DID's leaf, and MUST NOT commit anything to it but
+        the old leaf's removal, or, as the new DID, its own external join.
       - The atomic form, one external commit by the new DID that also removes the
         old leaf, is valid MLS: RFC 9420 leaves it to the application which
         identities a joiner may remove. The openmls version we use can't build an
