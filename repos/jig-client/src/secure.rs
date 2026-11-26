@@ -645,6 +645,13 @@ impl Session {
         key_package: &[u8],
         did: &str,
     ) -> Result<Commit> {
+        // The welcome and the new epoch would reach the old key too, and
+        // the member added never saw the link to hold back its own sends
+        // (JEP-0005 rule 7b). Removing a linked DID stays open: that is the
+        // tidy-up.
+        if let Some(did) = self.linked_leaves(server, slug)?.into_iter().next() {
+            return Err(SecureError::LinkedLeafInGroup { did });
+        }
         self.with_group(server, slug, |m, gid| Ok(m.add(gid, key_package, did)?))
     }
 
@@ -2493,6 +2500,49 @@ mod tests {
         ));
         assert!(carol.linked_leaves(SERVER, "#sealed").unwrap().is_empty());
         carol.encrypt(SERVER, "#sealed", "hi").unwrap();
+    }
+
+    /// Nor does she add anyone while the old leaf is there (JEP-0005 rule
+    /// 7b): the new epoch and the welcome would reach the old key, and the
+    /// member added never saw the link. Her removal of the linked DID, the
+    /// tidy-up itself, stays open; once the leaf is out, the add goes through.
+    #[test]
+    fn a_member_adds_no_one_while_a_linked_leaf_is_in_its_group() {
+        let root = tempfile::tempdir().unwrap();
+        let (bob_key, bob2_key) = (
+            jig_core::crypto::ed25519::generate_signing_key(),
+            jig_core::crypto::ed25519::generate_signing_key(),
+        );
+        let carol = session(root.path());
+        let erin = session(root.path());
+        let bob = Session::open(root.path(), Identity::from_signing_key(bob_key.clone())).unwrap();
+        carol.create_group(SERVER, "#sealed").unwrap();
+        bob.observe(SERVER, &deliver(&add_block(&carol, "#sealed", &bob)));
+
+        let chan = jig_pipeline::ingest_record::label_cid("#sealed-channel");
+        let read = ReadIn {
+            key: "#sealed",
+            id: &chan,
+            slug: "#sealed",
+        };
+        carol.observe_in(
+            SERVER,
+            Some(&read),
+            &deliver(&key_link_block(&bob_key, &bob2_key, &chan)),
+        );
+        let kp = erin.key_packages(1, false).unwrap().remove(0);
+        assert!(matches!(
+            carol.prepare_add(SERVER, "#sealed", &kp, erin.did()),
+            Err(SecureError::LinkedLeafInGroup { did }) if did == bob.did()
+        ));
+
+        // The tidy-up is allowed, and lands; then the add goes through.
+        carol.prepare_remove(SERVER, "#sealed", bob.did()).unwrap();
+        carol.confirm(SERVER, "#sealed").unwrap();
+        assert!(carol.linked_leaves(SERVER, "#sealed").unwrap().is_empty());
+        carol
+            .prepare_add(SERVER, "#sealed", &kp, erin.did())
+            .unwrap();
     }
 
     /// JEP-0005 rule 7b on an encrypted channel, as members see it. A
