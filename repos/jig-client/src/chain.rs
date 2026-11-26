@@ -54,6 +54,28 @@ pub struct ChainHead {
     /// sessions too. `None` in a pin written before it was kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub high: Option<IngestRecord>,
+    /// The moves of the channel's sequencer this client verified up to here
+    /// (JEP-0005 rule 11a), oldest first: from each one's `seq` on, its
+    /// sequencer signs the channel's records. Empty for a channel that never
+    /// moved, and in a pin written before moves.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub moves: Vec<HeadMove>,
+}
+
+/// The features a request outside a connection declares in its
+/// `jig-capabilities` header, as a hello's capabilities say them on a
+/// connection: channel tiers (JEP-0014 rule 5), and the block kinds added
+/// since v0.2.0 that this client checks (JEP-0005 rule 11a).
+pub const REQUEST_FEATURES: &str = "tiers, sequencer-set";
+
+/// One move of a channel's sequencer, as a client keeps it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeadMove {
+    /// The `seq` of the `sequencer-set`'s record: the first the new
+    /// sequencer signs.
+    pub seq: u64,
+    /// The new sequencer's DID.
+    pub sequencer: String,
 }
 
 impl ChainHead {
@@ -73,6 +95,7 @@ impl ChainHead {
             ingest_logical: record.ingest_logical,
             record: Some(record.clone()),
             high: None,
+            moves: Vec::new(),
         }
     }
 
@@ -103,6 +126,7 @@ impl ChainHead {
         if (record.ingest_wall_ms, record.ingest_logical) < self.clock_high() {
             next.high = self.high_record().cloned();
         }
+        next.moves = self.moves.clone();
         next
     }
 }
@@ -150,6 +174,19 @@ pub enum ChainBreak {
         signer: String,
         newer: String,
     },
+    /// A record past a move of the channel's sequencer (JEP-0005 rule 11a),
+    /// signed by a sequencer the channel moved away from.
+    #[error("record {seq} is signed by {signer}; the channel moved to {sequencer} before it")]
+    Superseded {
+        seq: u64,
+        signer: String,
+        sequencer: String,
+    },
+    /// A `sequencer-set` that does not move this channel: malformed, not
+    /// signed by an owner this client knows, or its record not the one the
+    /// move names.
+    #[error("record {seq}'s block is a sequencer move that does not hold: {why}")]
+    BadMove { seq: u64, why: String },
 }
 
 impl ChainBreak {
@@ -164,6 +201,8 @@ impl ChainBreak {
             Self::ClockBackwards { .. } => "chain-clock-backwards",
             Self::BadGenesis => "chain-bad-genesis",
             Self::RetiredKey { .. } => "chain-retired-key",
+            Self::Superseded { .. } => "chain-superseded",
+            Self::BadMove { .. } => "chain-bad-move",
         }
     }
 
@@ -292,6 +331,10 @@ pub struct ChannelChain {
     head: Option<ChainHead>,
     /// Small clock steps back accepted since [`Self::take_clock_defects`].
     clock_defects: Vec<ClockDefect>,
+    /// The DIDs that may move the channel's sequencer (JEP-0005 rule 11a):
+    /// its root owners, as this client pinned them. None, and no move is
+    /// taken ([`Self::accept_block`]).
+    owners: Vec<String>,
 }
 
 impl ChannelChain {
@@ -317,7 +360,20 @@ impl ChannelChain {
             sequencers,
             head,
             clock_defects: Vec::new(),
+            owners: Vec::new(),
         }
+    }
+
+    /// This chain, taking a sequencer move only when signed by one of
+    /// `owners`, the channel's root owners as this client pinned them.
+    pub fn with_owners(mut self, owners: Vec<String>) -> Self {
+        self.owners = owners;
+        self
+    }
+
+    /// The moves of the channel's sequencer this chain verified, oldest first.
+    pub fn moves(&self) -> &[HeadMove] {
+        self.head.as_ref().map_or(&[], |h| h.moves.as_slice())
     }
 
     /// The DID the sequencer signs as now.
@@ -396,10 +452,39 @@ impl ChannelChain {
         block_cid: Option<&str>,
     ) -> Result<Step, ChainBreak> {
         // Which of the sequencer's DIDs signed it; one outside the chain is
-        // held to the current DID, and fails as before.
+        // held to the current DID, and fails as before. Past a move
+        // (JEP-0005 rule 11a), the record is the new sequencer's alone, and
+        // one by a sequencer the channel moved away from is refused.
         let signer = self.position(&record.sequencer);
-        let expected = signer.map_or(self.sequencer(), |i| &self.sequencers[i]);
-        record.verify(expected)?;
+        match self.moves().iter().rev().find(|m| m.seq <= record.seq) {
+            Some(range) => {
+                let same = |a: &str, b: &str| jig_pipeline::handshake::same_did(a, b);
+                if !same(&record.sequencer, &range.sequencer)
+                    && (signer.is_some()
+                        || self
+                            .moves()
+                            .iter()
+                            .any(|m| m.seq < range.seq && same(&m.sequencer, &record.sequencer)))
+                {
+                    return Err(ChainBreak::Superseded {
+                        seq: record.seq,
+                        signer: record.sequencer.clone(),
+                        sequencer: range.sequencer.clone(),
+                    });
+                }
+                record.verify(&range.sequencer)?;
+            }
+            None => {
+                let expected = signer.map_or(self.sequencer(), |i| &self.sequencers[i]);
+                record.verify(expected)?;
+            }
+        }
+        // The retired-key order below is the first range's: a record past a
+        // move is not one of its DIDs.
+        let signer = match self.moves().iter().any(|m| m.seq <= record.seq) {
+            true => None,
+            false => signer,
+        };
         if record.channel_id != self.channel_id {
             return Err(ChainBreak::OtherChannel {
                 expected: self.channel_id.clone(),
@@ -508,6 +593,118 @@ impl ChannelChain {
         Ok(Step::Next)
     }
 
+    /// [`Self::accept`] for a record delivered with its block, `bundle_b64`
+    /// and `sig_b64` as the server sent them. A block that is the owner's
+    /// `sequencer-set` (JEP-0005 rule 11a) moves the channel's sequencer from
+    /// its record on, once checked: signed by one of the owners this chain
+    /// was given ([`Self::with_owners`]), naming this channel, and its record
+    /// the new sequencer's, right after the head it cites. Any other block is
+    /// [`Self::accept`].
+    pub fn accept_block(
+        &mut self,
+        record: &IngestRecord,
+        block_cid: Option<&str>,
+        bundle_b64: &str,
+        sig_b64: Option<&str>,
+    ) -> Result<Step, ChainBreak> {
+        self.with_move(record, bundle_b64, sig_b64, |chain| {
+            chain.accept(record, block_cid)
+        })
+    }
+
+    /// [`Self::accept_block`], with [`Self::accept_live`]'s gaps.
+    pub fn accept_block_live(
+        &mut self,
+        record: &IngestRecord,
+        block_cid: Option<&str>,
+        bundle_b64: &str,
+        sig_b64: Option<&str>,
+    ) -> Result<Step, ChainBreak> {
+        self.with_move(record, bundle_b64, sig_b64, |chain| {
+            chain.accept_live(record, block_cid)
+        })
+    }
+
+    /// Run `step` with the move `bundle_b64` makes, if it is one, in force
+    /// from `record` on; kept only if the step takes `record` past the head.
+    fn with_move(
+        &mut self,
+        record: &IngestRecord,
+        bundle_b64: &str,
+        sig_b64: Option<&str>,
+        step: impl FnOnce(&mut Self) -> Result<Step, ChainBreak>,
+    ) -> Result<Step, ChainBreak> {
+        let Some(moved) = self.move_in(record, bundle_b64, sig_b64)? else {
+            return step(self);
+        };
+        let saved = self.head.clone();
+        if let Some(head) = self.head.as_mut()
+            && record.seq > head.seq
+            && !head.moves.iter().any(|m| m.seq == moved.seq)
+        {
+            head.moves.push(moved);
+        }
+        let result = step(self);
+        let advanced = self
+            .head
+            .as_ref()
+            .is_some_and(|h| h.seq == record.seq && h.hash == hex::encode(record.hash()));
+        if !advanced {
+            self.head = saved;
+        }
+        result
+    }
+
+    /// The move `bundle_b64` makes, if it is an owner's `sequencer-set`.
+    fn move_in(
+        &self,
+        record: &IngestRecord,
+        bundle_b64: &str,
+        sig_b64: Option<&str>,
+    ) -> Result<Option<HeadMove>, ChainBreak> {
+        let delivered = crate::DeliveredBlock {
+            bundle_b64: bundle_b64.to_string(),
+            sig_b64: sig_b64.map(str::to_string),
+            receipts: Vec::new(),
+            delivery_cid: String::new(),
+            ingest: None,
+        };
+        let Ok(opened) = crate::open::open(&delivered) else {
+            return Ok(None);
+        };
+        if opened.manifest.kind != Some(jig_core::BlockKind::SequencerSet) {
+            return Ok(None);
+        }
+        let bad = |why: String| ChainBreak::BadMove {
+            seq: record.seq,
+            why,
+        };
+        if opened.authenticity != crate::open::Authenticity::Verified {
+            return Err(bad("it carries no signature".into()));
+        }
+        let set = jig_core::sequencer_move::SequencerSet::from_metadata(&opened.manifest.metadata)
+            .map_err(|e| bad(e.to_string()))?;
+        if set.channel_id != self.channel_id {
+            return Err(bad("it names another channel".into()));
+        }
+        set.check_record(record.seq, &record.prev, &record.sequencer)
+            .map_err(|e| bad(e.to_string()))?;
+        if !self
+            .owners
+            .iter()
+            .any(|o| jig_pipeline::handshake::same_did(o, &opened.sender))
+        {
+            return Err(bad(format!(
+                "it is signed by {}, not by an owner of the channel this client knows",
+                opened.sender
+            )));
+        }
+        Ok(Some(HeadMove {
+            seq: record.seq,
+            sequencer: set.sequencer,
+        }))
+    }
+
     /// [`Self::accept`], except that a gap moves the head to `record` (which
     /// verified) instead of holding it back. For a live stream, which cannot
     /// stop to fetch what it missed: the caller fills the reported gap later,
@@ -585,6 +782,148 @@ mod tests {
                 records: self.records.clone(),
             }
         }
+    }
+
+    /// The owner's `sequencer-set` for `server`'s channel, citing its last
+    /// record and moving it to `new`, as a server delivers it: bundle and
+    /// signature, base64.
+    fn move_block(
+        server: &Seq,
+        new: &ed25519_dalek::SigningKey,
+        owner: &ed25519_dalek::SigningKey,
+    ) -> (String, String) {
+        use base64::Engine as _;
+        use jig_core::contract::{ContractAccept, ContractOffer, Grant, ManifestRef};
+        let channel: cid::Cid = label_cid("bafyCreate").parse().unwrap();
+        let did = |k: &ed25519_dalek::SigningKey| {
+            jig_core::Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        };
+        let held = ContractOffer::sign(
+            &server.key,
+            &did(new),
+            channel,
+            Grant::Read,
+            b"create".to_vec(),
+            b"head".to_vec(),
+            ManifestRef {
+                cid: channel,
+                seq: 0,
+            },
+            vec![],
+        );
+        let cited = server.records.last().unwrap();
+        let set = jig_core::sequencer_move::SequencerSet {
+            channel_id: label_cid("bafyCreate"),
+            sequencer: did(new),
+            head: jig_core::sequencer_move::CitedHead {
+                seq: cited.seq,
+                hash: cited.hash(),
+            },
+            accept: ContractAccept::sign_move(
+                new,
+                &held,
+                ManifestRef {
+                    cid: channel,
+                    seq: 1,
+                },
+                vec![],
+                vec![],
+                vec![],
+            ),
+            reinstalls: vec![],
+        };
+        let block = crate::blocks::build_with_metadata(
+            &crate::Identity::from_signing_key(owner.clone()),
+            jig_core::BlockKind::SequencerSet,
+            jig_core::HlcTimestamp::now_wall(jig_core::Did::from_ed25519_pubkey(&[1; 32])),
+            serde_json::Value::Object(set.to_metadata().into_iter().collect()),
+        );
+        let b64 = base64::engine::general_purpose::STANDARD;
+        (
+            b64.encode(block.canonical_bytes()),
+            b64.encode(&block.sender_sig),
+        )
+    }
+
+    /// The owner moves the channel's sequencer (JEP-0005 rule 11a): its
+    /// `sequencer-set`, delivered with the new sequencer's record right after
+    /// the head it cites, hands the chain on. From there the new sequencer
+    /// signs, and the old one's records are refused. A move not signed by an
+    /// owner this client knows, or a chain told of no owner, takes nothing.
+    #[test]
+    fn a_move_hands_the_chain_to_the_new_sequencer() {
+        let mut server = Seq::new();
+        let old = server.did();
+        server.push("bafyCreate", 10);
+        server.push("b1", 20);
+        let owner = generate_signing_key();
+        let owner_did = jig_core::Did::from_ed25519_pubkey(owner.verifying_key().as_bytes())
+            .to_did_jig_string();
+        let new = generate_signing_key();
+        let (bundle, sig) = move_block(&server, &new, &owner);
+        let old_key = std::mem::replace(&mut server.key, new.clone());
+        let new_did = server.did();
+        let set = server.push("set", 30);
+        let after = server.push("b3", 40);
+        let stale = {
+            let mut forked = server.fork_with(old_key.clone());
+            forked.records.truncate(3);
+            forked.push("b3 by the old sequencer", 40)
+        };
+
+        let read = |owners: Vec<String>| {
+            let mut chain =
+                ChannelChain::new(&label_cid("bafyCreate"), &old, None).with_owners(owners);
+            for r in &server.records[..2] {
+                assert_eq!(chain.accept(r, None), Ok(Step::Next));
+            }
+            chain
+        };
+
+        let mut chain = read(vec![owner_did.clone()]);
+        assert_eq!(
+            chain.accept_block(&set, None, &bundle, Some(&sig)),
+            Ok(Step::Next)
+        );
+        assert_eq!(
+            chain.moves(),
+            [HeadMove {
+                seq: 2,
+                sequencer: new_did.clone()
+            }]
+        );
+        assert_eq!(chain.accept(&after, None), Ok(Step::Next));
+        assert!(matches!(
+            chain.clone().accept(&stale, None),
+            Err(ChainBreak::Superseded { seq: 3, .. })
+        ));
+        // Kept with the head: a chain picked up from it holds the move.
+        let resumed = ChannelChain::new(&label_cid("bafyCreate"), &old, chain.head().cloned());
+        assert_eq!(resumed.moves(), chain.moves());
+
+        // Without the block, or by someone who is not an owner, or with no
+        // owner known: the new key's record is not the old sequencer's.
+        assert!(read(vec![owner_did.clone()]).accept(&set, None).is_err());
+        assert!(matches!(
+            read(vec![owner_did.clone()]).accept_block(&set, None, &bundle, None),
+            Err(ChainBreak::BadMove { .. })
+        ));
+        let stranger = generate_signing_key();
+        let mut by_stranger = read(vec![owner_did]);
+        let mut at = Seq {
+            key: old_key,
+            records: server.records[..2].to_vec(),
+        };
+        let (bundle, sig) = move_block(&at, &new, &stranger);
+        at.key = new;
+        assert!(matches!(
+            by_stranger.accept_block(&set, None, &bundle, Some(&sig)),
+            Err(ChainBreak::BadMove { .. })
+        ));
+        assert!(matches!(
+            read(vec![]).accept_block(&set, None, &bundle, Some(&sig)),
+            Err(ChainBreak::BadMove { .. })
+        ));
     }
 
     /// History that spans two key changes verifies across the chain of DIDs,

@@ -16,7 +16,8 @@ use jig_client::chain::{ChannelChain, Step};
 use jig_client::limits;
 use jig_client::open::open;
 use jig_client::pins::{
-    ChannelPin, Pins, names_another_server, prove_carried, prove_channel_ordered_by,
+    ChannelPin, Pins, names_another_server, prove_carried, prove_carried_after_move,
+    prove_channel_ordered_by,
 };
 use jig_client::secure::{CommitLock, ReadIn, Seen, Session, history_reaches, replay_order};
 use jig_client::servers::{LocalAdds, Reach, ServerState, ServerStates};
@@ -214,6 +215,7 @@ pub async fn connect_pinned(server: &str, identity: Identity) -> Result<Client> 
             .map(|p| p.links.clone())
             .unwrap_or_default(),
         carried: pins.carried_signers(server),
+        owners: pins.owners(server),
     };
     let client = Client::connect_with_options(server, identity, options)
         .await
@@ -401,7 +403,7 @@ fn continues(chain: &mut ChannelChain, page: &[DeliveredBlock]) -> Result<(), St
             return Err(format!("block {} has no sequencer record", d.delivery_cid));
         };
         let cid = placed_cid(d);
-        match chain.accept(record, cid.as_deref()) {
+        match chain.accept_block(record, cid.as_deref(), &d.bundle_b64, d.sig_b64.as_deref()) {
             Ok(Step::Next) => {}
             Ok(Step::Gap { from, to }) => {
                 return Err(format!("records {from} to {} are missing", to - 1));
@@ -808,7 +810,10 @@ impl Secure {
         let http = self.http().await?;
         let resp =
             crate::cmd::request_proof::send(&self.server, &self.identity, "GET", &url, b"", || {
+                // History this client reads is held to its chain, moves
+                // included: it is served past a `sequencer-set`.
                 http.get(&url)
+                    .header("jig-capabilities", jig_client::chain::REQUEST_FEATURES)
             })
             .await?;
         if !resp.status().is_success() {
@@ -920,6 +925,29 @@ impl Secure {
             .map(|p| p.sequencers())
             .unwrap_or_default();
         let other = names_another_server(&ours, &info.sequencer).then_some(info.sequencer.as_str());
+        // A channel whose chain this device verified moving to the server
+        // listed (JEP-0005 rule 11a) is held to that server by the chain's
+        // moves; its pin stays as it was pinned.
+        if let Some(moved_to) = pins.moved_to(&self.server, &info.id) {
+            let listed = match other {
+                Some(sequencer) => !names_another_server(&[moved_to.to_string()], sequencer),
+                None => !names_another_server(&ours, moved_to),
+            };
+            if listed {
+                if let Some(sequencer) = other {
+                    prove_carried_after_move(
+                        &self.server,
+                        &info.slug,
+                        &info.id,
+                        sequencer,
+                        &ours,
+                        info.share.as_deref(),
+                        moved_to,
+                    )?;
+                }
+                return Ok(());
+            }
+        }
         let owner = match other {
             Some(sequencer) => Some(prove_carried(
                 &self.server,
@@ -2075,7 +2103,20 @@ impl Secure {
             .session
             .head_record(&self.server, &self.key(slug))?
             .and_then(|h| h.record.clone().map(|r| (h, r)))
-            .map(|(h, r)| ChannelChain::across(&r.channel_id, self.sequencers(&r), Some(h))))
+            .map(|(h, r)| {
+                ChannelChain::across(&r.channel_id, self.sequencers(&r), Some(h))
+                    .with_owners(self.owners(&r.channel_id))
+            }))
+    }
+
+    /// Who may move `channel_id`'s sequencer, for [`ChannelChain`]: the
+    /// channel's owner as this device pinned it from the creation block
+    /// (JEP-0005 rule 11a).
+    fn owners(&self, channel_id: &str) -> Vec<String> {
+        Pins::load(&Pins::default_path())
+            .ok()
+            .and_then(|pins| pins.owners(&self.server).remove(channel_id))
+            .unwrap_or_default()
     }
 
     /// Whether `page` starts right after `cursor`, with no chain on this

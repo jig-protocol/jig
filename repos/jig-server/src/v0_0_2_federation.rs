@@ -185,7 +185,7 @@ where
         + Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
         + Unpin,
 {
-    handshake_as(ws, pinned_server_did, &[], None).await
+    handshake_as(ws, pinned_server_did, &[], None, false).await
 }
 
 /// [`complete_client_handshake`] as a server dialing a peer (JEP-0002 rule
@@ -203,7 +203,23 @@ where
         + Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
         + Unpin,
 {
-    handshake_as(ws, Some(pinned_server_did), tls_exporter, Some(key)).await
+    handshake_as(ws, Some(pinned_server_did), tls_exporter, Some(key), false).await
+}
+
+/// [`complete_peer_handshake`] as a v0.2.0 node sends it: its hello lists
+/// no block kinds, so a server gates it at any kind added since.
+#[cfg(test)]
+pub(crate) async fn complete_v0_2_0_peer_handshake<S>(
+    ws: &mut S,
+    pinned_server_did: &str,
+    key: &ed25519_dalek::SigningKey,
+) -> anyhow::Result<jig_pipeline::handshake::VerifiedWelcome>
+where
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+        + Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+{
+    handshake_as(ws, Some(pinned_server_did), &[], Some(key), true).await
 }
 
 async fn handshake_as<S>(
@@ -211,19 +227,23 @@ async fn handshake_as<S>(
     pinned_server_did: Option<&str>,
     tls_exporter: &[u8],
     key: Option<&ed25519_dalek::SigningKey>,
+    lists_no_kinds: bool,
 ) -> anyhow::Result<jig_pipeline::handshake::VerifiedWelcome>
 where
     S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
         + Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
         + Unpin,
 {
-    let offer = jig_pipeline::handshake::ClientOffer {
+    let mut offer = jig_pipeline::handshake::ClientOffer {
         pinned_server_did: pinned_server_did.map(str::to_string),
         peer_did: key.map(|k| {
             jig_core::Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
         }),
         ..Default::default()
     };
+    if lists_no_kinds {
+        offer.capabilities.block_kinds.clear();
+    }
     let (hello, pending) = jig_pipeline::handshake::begin(&offer);
     // The transcript covers the hello exactly as sent.
     let hello_text = serde_json::to_string(&hello)?;

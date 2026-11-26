@@ -1308,6 +1308,7 @@ mod tests {
                 ingest_logical: 0,
                 record: None,
                 high: None,
+                moves: Vec::new(),
             },
         )
         .unwrap();

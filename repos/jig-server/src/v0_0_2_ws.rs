@@ -2657,10 +2657,9 @@ mod tests {
         let (state, url) = start_test_server().await;
         let key = jig_core::crypto::ed25519::generate_signing_key();
         let (mut ws, _) = connect_async(&url).await.unwrap();
-        crate::v0_0_2_federation::complete_peer_handshake(
+        crate::v0_0_2_federation::complete_v0_2_0_peer_handshake(
             &mut ws,
             &state.server_did.to_did_jig_string(),
-            &[],
             &key,
         )
         .await

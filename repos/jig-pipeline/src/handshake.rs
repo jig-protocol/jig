@@ -231,6 +231,13 @@ impl Default for ClientOffer {
                 ruleset: true,
                 // It signs request proofs bound to their audience.
                 request_auth: vec![jig_core::request_auth::VERSION.to_string()],
+                // Every block kind it implements (JEP-0002 rule 1): a server
+                // serves it a channel past a kind added after v0.2.0 only if
+                // it lists the kind (JEP-0005 rule 11a).
+                block_kinds: jig_core::BlockKind::ALL
+                    .iter()
+                    .map(|k| k.as_str().to_string())
+                    .collect(),
                 ..Capabilities::default()
             },
             pinned_server_did: None,
@@ -1362,6 +1369,19 @@ mod tests {
             capabilities: Capabilities::default(),
             nonce: nonce.to_string(),
             peer_did: None,
+        }
+    }
+
+    /// A client declares every kind it implements, so a server serves it a
+    /// channel past a kind added after v0.2.0, such as a sequencer move,
+    /// only when it can read it (JEP-0005 rule 11a).
+    #[test]
+    fn a_client_hello_declares_the_kinds_it_reads() {
+        let kinds = ClientOffer::default().capabilities.block_kinds;
+        assert_eq!(kinds.len(), jig_core::BlockKind::ALL.len());
+        assert!(kinds.iter().any(|k| k == "sequencer-set"));
+        for kind in jig_core::block_kind::V0_2_0_KINDS {
+            assert!(kinds.iter().any(|k| k == kind), "{kind}");
         }
     }
 
