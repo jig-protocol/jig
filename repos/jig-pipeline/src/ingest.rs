@@ -657,16 +657,19 @@ pub async fn ingest(
     let block_channel = channel_id_of(&ctx.store, kind, &manifest, &block_cid)?;
     let channel_id = block_channel.as_ref().and_then(|c| c.id.as_deref());
     let channel_named = block_channel.as_ref().map(|c| c.named.as_str());
-    // JEP-0005 rule 7b: a control block is judged and sequenced under its
-    // channel's gate, so the rights it is judged by are its rights at the
-    // seq it is given. Without it an old key's block, checked just before
-    // its key link lands, could still be sequenced after the link. Held to
-    // the landing, and let go before delivery.
+    // JEP-0005 rule 7b: a block is judged and sequenced under its channel's
+    // gate, exclusive for a block that changes the channel and shared for
+    // content, so the rights it is judged by are its rights at the seq it is
+    // given. Without it an old key's block, checked just before its key link
+    // lands, could still be sequenced after the link. Held to the landing,
+    // and let go before delivery.
     let channel_gate = match channel_id {
-        Some(id) if crate::authorize_write::changes_the_channel(kind) => {
-            Some(ctx.store.gate_channel(id).await)
-        }
-        _ => None,
+        Some(id) => Some(
+            ctx.store
+                .gate_channel(id, crate::authorize_write::changes_the_channel(kind))
+                .await,
+        ),
+        None => None,
     };
     let mut resolved_channel = match channel_id {
         Some(id) => ctx.store.get_channel_by_id(id)?,
@@ -6096,7 +6099,7 @@ mod tests {
         .unwrap();
 
         // The key link is in flight: it holds the channel's gate.
-        let gate = ctx.store.gate_channel(&chan).await;
+        let gate = ctx.store.gate_channel(&chan, true).await;
         let archive = plain(
             &ctx,
             &owner,
@@ -6158,6 +6161,111 @@ mod tests {
         .await
         .expect("the new key archives");
         assert!(ctx.store.get_channel_by_id(&chan).unwrap().is_none());
+    }
+
+    /// JEP-0005 rule 7b, for content: a post takes its channel's gate shared,
+    /// so while a key link holds it exclusive, a post signed by the old key
+    /// waits, unjudged, and is judged and ordered after the link. Wherever a
+    /// poster's membership is checked, it is then checked against the moved
+    /// membership.
+    ///
+    /// Today only a channel that is not open checks a poster's membership,
+    /// and those are `mls`, which take no key link yet; a restricted
+    /// plaintext channel is frozen. So this shows the order on an open
+    /// channel, where the post is still accepted. The refusal follows with
+    /// the MLS leaf swap.
+    #[tokio::test]
+    async fn an_old_keys_post_racing_its_key_link_is_judged_after_it() {
+        let ctx = test_ctx_allowing(&["channel-create", "member-add", "text-render", "key-link"]);
+        let (owner, member, member2) = (person(), person(), person());
+        let chan = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#team"}),
+        )
+        .await
+        .unwrap();
+        plain(
+            &ctx,
+            &owner,
+            BlockKind::MemberAdd,
+            serde_json::json!({"channel_id": chan, "member_did": member.did}),
+        )
+        .await
+        .unwrap();
+        let hi = serde_json::json!({"channel_id": chan, "body": "hi"});
+
+        // The member's key link is in flight: it holds the gate.
+        let gate = ctx.store.gate_channel(&chan, true).await;
+        let racing = plain(&ctx, &member, BlockKind::TextRender, hi.clone());
+        tokio::pin!(racing);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut racing)
+                .await
+                .is_err(),
+            "the old key's post waits at the gate, unjudged"
+        );
+        // Content does not wait for content.
+        let gate2 = ctx.store.gate_channel(&chan, false);
+        tokio::pin!(gate2);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut gate2)
+                .await
+                .is_err(),
+            "a shared gate waits for the exclusive one"
+        );
+        let link = crate::ingest_record::label_cid("the member's link in the window");
+        let (mb, cb, sig) = signed_parts(
+            &member2.key,
+            BlockKind::KeyLink,
+            jig_core::EncryptionSuite::Unencrypted,
+            key_link(&member, &member2, &chan, None),
+        );
+        let linked = ctx
+            .store
+            .insert_block_sequenced(
+                &StoredBlock {
+                    cid: link.clone(),
+                    channel_id: Some(chan.clone()),
+                    block_kind: "key-link".to_string(),
+                    sender_did: member2.did.clone(),
+                    sender_sig: sig,
+                    bundle_bytes: serde_json::to_vec(&(&mb, &cb)).unwrap(),
+                    is_synthetic: true,
+                    hlc_wall_ms: 0,
+                    hlc_logical: 0,
+                    hlc_origin: String::new(),
+                    posted_at: 0,
+                    origin_server: String::new(),
+                    federated_from: None,
+                },
+                &crate::ingest_record::RecordSigner {
+                    channel_id: chan.clone(),
+                    key: &ctx.server_key,
+                    ingest_wall_ms: 0,
+                    ingest_logical: 0,
+                },
+            )
+            .unwrap();
+        drop(gate);
+        let _shared = gate2.await;
+        drop(_shared);
+
+        let posted = racing.await.expect("an open channel takes the post");
+        let posted = ctx.store.get_ingest_record(&posted).unwrap().unwrap();
+        assert!(
+            posted.seq > linked.seq,
+            "judged and ordered after the link: {} then {}",
+            linked.seq,
+            posted.seq
+        );
+        // Two posts hold the shared gate at once.
+        let (a, b) = (
+            ctx.store.gate_channel(&chan, false).await,
+            ctx.store.gate_channel(&chan, false).await,
+        );
+        drop((a, b));
     }
 
     /// JEP-0005 rule 7b: an encrypted channel takes no key link until the

@@ -174,13 +174,22 @@ pub struct SqliteStore {
     /// Until then only rows whose `sequencer_did` is still the empty
     /// placeholder count as local.
     local_sequencer: OnceLock<String>,
-    /// One lock per channel, held by ingest from a control block's rights
-    /// check to its landing ([`Self::gate_channel`]).
+    /// One gate per channel, held by ingest from a block's rights check to
+    /// its landing ([`Self::gate_channel`]).
     channel_gates: ChannelGates,
 }
 
 type ChannelGates =
-    Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>;
+    Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::RwLock<()>>>>;
+
+/// A channel's gate, held ([`SqliteStore::gate_channel`]).
+#[derive(Debug)]
+pub enum ChannelGate {
+    /// A content block: many at once, none while a control block holds it.
+    Shared(tokio::sync::OwnedRwLockReadGuard<()>),
+    /// A control block: alone.
+    Exclusive(tokio::sync::OwnedRwLockWriteGuard<()>),
+}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StoredBlock {
@@ -1228,12 +1237,21 @@ fn row_to_stored_mls_group(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMlsG
 }
 
 impl SqliteStore {
-    /// Hold `channel_id`'s gate: while the guard lives, no other control
-    /// block of the channel is judged or sequenced here (JEP-0005 rule 7b).
+    /// Hold `channel_id`'s gate (JEP-0005 rule 7b) from a block's rights
+    /// check to its landing. A block that changes the channel holds it
+    /// `exclusive`: no other block of the channel is judged or sequenced
+    /// meanwhile. A content block holds it shared, alongside other content.
+    ///
     /// So a block's rights, read under the gate, are its rights at the `seq`
-    /// it is given: a key link cannot land between the check of an old key's
-    /// block and its sequencing. Content blocks do not take it.
-    pub async fn gate_channel(&self, channel_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    /// it is given. A key link waits for content already in flight, and
+    /// content that comes after the link is judged by the moved standing: no
+    /// block signed by the old key can be checked before the link and land
+    /// after it.
+    ///
+    /// The gate is in this process's memory. It holds for one server process
+    /// writing its own SQLite store, which is every deployment today. Several
+    /// writers against one store would need a lock in the database instead.
+    pub async fn gate_channel(&self, channel_id: &str, exclusive: bool) -> ChannelGate {
         let gate = self
             .channel_gates
             .lock()
@@ -1241,7 +1259,11 @@ impl SqliteStore {
             .entry(channel_id.to_string())
             .or_default()
             .clone();
-        gate.lock_owned().await
+        if exclusive {
+            ChannelGate::Exclusive(gate.write_owned().await)
+        } else {
+            ChannelGate::Shared(gate.read_owned().await)
+        }
     }
 
     /// Open (or create) a SQLite file at `path` and run migrations.
