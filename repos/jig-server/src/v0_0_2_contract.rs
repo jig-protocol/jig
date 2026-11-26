@@ -1236,7 +1236,6 @@ fn manifest_of(bundle_bytes: &[u8]) -> anyhow::Result<BlockManifest> {
     Ok(serde_json::from_slice(&manifest_bytes)?)
 }
 
-/// A creation block as an offer carries it, and the CID it hashes to.
 /// The DID a creation block names as its channel's sequencer, canonical.
 fn named_sequencer(creation_block: &[u8]) -> Option<String> {
     let (manifest, _) = creation_of(creation_block)?;
@@ -1269,6 +1268,7 @@ fn proven_key_links(offer: &ContractOffer, links: &[Vec<u8>]) -> Option<Vec<Vec<
     }
 }
 
+/// A creation block as an offer carries it, and the CID it hashes to.
 fn creation_of(bundle_bytes: &[u8]) -> Option<(BlockManifest, Cid)> {
     let (manifest_bytes, code_bytes): (Vec<u8>, Vec<u8>) =
         serde_json::from_slice(bundle_bytes).ok()?;
