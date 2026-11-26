@@ -657,6 +657,17 @@ pub async fn ingest(
     let block_channel = channel_id_of(&ctx.store, kind, &manifest, &block_cid)?;
     let channel_id = block_channel.as_ref().and_then(|c| c.id.as_deref());
     let channel_named = block_channel.as_ref().map(|c| c.named.as_str());
+    // JEP-0005 rule 7b: a control block is judged and sequenced under its
+    // channel's gate, so the rights it is judged by are its rights at the
+    // seq it is given. Without it an old key's block, checked just before
+    // its key link lands, could still be sequenced after the link. Held to
+    // the landing, and let go before delivery.
+    let channel_gate = match channel_id {
+        Some(id) if crate::authorize_write::changes_the_channel(kind) => {
+            Some(ctx.store.gate_channel(id).await)
+        }
+        _ => None,
+    };
     let mut resolved_channel = match channel_id {
         Some(id) => ctx.store.get_channel_by_id(id)?,
         None => None,
@@ -1396,6 +1407,9 @@ pub async fn ingest(
             }
         }
     }
+
+    // Landed: the next control block of the channel may be judged.
+    drop(channel_gate);
 
     // Channel membership for bridge-sink dispatch. Step 3b resolved the row
     // BEFORE `apply_effect`; a control-plane block has just changed
@@ -6060,6 +6074,90 @@ mod tests {
         )
         .await
         .expect("role-assign on an mls channel");
+    }
+
+    /// JEP-0005 rule 7b, at the source: a control block is judged and
+    /// sequenced under its channel's gate. An archive signed by the
+    /// creator's old key, submitted while the creator's key link holds the
+    /// gate, waits; the link lands; the archive is then judged after it and
+    /// refused, and the channel stays. (Promote takes the same gate, but a
+    /// tier is fixed, so it never lands.) The new key archives.
+    #[tokio::test]
+    async fn an_old_keys_archive_racing_its_key_link_is_refused() {
+        let ctx = test_ctx_allowing(&["channel-create", "channel-archive", "key-link"]);
+        let (owner, owner2) = (person(), person());
+        let chan = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#team"}),
+        )
+        .await
+        .unwrap();
+
+        // The key link is in flight: it holds the channel's gate.
+        let gate = ctx.store.gate_channel(&chan).await;
+        let archive = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelArchive,
+            serde_json::json!({"channel_id": chan}),
+        );
+        tokio::pin!(archive);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut archive)
+                .await
+                .is_err(),
+            "the old key's archive waits at the gate, unjudged"
+        );
+        let (mb, cb, sig) = signed_parts(
+            &owner2.key,
+            BlockKind::KeyLink,
+            jig_core::EncryptionSuite::Unencrypted,
+            key_link(&owner, &owner2, &chan, None),
+        );
+        ctx.store
+            .insert_block_sequenced(
+                &StoredBlock {
+                    cid: crate::ingest_record::label_cid("the link in the window"),
+                    channel_id: Some(chan.clone()),
+                    block_kind: "key-link".to_string(),
+                    sender_did: owner2.did.clone(),
+                    sender_sig: sig,
+                    bundle_bytes: serde_json::to_vec(&(&mb, &cb)).unwrap(),
+                    is_synthetic: true,
+                    hlc_wall_ms: 0,
+                    hlc_logical: 0,
+                    hlc_origin: String::new(),
+                    posted_at: 0,
+                    origin_server: String::new(),
+                    federated_from: None,
+                },
+                &crate::ingest_record::RecordSigner {
+                    channel_id: chan.clone(),
+                    key: &ctx.server_key,
+                    ingest_wall_ms: 0,
+                    ingest_logical: 0,
+                },
+            )
+            .unwrap();
+        drop(gate);
+
+        let refused = archive.await;
+        assert!(
+            matches!(refused, Err(IngestError::NotChannelOwner { .. })),
+            "judged after the link: {refused:?}"
+        );
+        assert!(ctx.store.get_channel_by_id(&chan).unwrap().is_some());
+        plain(
+            &ctx,
+            &owner2,
+            BlockKind::ChannelArchive,
+            serde_json::json!({"channel_id": chan}),
+        )
+        .await
+        .expect("the new key archives");
+        assert!(ctx.store.get_channel_by_id(&chan).unwrap().is_none());
     }
 
     /// JEP-0005 rule 7b: an encrypted channel takes no key link until the

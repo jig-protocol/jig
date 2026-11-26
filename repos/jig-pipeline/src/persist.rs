@@ -174,7 +174,13 @@ pub struct SqliteStore {
     /// Until then only rows whose `sequencer_did` is still the empty
     /// placeholder count as local.
     local_sequencer: OnceLock<String>,
+    /// One lock per channel, held by ingest from a control block's rights
+    /// check to its landing ([`Self::gate_channel`]).
+    channel_gates: ChannelGates,
 }
+
+type ChannelGates =
+    Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StoredBlock {
@@ -1222,6 +1228,22 @@ fn row_to_stored_mls_group(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMlsG
 }
 
 impl SqliteStore {
+    /// Hold `channel_id`'s gate: while the guard lives, no other control
+    /// block of the channel is judged or sequenced here (JEP-0005 rule 7b).
+    /// So a block's rights, read under the gate, are its rights at the `seq`
+    /// it is given: a key link cannot land between the check of an old key's
+    /// block and its sequencing. Content blocks do not take it.
+    pub async fn gate_channel(&self, channel_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = self
+            .channel_gates
+            .lock()
+            .expect("poisoned")
+            .entry(channel_id.to_string())
+            .or_default()
+            .clone();
+        gate.lock_owned().await
+    }
+
     /// Open (or create) a SQLite file at `path` and run migrations.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -1240,6 +1262,7 @@ impl SqliteStore {
         Ok(Self {
             conn: Mutex::new(conn),
             local_sequencer: OnceLock::new(),
+            channel_gates: Default::default(),
         })
     }
 
@@ -1250,6 +1273,7 @@ impl SqliteStore {
         Ok(Self {
             conn: Mutex::new(conn),
             local_sequencer: OnceLock::new(),
+            channel_gates: Default::default(),
         })
     }
 
@@ -4217,6 +4241,7 @@ mod tests {
         let store = SqliteStore {
             conn: Mutex::new(conn),
             local_sequencer: Default::default(),
+            channel_gates: Default::default(),
         };
         assert_eq!(
             store.backfill_ingest_records(&key).unwrap(),
@@ -4409,6 +4434,7 @@ mod tests {
         let store = SqliteStore {
             conn: Mutex::new(conn),
             local_sequencer: Default::default(),
+            channel_gates: Default::default(),
         };
         assert_eq!(
             store.list_channels().unwrap().len(),
@@ -4643,6 +4669,7 @@ mod tests {
         let store = SqliteStore {
             conn: Mutex::new(conn),
             local_sequencer: Default::default(),
+            channel_gates: Default::default(),
         };
         assert_eq!(
             store.get_channel_by_slug("#a").unwrap().map(|c| c.id),
@@ -4969,6 +4996,7 @@ mod tests {
         let store = SqliteStore {
             conn: Mutex::new(conn),
             local_sequencer: Default::default(),
+            channel_gates: Default::default(),
         };
         let g = store
             .get_mls_group_by_id("bafy_create_sealed")
