@@ -76,25 +76,27 @@ fn parse_link(raw: &str, link: &str) -> Result<Link, String> {
             continue;
         }
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        // A hint this build does not read is skipped before its value is
-        // decoded, so a later build's hint never makes the link unreadable.
-        if !matches!(key, "sequencer" | "slug") {
-            continue;
-        }
-        let value = percent_decode(value).map_err(|why| format!("`{raw}`: {key}: {why}"))?;
+        // Each hint's value is decoded in its own arm: a hint this build does
+        // not read is skipped before its value is read, so a later build's
+        // hint never makes the link unreadable.
+        let decode =
+            |value: &str| percent_decode(value).map_err(|why| format!("`{raw}`: {key}: {why}"));
         let (field, value) = match key {
             "sequencer" => {
+                let value = decode(value)?;
                 let did = jig_core::Did::canonicalize(&value)
                     .map_err(|_| format!("`{raw}`: sequencer `{value}` is not a did:jig"))?;
                 (&mut out.sequencer, did.to_did_jig_string())
             }
             "slug" => {
+                let value = decode(value)?;
                 if !value.starts_with('#') || value.len() < 2 {
                     return Err(format!("`{raw}`: slug `{value}` is not a `#slug`"));
                 }
                 (&mut out.slug, value)
             }
-            _ => unreachable!("only the hints read above get here"),
+            // A hint this build does not read.
+            _ => continue,
         };
         if field.replace(value).is_some() {
             return Err(format!("`{raw}`: `{key}` is given twice"));
