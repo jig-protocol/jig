@@ -1779,12 +1779,17 @@ mod tests {
         // Another request, even with every field but the nonce the same, has
         // another id.
         let r = kp_request();
+        // Derived, not a literal, as in `kp_request`.
+        let digest = blake3::hash(b"kp-request vector: another nonce");
+        let nonce: [u8; 16] = digest.as_bytes()[..16]
+            .try_into()
+            .expect("a blake3 digest is 32 bytes");
         let other = KpRequest::sign(
             &key(3),
             &r.did,
             r.channel_id,
             &r.custodian,
-            [0; 16],
+            nonce,
             r.issued_at,
         );
         assert_ne!(other.request_id(), r.request_id());
@@ -1803,8 +1808,50 @@ mod tests {
         ));
     }
 
+    /// Each object signed for another custodian than `custodian` in the
+    /// vectors: a custodian MUST refuse it (rules 21b, 21c), so that one
+    /// uploaded or sent to one custodian cannot be replayed to another.
+    fn for_another_custodian() -> (ReleasePolicy, KpDecision) {
+        let other = did_of(&key(9));
+        let p = release_policy();
+        (
+            ReleasePolicy::sign(&key(4), &other, p.seq, p.issued_at, p.release_to, false),
+            KpDecision::sign(
+                &key(4),
+                &other,
+                kp_request().request_id(),
+                true,
+                1_800_000_060,
+            ),
+        )
+    }
+
+    #[test]
+    fn each_object_names_the_custodian_it_is_for() {
+        let (p, d) = for_another_custodian();
+        // Valid objects, for the custodian they name, and only that one.
+        let p = ReleasePolicy::from_envelope(&p.envelope).unwrap();
+        let d = KpDecision::from_envelope(&d.envelope).unwrap();
+        assert_ne!(p.custodian, release_policy().custodian);
+        assert_ne!(d.custodian, kp_decision().custodian);
+        // Moving either to another custodian breaks its signature.
+        let mut moved = release_policy();
+        moved.custodian = p.custodian.clone();
+        assert!(matches!(
+            moved.verify(),
+            Err(ContractError::BadSignature(_))
+        ));
+        let mut moved = kp_decision();
+        moved.custodian = d.custodian.clone();
+        assert!(matches!(
+            moved.verify(),
+            Err(ContractError::BadSignature(_))
+        ));
+    }
+
     fn kp_custody_vectors() -> serde_json::Value {
         let (p, r, d) = (release_policy(), kp_request(), kp_decision());
+        let (other_p, other_d) = for_another_custodian();
         serde_json::json!({
             "comment": "A jig-kp-release-policy-v1 and a jig-kp-decision-v1 (JEP-0005 rules 21b, 21c), approving the request in kp-request.json by its request_id. payload_hex is the deterministic CBOR payload; cose_sign1_hex is the envelope.",
             "keys": {
@@ -1824,6 +1871,18 @@ mod tests {
             "decision": {
                 "payload_hex": hex::encode(d.payload()),
                 "cose_sign1_hex": hex::encode(&d.envelope),
+            },
+            "refused": {
+                "comment": "Each signed by did for another custodian (seed byte 9): valid objects that the custodian above MUST refuse, because each names another custodian.",
+                "other_custodian": {"seed_byte": 9, "did": did_of(&key(9))},
+                "policy": {
+                    "payload_hex": hex::encode(other_p.payload()),
+                    "cose_sign1_hex": hex::encode(&other_p.envelope),
+                },
+                "decision": {
+                    "payload_hex": hex::encode(other_d.payload()),
+                    "cose_sign1_hex": hex::encode(&other_d.envelope),
+                },
             },
         })
     }
