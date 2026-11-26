@@ -1127,7 +1127,10 @@ mod tests {
             });
         }
         manifest.hlc_ts = Some(jig_core::HlcTimestamp {
-            wall_ms: rand::random::<u32>() as u64,
+            // The author's clock now, plus a random offset inside the
+            // future-skew bound, so equal payloads are distinct blocks.
+            wall_ms: chrono::Utc::now().timestamp_millis() as u64
+                + u64::from(rand::random::<u16>()),
             logical: 0,
             server_did: Did::from_str_unchecked("did:jig:client"),
         });

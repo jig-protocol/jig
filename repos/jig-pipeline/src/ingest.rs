@@ -927,7 +927,6 @@ pub async fn ingest(
                     since_wall_ms,
                 }),
             ctx.require_remove_ends,
-            ctx.hlc_clock.max_future_skew_ms(),
         ) {
             tracing::info!(kind = kind_str, refusal = ?refusal, "write refused");
             return Err(match refusal {
@@ -3534,8 +3533,17 @@ mod tests {
         meta: serde_json::Value,
     ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         // A fresh HLC per block, so two blocks with the same payload (a
-        // replayed commit) are different blocks rather than one duplicate.
-        signed_parts_at(key, kind, suite, meta, rand::random::<u32>() as u64)
+        // replayed commit) are different blocks rather than one duplicate:
+        // the author's clock now, as a client stamps it, plus a random
+        // offset well inside the future-skew bound.
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        signed_parts_at(
+            key,
+            kind,
+            suite,
+            meta,
+            now + u64::from(rand::random::<u16>()),
+        )
     }
 
     /// [`signed_parts`] with the author's clock at `wall_ms`.

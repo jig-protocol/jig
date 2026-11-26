@@ -181,8 +181,9 @@ Draft. Field names are provisional. The design behind this revision is
     member's current membership, and MAY refuse one without `ends`
     (`[server] require_remove_ends`; off by default in v0.2.x, so that removes from authors
     that predate `ends` still land). A remove without `ends` that was written, by its
-    `hlc_ts`, more than `max_future_skew_ms` before the current membership began, by its
-    `ingest` record's clock, is refused as well. A remove of someone who is not a member
+    `hlc_ts`, more than one day before the current membership began, by its `ingest`
+    record's clock, is refused as well: an author's clock may run behind without bound
+    (rule 13), so the margin is wide. A remove of someone who is not a member
     changes nothing, whatever it names.
 
 ## Manifest log
