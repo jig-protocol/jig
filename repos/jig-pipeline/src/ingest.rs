@@ -618,6 +618,14 @@ pub async fn ingest(
             kind: kind_str.to_string(),
         });
     }
+    // A sequencer move is read from the owner's stream (JEP-0005 rule 11a),
+    // but this server does not yet take a channel over: submitted to it, a
+    // `sequencer-set` is refused whatever the allow-list says.
+    if kind == BlockKind::SequencerSet {
+        return Err(IngestError::DisallowedBlockKind {
+            kind: kind_str.to_string(),
+        });
+    }
 
     // The store's local channels are the ones this server sequences; make
     // sure it knows which server that is before any slug is resolved (a

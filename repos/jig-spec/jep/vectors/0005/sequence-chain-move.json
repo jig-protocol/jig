@@ -1,0 +1,57 @@
+{
+  "chain": [
+    {
+      "hash_hex": "03c26ac5035480ee6e1a1d71fe68250981f0b722f5ef00ce2f28c51a6dbc2be9",
+      "record": "{\"format\":\"jig-ingest-v2\",\"channel_id\":\"bafkr4ihukvr5hpxlplbbaqmh4t5u3zqgd5u4tnzpo4mncxtpa4tcsnpkk4\",\"seq\":0,\"ingest_wall_ms\":1700000000000,\"ingest_logical\":0,\"block_cid\":\"bafkr4ihukvr5hpxlplbbaqmh4t5u3zqgd5u4tnzpo4mncxtpa4tcsnpkk4\",\"prev\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"sequencer\":\"did:jig:zkutpoquuc4i3hpctbose75xw3kypbk3rv6bs6qnh7y5z7wxntrqa\",\"cose\":\"hEOhASegWQEUqGNzZXEAZHByZXZYIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAZmRvbWFpbm1qaWctaW5nZXN0LXYyaWJsb2NrX2NpZFgkAVUeIPRVY9O+63rCEEGH5PtN5gYfacm3L3cY0V5vByYpNepXaXNlcXVlbmNlcng9ZGlkOmppZzp6a3V0cG9xdXVjNGkzaHBjdGJvc2U3NXh3M2t5cGJrM3J2NmJzNnFuaDd5NXo3d3hudHJxYWpjaGFubmVsX2lkWCQBVR4g9FVj077resIQQYfk+03mBh9pybcvdxjRXm8HJik16lduaW5nZXN0X2xvZ2ljYWwAbmluZ2VzdF93YWxsX21zGwAAAYvP5WgAWEC08MqLLClntHUxvZ3jLzJK67EH3pE0VM6EUMZnhpK5dHevLalTW5/JHQQTr8g90nLn+DjFkL23Wp5bXoIHivoJ\"}",
+      "seq": 0,
+      "signed_by": "did:jig:zkutpoquuc4i3hpctbose75xw3kypbk3rv6bs6qnh7y5z7wxntrqa"
+    },
+    {
+      "hash_hex": "0ba947b06a45a6726f615aa498dd279c669d7fda2d0364178aed09a6dccb43bb",
+      "record": "{\"format\":\"jig-ingest-v2\",\"channel_id\":\"bafkr4ihukvr5hpxlplbbaqmh4t5u3zqgd5u4tnzpo4mncxtpa4tcsnpkk4\",\"seq\":1,\"ingest_wall_ms\":1700000000001,\"ingest_logical\":0,\"block_cid\":\"bafkr4igubclvrjfqjybcbxc6ekp6hlkvh36c2iaq3ttzinbvorrdsjstye\",\"prev\":\"03c26ac5035480ee6e1a1d71fe68250981f0b722f5ef00ce2f28c51a6dbc2be9\",\"sequencer\":\"did:jig:zkutpoquuc4i3hpctbose75xw3kypbk3rv6bs6qnh7y5z7wxntrqa\",\"cose\":\"hEOhASegWQEUqGNzZXEBZHByZXZYIAPCasUDVIDubhodcf5oJQmB8Lci9e8Azi8oxRptvCvpZmRvbWFpbm1qaWctaW5nZXN0LXYyaWJsb2NrX2NpZFgkAVUeINQIl1iksE4CINxeIp/jrVU+/C0gENznlDQ1dGI5JlPBaXNlcXVlbmNlcng9ZGlkOmppZzp6a3V0cG9xdXVjNGkzaHBjdGJvc2U3NXh3M2t5cGJrM3J2NmJzNnFuaDd5NXo3d3hudHJxYWpjaGFubmVsX2lkWCQBVR4g9FVj077resIQQYfk+03mBh9pybcvdxjRXm8HJik16lduaW5nZXN0X2xvZ2ljYWwAbmluZ2VzdF93YWxsX21zGwAAAYvP5WgBWEDcwtKUwVrfT30BVdbmgHePGamBZ/nmiS/shOuJMi61jH0CvA8Qw+y0wkXe/IkBPgKwrOP7xGp3+SvOfJKDPBIM\"}",
+      "seq": 1,
+      "signed_by": "did:jig:zkutpoquuc4i3hpctbose75xw3kypbk3rv6bs6qnh7y5z7wxntrqa"
+    },
+    {
+      "hash_hex": "4c7b0979eb4962ef0f8986ddd73aa15a612e859b6dc18e44eb24d8ece215a83d",
+      "record": "{\"format\":\"jig-ingest-v2\",\"channel_id\":\"bafkr4ihukvr5hpxlplbbaqmh4t5u3zqgd5u4tnzpo4mncxtpa4tcsnpkk4\",\"seq\":2,\"ingest_wall_ms\":1700000000002,\"ingest_logical\":0,\"block_cid\":\"bafkr4icp3j2uefdbiohg7weqbusvasfgsqhae467piu3eb744ngyqotwyq\",\"prev\":\"0ba947b06a45a6726f615aa498dd279c669d7fda2d0364178aed09a6dccb43bb\",\"sequencer\":\"did:jig:zkutpoquuc4i3hpctbose75xw3kypbk3rv6bs6qnh7y5z7wxntrqa\",\"cose\":\"hEOhASegWQEUqGNzZXECZHByZXZYIAupR7BqRaZyb2FapJjdJ5xmnX/aLQNkF4rtCabcy0O7ZmRvbWFpbm1qaWctaW5nZXN0LXYyaWJsb2NrX2NpZFgkAVUeIE/adUIUYUOOb9iQDSVQSKaUDgJz33opsgf8402IOnbEaXNlcXVlbmNlcng9ZGlkOmppZzp6a3V0cG9xdXVjNGkzaHBjdGJvc2U3NXh3M2t5cGJrM3J2NmJzNnFuaDd5NXo3d3hudHJxYWpjaGFubmVsX2lkWCQBVR4g9FVj077resIQQYfk+03mBh9pybcvdxjRXm8HJik16lduaW5nZXN0X2xvZ2ljYWwAbmluZ2VzdF93YWxsX21zGwAAAYvP5WgCWEClVjI/SCXSCMtzkUrhxNBw1I0IPglBq/uhZFHdYJb+LGFHyoTh3Nxb1er1WUWRRgokClo/pv9MylBFUsdkPyoO\"}",
+      "seq": 2,
+      "signed_by": "did:jig:zkutpoquuc4i3hpctbose75xw3kypbk3rv6bs6qnh7y5z7wxntrqa"
+    },
+    {
+      "hash_hex": "142ae2f7fe6b75c0ebb640cb6c9f254b5dcfe07528da7a453f295d4b86250c0a",
+      "record": "{\"format\":\"jig-ingest-v2\",\"channel_id\":\"bafkr4ihukvr5hpxlplbbaqmh4t5u3zqgd5u4tnzpo4mncxtpa4tcsnpkk4\",\"seq\":3,\"ingest_wall_ms\":1700000000003,\"ingest_logical\":0,\"block_cid\":\"bafkr4iapduddmjijq5i2n2e2k2qqx2zhwojcic4b7qwlzreki5svnmikke\",\"prev\":\"4c7b0979eb4962ef0f8986ddd73aa15a612e859b6dc18e44eb24d8ece215a83d\",\"sequencer\":\"did:jig:zodpz4itzvw7mnujl6kjbdbgjeixletwykiafx5sacopvfzm43gxa\",\"cose\":\"hEOhASegWQEUqGNzZXEDZHByZXZYIEx7CXnrSWLvD4mG3dc6oVphLoWbbcGOROsk2OziFag9ZmRvbWFpbm1qaWctaW5nZXN0LXYyaWJsb2NrX2NpZFgkAVUeIA8dBjYlCYdRpuiaVqEL6yezkiQLgfwsvMSKR2VWsQpRaXNlcXVlbmNlcng9ZGlkOmppZzp6b2RwejRpdHp2dzdtbnVqbDZramJkYmdqZWl4bGV0d3lraWFmeDVzYWNvcHZmem00M2d4YWpjaGFubmVsX2lkWCQBVR4g9FVj077resIQQYfk+03mBh9pybcvdxjRXm8HJik16lduaW5nZXN0X2xvZ2ljYWwAbmluZ2VzdF93YWxsX21zGwAAAYvP5WgDWEA/t0zT48nh80MKxaFZI8pn7zJrkwiiNK2G/bsBDssZmYiHvAdtpMCg7nuCocdHLwMwrwi1HrTg0jan6cpp7ukJ\"}",
+      "seq": 3,
+      "signed_by": "did:jig:zodpz4itzvw7mnujl6kjbdbgjeixletwykiafx5sacopvfzm43gxa"
+    },
+    {
+      "hash_hex": "624868b65c3bf15c66923aef52ee6724761be1dd6d3a02d04ab9e45e43a0d170",
+      "record": "{\"format\":\"jig-ingest-v2\",\"channel_id\":\"bafkr4ihukvr5hpxlplbbaqmh4t5u3zqgd5u4tnzpo4mncxtpa4tcsnpkk4\",\"seq\":4,\"ingest_wall_ms\":1700000000004,\"ingest_logical\":0,\"block_cid\":\"bafkr4iahoqba6wlknkto7eluzlarms5746jtuusn2xnbztcwp3nybc5ii4\",\"prev\":\"142ae2f7fe6b75c0ebb640cb6c9f254b5dcfe07528da7a453f295d4b86250c0a\",\"sequencer\":\"did:jig:zodpz4itzvw7mnujl6kjbdbgjeixletwykiafx5sacopvfzm43gxa\",\"cose\":\"hEOhASegWQEUqGNzZXEEZHByZXZYIBQq4vf+a3XA67ZAy2yfJUtdz+B1KNp6RT8pXUuGJQwKZmRvbWFpbm1qaWctaW5nZXN0LXYyaWJsb2NrX2NpZFgkAVUeIAd0Ag9Zamqm75F0ysEWS7/nkzpSTdXaHMxWftuAi6hHaXNlcXVlbmNlcng9ZGlkOmppZzp6b2RwejRpdHp2dzdtbnVqbDZramJkYmdqZWl4bGV0d3lraWFmeDVzYWNvcHZmem00M2d4YWpjaGFubmVsX2lkWCQBVR4g9FVj077resIQQYfk+03mBh9pybcvdxjRXm8HJik16lduaW5nZXN0X2xvZ2ljYWwAbmluZ2VzdF93YWxsX21zGwAAAYvP5WgEWEC0EVb6gPHRru5L52H/cd1A8cjzz42Hpm+PybvcI/yAA6cwWzvg8f7uGrnHM6bgjALK+d+B3hY5zVu1LVdvPDUM\"}",
+      "seq": 4,
+      "signed_by": "did:jig:zodpz4itzvw7mnujl6kjbdbgjeixletwykiafx5sacopvfzm43gxa"
+    }
+  ],
+  "channel_id": "bafkr4ihukvr5hpxlplbbaqmh4t5u3zqgd5u4tnzpo4mncxtpa4tcsnpkk4",
+  "cited_head": {
+    "hash": "4c7b0979eb4962ef0f8986ddd73aa15a612e859b6dc18e44eb24d8ece215a83d",
+    "seq": 2
+  },
+  "comment": "JEP-0005 rule 11a: a chain across a sequencer-set. `record` is the ingest record as stored and served (JSON). seq 3 is the sequencer-set's record: signed by the new sequencer, its prev the cited head's hash (seq 2). `refused` is a record by the old sequencer past the cited head: a reader that holds the set refuses it.",
+  "keys": {
+    "comment": "Ed25519 seeds: every byte set to the given value",
+    "new_sequencer": {
+      "did": "did:jig:zodpz4itzvw7mnujl6kjbdbgjeixletwykiafx5sacopvfzm43gxa",
+      "seed_byte": 61
+    },
+    "old_sequencer": {
+      "did": "did:jig:zkutpoquuc4i3hpctbose75xw3kypbk3rv6bs6qnh7y5z7wxntrqa",
+      "seed_byte": 60
+    }
+  },
+  "refused": {
+    "hash_hex": "44b67cf7cdea7f3611bad3299631de831af988a9f86a1d320f48b7d7c534c256",
+    "record": "{\"format\":\"jig-ingest-v2\",\"channel_id\":\"bafkr4ihukvr5hpxlplbbaqmh4t5u3zqgd5u4tnzpo4mncxtpa4tcsnpkk4\",\"seq\":4,\"ingest_wall_ms\":1700000000004,\"ingest_logical\":0,\"block_cid\":\"bafkr4igarkvovqkqae6iau7mg6ih5nv6tykvtax4loluiu6cg25chpblua\",\"prev\":\"142ae2f7fe6b75c0ebb640cb6c9f254b5dcfe07528da7a453f295d4b86250c0a\",\"sequencer\":\"did:jig:zkutpoquuc4i3hpctbose75xw3kypbk3rv6bs6qnh7y5z7wxntrqa\",\"cose\":\"hEOhASegWQEUqGNzZXEEZHByZXZYIBQq4vf+a3XA67ZAy2yfJUtdz+B1KNp6RT8pXUuGJQwKZmRvbWFpbm1qaWctaW5nZXN0LXYyaWJsb2NrX2NpZFgkAVUeIMCKqurBUAE8gFPsN5B+tr6eFVmC/FuXRFPCNrojvCugaXNlcXVlbmNlcng9ZGlkOmppZzp6a3V0cG9xdXVjNGkzaHBjdGJvc2U3NXh3M2t5cGJrM3J2NmJzNnFuaDd5NXo3d3hudHJxYWpjaGFubmVsX2lkWCQBVR4g9FVj077resIQQYfk+03mBh9pybcvdxjRXm8HJik16lduaW5nZXN0X2xvZ2ljYWwAbmluZ2VzdF93YWxsX21zGwAAAYvP5WgEWEA1qoweyt6X7f9Re1DgyGjYkOexafNnYfRH3HislRamXW8/Ap7mNvQK+Jzpblsak14tr64hpai62YlYqM0q56cN\"}",
+    "seq": 4,
+    "signed_by": "did:jig:zkutpoquuc4i3hpctbose75xw3kypbk3rv6bs6qnh7y5z7wxntrqa"
+  }
+}

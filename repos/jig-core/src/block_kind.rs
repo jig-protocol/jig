@@ -111,11 +111,15 @@ pub enum BlockKind {
     /// The record of an ended share, carrying the signed `contract-end` of
     /// whichever side ended it. Written only by the channel's sequencer.
     ContractEnd,
+    /// The owner moves the channel's sequencer to another server (JEP-0005
+    /// rule 11a); its metadata is [`crate::sequencer_move::SequencerSet`]'s.
+    /// Its record is signed by the new sequencer. Critical: no `opt-` prefix.
+    SequencerSet,
 }
 
 impl BlockKind {
     /// Every kind this build implements.
-    pub const ALL: [BlockKind; 23] = [
+    pub const ALL: [BlockKind; 24] = [
         Self::TextRender,
         Self::ChannelCreate,
         Self::MemberAdd,
@@ -139,6 +143,7 @@ impl BlockKind {
         Self::ContractAccept,
         Self::ContractRefuse,
         Self::ContractEnd,
+        Self::SequencerSet,
     ];
 
     /// Stable wire-format string (kebab-case).
@@ -167,6 +172,7 @@ impl BlockKind {
             Self::ContractAccept => "contract-accept",
             Self::ContractRefuse => "contract-refuse",
             Self::ContractEnd => "contract-end",
+            Self::SequencerSet => "sequencer-set",
         }
     }
 
@@ -205,6 +211,7 @@ impl std::str::FromStr for BlockKind {
             "contract-accept" => Ok(Self::ContractAccept),
             "contract-refuse" => Ok(Self::ContractRefuse),
             "contract-end" => Ok(Self::ContractEnd),
+            "sequencer-set" => Ok(Self::SequencerSet),
             _ => Err(BlockKindError::Unknown(s.to_string())),
         }
     }

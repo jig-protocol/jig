@@ -501,6 +501,30 @@ async fn handle_socket(
                         // Sub channel closed (server shutdown path).
                         break;
                     };
+                    // A channel that moved while subscribed: a client that
+                    // cannot check the new sequencer's records is told so,
+                    // once, and sent none of them (JEP-0005 rule 11a).
+                    if let Some(channel_id) = &block.channel_id
+                        && let Some(moved) = moved_past(&state, &session.block_kinds, channel_id)
+                    {
+                        if session.noticed != session.sub_id {
+                            session.noticed = session.sub_id;
+                            let notice = moved.notice(channel_id);
+                            if send_error(
+                                &mut socket,
+                                Some(notice.status),
+                                notice.code,
+                                Some(notice.channel_id),
+                                &notice.message,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
                     let receipts = vec![ReceiptRef {
                         server_did: receipt.server_id.clone(),
                         render_hash: receipt.render_hash.clone(),
@@ -607,6 +631,32 @@ struct ConnState {
     /// Whether the hello asked for channel tiers (JEP-0014 rule 5): a client
     /// that did not may read a `public` channel but not post to it.
     tiers: bool,
+    /// The block kinds the hello says its client implements (JEP-0002 rule
+    /// 1). A client that does not list `sequencer-set` reads nothing of a
+    /// channel that moved ([`moved_past`]).
+    block_kinds: Vec<String>,
+}
+
+/// The first move of `channel_id`'s sequencer, when a client implementing
+/// only `block_kinds` cannot read past it (JEP-0005 rule 11a): it cannot
+/// check the new sequencer's records, so it is told the channel needs an
+/// upgrade instead of being sent them. `None` when it can read the channel.
+fn moved_past(
+    state: &AppState,
+    block_kinds: &[String],
+    channel_id: &str,
+) -> Option<jig_pipeline::follow::ChannelMove> {
+    let kind = jig_core::BlockKind::SequencerSet.as_str();
+    if block_kinds.iter().any(|k| k == kind) {
+        return None;
+    }
+    match state.ingest_ctx.store.channel_moves(channel_id) {
+        Ok(moves) => moves.into_iter().next(),
+        Err(e) => {
+            tracing::warn!(channel_id, "reading a channel's moves: {e}");
+            None
+        }
+    }
 }
 
 /// A handshake that ends with the dialer's [`Frame::PeerProof`].
@@ -989,6 +1039,20 @@ async fn handle_client_frame(
                 (None, Scope::ChannelId { channel_id }) => Some(channel_id.as_str()),
                 (None, Scope::Channel { .. }) => None,
             };
+            if let Some(id) = stopped_id
+                && let Some(moved) = moved_past(state, &session.block_kinds, id)
+            {
+                let notice = moved.notice(id);
+                let _ = send_error(
+                    socket,
+                    Some(notice.status),
+                    notice.code,
+                    Some(notice.channel_id),
+                    &notice.message,
+                )
+                .await;
+                return Ok(());
+            }
             if let Some(id) = stopped_id {
                 match state.ingest_ctx.store.carried_upgrade(id) {
                     Ok(None) => {}
@@ -1295,6 +1359,7 @@ async fn complete_hello(
                 .map_err(|err| err.to_string())?;
             session.handshaken = true;
             session.tiers = hello.capabilities.tiers;
+            session.block_kinds = hello.capabilities.block_kinds.clone();
             if let Some(peer_did) = hello.peer_did {
                 session.awaiting_peer = Some(AwaitingPeer {
                     peer_did,
@@ -2560,6 +2625,75 @@ mod tests {
                 .is_err(),
             "and is not answered with an error"
         );
+    }
+
+    /// A channel whose sequencer moved (JEP-0005 rule 11a) is read only by a
+    /// client whose hello lists `sequencer-set`: one that does not (every
+    /// client up to v0.2.0 lists no kinds) could not check the new
+    /// sequencer's records. Its subscribe is answered `CHANNEL_NEEDS_UPGRADE`.
+    #[tokio::test]
+    async fn a_moved_channel_is_refused_to_a_client_that_cannot_read_the_move() {
+        let (state, url) = start_test_server().await;
+        let key = jig_core::crypto::ed25519::generate_signing_key();
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+        crate::v0_0_2_federation::complete_peer_handshake(
+            &mut ws,
+            &state.server_did.to_did_jig_string(),
+            &[],
+            &key,
+        )
+        .await
+        .unwrap();
+        seed_channel(&state, "#moved");
+        let id = jig_pipeline::ingest_record::label_cid("#moved");
+        let moved = jig_pipeline::follow::ChannelMove {
+            seq: 6,
+            sequencer: "did:jig:znew".to_string(),
+            previous: "did:jig:zold".to_string(),
+            block_cid: "bafkmove".to_string(),
+        };
+        state
+            .ingest_ctx
+            .store
+            .record_move_for_tests(&id, &moved)
+            .unwrap();
+        let sub = Envelope::new(Frame::Subscribe {
+            scope: Scope::Channel {
+                slug: "#moved".into(),
+            },
+            auth: None,
+        });
+        ws.send(TMessage::Text(serde_json::to_string(&sub).unwrap().into()))
+            .await
+            .unwrap();
+        let Frame::Error {
+            status,
+            code,
+            ref_cid,
+            message,
+            ..
+        } = next_frame(&mut ws).await.frame
+        else {
+            panic!("expected an error frame");
+        };
+        assert_eq!(status, Some(409));
+        assert_eq!(code, "CHANNEL_NEEDS_UPGRADE");
+        assert_eq!(ref_cid, Some(id.clone()));
+        assert!(message.contains("`sequencer-set` at seq 6"), "{message}");
+        assert_eq!(state.ingest_ctx.fanout.local_subscription_count().await, 0);
+
+        // What decides it: the kinds the hello listed.
+        assert_eq!(moved_past(&state, &[], &id), Some(moved.clone()));
+        assert_eq!(
+            moved_past(&state, &["text-render".to_string()], &id),
+            Some(moved)
+        );
+        assert_eq!(
+            moved_past(&state, &["sequencer-set".to_string()], &id),
+            None
+        );
+        let unmoved = jig_pipeline::ingest_record::label_cid("#unmoved");
+        assert_eq!(moved_past(&state, &[], &unmoved), None);
     }
 
     /// A channel this server stopped at a block kind it does not implement
