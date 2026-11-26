@@ -77,6 +77,17 @@ pub enum Grant {
 }
 
 impl Grant {
+    /// Whether this grant relays nothing `other` does not (rule 7a): `read`
+    /// is within `write`, which is within `member`.
+    pub fn within(self, other: Grant) -> bool {
+        let rank = |g: Grant| match g {
+            Grant::Read => 0,
+            Grant::Write => 1,
+            Grant::Member => 2,
+        };
+        rank(self) <= rank(other)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Grant::Read => "read",

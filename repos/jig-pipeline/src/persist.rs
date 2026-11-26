@@ -985,7 +985,9 @@ fn sequence_on(
 ) -> Result<IngestRecord> {
     let last: Option<Vec<u8>> = conn
         .query_row(
-            "SELECT record FROM ingest_records WHERE channel_id = ? ORDER BY seq DESC LIMIT 1",
+            // The chain as this server holds it: a channel it took over
+            // (JEP-0005 rule 11a) goes on from the head it carried.
+            "SELECT record FROM chain_records WHERE channel_id = ? ORDER BY seq DESC LIMIT 1",
             [signer.channel_id.as_str()],
             |r| r.get(0),
         )

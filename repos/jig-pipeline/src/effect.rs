@@ -62,9 +62,8 @@ pub async fn apply_effect(
         | BlockKind::ContractAccept
         | BlockKind::ContractRefuse
         | BlockKind::ContractEnd => Ok(()),
-        // Ingest refuses a submitted move until this server can take a channel
-        // over (JEP-0005 rule 11a); a carried one lands through
-        // `apply_carried_effect`.
+        // The takeover needs the block's record, so ingest records it once
+        // the block has landed (`SqliteStore::take_over`).
         BlockKind::SequencerSet => Ok(()),
         BlockKind::FedHello => apply_fed_hello(store, &manifest, block_cid),
 

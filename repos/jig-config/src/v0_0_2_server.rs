@@ -317,6 +317,10 @@ impl Default for ServerSection {
                 "contract-accept".to_string(),
                 "contract-refuse".to_string(),
                 "contract-end".to_string(),
+                // The owner's move of a channel this server carries to this
+                // server (JEP-0005 rule 11a). Listed in the welcome, it also
+                // tells a client this server can take a channel over.
+                "sequencer-set".to_string(),
             ],
             max_future_skew_ms: DEFAULT_MAX_FUTURE_SKEW_MS,
             proxy_protocol: ProxyProtocolSection::default(),
