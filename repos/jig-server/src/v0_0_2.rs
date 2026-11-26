@@ -415,6 +415,7 @@ impl AppState {
             server_url: server_url.clone(),
             naively_allow_unknown_handles_fallback,
             executor: Some(executor),
+            require_remove_ends: config.server.require_remove_ends,
         });
 
         let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));
@@ -490,6 +491,7 @@ impl AppState {
             server_url: server_url.clone(),
             naively_allow_unknown_handles_fallback,
             executor: Some(BlockExecutor::shared()),
+            require_remove_ends: false,
         });
 
         let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));
@@ -549,6 +551,7 @@ impl AppState {
             server_url: server_url.clone(),
             naively_allow_unknown_handles_fallback,
             executor: Some(BlockExecutor::shared()),
+            require_remove_ends: false,
         });
 
         let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));

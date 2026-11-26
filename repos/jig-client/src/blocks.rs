@@ -136,9 +136,24 @@ pub fn build_member_add(
     )
 }
 
+/// The metadata key under which a `member-remove` names the membership it
+/// ends (JEP-0002 rule 11): the `since` the channel's members listing gives.
+pub use jig_pipeline::authorize_write::ENDS_KEY;
+
+/// What [`build_member_remove`]'s `extra` carries for a remove that ends the
+/// membership begun by `since`: `{ends: since}`, or nothing when the member's
+/// server did not say (one that predates `ends`).
+pub fn ends(since: Option<&str>) -> Value {
+    match since {
+        Some(since) => json!({ ENDS_KEY: since }),
+        None => json!({}),
+    }
+}
+
 /// Build a signed `member-remove` block: the owner removing `member_did`, or
 /// a member leaving when `member_did` is its own DID. `extra` carries the MLS
-/// fields on an encrypted channel (see `jig_pipeline::mls_gate`).
+/// fields on an encrypted channel (see `jig_pipeline::mls_gate`), and the
+/// membership it ends ([`ends`]).
 pub fn build_member_remove(
     sender: &Identity,
     channel_slug: &str,

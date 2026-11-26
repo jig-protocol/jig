@@ -2574,6 +2574,35 @@ impl SqliteStore {
         Ok(found.is_some())
     }
 
+    /// `member_did`'s membership of the channel with this id: `None` when it
+    /// is not a member, or the channel is archived or unknown, as in
+    /// [`Self::is_member_by_id`].
+    pub fn get_membership_by_id(
+        &self,
+        channel_id: &str,
+        member_did: &str,
+    ) -> Result<Option<StoredMembership>> {
+        let conn = self.conn.lock().expect("poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT m.channel_id, m.member_did, m.role, m.joined_at, m.source_block_cid
+                   FROM memberships m
+                   JOIN channels c ON c.id = m.channel_id AND c.archived_at IS NULL
+                  WHERE m.channel_id = ? AND m.member_did = ?",
+                [channel_id, member_did],
+                |r| {
+                    Ok(StoredMembership {
+                        channel_id: r.get(0)?,
+                        member_did: r.get(1)?,
+                        role: r.get(2)?,
+                        joined_at: r.get(3)?,
+                        source_block_cid: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
     pub fn list_members(&self, channel_id: &str) -> Result<Vec<StoredMembership>> {
         let conn = self.conn.lock().expect("poisoned");
         let mut stmt = conn.prepare(

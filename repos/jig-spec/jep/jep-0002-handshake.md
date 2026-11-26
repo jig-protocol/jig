@@ -174,9 +174,16 @@ Draft. Field names are provisional. The design behind this revision is
     identity attached; servers verify heads and forward them toward the sequencer and
     other carriers. Two records signed by one sequencer for the same `channel_id` and
     `seq` with different contents are proof of a fork.
-11. A `member-remove` block, including a self-leave, carries `ends`: the CID of the
-    `member-add` it ends. A server MUST refuse a remove whose `ends` is not the member's
-    current membership.
+11. A `member-remove` block, including a self-leave, SHOULD carry `ends`, under the manifest
+    metadata key `ends`: the CID of the block that began the membership it ends (the
+    `member-add`, or the `channel-create` for a root owner). A server lists it as `since`
+    beside each member. A server MUST refuse a remove whose `ends` is present and is not the
+    member's current membership, and MAY refuse one without `ends`
+    (`[server] require_remove_ends`; off by default in v0.2.x, so that removes from authors
+    that predate `ends` still land). A remove without `ends` that was written, by its
+    `hlc_ts`, more than `max_future_skew_ms` before the current membership began, by its
+    `ingest` record's clock, is refused as well. A remove of someone who is not a member
+    changes nothing, whatever it names.
 
 ## Manifest log
 

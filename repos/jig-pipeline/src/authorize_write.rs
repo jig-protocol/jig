@@ -55,6 +55,86 @@ pub enum WriteRefusal {
     /// A share block or contract record whose metadata does not say what its
     /// kind needs, or whose envelopes do not check out.
     BadContractBlock { detail: String },
+    /// A `member-remove` whose `ends` does not name the target's current
+    /// membership, or one without `ends` written before that membership
+    /// began (JEP-0002 rule 11).
+    RemoveEndsStale {
+        slug: String,
+        member: String,
+        detail: String,
+    },
+    /// A `member-remove` without `ends`, on a server that requires it
+    /// (`[server] require_remove_ends`).
+    RemoveEndsRequired { slug: String, member: String },
+}
+
+/// The metadata key under which a `member-remove` names the membership it
+/// ends: the CID of the block that began it (JEP-0002 rule 11). For a member
+/// that is the `member-add` that added it; for a root owner, the
+/// `channel-create`.
+pub const ENDS_KEY: &str = "ends";
+
+/// The membership a `member-remove` would end, as the caller resolved it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CurrentMembership<'a> {
+    /// The CID of the block that began it (`memberships.source_block_cid`).
+    pub since: &'a str,
+    /// The sequencer's clock when that block landed, from its `ingest`
+    /// record; `None` when it has none (a membership from before records).
+    pub since_wall_ms: Option<u64>,
+}
+
+/// Whether a `member-remove` may end `current`, the target's membership
+/// (`None` when the target is not a member, which a remove cannot change).
+///
+/// - `ends` present: it must name `current` exactly. A remove written for an
+///   earlier membership, of this channel or another server's channel under
+///   the same slug, names a membership that is not this one.
+/// - `ends` absent: refused when `require` is set. Otherwise the remove is
+///   from an author that predates `ends` (v0.2.0), and is taken unless its
+///   `hlc_ts` is more than `skew_ms` before `current` began: a remove written
+///   before a membership existed was not meant for it.
+pub fn check_remove_ends(
+    manifest: &BlockManifest,
+    slug: &str,
+    member: &str,
+    current: Option<CurrentMembership<'_>>,
+    require: bool,
+    skew_ms: u64,
+) -> Result<(), WriteRefusal> {
+    let Some(current) = current else {
+        return Ok(());
+    };
+    let stale = |detail: String| {
+        Err(WriteRefusal::RemoveEndsStale {
+            slug: slug.to_string(),
+            member: member.to_string(),
+            detail,
+        })
+    };
+    match manifest.metadata.get(ENDS_KEY) {
+        Some(ends) => match ends.as_str() {
+            Some(ends) if ends == current.since => Ok(()),
+            Some(ends) => stale(format!(
+                "it ends the membership begun by {ends}; the current one was begun by {}",
+                current.since
+            )),
+            None => stale("`ends` is not a CID".to_string()),
+        },
+        None if require => Err(WriteRefusal::RemoveEndsRequired {
+            slug: slug.to_string(),
+            member: member.to_string(),
+        }),
+        None => match (manifest.hlc_ts.as_ref(), current.since_wall_ms) {
+            (Some(written), Some(began)) if written.wall_ms.saturating_add(skew_ms) < began => {
+                stale(format!(
+                    "it was written at {} ms, before the current membership began at {began} ms",
+                    written.wall_ms
+                ))
+            }
+            _ => Ok(()),
+        },
+    }
 }
 
 /// The membership facts a decision can turn on, resolved by the caller.
@@ -388,6 +468,76 @@ mod tests {
             }
         }
         builder.build().unwrap().with_kind(kind)
+    }
+
+    /// JEP-0002 rule 11: a remove ends the membership its `ends` names, and
+    /// only that one; one without `ends` is from an author that predates it.
+    #[test]
+    fn a_remove_ends_only_the_membership_it_names() {
+        const MEMBER: &str = "did:jig:zMember";
+        let remove = |ends: Option<&str>, written_ms: Option<u64>| {
+            let mut meta = json!({"channel": "#room", "member_did": MEMBER});
+            if let Some(ends) = ends {
+                meta[ENDS_KEY] = json!(ends);
+            }
+            let mut m = manifest_with(BlockKind::MemberRemove, MEMBER, meta);
+            m.hlc_ts = written_ms.map(|wall_ms| jig_core::HlcTimestamp {
+                wall_ms,
+                logical: 0,
+                server_did: jig_core::Did::from_ed25519_pubkey(&[1; 32]),
+            });
+            m
+        };
+        let current = Some(CurrentMembership {
+            since: "bafy-add-2",
+            since_wall_ms: Some(1_000_000),
+        });
+        let check = |m: &BlockManifest, current, require| {
+            check_remove_ends(m, "#room", MEMBER, current, require, 300_000)
+        };
+        // Naming the current membership.
+        assert_eq!(
+            check(&remove(Some("bafy-add-2"), None), current, true),
+            Ok(())
+        );
+        // Naming an earlier one, or something that is not a CID.
+        for stale in [remove(Some("bafy-add-1"), None), {
+            let mut m = remove(None, None);
+            m.metadata.insert(ENDS_KEY.into(), json!(7));
+            m
+        }] {
+            assert!(
+                matches!(
+                    check(&stale, current, false),
+                    Err(WriteRefusal::RemoveEndsStale { .. })
+                ),
+                "{stale:?}"
+            );
+        }
+        // No `ends`: refused only where it is required, or when the block
+        // was written before the membership began, past the skew bound.
+        assert_eq!(
+            check(&remove(None, Some(1_000_000)), current, false),
+            Ok(())
+        );
+        assert_eq!(check(&remove(None, Some(700_000)), current, false), Ok(()));
+        assert!(matches!(
+            check(&remove(None, Some(699_999)), current, false),
+            Err(WriteRefusal::RemoveEndsStale { .. })
+        ));
+        assert_eq!(check(&remove(None, None), current, false), Ok(()));
+        assert!(matches!(
+            check(&remove(None, Some(1_000_000)), current, true),
+            Err(WriteRefusal::RemoveEndsRequired { .. })
+        ));
+        // A membership with no record to date it: nothing to compare with.
+        let undated = Some(CurrentMembership {
+            since: "bafy-add-2",
+            since_wall_ms: None,
+        });
+        assert_eq!(check(&remove(None, Some(1)), undated, false), Ok(()));
+        // No current membership: the remove changes nothing, whatever it names.
+        assert_eq!(check(&remove(Some("bafy-add-1"), None), None, true), Ok(()));
     }
 
     fn member_add(sender: &str, member: &str) -> BlockManifest {

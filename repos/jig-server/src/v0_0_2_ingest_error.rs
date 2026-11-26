@@ -228,6 +228,17 @@ pub fn classify_with_wait(
         IngestError::BadContractBlock { .. } => {
             (StatusCode::BAD_REQUEST, "BAD_CONTRACT_BLOCK", e.to_string())
         }
+        // 409: well-formed, but it ends a membership that is not the
+        // target's current one (JEP-0002 rule 11).
+        IngestError::RemoveEndsStale { .. } => {
+            (StatusCode::CONFLICT, "REMOVE_ENDS_STALE", e.to_string())
+        }
+        // 400: the block lacks a field this server requires.
+        IngestError::RemoveEndsRequired { .. } => (
+            StatusCode::BAD_REQUEST,
+            "REMOVE_ENDS_REQUIRED",
+            e.to_string(),
+        ),
         // 400: the slug is outside the canonical grammar or in a reserved
         // namespace (`#dm/`, `#jig/`, `#email/`) the author may not use.
         IngestError::InvalidSlug { .. } => (StatusCode::BAD_REQUEST, "INVALID_SLUG", e.to_string()),
@@ -477,6 +488,15 @@ mod tests {
             IngestError::BadContractBlock {
                 kind: "channel-share".to_string(),
                 detail: "`to` is missing".to_string(),
+            },
+            IngestError::RemoveEndsStale {
+                slug: "#room".to_string(),
+                member: "did:jig:zMember".to_string(),
+                detail: "it ends another membership".to_string(),
+            },
+            IngestError::RemoveEndsRequired {
+                slug: "#room".to_string(),
+                member: "did:jig:zMember".to_string(),
             },
             IngestError::InvalidSlug {
                 slug: "#General".to_string(),

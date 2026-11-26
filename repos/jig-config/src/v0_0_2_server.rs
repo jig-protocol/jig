@@ -244,6 +244,11 @@ pub struct ServerSection {
     /// requests already in flight finish. Whatever is still open when this runs
     /// out is cut. `0` cuts at once. At most [`MAX_SHUTDOWN_DRAIN_MS`].
     pub shutdown_drain_ms: u64,
+    /// Refuse a `member-remove` that does not name the membership it ends
+    /// (JEP-0002 rule 11), instead of taking it as a block from an author
+    /// that predates `ends`. Off by default in v0.2.x, so removes from
+    /// v0.2.0 clients still land; planned to default on in v0.3.
+    pub require_remove_ends: bool,
 }
 
 /// The default `[server] max_future_skew_ms`: five minutes.
@@ -321,6 +326,7 @@ impl Default for ServerSection {
             max_future_skew_ms: DEFAULT_MAX_FUTURE_SKEW_MS,
             proxy_protocol: ProxyProtocolSection::default(),
             shutdown_drain_ms: DEFAULT_SHUTDOWN_DRAIN_MS,
+            require_remove_ends: false,
         }
     }
 }
@@ -1619,6 +1625,16 @@ mod tests {
         let set: JigServerConfig =
             toml::from_str("[server]\nmax_future_skew_ms = 60000\n").unwrap();
         assert_eq!(set.server.max_future_skew_ms, 60_000);
+    }
+
+    #[test]
+    fn remove_ends_are_not_required_unless_set() {
+        let omitted: JigServerConfig =
+            toml::from_str("[server]\nlisten = \"0.0.0.0:443\"\n").unwrap();
+        assert!(!omitted.server.require_remove_ends);
+        let set: JigServerConfig =
+            toml::from_str("[server]\nrequire_remove_ends = true\n").unwrap();
+        assert!(set.server.require_remove_ends);
     }
 
     #[test]

@@ -1081,6 +1081,7 @@ mod tests {
             server_url: "ws://127.0.0.1:7117".to_string(),
             naively_allow_unknown_handles_fallback: false,
             executor: Some(crate::executor::BlockExecutor::shared()),
+            require_remove_ends: false,
         }
     }
 
