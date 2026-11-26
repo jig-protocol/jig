@@ -515,7 +515,8 @@ deterministic payload and its `COSE_Sign1`, in hex.
 `vectors/0005/kp-custody.json`: a `jig-kp-release-policy-v1` (21b) releasing to two
 requesters, the `request_id` of the request in `kp-request.json`, and a
 `jig-kp-decision-v1` (21c) approving that request, each as its deterministic payload and
-its `COSE_Sign1`, in hex, under fixed test keys.
+its `COSE_Sign1`, in hex, under fixed test keys. Under `refused`, the same policy and
+decision signed for another custodian: valid objects that the custodian above MUST refuse.
 
 `vectors/0005/unknown-kinds.json` (14c): manifests of kinds that no v0.2 build implements,
 each signed under a fixed test key. For each it gives whether the block is critical and
