@@ -379,4 +379,33 @@ mod tests {
             Verdict::Keep(format!("their reachability record lists {a}"))
         );
     }
+
+    /// A run cut short after some removals is finished by running it again:
+    /// the verdicts come from the membership as it is now, so the members
+    /// already removed are not judged, nor removed twice, and the rest are.
+    #[test]
+    fn a_run_cut_short_is_finished_by_running_it_again() {
+        let b = "did:jig:zB";
+        let all = [
+            member("did:jig:zOne", "member", Some(b)),
+            member("did:jig:zTwo", "member", Some(b)),
+            member("did:jig:zThree", "member", Some(b)),
+        ];
+        let removed = |v: &[(String, Verdict)]| -> Vec<String> {
+            v.iter()
+                .filter(|(_, v)| matches!(v, Verdict::Remove(_)))
+                .map(|(d, _)| d.clone())
+                .collect()
+        };
+        let reach = HashMap::new();
+        let first = removed(&judge(&all, b, "did:jig:zMe", &reach));
+        assert_eq!(first.len(), 3);
+        // The first removal landed, then the run stopped: the membership the
+        // second run reads no longer lists it.
+        let left: Vec<Member> = all.iter().filter(|m| m.did != first[0]).cloned().collect();
+        let second = removed(&judge(&left, b, "did:jig:zMe", &reach));
+        assert_eq!(second, first[1..]);
+        // Once all are gone, there is nothing left to do.
+        assert!(judge(&[], b, "did:jig:zMe", &reach).is_empty());
+    }
 }

@@ -859,7 +859,13 @@ pub async fn prune(ctx: &CliContext, slug: String, via: String, yes: bool) -> Re
     for did in removing {
         let cid = remove_member(&secure, &slug, &info, &did)
             .await
-            .with_context(|| format!("removing {did}; those listed after it were not removed"))?;
+            .with_context(|| {
+                format!(
+                    "removing {did}; those listed after it were not removed. Each removal \
+                     printed above landed; run `jig channel prune {slug} --via {via} --yes` \
+                     again to finish: it judges from the membership as it is now"
+                )
+            })?;
         println!("removed {did}  (block_cid: {cid})");
     }
     Ok(())
