@@ -235,6 +235,78 @@ pub enum Switch {
 }
 
 /// Apply `jig server custody on|off` (JEP-0017 R1 and its undo).
+/// Apply `jig server policy [--release-to WHO]... [--any]` (JEP-0005 rule
+/// 21b).
+pub async fn policy(ctx: &CliContext, release_to: Vec<String>, any: bool) -> Result<()> {
+    let mut dids = Vec::new();
+    for who in &release_to {
+        dids.push(crate::cmd::channel::resolve_who(ctx, who).await?);
+    }
+    let secure = crate::cmd::secure::Secure::open(ctx)?;
+    let seq = secure.put_release_policy(dids.clone(), any).await?;
+    let server = secure.server();
+    if any {
+        println!("{server} releases your key packages to anyone it admits (policy seq {seq})");
+    } else if dids.is_empty() {
+        println!(
+            "{server} holds every request for your key packages from another server's member \
+             for your approval (policy seq {seq}); see `jig server held`"
+        );
+    } else {
+        println!(
+            "{server} releases your key packages to {} without asking, and holds every other \
+             request for your approval (policy seq {seq}):",
+            if dids.len() == 1 {
+                "this member"
+            } else {
+                "these members"
+            }
+        );
+        for did in dids {
+            println!("  {did}");
+        }
+    }
+    Ok(())
+}
+
+/// Apply `jig server held` (JEP-0005 rule 21c).
+pub async fn held(ctx: &CliContext) -> Result<()> {
+    let secure = crate::cmd::secure::Secure::open(ctx)?;
+    let held = secure.held_requests().await?;
+    if held.is_empty() {
+        println!("{} holds no request for your key packages", secure.server());
+        return Ok(());
+    }
+    let contacts = &ctx.effective().contacts;
+    for h in held {
+        let name = contacts.get(&h.requester).map(String::as_str).unwrap_or("");
+        let minutes = (chrono::Utc::now().timestamp() - h.held_at).max(0) / 60;
+        println!(
+            "{}  {name:<16}  {}  for channel {}  (held {minutes} min ago)",
+            h.request_id_hex, h.requester, h.channel_id
+        );
+    }
+    println!(
+        "approve one with `jig server approve <id>`, or refuse it with `jig server refuse <id>`"
+    );
+    Ok(())
+}
+
+/// Apply `jig server approve <id>` or `jig server refuse <id>`.
+pub async fn decide(ctx: &CliContext, request_id: &str, approve: bool) -> Result<()> {
+    let secure = crate::cmd::secure::Secure::open(ctx)?;
+    secure.decide_held(request_id, approve).await?;
+    if approve {
+        println!(
+            "approved {request_id}: the requester's next request for that channel is \
+             released, once, within a day"
+        );
+    } else {
+        println!("refused {request_id}");
+    }
+    Ok(())
+}
+
 pub async fn custody(ctx: &CliContext, state: Switch) -> Result<()> {
     let secure = crate::cmd::secure::Secure::open(ctx)?;
     let on = state == Switch::On;

@@ -492,6 +492,41 @@ enum ServerAction {
         #[arg(value_enum)]
         state: cmd::server::Switch,
     },
+
+    /// Set your release policy on the configured server (JEP-0005 rule
+    /// 21b): it releases your key packages to the members you name, or to
+    /// anyone with `--any`, and holds every other request from another
+    /// server's member until you approve it (`jig server held`). Without a
+    /// policy of yours, the server's own `[custody] release` applies. Each
+    /// run replaces the last.
+    Policy {
+        /// Release to this member without asking: a did:jig, a `[contacts]`
+        /// name or a verified `alias@suffix`. Repeat for each.
+        #[arg(long = "release-to", value_name = "WHO")]
+        release_to: Vec<String>,
+        /// Release to anyone, as an `open` server does.
+        #[arg(long, conflicts_with = "release_to")]
+        any: bool,
+    },
+
+    /// List the requests for your key packages the configured server holds
+    /// for your decision (JEP-0005 rule 21c): who asked, for which channel.
+    Held,
+
+    /// Approve a held request: the requester's next request for the same
+    /// channel is released, once, within a day.
+    Approve {
+        /// The request's id, as `jig server held` lists it.
+        #[arg()]
+        request_id: String,
+    },
+
+    /// Refuse a held request.
+    Refuse {
+        /// The request's id, as `jig server held` lists it.
+        #[arg()]
+        request_id: String,
+    },
 }
 
 // Parsed once per process; boxing `Run`'s fields would buy nothing.
@@ -916,6 +951,16 @@ async fn run() -> Result<()> {
             }
             ServerAction::Forget { url } => {
                 cmd::server::forget(&ctx, url.as_deref())?;
+            }
+            ServerAction::Policy { release_to, any } => {
+                cmd::server::policy(&ctx, release_to, any).await?;
+            }
+            ServerAction::Held => cmd::server::held(&ctx).await?,
+            ServerAction::Approve { request_id } => {
+                cmd::server::decide(&ctx, &request_id, true).await?;
+            }
+            ServerAction::Refuse { request_id } => {
+                cmd::server::decide(&ctx, &request_id, false).await?;
             }
             ServerAction::Custody { state } => {
                 cmd::server::custody(&ctx, state).await?;
