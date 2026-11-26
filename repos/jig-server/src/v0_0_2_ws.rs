@@ -607,6 +607,11 @@ struct ConnState {
     /// Whether the hello asked for channel tiers (JEP-0014 rule 5): a client
     /// that did not may read a `public` channel but not post to it.
     tiers: bool,
+    /// Whether the welcome granted head gossip (JEP-0002 rule 10): only
+    /// then does this connection take `head` frames.
+    heads: bool,
+    /// The connection's allowance of heads ([`crate::v0_0_2_heads::CLIENT_HEADS`]).
+    head_allowance: crate::v0_0_2_heads::ClientAllowance,
 }
 
 /// A handshake that ends with the dialer's [`Frame::PeerProof`].
@@ -776,8 +781,11 @@ async fn handle_client_frame(
             Ok(()) => {
                 session.peer = jig_core::did::Did::from_did_jig_string(&awaiting.peer_did).ok();
                 if let Some(peer) = session.peer.clone() {
-                    let (sender, rx) =
-                        crate::v0_0_2_peer::PeerSender::with_tiers(peer, session.tiers);
+                    let (sender, rx) = crate::v0_0_2_peer::PeerSender::with_features(
+                        peer,
+                        session.tiers,
+                        session.heads,
+                    );
                     session.peer_registration = Some(state.peers.register(sender.clone()));
                     session.peer_sender = Some(sender);
                     session.peer_rx = Some(rx);
@@ -1054,6 +1062,23 @@ async fn handle_client_frame(
                 }
             }
             tracing::debug!(conn_id, sub_id = id, "ws subscription registered");
+            // What this server's heads show of the channel, to a client that
+            // takes them (JEP-0002 rule 10): a fork it holds the proof of,
+            // or a head past what it serves. Signed by the sequencer, so the
+            // client checks them itself.
+            if session.heads {
+                for record_b64 in
+                    crate::v0_0_2_heads::for_subscriber(&state.ingest_ctx.store, &sub_key)
+                {
+                    let frame = Envelope::new(Frame::Head {
+                        channel_id: sub_key.clone(),
+                        record_b64,
+                    });
+                    if let Ok(json) = serde_json::to_string(&frame) {
+                        let _ = socket.send(Message::Text(json.into())).await;
+                    }
+                }
+            }
             Ok(())
         }
 
@@ -1196,8 +1221,35 @@ async fn handle_client_frame(
 
         // ------------------------------------------------------------------ Head
         // Head gossip (JEP-0002 rule 10), on a connection whose welcome
-        // granted it. This server grants it to none yet, so every `head` is
-        // answered with an ordinary error and the connection stays up, as it
+        // granted it. Over the connection's limit, a refusal that says when
+        // to send again; otherwise nothing is said back, whatever the head
+        // showed, so it is no way to ask which channels this server holds.
+        Frame::Head {
+            channel_id,
+            record_b64,
+        } if session.heads && state.heads.get().is_some() => {
+            use base64::Engine as _;
+            let heads = state.heads.get().expect("checked above");
+            let Ok(envelope) = base64::engine::general_purpose::STANDARD.decode(&record_b64) else {
+                return Ok(());
+            };
+            if let crate::v0_0_2_heads::Taken::RateLimited(wait) =
+                heads.take_from_client(&mut session.head_allowance, &channel_id, &envelope)
+            {
+                let ms = crate::v0_0_2_ingest_error::millis(wait);
+                let _ = send_error_after(
+                    socket,
+                    Some(429),
+                    "RATE_LIMITED",
+                    None,
+                    &format!("head frames past this connection's limit; try again in {ms} ms"),
+                    Some(ms),
+                )
+                .await;
+            }
+            Ok(())
+        }
+        // Elsewhere, an ordinary error, and the connection stays up, as it
         // does for a frame a server predating heads cannot parse.
         Frame::Head { .. } => {
             let _ = send_error(
@@ -1249,9 +1301,9 @@ pub(crate) fn handshake_capabilities(state: &AppState) -> jig_pipeline::handshak
         // The request-proof versions this server accepts; `negotiate` signs
         // those the hello listed.
         request_auth: vec![jig_core::request_auth::VERSION.to_string()],
-        // Not yet: this server neither checks nor forwards `head` frames, so
-        // it grants none.
-        heads: false,
+        // Once head gossip is running here ([`crate::v0_0_2_contract`]);
+        // `negotiate` signs it only into a welcome whose hello asked.
+        heads: state.heads.get().is_some(),
     }
 }
 
@@ -1311,6 +1363,7 @@ async fn complete_hello(
     };
     match jig_pipeline::handshake::negotiate(&hello, &offer) {
         Ok(statement) => {
+            let heads = statement.capabilities.heads;
             let welcome = jig_pipeline::handshake::seal(&state.ingest_ctx.server_key, statement);
             let json = serde_json::to_string(&welcome).map_err(|err| err.to_string())?;
             socket
@@ -1319,6 +1372,7 @@ async fn complete_hello(
                 .map_err(|err| err.to_string())?;
             session.handshaken = true;
             session.tiers = hello.capabilities.tiers;
+            session.heads = heads;
             if let Some(peer_did) = hello.peer_did {
                 session.awaiting_peer = Some(AwaitingPeer {
                     peer_did,
@@ -3329,6 +3383,48 @@ mod tests {
             other => panic!("expected UNSUPPORTED_VERSION, got {other:?}"),
         }
         assert_eq!(close_code(&mut ws).await, Some(close::PROTOCOL_VIOLATION));
+    }
+
+    /// On a connection whose welcome granted `heads`, a head is taken and
+    /// nothing is said back; past the connection's allowance, `RATE_LIMITED`
+    /// with when to send again, whether or not the channel is held here.
+    #[tokio::test]
+    async fn heads_past_a_connections_allowance_are_refused_with_a_wait() {
+        let (state, url) = start_test_server().await;
+        assert!(
+            state
+                .heads
+                .set(Arc::new(crate::v0_0_2_heads::Heads::new(
+                    state.ingest_ctx.clone(),
+                    state.peers.clone(),
+                )))
+                .is_ok()
+        );
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+        handshake(&mut ws).await;
+        let head = Envelope::new(Frame::Head {
+            channel_id: jig_pipeline::ingest_record::label_cid("not here"),
+            record_b64: "AAAA".into(),
+        });
+        let text = serde_json::to_string(&head).unwrap();
+        for _ in 0..=crate::v0_0_2_heads::CLIENT_HEADS.burst {
+            ws.send(TMessage::Text(text.clone().into())).await.unwrap();
+        }
+        // The first frame back is the refusal of the one past the allowance:
+        // the ones within it were taken silently.
+        match next_frame(&mut ws).await.frame {
+            Frame::Error {
+                code,
+                status,
+                retry_after_ms,
+                ..
+            } => {
+                assert_eq!(code, "RATE_LIMITED");
+                assert_eq!(status, Some(429));
+                assert!(retry_after_ms.is_some_and(|ms| ms > 0));
+            }
+            other => panic!("expected RATE_LIMITED, got {other:?}"),
+        }
     }
 
     /// A `head` frame on a connection whose welcome did not grant `heads` is

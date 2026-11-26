@@ -130,6 +130,21 @@ fn lock_defects(
 
 /// The CID of a delivered bundle, or `None` when it does not decode; opening
 /// the block refuses it then, so the record check has nothing to compare.
+/// How often a client sends one channel's head (JEP-0002 rule 10).
+pub const HEAD_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The `head` frame for `record`, the latest this session verified of its
+/// channel.
+fn head_frame(record: &crate::chain::IngestRecord) -> Option<Message> {
+    use base64::Engine as _;
+    let envelope = record.cose_bytes().ok()?;
+    let frame = Envelope::new(Frame::Head {
+        channel_id: record.channel_id.clone(),
+        record_b64: base64::engine::general_purpose::STANDARD.encode(envelope),
+    });
+    Some(Message::Text(serde_json::to_string(&frame).ok()?.into()))
+}
+
 fn block_cid_of(bundle_b64: &str) -> Option<String> {
     use base64::Engine as _;
     let bytes = base64::engine::general_purpose::STANDARD
@@ -569,6 +584,11 @@ impl Client {
         let defects_for_reader = clock_defects.clone();
         let write_tx_for_reader = write_tx.clone();
         let hook_for_reader = on_contradiction.clone();
+        // Head gossip (JEP-0002 rule 10), when the welcome granted it: the
+        // latest record verified per channel, sent at most once every
+        // `HEAD_EVERY` per channel.
+        let send_heads = welcome.capabilities.heads;
+        let mut heads_sent: HashMap<String, std::time::Instant> = HashMap::new();
         tokio::spawn(async move {
             let _cleanup = ReaderCleanup {
                 pending_subscriptions: pending_subs_for_reader.clone(),
@@ -725,6 +745,20 @@ impl Client {
                                     contradict_with(code, reason, &text, Some(Box::new(proof)));
                                     break;
                                 }
+                                if send_heads
+                                    && step.is_ok()
+                                    && let Some(head) = chain.head().and_then(|h| h.record.as_ref())
+                                    && heads_sent
+                                        .get(&record.channel_id)
+                                        .is_none_or(|at| at.elapsed() >= HEAD_EVERY)
+                                    && let Some(frame) = head_frame(head)
+                                {
+                                    heads_sent.insert(
+                                        record.channel_id.clone(),
+                                        std::time::Instant::now(),
+                                    );
+                                    let _ = write_tx_for_reader.send(frame);
+                                }
                                 match step {
                                     Ok(crate::chain::Step::Gap { from, to }) => {
                                         lock_gaps(&gaps_for_reader).push(ChainGap {
@@ -805,6 +839,61 @@ impl Client {
                         // a block kind it does not implement: refused at
                         // subscribe, or ended mid-stream. A connection holds one
                         // subscription, so it ends, with the reason.
+                        // A head the server passes on (JEP-0002 rule 10):
+                        // a record signed by the channel's sequencer, held
+                        // to this session's chain like any other. A fork it
+                        // shows is the sequencer's, which may be another
+                        // server: the evidence names whose key signed both.
+                        Frame::Head {
+                            channel_id,
+                            record_b64,
+                        } if send_heads => {
+                            use base64::Engine as _;
+                            let Some(record) = base64::engine::general_purpose::STANDARD
+                                .decode(&record_b64)
+                                .ok()
+                                .and_then(|e| crate::chain::IngestRecord::from_cose(&e).ok())
+                                .filter(|r| r.channel_id == channel_id)
+                            else {
+                                continue;
+                            };
+                            let chains = lock_chains(&chains_for_reader);
+                            let Some(chain) = chains.get(&channel_id) else {
+                                continue;
+                            };
+                            match chain.check_seen(&record, None) {
+                                crate::chain::SeenCheck::Forked(proof) => {
+                                    drop(chains);
+                                    contradict_with(
+                                        "chain-seen-forked",
+                                        format!(
+                                            "a head of channel {channel_id} is record {} signed \
+                                             by its sequencer, and not the one this session \
+                                             verified",
+                                            record.seq
+                                        ),
+                                        &text,
+                                        Some(Box::new(crate::evidence::Proof::Chain(proof))),
+                                    );
+                                    break;
+                                }
+                                crate::chain::SeenCheck::Differs { seq } => tracing::warn!(
+                                    channel = %channel_id,
+                                    seq,
+                                    "a head is not the record this session verified at that seq"
+                                ),
+                                crate::chain::SeenCheck::Ahead { to } => {
+                                    let from = chain.head().map_or(0, |h| h.seq + 1);
+                                    drop(chains);
+                                    lock_gaps(&gaps_for_reader).push(ChainGap {
+                                        channel_id: channel_id.clone(),
+                                        from,
+                                        to: to + 1,
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
                         Frame::Error { code, message, .. }
                             if code == jig_pipeline::fanout::CHANNEL_NEEDS_UPGRADE =>
                         {

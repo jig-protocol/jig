@@ -246,6 +246,8 @@ impl Default for ClientOffer {
                 ruleset: true,
                 // It signs request proofs bound to their audience.
                 request_auth: vec![jig_core::request_auth::VERSION.to_string()],
+                // It sends the heads it verifies (JEP-0002 rule 10).
+                heads: true,
                 ..Capabilities::default()
             },
             pinned_server_did: None,

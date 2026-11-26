@@ -91,6 +91,8 @@ pub struct Contracts {
     /// The same [`Relay`] as `AppState::relay`, once [`handle`] has set it:
     /// one table of requests waiting on owners.
     relay: Arc<Relay>,
+    /// `AppState::heads`, which [`handle`] sets.
+    heads: Arc<std::sync::OnceLock<Arc<crate::v0_0_2_heads::Heads>>>,
 }
 
 /// Run the contract on `state`'s server:
@@ -136,6 +138,16 @@ pub fn start(state: &AppState) -> Contracts {
 /// resending, the decisions and the pulls.
 fn handle(state: &AppState) -> Contracts {
     let contracts = Contracts::new(state);
+    // Head gossip (JEP-0002 rule 10) rides the same peer connections, and a
+    // follower fetches up to a head with the contract's stream.
+    let heads = Arc::new(crate::v0_0_2_heads::Heads::new(
+        state.ingest_ctx.clone(),
+        state.peers.clone(),
+    ));
+    heads.set_stream(contracts.stream.clone());
+    if state.heads.set(heads).is_err() {
+        tracing::warn!("head gossip was already set up");
+    }
     repair_relayed_copies(&state.ingest_ctx.store);
     if !state.set_peer_frames(Arc::new(contracts.clone())) {
         tracing::warn!("a peer-frame handler was already registered; contract frames go to it");
@@ -246,6 +258,7 @@ impl Contracts {
                     state.peers.clone(),
                 ))
             }),
+            heads: state.heads.clone(),
         }
     }
 
@@ -960,6 +973,13 @@ impl PeerFrames for Contracts {
                         tracing::warn!("contract end not recorded: {e:#}");
                     }
                 });
+            }
+            crate::v0_0_2_heads::HEAD_FRAME => {
+                if let Some(heads) = self.heads.get()
+                    && let Ok(peer) = Did::from_did_jig_string(&peer)
+                {
+                    heads.on_peer_frame(&peer, body);
+                }
             }
             // A frame for a later slice of the contract, or another
             // extension: not this handler's to judge.

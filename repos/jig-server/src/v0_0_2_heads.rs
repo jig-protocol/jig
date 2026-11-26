@@ -11,8 +11,317 @@
 //! it ignores the kind. Its body is deterministic CBOR, like the stream's
 //! frames ([`crate::v0_0_2_stream`]).
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+use jig_config::v0_0_2_server::RateLimit;
 use jig_core::dcbor::{self, Value};
-use jig_pipeline::ingest_record::MAX_COSE_BYTES;
+use jig_core::did::Did;
+use jig_pipeline::contracts::{OfferState, Side};
+use jig_pipeline::heads::HeadCheck;
+use jig_pipeline::ingest::IngestContext;
+use jig_pipeline::ingest_record::{IngestRecord, MAX_COSE_BYTES};
+
+use crate::v0_0_2_peer::PeerRegistry;
+use crate::v0_0_2_stream::{RequestLimit, Stream};
+
+/// How many heads one client connection may hand in: one a second, with a
+/// burst of 32. A client sends one per channel it follows on subscribe, and
+/// then at most one every [`CLIENT_SEND_EVERY`] per channel.
+pub const CLIENT_HEADS: RateLimit = RateLimit {
+    per_min: 60,
+    burst: 32,
+};
+
+/// How many heads one peer may hand in: 20 a second, with a burst of 200.
+pub const PEER_HEADS: RateLimit = RateLimit {
+    per_min: 1200,
+    burst: 200,
+};
+
+/// The most often this server forwards one channel's head to one peer.
+pub const FORWARD_EVERY: Duration = Duration::from_secs(5);
+
+/// The most often a client sends one channel's head.
+pub const CLIENT_SEND_EVERY: Duration = Duration::from_secs(30);
+
+/// One client connection's allowance of heads ([`CLIENT_HEADS`]), kept
+/// with the connection so that it goes when the connection does.
+#[derive(Debug, Clone)]
+pub struct ClientAllowance {
+    tokens: f64,
+    at: tokio::time::Instant,
+}
+
+impl Default for ClientAllowance {
+    fn default() -> Self {
+        ClientAllowance {
+            tokens: f64::from(CLIENT_HEADS.burst),
+            at: tokio::time::Instant::now(),
+        }
+    }
+}
+
+impl ClientAllowance {
+    /// Take one head, or say how long until one is free.
+    fn take(&mut self, now: tokio::time::Instant) -> Result<(), Duration> {
+        let per_sec = f64::from(CLIENT_HEADS.per_min) / 60.0;
+        let elapsed = now.saturating_duration_since(self.at).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * per_sec).min(f64::from(CLIENT_HEADS.burst));
+        self.at = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            Ok(())
+        } else {
+            Err(Duration::from_secs_f64((1.0 - self.tokens) / per_sec))
+        }
+    }
+}
+
+/// What became of a head handed in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Taken {
+    /// Over its sender's limit: refused, with when to send again. Charged
+    /// before anything else is looked at, so the answer is the same whether
+    /// or not this server holds the channel.
+    RateLimited(Duration),
+    /// Looked at. Nothing is said back, whatever it showed.
+    Checked(HeadCheck),
+}
+
+/// One server's head gossip: what clients and peers hand it, and what it
+/// forwards.
+pub struct Heads {
+    ctx: Arc<IngestContext>,
+    peers: Arc<PeerRegistry>,
+    /// The follower's stream, to fetch up to a head past its chain.
+    stream: OnceLock<Stream>,
+    from_peers: RequestLimit,
+    /// When each channel's head was last forwarded to each peer.
+    forwarded: Mutex<HashMap<(String, String), tokio::time::Instant>>,
+    /// Signatures checked: what a flood of heads cost.
+    verifications: AtomicU64,
+}
+
+impl Heads {
+    pub fn new(ctx: Arc<IngestContext>, peers: Arc<PeerRegistry>) -> Self {
+        Heads {
+            ctx,
+            peers,
+            stream: OnceLock::new(),
+            from_peers: RequestLimit::new(PEER_HEADS),
+            forwarded: Mutex::new(HashMap::new()),
+            verifications: AtomicU64::new(0),
+        }
+    }
+
+    /// The stream a follower fetches with. Once.
+    pub fn set_stream(&self, stream: Stream) {
+        let _ = self.stream.set(stream);
+    }
+
+    /// How many signatures heads have cost this server.
+    pub fn verifications(&self) -> u64 {
+        self.verifications.load(Ordering::Relaxed)
+    }
+
+    /// Take `envelope`, a head for `channel_id`, from a client whose
+    /// connection holds `allowance`.
+    pub fn take_from_client(
+        &self,
+        allowance: &mut ClientAllowance,
+        channel_id: &str,
+        envelope: &[u8],
+    ) -> Taken {
+        if envelope.len() > MAX_COSE_BYTES {
+            return Taken::Checked(HeadCheck::Malformed("past the record size".into()));
+        }
+        if let Err(wait) = allowance.take(tokio::time::Instant::now()) {
+            return Taken::RateLimited(wait);
+        }
+        Taken::Checked(self.check(None, channel_id, envelope))
+    }
+
+    /// Take `envelope`, a head for `channel_id`, from `peer`.
+    pub fn take_from_peer(&self, peer: &Did, channel_id: &str, envelope: &[u8]) -> Taken {
+        if envelope.len() > MAX_COSE_BYTES {
+            return Taken::Checked(HeadCheck::Malformed("past the record size".into()));
+        }
+        let peer = peer.to_did_jig_string();
+        if let Err(wait) = self.from_peers.take(&peer, "", tokio::time::Instant::now()) {
+            return Taken::RateLimited(wait);
+        }
+        Taken::Checked(self.check(Some(&peer), channel_id, envelope))
+    }
+
+    /// The store's check ([`jig_pipeline::heads`]), which looks at bytes
+    /// before signatures, and what follows from it. The sender is charged
+    /// already, before the channel is looked up, so that a refusal does not
+    /// depend on whether this server holds it.
+    fn check(&self, from: Option<&str>, channel_id: &str, envelope: &[u8]) -> HeadCheck {
+        let check = match self.ctx.store.check_head(channel_id, envelope) {
+            Ok(check) => check,
+            Err(e) => {
+                tracing::warn!(channel_id, "checking a head: {e}");
+                return HeadCheck::Malformed("not checked".into());
+            }
+        };
+        if check.verified() {
+            self.verifications.fetch_add(1, Ordering::Relaxed);
+        }
+        match &check {
+            HeadCheck::Ahead { advanced: true, .. } => {
+                self.fetch_up_to(channel_id);
+                self.forward(channel_id, envelope, from);
+            }
+            HeadCheck::Fork {
+                first: true, seq, ..
+            } => {
+                tracing::warn!(
+                    channel_id,
+                    seq,
+                    "a head shows the channel's sequencer forked"
+                );
+                self.forward(channel_id, envelope, from);
+            }
+            _ => {}
+        }
+        check
+    }
+
+    /// The server that sequences `channel_id`, when it is not this one.
+    fn owner_of(&self, channel_id: &str) -> Option<String> {
+        let channel = self.ctx.store.get_channel_by_id(channel_id).ok()??;
+        let local = self.ctx.store.local_sequencer();
+        (!channel.sequencer_did.is_empty()
+            && !jig_pipeline::handshake::same_did(&channel.sequencer_did, local))
+        .then_some(channel.sequencer_did)
+    }
+
+    /// A follower handed a head past its chain asks the owner for what it is
+    /// missing, as its periodic pull would.
+    fn fetch_up_to(&self, channel_id: &str) {
+        if let (Some(owner), Some(stream)) = (self.owner_of(channel_id), self.stream.get()) {
+            stream.pull_from_head(&owner, channel_id);
+        }
+    }
+
+    /// The servers `channel_id`'s heads go to: its owner, when this server
+    /// follows it, and every server holding an accepted share of it, when
+    /// this server owns it.
+    fn targets(&self, channel_id: &str) -> Vec<String> {
+        let mut targets: Vec<String> = self.owner_of(channel_id).into_iter().collect();
+        match self
+            .ctx
+            .store
+            .contract_offers_in(Side::Owner, OfferState::Accepted)
+        {
+            Ok(shares) => targets.extend(
+                shares
+                    .into_iter()
+                    .filter(|s| s.channel_id == channel_id)
+                    .map(|s| s.peer_did),
+            ),
+            Err(e) => tracing::warn!(channel_id, "listing a channel's shares: {e}"),
+        }
+        targets
+    }
+
+    /// Send `envelope` on to every target but `from`, on links that take
+    /// heads, at most once every [`FORWARD_EVERY`] per peer and channel.
+    fn forward(&self, channel_id: &str, envelope: &[u8], from: Option<&str>) {
+        let body = ChannelHead {
+            channel_id: channel_id.to_string(),
+            record: envelope.to_vec(),
+        }
+        .encode();
+        let now = tokio::time::Instant::now();
+        for target in self.targets(channel_id) {
+            if from.is_some_and(|f| jig_pipeline::handshake::same_did(f, &target)) {
+                continue;
+            }
+            let Some(sender) = Did::from_did_jig_string(&target)
+                .ok()
+                .and_then(|did| self.peers.sender_for(&did))
+                .filter(|s| s.heads())
+            else {
+                continue;
+            };
+            {
+                let mut forwarded = self.forwarded.lock().unwrap_or_else(|p| p.into_inner());
+                let key = (target.clone(), channel_id.to_string());
+                if forwarded
+                    .get(&key)
+                    .is_some_and(|at| now.saturating_duration_since(*at) < FORWARD_EVERY)
+                {
+                    continue;
+                }
+                forwarded.insert(key, now);
+            }
+            if let Err(e) = sender.send(HEAD_FRAME, body.clone()) {
+                tracing::debug!(peer = target, "head not forwarded: {e}");
+            }
+        }
+    }
+
+    /// A [`HEAD_FRAME`] from `peer`. A body that does not decode is
+    /// dropped; a peer over its limit has its heads dropped until it is
+    /// under it again. Neither closes the connection, which carries every
+    /// contract between the two servers.
+    pub fn on_peer_frame(&self, peer: &Did, body: &[u8]) {
+        let Some(head) = ChannelHead::decode(body) else {
+            tracing::debug!(peer = %peer.to_did_jig_string(), "a channel-head that does not decode");
+            return;
+        };
+        if let Taken::RateLimited(wait) = self.take_from_peer(peer, &head.channel_id, &head.record)
+        {
+            tracing::debug!(
+                peer = %peer.to_did_jig_string(),
+                "heads past the limit, dropped for {wait:?}"
+            );
+        }
+    }
+}
+
+/// What a server tells a client that subscribes to `channel_id` on a
+/// connection that takes heads, as base64 record envelopes: both records of
+/// the fork its chain evidence holds, when it holds one, and the highest
+/// head it was handed, when that is past what it serves. Either is signed
+/// by the channel's sequencer, so the client checks them against its own
+/// chain as it checks any record; what the server says is not taken on its
+/// word.
+pub fn for_subscriber(store: &jig_pipeline::persist::SqliteStore, channel_id: &str) -> Vec<String> {
+    use base64::Engine as _;
+    let b64 = |r: &IngestRecord| {
+        r.cose_bytes()
+            .ok()
+            .map(|e| base64::engine::general_purpose::STANDARD.encode(e))
+    };
+    let mut out = Vec::new();
+    if let Ok(evidence) = store.chain_evidence(channel_id) {
+        for e in evidence {
+            for bytes in [&e.held, &e.offered] {
+                if let Some(record) = IngestRecord::decode(bytes).ok().as_ref().and_then(b64) {
+                    out.push(record);
+                }
+            }
+        }
+    }
+    let served = store
+        .latest_ingest_record(channel_id)
+        .ok()
+        .flatten()
+        .map(|r| r.seq);
+    if let Ok(Some(kept)) = store.kept_head_record(channel_id)
+        && served.is_none_or(|s| kept.seq > s)
+        && let Some(record) = b64(&kept)
+    {
+        out.push(record);
+    }
+    out
+}
 
 /// The peer frame kind for one channel's head.
 pub const HEAD_FRAME: &str = "channel-head";
@@ -98,6 +407,231 @@ mod tests {
         ] {
             assert_eq!(ChannelHead::decode(&bad), None);
         }
+    }
+
+    /// A server and a channel it sequences, with its record 0.
+    async fn sequencing() -> (crate::v0_0_2::AppState, String, IngestRecord) {
+        let state = crate::v0_0_2::AppState::for_test().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let owner = jig_client::Identity::generate_for_tests(dir.path());
+        let block = jig_client::blocks::build_channel_create(
+            &owner,
+            "#c",
+            "open",
+            &state.server_did.to_did_jig_string(),
+            jig_core::HlcTimestamp::now_wall(owner.did().clone()),
+        );
+        let cid = jig_pipeline::ingest::ingest(
+            &state.ingest_ctx,
+            jig_core::BlockBundle {
+                manifest_bytes: &block.manifest_bytes,
+                code_bytes: &block.code_bytes,
+                resources: vec![],
+            },
+            block.sender_sig.clone(),
+            jig_pipeline::ingest::IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .unwrap();
+        let held = state
+            .ingest_ctx
+            .store
+            .list_ingest_records_by_id(&cid, 0, 1)
+            .unwrap()
+            .remove(0);
+        (state, cid, held)
+    }
+
+    /// F2 Task 10: a flood of heads costs no signature checks past what the
+    /// sender's allowance lets through. Duplicates, oversize heads and
+    /// heads over the limit cost none; distinct stale heads, which could be
+    /// a fork, cost one each, and only up to the allowance. Over the limit,
+    /// the refusal is the same whether or not the channel is held here.
+    #[tokio::test(start_paused = true)]
+    async fn a_flood_of_heads_costs_no_more_signatures_than_its_allowance() {
+        let (state, channel, held) = sequencing().await;
+        let heads = Heads::new(state.ingest_ctx.clone(), state.peers.clone());
+        let duplicate = held.cose_bytes().unwrap();
+        let burst = CLIENT_HEADS.burst as usize;
+
+        // Duplicates, up to the allowance and past it: no signature.
+        let mut allowance = ClientAllowance::default();
+        let taken: Vec<Taken> = (0..burst * 3)
+            .map(|_| heads.take_from_client(&mut allowance, &channel, &duplicate))
+            .collect();
+        assert!(
+            taken[..burst]
+                .iter()
+                .all(|t| *t == Taken::Checked(HeadCheck::Duplicate))
+        );
+        assert!(
+            taken[burst..]
+                .iter()
+                .all(|t| matches!(t, Taken::RateLimited(_)))
+        );
+        assert_eq!(heads.verifications(), 0);
+
+        // Oversize: refused before anything is charged or checked.
+        let mut allowance = ClientAllowance::default();
+        for _ in 0..burst * 3 {
+            assert!(matches!(
+                heads.take_from_client(&mut allowance, &channel, &vec![0; MAX_COSE_BYTES + 1]),
+                Taken::Checked(HeadCheck::Malformed(_))
+            ));
+        }
+        assert_eq!(heads.verifications(), 0);
+
+        // Over the limit, a held and an unheld channel are refused alike.
+        let unheld = jig_pipeline::ingest_record::label_cid("not here");
+        let mut allowance = ClientAllowance::default();
+        for _ in 0..burst {
+            heads.take_from_client(&mut allowance, &unheld, &duplicate);
+        }
+        for channel in [&channel, &unheld] {
+            assert!(matches!(
+                heads.take_from_client(&mut allowance, channel, &duplicate),
+                Taken::RateLimited(_)
+            ));
+        }
+        assert_eq!(heads.verifications(), 0);
+
+        // Distinct heads at a held seq, by keys that are not the sequencer's:
+        // each could be a fork, so each within the allowance is checked, and
+        // none past it.
+        let mut allowance = ClientAllowance::default();
+        for _ in 0..burst * 3 {
+            let forged = RecordSigner {
+                channel_id: channel.clone(),
+                key: &jig_core::crypto::ed25519::generate_signing_key(),
+                ingest_wall_ms: 1,
+                ingest_logical: 0,
+            }
+            .sign(0, &channel, GENESIS_PREV)
+            .unwrap();
+            heads.take_from_client(&mut allowance, &channel, &forged.cose_bytes().unwrap());
+        }
+        assert_eq!(heads.verifications(), burst as u64);
+
+        // A peer's allowance is larger, and the same holds for it.
+        let peer = Did::from_ed25519_pubkey(&[9; 32]);
+        let before = heads.verifications();
+        let refused = (0..PEER_HEADS.burst as usize + 50)
+            .filter(|_| {
+                matches!(
+                    heads.take_from_peer(&peer, &channel, &duplicate),
+                    Taken::RateLimited(_)
+                )
+            })
+            .count();
+        assert_eq!(refused, 50);
+        assert_eq!(heads.verifications(), before);
+    }
+
+    /// A head past the chain goes on to the servers holding a share of the
+    /// channel, on links that take heads, never back to whoever sent it,
+    /// and at most once every [`FORWARD_EVERY`] per peer and channel.
+    #[tokio::test(start_paused = true)]
+    async fn a_head_past_the_chain_goes_on_to_the_channels_other_servers() {
+        use crate::v0_0_2_peer::PeerSender;
+        let (state, channel, held) = sequencing().await;
+        let heads = Heads::new(state.ingest_ctx.clone(), state.peers.clone());
+        let peer = |n: u8| Did::from_ed25519_pubkey(&[n; 32]);
+        let (takes, others, source) = (peer(1), peer(2), peer(3));
+        let mut inboxes = Vec::new();
+        for (did, takes_heads) in [(&takes, true), (&others, false), (&source, true)] {
+            let (sender, rx) = PeerSender::with_features(did.clone(), true, takes_heads);
+            state.peers.register(sender);
+            inboxes.push(rx);
+            state
+                .ingest_ctx
+                .store
+                .put_contract_offer(&jig_pipeline::contracts::StoredOffer {
+                    offer_id: [did.as_bytes().unwrap()[0]; 32],
+                    channel_id: channel.clone(),
+                    side: Side::Owner,
+                    peer_did: did.to_did_jig_string(),
+                    grant: jig_core::contract::Grant::Write,
+                    state: OfferState::Accepted,
+                    offer: Vec::new(),
+                    answer: None,
+                    share_cid: None,
+                })
+                .unwrap();
+        }
+        let ahead = |seq: u64| {
+            RecordSigner {
+                channel_id: channel.clone(),
+                key: &state.ingest_ctx.server_key,
+                ingest_wall_ms: 99,
+                ingest_logical: 0,
+            }
+            .sign(seq, &channel, held.hash())
+            .unwrap()
+            .cose_bytes()
+            .unwrap()
+        };
+        let sent = |inbox: &mut tokio::sync::mpsc::Receiver<jig_pipeline::Envelope>| {
+            std::iter::from_fn(|| inbox.try_recv().ok())
+                .filter_map(|e| match e.frame {
+                    jig_pipeline::Frame::Peer { kind, body } if kind == HEAD_FRAME => {
+                        ChannelHead::decode(&body)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let first = ahead(5);
+        assert_eq!(
+            heads.take_from_peer(&source, &channel, &first),
+            Taken::Checked(HeadCheck::Ahead {
+                seq: 5,
+                advanced: true
+            })
+        );
+        assert_eq!(sent(&mut inboxes[0]).len(), 1, "a link that takes heads");
+        assert!(sent(&mut inboxes[1]).is_empty(), "a link that does not");
+        assert!(sent(&mut inboxes[2]).is_empty(), "never back to the sender");
+
+        // Coalesced: a higher head within the interval is not sent again.
+        heads.take_from_peer(&source, &channel, &ahead(6));
+        assert!(sent(&mut inboxes[0]).is_empty());
+        tokio::time::advance(FORWARD_EVERY).await;
+        heads.take_from_peer(&source, &channel, &ahead(7));
+        let got = sent(&mut inboxes[0]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(IngestRecord::from_cose(&got[0].record).unwrap().seq, 7);
+    }
+
+    /// A subscriber is told the highest head this server was handed, when
+    /// it is past what the server serves; and nothing when there is none.
+    #[tokio::test]
+    async fn a_subscriber_is_told_of_a_head_past_what_is_served() {
+        let (state, channel, held) = sequencing().await;
+        let store = &state.ingest_ctx.store;
+        assert!(for_subscriber(store, &channel).is_empty());
+        let ahead = RecordSigner {
+            channel_id: channel.clone(),
+            key: &state.ingest_ctx.server_key,
+            ingest_wall_ms: 99,
+            ingest_logical: 0,
+        }
+        .sign(3, &channel, held.hash())
+        .unwrap();
+        let heads = Heads::new(state.ingest_ctx.clone(), state.peers.clone());
+        heads.take_from_peer(
+            &Did::from_ed25519_pubkey(&[4; 32]),
+            &channel,
+            &ahead.cose_bytes().unwrap(),
+        );
+        use base64::Engine as _;
+        assert_eq!(
+            for_subscriber(store, &channel),
+            vec![base64::engine::general_purpose::STANDARD.encode(ahead.cose_bytes().unwrap())]
+        );
     }
 
     /// `jig-spec/jep/vectors/0002/heads.json` (JEP-0002 rule 10): one record,

@@ -85,6 +85,10 @@ pub struct AppState {
     /// ([`crate::v0_0_2_relay`]), set once the contract runs. Shared by
     /// every clone.
     pub relay: Arc<std::sync::OnceLock<Arc<crate::v0_0_2_relay::Relay>>>,
+    /// Head gossip (JEP-0002 rule 10), once the federation contract has set
+    /// it up ([`crate::v0_0_2_contract::start`]). A welcome grants `heads`
+    /// only when it is set.
+    pub heads: Arc<std::sync::OnceLock<Arc<crate::v0_0_2_heads::Heads>>>,
     /// The ruleset this server declares (`[ruleset]`, JEP-0009 rule 4), read
     /// at boot; `None` when it declares none.
     pub ruleset: Option<Arc<crate::v0_0_2_ruleset::Declared>>,
@@ -434,6 +438,7 @@ impl AppState {
             prior_dids,
             peer_frames: Default::default(),
             relay: Default::default(),
+            heads: Default::default(),
             peers: Default::default(),
             ruleset,
         })
@@ -509,6 +514,7 @@ impl AppState {
             prior_dids: Vec::new(),
             peer_frames: Default::default(),
             relay: Default::default(),
+            heads: Default::default(),
             peers: Default::default(),
             ruleset,
         })
@@ -568,6 +574,7 @@ impl AppState {
             prior_dids: Vec::new(),
             peer_frames: Default::default(),
             relay: Default::default(),
+            heads: Default::default(),
             peers: Default::default(),
             ruleset,
         })

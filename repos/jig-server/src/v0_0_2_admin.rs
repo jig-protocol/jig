@@ -436,6 +436,7 @@ mod tests {
             peers: Default::default(),
             ruleset: None,
             relay: Default::default(),
+            heads: Default::default(),
         })
     }
 

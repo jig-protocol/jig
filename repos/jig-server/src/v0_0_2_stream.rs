@@ -656,7 +656,7 @@ impl Stream {
     }
 
     /// Ask `peer` for `channel_id`'s records past this server's head.
-    fn pull_from_head(&self, peer: &str, channel_id: &str) {
+    pub(crate) fn pull_from_head(&self, peer: &str, channel_id: &str) {
         // Stopped for an upgrade (JEP-0005 rule 14c): asked for nothing, on
         // the periodic pull or on a retry the owner scheduled before the stop.
         if !matches!(self.store().carried_upgrade(channel_id), Ok(None)) {

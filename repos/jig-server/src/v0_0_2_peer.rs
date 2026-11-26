@@ -77,6 +77,9 @@ pub struct PeerSender {
     /// Whether the peer implements channel tiers (JEP-0014), as its handshake
     /// on this connection said.
     tiers: bool,
+    /// Whether the handshake on this connection granted head gossip
+    /// (JEP-0002 rule 10): only then are `channel-head` frames sent on it.
+    heads: bool,
     tx: mpsc::Sender<Envelope>,
 }
 
@@ -90,8 +93,27 @@ impl PeerSender {
     /// [`Self::new`], for a peer whose handshake said whether it implements
     /// tiers.
     pub fn with_tiers(peer: Did, tiers: bool) -> (Self, mpsc::Receiver<Envelope>) {
+        Self::with_features(peer, tiers, false)
+    }
+
+    /// [`Self::with_tiers`], for a peer whose handshake also said whether it
+    /// takes head gossip.
+    pub fn with_features(peer: Did, tiers: bool, heads: bool) -> (Self, mpsc::Receiver<Envelope>) {
         let (tx, rx) = mpsc::channel(PEER_QUEUE);
-        (Self { peer, tiers, tx }, rx)
+        (
+            Self {
+                peer,
+                tiers,
+                heads,
+                tx,
+            },
+            rx,
+        )
+    }
+
+    /// Whether the peer takes head gossip on this connection.
+    pub fn heads(&self) -> bool {
+        self.heads
     }
 
     /// The DID this connection's peer proved.
