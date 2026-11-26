@@ -10,7 +10,8 @@
 //!   1 and 1b run before it finds the channel carried);
 //! - it checks the grant itself, so the owner never sees a write it would
 //!   refuse for that, and it holds at most [`MAX_IN_FLIGHT`] relays per
-//!   client connection, [`MAX_CLIENT_IN_FLIGHT`] per client and
+//!   client connection (each REST request is its own, and its address is
+//!   the client), [`MAX_CLIENT_IN_FLIGHT`] per client and
 //!   [`MAX_SERVER_IN_FLIGHT`] in all, refusing past any of them with
 //!   `RELAY_BUSY` and when to try again. Nothing waits in a queue: a write
 //!   the owner cannot take now is refused with a code, never dropped (this
@@ -1222,6 +1223,23 @@ mod tests {
             held.push(relay.hold(&carol).unwrap());
         }
         busy(relay.hold(&carol).err().unwrap(), "this connection");
+    }
+
+    /// A REST request's connection key is its own, so it must not outlive
+    /// the request: after many REST relays from one address have ended,
+    /// nothing is left counted for their connections or their client.
+    #[tokio::test]
+    async fn rest_relays_leave_no_slots_behind() {
+        let state = crate::v0_0_2::AppState::for_test().unwrap();
+        let relay = relay_for(&state);
+        let ip = Some(std::net::IpAddr::from([192, 0, 2, 9]));
+        for _ in 0..4 * MAX_CLIENT_IN_FLIGHT {
+            drop(relay.hold(&rest_caller(ip, "did:jig:zAuthor")).unwrap());
+        }
+        let counts = relay.in_flight.lock().unwrap();
+        assert!(counts.conns.is_empty(), "{:?}", counts.conns);
+        assert!(counts.clients.is_empty(), "{:?}", counts.clients);
+        assert_eq!(counts.total, 0);
     }
 
     /// The answer `rx` carries next, as the follower would read it.

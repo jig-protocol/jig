@@ -4238,17 +4238,18 @@ mod tests {
 
     /// A REST write's relay slots are its caller's: whoever replays an
     /// author's signed blocks from their own address fills their own
-    /// [`crate::v0_0_2_relay::MAX_IN_FLIGHT`], and the author, from theirs,
-    /// still gets through.
+    /// [`crate::v0_0_2_relay::MAX_CLIENT_IN_FLIGHT`] (each request is its
+    /// own connection, and the address is the client), and the author, from
+    /// theirs, still gets through.
     #[tokio::test]
-    async fn a_replayer_holds_its_own_relay_slots_not_the_authors() {
+    async fn a_replayer_fills_its_own_client_slots_not_the_authors() {
         let p = pair(OfferPolicy::Accept).await;
         let channel = p.carried("write").await;
         let (silent, mut swallowed) = PeerSender::new(p.owner.server_did.clone());
         let _registration = p.follower.peers.register(silent);
         let author = SigningKey::from_bytes(&rand::random());
         let mut waiting = Vec::new();
-        for i in 0..crate::v0_0_2_relay::MAX_IN_FLIGHT {
+        for i in 0..crate::v0_0_2_relay::MAX_CLIENT_IN_FLIGHT {
             let parts = signed(
                 &author,
                 BlockKind::TextRender,
@@ -4260,7 +4261,7 @@ mod tests {
             }));
         }
         let ten_s = std::time::Duration::from_secs(10);
-        for _ in 0..crate::v0_0_2_relay::MAX_IN_FLIGHT {
+        for _ in 0..crate::v0_0_2_relay::MAX_CLIENT_IN_FLIGHT {
             tokio::time::timeout(ten_s, swallowed.recv())
                 .await
                 .expect("a replayed write is relayed")
