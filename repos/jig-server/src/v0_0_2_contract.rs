@@ -77,9 +77,10 @@ pub const END_FRAME: &str = "contract-end";
 /// that does not know the frame ignores it and judges the offer as before.
 pub const KEY_LINKS_FRAME: &str = "owner-key-links";
 
-/// The most key-link chains the offered side holds for offers that have not
-/// arrived yet. Each is sent just before its offer, so a few suffice; past
-/// this many, the held ones are dropped and their offers judged without.
+/// The most key-link chains the offered side holds, per sending peer, for
+/// offers that have not arrived yet. Each is sent just before its offer, so a
+/// few suffice; past this many, that peer's held ones are dropped and its
+/// offers judged without.
 const MAX_PENDING_KEY_LINKS: usize = 64;
 
 /// Key-link chains held for offers to come, by the sending peer's DID and the
@@ -454,11 +455,25 @@ impl Contracts {
 
     /// Send an offer to `peer`, with the key-link chain it needs, if any,
     /// just before it.
+    /// Both go on one connection, and the offer goes only if its chain was
+    /// queued: an offer that arrived without its chain would be refused.
     fn send_offer(&self, peer: &str, offer: Vec<u8>, links: Option<OwnerKeyLinks>) {
-        if let Some(links) = links {
-            self.send(peer, KEY_LINKS_FRAME, links.to_bytes());
+        let Ok(did) = Did::from_did_jig_string(peer) else {
+            return;
+        };
+        let Some(sender) = self.peers.sender_for(&did) else {
+            tracing::debug!(peer, "no live connection to the peer");
+            return;
+        };
+        if let Some(links) = links
+            && let Err(e) = sender.send(KEY_LINKS_FRAME, links.to_bytes())
+        {
+            tracing::info!(peer, "key links not sent, so the offer waits: {e}");
+            return;
         }
-        self.send(peer, OFFER_FRAME, offer);
+        if let Err(e) = sender.send(OFFER_FRAME, offer) {
+            tracing::info!(peer, kind = OFFER_FRAME, "contract frame not sent: {e}");
+        }
     }
 
     /// The links from the DID `offer`'s creation block names as the
@@ -1008,8 +1023,10 @@ impl PeerFrames for Contracts {
             KEY_LINKS_FRAME => {
                 let chain = OwnerKeyLinks::from_bytes(body).map_err(violation)?;
                 let mut pending = self.pending_key_links.lock().expect("poisoned");
-                if pending.len() >= MAX_PENDING_KEY_LINKS {
-                    pending.clear();
+                // Bounded per peer: one peer's chains never push out another's.
+                let held = pending.keys().filter(|(from, _)| *from == peer).count();
+                if held >= MAX_PENDING_KEY_LINKS {
+                    pending.retain(|(from, _), _| *from != peer);
                 }
                 pending.insert((peer.clone(), chain.offer_id), chain.links);
             }
@@ -2167,6 +2184,33 @@ mod tests {
                 .on_peer_frame(out.peer(), KEY_LINKS_FRAME, b"not a chain", &out)
                 .is_err()
         );
+    }
+
+    /// Held chains are bounded per peer: one peer that fills its share
+    /// drops only its own, never another peer's chain for an offer to come.
+    #[test]
+    fn one_peer_filling_its_held_chains_keeps_another_peers() {
+        let state = state_with(vec![], &[]);
+        let contracts = Contracts::new(&state);
+        let (a, b) = (
+            SigningKey::from_bytes(&[3; 32]),
+            SigningKey::from_bytes(&[4; 32]),
+        );
+        let chain = |id: u8| OwnerKeyLinks {
+            offer_id: [id; 32],
+            links: vec![public_link(&a, &b)],
+        };
+        send_key_links(&contracts, &a, &chain(0)).unwrap();
+        for id in 1..=(MAX_PENDING_KEY_LINKS as u8 + 1) {
+            send_key_links(&contracts, &b, &chain(id)).unwrap();
+        }
+        let pending = contracts.pending_key_links.lock().unwrap();
+        assert!(pending.contains_key(&(did_of(&a), [0; 32])));
+        let held_for_b = pending
+            .keys()
+            .filter(|(from, _)| *from == did_of(&b))
+            .count();
+        assert!(held_for_b <= MAX_PENDING_KEY_LINKS, "{held_for_b}");
     }
 
     /// The owner sends the links from the DID a channel's creation block
