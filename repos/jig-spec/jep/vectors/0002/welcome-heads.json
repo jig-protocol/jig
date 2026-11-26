@@ -1,0 +1,5 @@
+{
+  "description": "The bytes a welcome that grants head gossip appends to its signed bytes, after every earlier part, under tag 7 (JEP-0002 rules 2 and 10). Each part is a little-endian u64 length, then its bytes: the tag is the one byte 7, then the feature name.",
+  "feature": "jig-heads-v1",
+  "appended_hex": "0100000000000000070c000000000000006a69672d68656164732d7631"
+}

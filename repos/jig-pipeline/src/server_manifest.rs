@@ -246,6 +246,8 @@ impl ServerManifest {
                 // Not in the document either, for the same reason as
                 // `tiers`: a welcome carries it.
                 request_auth: Vec::new(),
+                // Likewise: a welcome carries it.
+                heads: false,
             },
             peer_policy: PeerPolicy {
                 relayed_kinds: text_list(&doc, "relayed_kinds")?,
@@ -412,6 +414,7 @@ mod tests {
                 tiers: false,
                 ruleset: false,
                 request_auth: Vec::new(),
+                heads: false,
             },
             peer_policy: PeerPolicy::default(),
         }

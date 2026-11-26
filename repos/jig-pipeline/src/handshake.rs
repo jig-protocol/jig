@@ -125,7 +125,21 @@ pub struct Capabilities {
     /// bytes it always did.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub request_auth: Vec<String>,
+    /// Head gossip (JEP-0002 rule 10). In a hello, the client asks to
+    /// exchange `head` frames; in a welcome, the server implements them and
+    /// the hello asked. Like `tiers`, never part of
+    /// [`Capabilities::canonical_bytes`]: a welcome signs it under its own
+    /// tag ([`HEADS_FEATURE`]), and only when set, so a client that predates
+    /// it checks the bytes it always did. Neither side sends a `head` frame
+    /// on a connection whose welcome does not grant it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub heads: bool,
 }
+
+/// What a welcome signs under tag 7 when it grants
+/// [`Capabilities::heads`]: the version of the `head` frame and of the
+/// `seen` record encoding it carries.
+pub const HEADS_FEATURE: &str = "jig-heads-v1";
 
 fn default_future_skew_ms() -> u64 {
     DEFAULT_FUTURE_SKEW_MS
@@ -141,6 +155,7 @@ impl Default for Capabilities {
             tiers: false,
             ruleset: false,
             request_auth: Vec::new(),
+            heads: false,
         }
     }
 }
@@ -436,6 +451,13 @@ impl WelcomeStatement {
         if !self.capabilities.request_auth.is_empty() {
             push(&mut out, &[6]);
             push(&mut out, &canonical_list(&self.capabilities.request_auth));
+        }
+        // Head gossip (JEP-0002 rule 10), signed only into a welcome to a
+        // hello that asked: a client that predates it never asks, and checks
+        // the bytes it always did.
+        if self.capabilities.heads {
+            push(&mut out, &[7]);
+            push(&mut out, HEADS_FEATURE.as_bytes());
         }
         out
     }
@@ -734,6 +756,8 @@ pub fn negotiate(
                 .filter(|v| hello.capabilities.request_auth.contains(v))
                 .cloned()
                 .collect(),
+            // Only to a hello that asked: see `Capabilities::heads`.
+            heads: server.capabilities.heads && hello.capabilities.heads,
             ..server.capabilities.clone()
         },
         reputation: Reputation::none(),
@@ -1195,6 +1219,9 @@ fn outside_offer(statement: &WelcomeStatement, offer: &ClientOffer) -> Option<&'
     {
         return Some("welcome lists a request-proof version the client did not offer");
     }
+    if statement.capabilities.heads && !offer.capabilities.heads {
+        return Some("welcome grants heads, which the client did not request");
+    }
     None
 }
 
@@ -1319,6 +1346,7 @@ fn frame_name(frame: &Frame) -> &'static str {
         Frame::Error { .. } => "error",
         Frame::PeerProof { .. } => "peer_proof",
         Frame::Peer { .. } => "peer",
+        Frame::Head { .. } => "head",
     }
 }
 
@@ -1658,6 +1686,97 @@ mod tests {
         );
     }
 
+    /// JEP-0002 rule 10: a server signs `heads` into a welcome only when it
+    /// implements them and the hello asked.
+    #[test]
+    fn heads_are_signed_only_into_a_welcome_whose_hello_asked() {
+        let key = generate_signing_key();
+        let server = |heads| ServerOffer {
+            capabilities: Capabilities {
+                heads,
+                ..offer_server().capabilities
+            },
+            ..offer_server()
+        };
+        for (asked, implemented, expect) in [
+            (true, true, true),
+            (false, true, false),
+            (true, false, false),
+            (false, false, false),
+        ] {
+            let (hello, pending) = begin(&ClientOffer {
+                capabilities: Capabilities {
+                    heads: asked,
+                    ..Capabilities::default()
+                },
+                ..ClientOffer::default()
+            });
+            let Frame::Hello { nonce, .. } = hello.frame else {
+                panic!("hello");
+            };
+            let mut view = hello_view(&nonce);
+            view.capabilities.heads = asked;
+            let welcome = seal(&key, negotiate(&view, &server(implemented)).unwrap());
+            let text = serde_json::to_string(&welcome).unwrap();
+            assert_eq!(text.contains("\"heads\""), expect, "{text}");
+            match pending.interpret(&text) {
+                HandshakeResult::Established(verified) => {
+                    assert_eq!(
+                        verified.capabilities.heads, expect,
+                        "asked {asked}, implemented {implemented}"
+                    )
+                }
+                other => panic!("expected a welcome, got {other:?}"),
+            }
+        }
+    }
+
+    /// A welcome without `heads` signs exactly the bytes it did before heads
+    /// existed; with them, those bytes and tag 7 naming [`HEADS_FEATURE`],
+    /// last.
+    #[test]
+    fn a_welcome_without_heads_signs_what_it_always_did() {
+        let mut view = hello_view(&fresh_nonce());
+        view.capabilities.request_auth = vec![jig_core::request_auth::VERSION.to_string()];
+        let mut server = offer_server();
+        server.capabilities.request_auth = vec![jig_core::request_auth::VERSION.to_string()];
+        let statement = negotiate(&view, &server).unwrap();
+        assert!(!statement.capabilities.heads);
+        let before = statement.canonical_bytes();
+        let mut with = statement.clone();
+        with.capabilities.heads = true;
+        let after = with.canonical_bytes();
+        let mut tail = Vec::new();
+        push(&mut tail, &[7]);
+        push(&mut tail, HEADS_FEATURE.as_bytes());
+        assert_eq!(after, [before.clone(), tail].concat());
+        assert_eq!(
+            statement.capabilities.canonical_bytes(),
+            with.capabilities.canonical_bytes()
+        );
+    }
+
+    /// A welcome that grants `heads` to a hello that did not ask is outside
+    /// the client's offer, signed or not.
+    #[test]
+    fn an_unrequested_heads_grant_fails_closed() {
+        let key = generate_signing_key();
+        let (hello, pending) = begin(&ClientOffer {
+            capabilities: Capabilities::default(),
+            ..ClientOffer::default()
+        });
+        let Frame::Hello { nonce, .. } = hello.frame else {
+            panic!("hello");
+        };
+        let mut statement = negotiate(&hello_view(&nonce), &offer_server()).unwrap();
+        statement.capabilities.heads = true;
+        let welcome = seal(&key, statement);
+        assert!(matches!(
+            pending.interpret(&serde_json::to_string(&welcome).unwrap()),
+            HandshakeResult::FailClosed { reason, .. } if reason.contains("heads")
+        ));
+    }
+
     fn declared_ruleset() -> RulesetRef {
         let hash = jig_core::canonical_cid::of(b"a ruleset envelope").to_string();
         RulesetRef {
@@ -1961,6 +2080,26 @@ mod tests {
         let before = statement.canonical_bytes();
         let mut with = statement.clone();
         with.capabilities.request_auth = versions;
+        let after = with.canonical_bytes();
+        let appended = after
+            .strip_prefix(before.as_slice())
+            .expect("appended last");
+        assert_eq!(hex::encode(appended), v["appended_hex"].as_str().unwrap());
+    }
+
+    /// The bytes tag 7 appends when a welcome grants `heads` (JEP-0002 rules
+    /// 2 and 10) match the committed vector.
+    #[test]
+    fn the_heads_tag_matches_the_committed_vector() {
+        let v: serde_json::Value = serde_json::from_str(include_str!(
+            "../../jig-spec/jep/vectors/0002/welcome-heads.json"
+        ))
+        .unwrap();
+        assert_eq!(v["feature"].as_str(), Some(HEADS_FEATURE));
+        let statement = negotiate(&hello_view(&fresh_nonce()), &offer_server()).unwrap();
+        let before = statement.canonical_bytes();
+        let mut with = statement.clone();
+        with.capabilities.heads = true;
         let after = with.canonical_bytes();
         let appended = after
             .strip_prefix(before.as_slice())
