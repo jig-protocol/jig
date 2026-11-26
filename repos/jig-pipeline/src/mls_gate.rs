@@ -12,6 +12,7 @@
 //! | `member-add` | `mls_commit` adding `member_did` (+ `mls_welcome`), or the sender's external commit |
 //! | `member-remove` | `mls_commit` removing `member_did`; none when the sender leaves |
 //! | `role-assign`, `role-unassign` | nothing: plaintext control plane, no commit |
+//! | `key-link` | nothing: plaintext; the new DID rejoins, the old leaf is tidied out |
 //! | content | `mls_message`, an application `PrivateMessage` for this group; no `body` |
 //!
 //! A restricted channel is always `mls` (ROADMAP D25): a `channel-create` that
@@ -190,7 +191,21 @@ pub fn plan(
         // Who may sign one is the write gate's call, from the chain.
         // Share blocks and contract records are control plane too: the
         // servers read them, and members check their signed envelopes.
-        BlockKind::RoleAssign
+        // A key link (rule 7b) moves the roster and the roles; it carries no
+        // commit. The new DID then joins by its own external commit, and the
+        // old DID's leaf is removed by an ordinary member commit, which the
+        // new DID's client sends right after joining and any member may send
+        // (the tidy-up `member-remove`). Until then the old leaf can read the
+        // join epoch.
+        //
+        // The target is the atomic form: one external commit by the new DID
+        // that also removes the old leaf, which this delivery service would
+        // accept under the key link. RFC 9420 allows it (the removed leaf's
+        // identity is the application's call), but openmls 0.9 cannot build
+        // an external commit that removes a leaf with another key, so
+        // `Intent::Join` still admits only the joiner's own old leaves.
+        BlockKind::KeyLink
+        | BlockKind::RoleAssign
         | BlockKind::RoleUnassign
         | BlockKind::ChannelShare
         | BlockKind::ChannelUnshare

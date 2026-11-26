@@ -2436,7 +2436,12 @@ impl Secure {
         for o in replay_order(opened) {
             let seen = self.session.observe_in(&self.server, Some(&channel), &o);
             match &seen {
-                Seen::Left { member, tidy: true } => r.left.push(member.clone()),
+                Seen::Left { member, tidy: true }
+                | Seen::Linked {
+                    old: member,
+                    tidy: true,
+                    ..
+                } => r.left.push(member.clone()),
                 // Back again since they left: nothing to tidy.
                 Seen::Added { member } => r.left.retain(|d| d != member),
                 _ => {}
@@ -2456,7 +2461,18 @@ impl Secure {
             .session
             .group_members(&self.server, &self.key(reference))
             .unwrap_or_default();
-        let tidy = r.left.into_iter().filter(|d| still.contains(d)).collect();
+        // A device a key link moved a place to holds no group yet: the old
+        // leaf it has to take out after rejoining is kept for it.
+        let linked = self
+            .session
+            .linked_from(&self.server, &self.key(reference))
+            .ok()
+            .flatten();
+        let tidy = r
+            .left
+            .into_iter()
+            .filter(|d| still.contains(d) || linked.as_ref() == Some(d))
+            .collect();
         Synced {
             lines: r.lines,
             tidy,
@@ -2543,7 +2559,64 @@ impl Secure {
 
     /// Commit the removal of a member who left. Losing the race to another
     /// member doing the same is success.
+    ///
+    /// A device whose key a key link moved `did`'s place to (JEP-0005 rule
+    /// 7b) holds no group yet: it first rejoins by its own external commit,
+    /// then commits `did`'s old leaf out, before it sends anything else.
     pub async fn tidy(&self, slug: &str, did: &str) -> Result<()> {
+        let key = self.key(slug);
+        let linked = self.session.linked_from(&self.server, &key)?;
+        if linked.as_deref() == Some(did) && !self.session.has_group(&self.server, &key)? {
+            self.rejoin(slug).await?;
+        }
+        let tidied = self.tidy_out(slug, did).await;
+        if tidied.is_ok() && linked.as_deref() == Some(did) {
+            self.session.link_settled(&self.server, &key)?;
+        }
+        tidied
+    }
+
+    /// Join `slug`'s group by this device's own external commit: what the
+    /// new DID of a key link does, already on the roster (JEP-0005 rule 7b).
+    /// One retry on a stale epoch.
+    async fn rejoin(&self, slug: &str) -> Result<()> {
+        let _held = self.hold(slug).await?;
+        let key = self.key(slug);
+        let me = self.identity.did_string();
+        for attempt in 0..2 {
+            let info = self.group_info(slug).await?;
+            let commit = self.session.prepare_join(&self.server, &key, &info)?;
+            let mut meta = serde_json::json!({"channel": slug, "member_did": me});
+            if let (Some(meta), serde_json::Value::Object(fields)) =
+                (meta.as_object_mut(), mls_fields(&commit))
+            {
+                meta.extend(fields);
+            }
+            let block = jig_client::blocks::build_with_metadata(
+                &self.identity,
+                jig_core::BlockKind::MemberAdd,
+                jig_core::HlcTimestamp::now_wall(self.identity.did().clone()),
+                meta,
+            );
+            match self.submit(&block).await {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    let stale = e
+                        .downcast_ref::<Refused>()
+                        .is_some_and(|r| r.code == "STALE_EPOCH");
+                    if e.downcast_ref::<Refused>().is_some() {
+                        self.session.discard_join(&self.server, &key)?;
+                    }
+                    if !(stale && attempt == 0) {
+                        return Err(e.context(format!("rejoining {slug} under the new key")));
+                    }
+                }
+            }
+        }
+        unreachable!("the loop returns on its second attempt")
+    }
+
+    async fn tidy_out(&self, slug: &str, did: &str) -> Result<()> {
         let prepare = |s: &Session, key: &str| Ok(s.prepare_remove(&self.server, key, did)?);
         let block_for = |c: &Commit| {
             jig_client::blocks::build_member_remove(
@@ -2564,6 +2637,13 @@ impl Secure {
 
     /// Encrypt and send `text`. Returns the block CID.
     pub async fn send(&self, slug: &str, text: &str) -> Result<String> {
+        // A key link moved this device's place here (JEP-0005 rule 7b): the
+        // old leaf is out before anything is sent under the new key.
+        if let Some(old) = self.session.linked_from(&self.server, &self.key(slug))? {
+            self.tidy(slug, &old)
+                .await
+                .with_context(|| format!("taking the old key's leaf out of {slug}"))?;
+        }
         let (message, epoch) = self
             .session
             .encrypt(&self.server, &self.key(slug), text)

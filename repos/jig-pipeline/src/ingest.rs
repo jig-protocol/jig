@@ -335,14 +335,6 @@ pub enum IngestError {
     /// A `key-link` that cannot move anything here (JEP-0005 rule 7b).
     #[error("the key link is refused: {detail}")]
     KeyLinkRefused { detail: String },
-    /// A `key-link` on an encrypted channel: the new DID needs the old one's
-    /// leaf in the MLS group, and this server has no commit that swaps a
-    /// leaf yet (JEP-0005 rule 7b).
-    #[error(
-        "{slug} is encrypted: moving a member to a new key needs an MLS commit that swaps its \
-         leaf, which this server does not implement yet"
-    )]
-    MlsKeyLinkUnsupported { slug: String },
     /// A relayed block for a channel the relaying server's share does not
     /// cover (JEP-0005 rule 15).
     #[error("`{kind}` refused: `{via}` relayed it outside its share of channel {channel_id}")]
@@ -755,14 +747,6 @@ pub async fn ingest(
     // JEP-0005 rule 7b: a key link moves the old DID's standing to its
     // author. What it may move is judged here, against the chain as it
     // stands; the write gate then takes it from anyone.
-    if kind == BlockKind::KeyLink
-        && let Some(chan) = resolved_channel.as_ref()
-        && chan.suite == jig_core::EncryptionSuite::Mls.as_str()
-    {
-        return Err(IngestError::MlsKeyLinkUnsupported {
-            slug: chan.slug.clone(),
-        });
-    }
     if kind == BlockKind::KeyLink
         && let Some(chan) = resolved_channel.as_ref()
         && let Err(detail) =
@@ -6268,31 +6252,118 @@ mod tests {
         drop((a, b));
     }
 
-    /// JEP-0005 rule 7b: an encrypted channel takes no key link until the
-    /// delivery service can swap a member's leaf; refused, not half-applied.
+    /// JEP-0005 rule 7b on an encrypted channel: the key link moves the
+    /// roster; the new DID joins by its own external commit, which a private
+    /// channel takes only because the roster lists it; then its client
+    /// commits the old leaf out under the tidy-up rule. After that the old
+    /// key reads nothing: the epoch after the join is sealed to it.
     #[tokio::test]
-    async fn a_key_link_on_an_encrypted_channel_is_refused() {
-        let ctx = test_ctx_allowing(&["channel-create", "key-link"]);
-        let (owner, owner2) = (person(), person());
-        create_sealed(&ctx, &owner).await;
+    async fn a_key_link_on_an_encrypted_channel_moves_the_roster_then_the_leaf() {
+        let ctx = test_ctx_allowing(&[
+            "text-render",
+            "channel-create",
+            "member-add",
+            "member-remove",
+            "key-link",
+        ]);
+        let (alice, bob, bob2) = (person(), person(), person());
+        let gid = create_sealed(&ctx, &alice).await;
+        add_to_sealed(&ctx, &alice, &bob, &gid).await;
         let chan = ctx
             .store
             .get_channel_by_slug("#sealed")
             .unwrap()
             .unwrap()
             .id;
-        let linked = plain(
+
+        // The link: plaintext, no commit. The roster moves; the leaf stays.
+        submit(
             &ctx,
-            &owner2,
+            &bob2,
             BlockKind::KeyLink,
-            key_link(&owner, &owner2, &chan, None),
+            jig_core::EncryptionSuite::Unencrypted,
+            key_link(&bob, &bob2, &chan, None),
+        )
+        .await
+        .expect("a key link on an encrypted channel");
+        assert!(!ctx.store.is_member_by_id(&chan, &bob.did).unwrap());
+        assert!(ctx.store.is_member_by_id(&chan, &bob2.did).unwrap());
+        let in_group = |did: &str| {
+            let group = ctx.store.get_mls_group("#sealed").unwrap().unwrap();
+            jig_mls::delivery::members(&group.state, &group.group_id)
+                .unwrap()
+                .iter()
+                .any(|m| m == did)
+        };
+        assert!(in_group(&bob.did) && !in_group(&bob2.did));
+
+        // A stranger's external join into the private channel is refused;
+        // the new DID's, on the roster, is taken.
+        let stranger = person();
+        let group = ctx.store.get_mls_group("#sealed").unwrap().unwrap();
+        let (_, refused) = stranger
+            .mls
+            .join_external(group.group_info.as_ref().unwrap())
+            .unwrap();
+        let stranger_join = submit(
+            &ctx,
+            &stranger,
+            BlockKind::MemberAdd,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"channel": "#sealed", "member_did": stranger.did,
+                "mls_commit": b64(&refused.commit)}),
         )
         .await;
-        assert!(
-            matches!(linked, Err(IngestError::MlsKeyLinkUnsupported { .. })),
-            "{linked:?}"
+        assert!(stranger_join.is_err(), "{stranger_join:?}");
+        let (_, joined) = bob2
+            .mls
+            .join_external(group.group_info.as_ref().unwrap())
+            .unwrap();
+        submit(
+            &ctx,
+            &bob2,
+            BlockKind::MemberAdd,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"channel": "#sealed", "member_did": bob2.did,
+                "mls_commit": b64(&joined.commit),
+                "mls_group_info": b64(joined.group_info.as_ref().unwrap())}),
+        )
+        .await
+        .expect("the new DID rejoins by its own external commit");
+        assert!(in_group(&bob.did) && in_group(&bob2.did));
+
+        // The new DID's client tidies the old leaf out: the old DID is no
+        // member now, so the existing tidy-up rule admits it.
+        let removed = bob2.mls.remove(&gid, &bob.did).unwrap();
+        submit(
+            &ctx,
+            &bob2,
+            BlockKind::MemberRemove,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"channel": "#sealed", "member_did": bob.did,
+                "mls_commit": b64(&removed.commit)}),
+        )
+        .await
+        .expect("the tidy-up removal of the old leaf");
+        bob2.mls.confirm(&gid).unwrap();
+        assert!(!in_group(&bob.did) && in_group(&bob2.did));
+
+        // The old key follows the join epoch, then is out: the next epoch's
+        // message is sealed to it.
+        for c in [&joined.commit, &removed.commit] {
+            alice.mls.apply_commit(&gid, c).unwrap();
+        }
+        bob.mls.apply_commit(&gid, &joined.commit).unwrap();
+        let _ = bob.mls.apply_commit(&gid, &removed.commit);
+        let (message, _) = alice.mls.encrypt(&gid, b"after the swap").unwrap();
+        assert_eq!(
+            bob2.mls.decrypt(&gid, &message).unwrap().plaintext,
+            b"after the swap"
         );
-        assert!(ctx.store.is_member_by_id(&chan, &owner.did).unwrap());
+        assert!(
+            bob.mls.decrypt(&gid, &message).is_err(),
+            "the old leaf reads nothing after the join epoch"
+        );
     }
 
     /// Sequence the owner's `role-unassign` of `admin` between the next

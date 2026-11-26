@@ -110,10 +110,11 @@ pub fn changes_the_channel(kind: BlockKind) -> bool {
 
 /// Whether [`authorize_block`] will need to know who is a member — so the
 /// caller runs the membership queries only when the answer can matter:
-/// something going into a restricted channel, or any removal.
+/// something going into a restricted channel, any removal, or an add (a
+/// member on the roster rejoins the group by its own external commit).
 pub fn needs_membership(kind: BlockKind, channel: Option<&StoredChannel>) -> bool {
     channel.is_some()
-        && (kind == BlockKind::MemberRemove
+        && (matches!(kind, BlockKind::MemberRemove | BlockKind::MemberAdd)
             || (!changes_the_channel(kind) && channel.is_some_and(|c| !is_open(&c.visibility))))
 }
 
@@ -204,6 +205,12 @@ pub fn authorize_block_with(
                 .and_then(|v| v.as_str())
                 .is_some_and(|member| crate::effect::canonical_did_string(member) == sender);
             if rights.membership {
+                return Ok(());
+            }
+            // A member already on the roster joins the group by its own
+            // external commit: what a key link's new DID does (JEP-0005 rule
+            // 7b), and any member's rejoin.
+            if adding_self && sender_is_member {
                 return Ok(());
             }
             // A `server` or `shared` channel takes a self-join on its join
@@ -1007,13 +1014,17 @@ mod tests {
     /// The membership query is the only I/O this gate ever asks for; it must
     /// be asked for exactly when the answer can change the decision.
     #[test]
-    fn membership_is_needed_only_for_content_into_restricted_channels() {
+    fn membership_is_needed_for_content_into_restricted_channels_removals_and_adds() {
         let restricted = channel("restricted");
         let open = channel("open");
         assert!(needs_membership(BlockKind::TextRender, Some(&restricted)));
         assert!(needs_membership(BlockKind::EmailRender, Some(&restricted)));
         assert!(!needs_membership(BlockKind::TextRender, Some(&open)));
-        assert!(!needs_membership(BlockKind::MemberAdd, Some(&restricted)));
+        // An add asks too: a member on the roster rejoins the group by its
+        // own external commit (JEP-0005 rule 7b).
+        assert!(needs_membership(BlockKind::MemberAdd, Some(&restricted)));
+        assert!(needs_membership(BlockKind::MemberAdd, Some(&open)));
+        assert!(!needs_membership(BlockKind::RoleAssign, Some(&restricted)));
         assert!(!needs_membership(BlockKind::TextRender, None));
         // Unknown visibility is restricted here too, so the lookup happens.
         assert!(needs_membership(
