@@ -501,15 +501,33 @@ async fn handle_socket(
                         // Sub channel closed (server shutdown path).
                         break;
                     };
-                    // A channel that moved while subscribed: a client that
-                    // cannot check the new sequencer's records is told so,
-                    // once, and sent none of them (JEP-0005 rule 11a).
-                    if let Some(channel_id) = &block.channel_id
-                        && let Some(moved) = moved_past(&state, &session.block_kinds, channel_id)
+                    // A block of a critical kind added after v0.2.0 that the
+                    // client does not list (a `sequencer-set`, say): it is
+                    // told so, once, and sent nothing of the channel from
+                    // there on (JEP-0005 rule 11a).
+                    let kind = block.block_kind.as_str();
+                    if session.gated
+                        || (jig_core::block_kind::gates_older_readers(kind)
+                            && !session.block_kinds.iter().any(|k| k == kind))
                     {
-                        if session.noticed != session.sub_id {
+                        session.gated = true;
+                        if session.noticed != session.sub_id
+                            && let Some(channel_id) = &block.channel_id
+                        {
                             session.noticed = session.sub_id;
-                            let notice = moved.notice(channel_id);
+                            let seq = state
+                                .ingest_ctx
+                                .store
+                                .get_chain_record(channel_id, &block.cid)
+                                .ok()
+                                .flatten()
+                                .map_or(0, |r| r.seq);
+                            let notice = jig_pipeline::follow::ReaderGate {
+                                channel_id: channel_id.clone(),
+                                seq,
+                                kind: kind.to_string(),
+                            }
+                            .notice();
                             if send_error(
                                 &mut socket,
                                 Some(notice.status),
@@ -632,28 +650,27 @@ struct ConnState {
     /// that did not may read a `public` channel but not post to it.
     tiers: bool,
     /// The block kinds the hello says its client implements (JEP-0002 rule
-    /// 1). A client that does not list `sequencer-set` reads nothing of a
-    /// channel that moved ([`moved_past`]).
+    /// 1). A client is not sent a channel past the first block of a critical
+    /// kind added after `v0.2.0` that it does not list ([`reader_gate`]).
     block_kinds: Vec<String>,
+    /// The subscription held now reached a block its client cannot read
+    /// ([`reader_gate`]): nothing more of the channel is sent on it.
+    gated: bool,
 }
 
-/// The first move of `channel_id`'s sequencer, when a client implementing
-/// only `block_kinds` cannot read past it (JEP-0005 rule 11a): it cannot
-/// check the new sequencer's records, so it is told the channel needs an
-/// upgrade instead of being sent them. `None` when it can read the channel.
-fn moved_past(
+/// Where a client implementing `block_kinds` stops reading `channel_id`
+/// (JEP-0005 rule 11a; [`jig_pipeline::follow::ReaderGate`]). A subscription
+/// delivers only what lands after it, which is past any gate already in the
+/// chain: so a channel with one answers the subscribe with its notice.
+fn reader_gate(
     state: &AppState,
     block_kinds: &[String],
     channel_id: &str,
-) -> Option<jig_pipeline::follow::ChannelMove> {
-    let kind = jig_core::BlockKind::SequencerSet.as_str();
-    if block_kinds.iter().any(|k| k == kind) {
-        return None;
-    }
-    match state.ingest_ctx.store.channel_moves(channel_id) {
-        Ok(moves) => moves.into_iter().next(),
+) -> Option<jig_pipeline::follow::ReaderGate> {
+    match state.ingest_ctx.store.reader_gate(channel_id, block_kinds) {
+        Ok(gate) => gate,
         Err(e) => {
-            tracing::warn!(channel_id, "reading a channel's moves: {e}");
+            tracing::warn!(channel_id, "reading a channel's reader gate: {e}");
             None
         }
     }
@@ -1040,9 +1057,9 @@ async fn handle_client_frame(
                 (None, Scope::Channel { .. }) => None,
             };
             if let Some(id) = stopped_id
-                && let Some(moved) = moved_past(state, &session.block_kinds, id)
+                && let Some(gate) = reader_gate(state, &session.block_kinds, id)
             {
-                let notice = moved.notice(id);
+                let notice = gate.notice();
                 let _ = send_error(
                     socket,
                     Some(notice.status),
@@ -1105,6 +1122,7 @@ async fn handle_client_frame(
                 .subscribe_local(sub_scope, who, sub_tx.clone())
                 .await;
             session.sub_id = Some(id);
+            session.gated = false;
             if let Some(tx) = &session.notice_tx {
                 state.ingest_ctx.fanout.watch_notices(id, tx.clone());
                 // A stop kept between the check above and this registration
@@ -2627,10 +2645,12 @@ mod tests {
         );
     }
 
-    /// A channel whose sequencer moved (JEP-0005 rule 11a) is read only by a
-    /// client whose hello lists `sequencer-set`: one that does not (every
-    /// client up to v0.2.0 lists no kinds) could not check the new
-    /// sequencer's records. Its subscribe is answered `CHANNEL_NEEDS_UPGRADE`.
+    /// A channel whose chain holds a critical kind added after v0.2.0 (a
+    /// `sequencer-set`, JEP-0005 rule 11a) is read past it only by a client
+    /// whose hello lists the kind: one that does not (every client up to
+    /// v0.2.0 lists no kinds) could not check what follows. A subscription
+    /// delivers only what lands after it, all past the gate, so the
+    /// subscribe is answered `CHANNEL_NEEDS_UPGRADE` at the gate's seq.
     #[tokio::test]
     async fn a_moved_channel_is_refused_to_a_client_that_cannot_read_the_move() {
         let (state, url) = start_test_server().await;
@@ -2646,17 +2666,9 @@ mod tests {
         .unwrap();
         seed_channel(&state, "#moved");
         let id = jig_pipeline::ingest_record::label_cid("#moved");
-        let moved = jig_pipeline::follow::ChannelMove {
-            seq: 6,
-            sequencer: "did:jig:znew".to_string(),
-            previous: "did:jig:zold".to_string(),
-            block_cid: "bafkmove".to_string(),
-        };
-        state
-            .ingest_ctx
-            .store
-            .record_move_for_tests(&id, &moved)
-            .unwrap();
+        let store = &state.ingest_ctx.store;
+        assert_eq!(reader_gate(&state, &[], &id), None);
+        store.gate_for_tests(&id, 6, "sequencer-set").unwrap();
         let sub = Envelope::new(Frame::Subscribe {
             scope: Scope::Channel {
                 slug: "#moved".into(),
@@ -2682,18 +2694,18 @@ mod tests {
         assert!(message.contains("`sequencer-set` at seq 6"), "{message}");
         assert_eq!(state.ingest_ctx.fanout.local_subscription_count().await, 0);
 
-        // What decides it: the kinds the hello listed.
-        assert_eq!(moved_past(&state, &[], &id), Some(moved.clone()));
+        // What decides it: the kinds the hello listed. A non-critical kind
+        // added later never gates.
+        let gate = reader_gate(&state, &[], &id).unwrap();
+        assert_eq!((gate.seq, gate.kind.as_str()), (6, "sequencer-set"));
+        assert!(reader_gate(&state, &["text-render".to_string()], &id).is_some());
         assert_eq!(
-            moved_past(&state, &["text-render".to_string()], &id),
-            Some(moved)
-        );
-        assert_eq!(
-            moved_past(&state, &["sequencer-set".to_string()], &id),
+            reader_gate(&state, &["sequencer-set".to_string()], &id),
             None
         );
-        let unmoved = jig_pipeline::ingest_record::label_cid("#unmoved");
-        assert_eq!(moved_past(&state, &[], &unmoved), None);
+        let other = jig_pipeline::ingest_record::label_cid("#skippable");
+        store.gate_for_tests(&other, 2, "opt-reaction").unwrap();
+        assert_eq!(reader_gate(&state, &[], &other), None);
     }
 
     /// A channel this server stopped at a block kind it does not implement
@@ -2716,7 +2728,7 @@ mod tests {
             channel_id: jig_pipeline::ingest_record::label_cid(slug),
             seq,
             block_cid: "bafkstop".to_string(),
-            kind: "sequencer-set".to_string(),
+            kind: "future-kind".to_string(),
             found_at: 0,
         };
         let expect_stop = |frame: Envelope, slug: &str, seq: u64| {
@@ -2734,7 +2746,7 @@ mod tests {
             assert_eq!(code, "CHANNEL_NEEDS_UPGRADE");
             assert_eq!(ref_cid, Some(jig_pipeline::ingest_record::label_cid(slug)));
             assert!(
-                message.contains(&format!("`sequencer-set` at seq {seq}")),
+                message.contains(&format!("`future-kind` at seq {seq}")),
                 "{message}"
             );
         };

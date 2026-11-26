@@ -1813,7 +1813,7 @@ mod tests {
                     status: Some(409),
                     code: jig_pipeline::fanout::CHANNEL_NEEDS_UPGRADE.to_string(),
                     ref_cid: Some("bafkchannel".to_string()),
-                    message: "block kind `sequencer-set` at seq 4".to_string(),
+                    message: "block kind `future-kind` at seq 4".to_string(),
                     retry_after_ms: None,
                 })],
                 Frame::Submit { bundle_b64, .. } => vec![ack(&bundle_b64)],
@@ -1827,7 +1827,7 @@ mod tests {
         assert!(!stream.lagged());
         assert_eq!(
             stream.server_needs_upgrade().as_deref(),
-            Some("block kind `sequencer-set` at seq 4")
+            Some("block kind `future-kind` at seq 4")
         );
         let block = text_block(&client, "still answered");
         let expected = block.cid();

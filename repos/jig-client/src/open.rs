@@ -259,14 +259,12 @@ mod tests {
         let id = identity();
         let critical = open(&delivered_unknown(
             &id,
-            "sequencer-set",
+            "future-kind",
             serde_json::json!({}),
         ))
         .unwrap_err();
         assert!(critical.needs_upgrade(), "{critical}");
-        assert!(
-            matches!(&critical, OpenError::UnknownKind { kind, .. } if kind == "sequencer-set")
-        );
+        assert!(matches!(&critical, OpenError::UnknownKind { kind, .. } if kind == "future-kind"));
 
         let skippable = open(&delivered_unknown(
             &id,
@@ -285,12 +283,12 @@ mod tests {
         assert!(commit.needs_upgrade());
 
         // Renamed after signing: forged, not skippable.
-        let mut renamed = delivered_unknown(&id, "sequencer-set", serde_json::json!({}));
+        let mut renamed = delivered_unknown(&id, "future-kind", serde_json::json!({}));
         let raw = STANDARD.decode(&renamed.bundle_b64).unwrap();
         let (m, c): (Vec<u8>, Vec<u8>) = serde_json::from_slice(&raw).unwrap();
         let m = String::from_utf8(m)
             .unwrap()
-            .replace("\"sequencer-set\"", "\"opt-sequencer-set\"")
+            .replace("\"future-kind\"", "\"opt-future-kind\"")
             .into_bytes();
         renamed.bundle_b64 = STANDARD.encode(serde_json::to_vec(&(&m, &c)).unwrap());
         assert!(matches!(open(&renamed), Err(OpenError::Forged { .. })));

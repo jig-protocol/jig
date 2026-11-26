@@ -675,7 +675,7 @@ mod tests {
             history[0].clone(),
             unknown(&id, "opt-reaction", 1),
             history[1].clone(),
-            unknown(&id, "sequencer-set", 2),
+            unknown(&id, "future-kind", 2),
             history[2].clone(),
         ];
         let server = Server::new(history.clone(), vec![]);
@@ -695,7 +695,7 @@ mod tests {
             "nothing shown past the stop, nothing for the skipped"
         );
         assert!(ended.contains("#busy needs an upgrade"), "{ended}");
-        assert!(ended.contains("`sequencer-set`"), "{ended}");
+        assert!(ended.contains("`future-kind`"), "{ended}");
         let again = crate::cmd::upgrade::check_open(&stops, "ws://test", "#busy").unwrap_err();
         assert!(crate::cmd::upgrade::is_needs_upgrade(&again));
         crate::cmd::upgrade::check_open(&stops, "ws://test", "#other").unwrap();
@@ -737,7 +737,7 @@ mod tests {
         };
         assert_eq!(crate::cmd::secure::placed_cid(&skippable), Some(cid));
         assert_eq!(
-            crate::cmd::secure::placed_cid(&unknown(&id, "sequencer-set", 2)),
+            crate::cmd::secure::placed_cid(&unknown(&id, "future-kind", 2)),
             None
         );
         let mut unsigned = skippable;

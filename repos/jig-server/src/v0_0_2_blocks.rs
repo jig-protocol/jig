@@ -168,34 +168,36 @@ pub fn declares_feature(headers: &axum::http::HeaderMap, feature: &str) -> bool 
         .any(|name| name.trim() == feature)
 }
 
-/// The refusal for a read of `channel`'s history or records by a request
-/// whose client does not declare `sequencer-set` in [`CAPABILITIES_HEADER`],
-/// once the channel has moved (JEP-0005 rule 11a): it cannot check the new
-/// sequencer's records, so it is told the channel needs an upgrade rather
-/// than sent them. `Ok(())` when it may read.
-fn moved_past(
+/// Where the client behind `headers` stops reading `channel_id`
+/// ([`jig_pipeline::follow::ReaderGate`]): the first block of a critical kind
+/// added after `v0.2.0` that it does not declare in [`CAPABILITIES_HEADER`].
+/// A request carries no hello, so the header is what says which kinds its
+/// client implements (JEP-0005 rule 11a). `None` when it can read it all.
+fn reader_gate(
     store: &jig_pipeline::persist::SqliteStore,
     headers: &axum::http::HeaderMap,
     channel_id: &str,
-) -> Result<(), (StatusCode, Json<ErrorBody>)> {
-    if declares_feature(headers, jig_core::BlockKind::SequencerSet.as_str()) {
-        return Ok(());
-    }
-    match store
-        .channel_moves(channel_id)
-        .map_err(persist_err)?
-        .first()
-    {
-        None => Ok(()),
-        Some(moved) => {
-            let notice = moved.notice(channel_id);
-            Err(err(
-                StatusCode::from_u16(notice.status).unwrap_or(StatusCode::CONFLICT),
-                notice.code,
-                notice.message,
-            ))
-        }
-    }
+) -> Result<Option<jig_pipeline::follow::ReaderGate>, (StatusCode, Json<ErrorBody>)> {
+    let declared: Vec<String> = headers
+        .get_all(CAPABILITIES_HEADER)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|name| name.trim().to_string())
+        .collect();
+    store
+        .reader_gate(channel_id, &declared)
+        .map_err(persist_err)
+}
+
+/// The refusal at a [`jig_pipeline::follow::ReaderGate`].
+fn gated(gate: &jig_pipeline::follow::ReaderGate) -> (StatusCode, Json<ErrorBody>) {
+    let notice = gate.notice();
+    err(
+        StatusCode::from_u16(notice.status).unwrap_or(StatusCode::CONFLICT),
+        notice.code,
+        notice.message,
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -884,9 +886,10 @@ pub async fn get_channel_history(
             ),
         ));
     }
-    if let Some(channel) = channel.as_ref() {
-        moved_past(store, &headers, &channel.id)?;
-    }
+    let gate = match channel.as_ref() {
+        Some(channel) => reader_gate(store, &headers, &channel.id)?,
+        None => None,
+    };
     // A carried channel stopped at a block kind this server does not
     // implement (JEP-0005 rule 14c): its history here ends short of the
     // owner's, and a reader must be told why rather than read it as whole.
@@ -1015,6 +1018,18 @@ pub async fn get_channel_history(
             .map_err(persist_err)?,
         });
     }
+    // A client that cannot read a block past the gate is served the history
+    // before it, and told at the gate (JEP-0005 rule 11a): a page that
+    // reaches it is cut there, and one that starts past it is refused.
+    if let Some(gate) = &gate {
+        let reached = timeline
+            .iter()
+            .any(|b| b.ingest.as_ref().is_none_or(|r| r.seq >= gate.seq));
+        timeline.retain(|b| b.ingest.as_ref().is_some_and(|r| r.seq < gate.seq));
+        if reached && timeline.is_empty() {
+            return Err(gated(gate));
+        }
+    }
     Ok(Json(timeline))
 }
 
@@ -1042,7 +1057,12 @@ pub async fn get_channel_records(
     let Some(channel) = channel else {
         return Ok(Json(Vec::new()));
     };
-    moved_past(store, &headers, &channel.id)?;
+    let gate = reader_gate(store, &headers, &channel.id)?;
+    if let Some(gate) = &gate
+        && query.from.unwrap_or(0) >= gate.seq
+    {
+        return Err(gated(gate));
+    }
     let records = store
         .list_ingest_records_by_id(
             &channel.id,
@@ -1050,6 +1070,10 @@ pub async fn get_channel_records(
             query.limit.unwrap_or(MAX_HISTORY_LIMIT),
         )
         .map_err(persist_err)?;
+    let records = match &gate {
+        Some(gate) => records.into_iter().filter(|r| r.seq < gate.seq).collect(),
+        None => records,
+    };
     Ok(Json(records))
 }
 
@@ -1948,11 +1972,12 @@ mod tests {
         assert!(message.contains("did:jig:zowner"), "{message}");
     }
 
-    /// A moved channel's history and records are read only by a request that
-    /// declares `sequencer-set` in `jig-capabilities` (JEP-0005 rule 11a).
-    /// Any other request is told the channel needs an upgrade.
+    /// A moved channel's records are served to a request that does not
+    /// declare `sequencer-set` in `jig-capabilities` up to the move, and a
+    /// read from the move on is told the channel needs an upgrade (JEP-0005
+    /// rule 11a). A request that declares it reads them all.
     #[tokio::test]
-    async fn a_moved_channels_history_needs_a_client_that_reads_the_move() {
+    async fn a_moved_channels_records_stop_at_the_move_for_a_client_that_cannot_read_it() {
         let state = Arc::new(unauthenticated_state());
         let id = jig_pipeline::ingest_record::label_cid("a moved channel");
         let store = &state.ingest_ctx.store;
@@ -1969,37 +1994,53 @@ mod tests {
                 tiering: jig_pipeline::persist::ChannelTiering::current("open", "none"),
             })
             .unwrap();
-        store
-            .record_move_for_tests(
-                &id,
-                &jig_pipeline::follow::ChannelMove {
-                    seq: 3,
-                    sequencer: "did:jig:znew".to_string(),
-                    previous: "did:jig:zold".to_string(),
-                    block_cid: "bafkmove".to_string(),
-                },
-            )
-            .unwrap();
-        let router = build_blocks_router(state.clone());
-        for path in [
-            format!("/api/v1/channels/{id}/blocks"),
-            format!("/api/v1/channels/{id}/records"),
-        ] {
-            let (status, body) = get_path(router.clone(), &path).await;
-            assert_eq!(status, StatusCode::CONFLICT, "{path}");
-            assert_eq!(body["code"], "CHANNEL_NEEDS_UPGRADE");
-            let message = body["message"].as_str().unwrap();
-            assert!(message.contains("`sequencer-set` at seq 3"), "{message}");
-
-            let req = Request::builder()
-                .method("GET")
-                .uri(&path)
-                .header(CAPABILITIES_HEADER, "tiers, sequencer-set")
-                .body(Body::empty())
-                .unwrap();
-            let resp = router.clone().oneshot(req).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        for seq in 0..3 {
+            store.gate_for_tests(&id, seq, "text-render").unwrap();
         }
+        store.gate_for_tests(&id, 3, "sequencer-set").unwrap();
+        store.gate_for_tests(&id, 4, "text-render").unwrap();
+        let router = build_blocks_router(state.clone());
+        let get = |path: String, declares: bool| {
+            let router = router.clone();
+            async move {
+                let mut req = Request::builder().method("GET").uri(&path);
+                if declares {
+                    req = req.header(CAPABILITIES_HEADER, "tiers, sequencer-set");
+                }
+                let resp = router
+                    .oneshot(req.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                )
+            }
+        };
+        let seqs = |body: &serde_json::Value| -> Vec<u64> {
+            body.as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["seq"].as_u64().unwrap())
+                .collect()
+        };
+
+        let records = format!("/api/v1/channels/{id}/records");
+        let (status, body) = get(records.clone(), false).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(seqs(&body), [0, 1, 2], "up to the move");
+        let (status, body) = get(format!("{records}?from=3"), false).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "CHANNEL_NEEDS_UPGRADE");
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains("`sequencer-set` at seq 3"), "{message}");
+        let (status, body) = get(records, true).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(seqs(&body), [0, 1, 2, 3, 4]);
     }
 
     /// A carried channel stopped at a block kind this server does not
@@ -2033,7 +2074,7 @@ mod tests {
                 channel_id: id.clone(),
                 seq: 7,
                 block_cid: "bafkstop".to_string(),
-                kind: "sequencer-set".to_string(),
+                kind: "future-kind".to_string(),
                 found_at: 0,
             })
             .unwrap();
@@ -2041,7 +2082,7 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["code"], "CHANNEL_NEEDS_UPGRADE");
         let message = body["message"].as_str().unwrap();
-        assert!(message.contains("`sequencer-set` at seq 7"), "{message}");
+        assert!(message.contains("`future-kind` at seq 7"), "{message}");
     }
 
     #[tokio::test]

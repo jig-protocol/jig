@@ -137,7 +137,7 @@ mod tests {
     fn critical() -> OpenError {
         OpenError::UnknownKind {
             cid: "bafy".to_string(),
-            kind: "sequencer-set".to_string(),
+            kind: "future-kind".to_string(),
             critical: true,
             channel_id: Some("chan".to_string()),
             seq: Some(7),
@@ -154,7 +154,7 @@ mod tests {
         assert!(is_needs_upgrade(&e));
         let shown = format!("{e}");
         assert!(shown.contains("#x needs an upgrade"), "{shown}");
-        assert!(shown.contains("`sequencer-set` (seq 7)"), "{shown}");
+        assert!(shown.contains("`future-kind` (seq 7)"), "{shown}");
 
         // The next session refuses the channel; other channels open.
         let again = check_open(&stops, "wss://a", "#x").unwrap_err();

@@ -220,7 +220,7 @@ mod tests {
         let mut stops = UpgradeStops::load(&path).unwrap();
         assert!(stops.get("wss://a.example", "#x").is_none());
         stops
-            .record("wss://a.example", "#x", stop("sequencer-set"))
+            .record("wss://a.example", "#x", stop("future-kind"))
             .unwrap();
         stops
             .record("wss://a.example", "#x", stop("later"))
@@ -230,7 +230,7 @@ mod tests {
         // The scheme is not part of which server it is.
         assert_eq!(
             again.get("https://a.example/", "#x"),
-            Some(&stop("sequencer-set"))
+            Some(&stop("future-kind"))
         );
         assert!(again.get("wss://a.example", "#y").is_none());
     }
@@ -240,12 +240,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("stops.json");
         let mut stops = UpgradeStops::load(&path).unwrap();
-        stops
-            .record("wss://a", "#x", stop("sequencer-set"))
-            .unwrap();
+        stops.record("wss://a", "#x", stop("future-kind")).unwrap();
         assert_eq!(
             stops.release_known("wss://a", "#x", |_| false).unwrap(),
-            Some(stop("sequencer-set"))
+            Some(stop("future-kind"))
         );
         assert_eq!(
             stops.release_known("wss://a", "#x", |_| true).unwrap(),
@@ -267,7 +265,7 @@ mod tests {
         let path = dir.path().join("stops.json");
         let mut a = UpgradeStops::load(&path).unwrap();
         let mut b = UpgradeStops::load(&path).unwrap();
-        a.record("wss://a", "#x", stop("sequencer-set")).unwrap();
+        a.record("wss://a", "#x", stop("future-kind")).unwrap();
         b.record("wss://a", "#y", stop("key-link")).unwrap();
         let both = UpgradeStops::load(&path).unwrap();
         assert!(both.get("wss://a", "#x").is_some());

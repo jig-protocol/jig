@@ -40,6 +40,44 @@ pub fn is_critical(name: &str, metadata: &BTreeMap<String, Value>) -> bool {
             .any(|key| key.starts_with("mls_") && !MLS_CONTENT_KEYS.contains(&key.as_str()))
 }
 
+/// The block kinds `v0.2.0` implements, as their wire names. Fixed: a kind
+/// added to [`BlockKind`] later is not one of them. A reader older than such a
+/// kind cannot act on it, so a server serves a channel to a client that does
+/// not list the kind only up to the first block of it, when the kind is
+/// critical (JEP-0005 rules 11a and 14c; [`gates_older_readers`]).
+pub const V0_2_0_KINDS: [&str; 23] = [
+    "text-render",
+    "channel-create",
+    "member-add",
+    "member-remove",
+    "channel-promote",
+    "channel-archive",
+    "role-assign",
+    "role-unassign",
+    "fed-hello",
+    "ns-register",
+    "ns-rotate",
+    "ns-renew",
+    "ns-attestation",
+    "time-attestation",
+    "email-render",
+    "email-encrypted",
+    "receipt",
+    "server-manifest",
+    "channel-share",
+    "channel-unshare",
+    "contract-accept",
+    "contract-refuse",
+    "contract-end",
+];
+
+/// Whether a block of kind `name` stops a reader that predates it: a critical
+/// kind (no `opt-` prefix, JEP-0005 rule 14c) that `v0.2.0` does not
+/// implement. A non-critical kind never does, since an older reader skips it.
+pub fn gates_older_readers(name: &str) -> bool {
+    !name.starts_with(NON_CRITICAL_PREFIX) && !V0_2_0_KINDS.contains(&name)
+}
+
 /// v0.0.2+ block kinds.
 ///
 /// Serialised as kebab-case strings on the wire (e.g. `"text-render"`,
@@ -226,6 +264,27 @@ pub enum BlockKindError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `v0.2.0` set is pinned: adding a kind to [`BlockKind`] does not
+    /// change it, and every kind added since gates older readers unless it
+    /// is `opt-`. Today that is `sequencer-set` alone.
+    #[test]
+    fn the_v0_2_0_kinds_are_pinned_and_every_later_kind_gates_older_readers() {
+        assert_eq!(V0_2_0_KINDS.len(), 23);
+        for name in V0_2_0_KINDS {
+            assert!(name.parse::<BlockKind>().is_ok(), "{name}");
+            assert!(!gates_older_readers(name), "{name}");
+        }
+        let later: Vec<&str> = BlockKind::ALL
+            .iter()
+            .map(BlockKind::as_str)
+            .filter(|k| !V0_2_0_KINDS.contains(k))
+            .collect();
+        assert_eq!(later, ["sequencer-set"]);
+        assert!(later.iter().all(|k| gates_older_readers(k)));
+        assert!(gates_older_readers("key-link"));
+        assert!(!gates_older_readers("opt-reaction"));
+    }
     use std::str::FromStr;
 
     #[test]
