@@ -145,6 +145,22 @@ Non-goals for v0.2:
       is ordered in the `ingest` chain. From its `seq`, the owning server reads the old
       DID's roles and membership as the new DID's. The creator rule carries across the
       link. A link scoped to another channel, alias or contact moves nothing here.
+      - Its metadata is `{channel_id, link}`: `link` is the JEP-0012 link, base64
+        COSE_Sign. The kind name has no `opt-` prefix, so the block is critical (14c).
+      - The sequencer MUST refuse it unless:
+        - the link verifies under both its keys;
+        - its audience is `{kind: "channel", channel_id}` for this channel;
+        - its `new` DID is the block's author;
+        - its `old` DID holds membership or a role at the block's position;
+        - no earlier `key-link` in the chain leaves the same `old` DID (JEP-0012,
+          ordered logs);
+        - `new` holds no membership or role in the channel.
+      - From the block's `seq` on, `old` holds nothing in the channel, and `new` holds
+        what `old` held. A root owner (the creator or a co-owner) stays a root owner
+        under `new`.
+      - On an MLS channel the link moves the roster and the roles, not the leaf. The
+        new DID joins by an external commit that also removes the old DID's leaf. The
+        owner's gate admits that removal because the link ties the two DIDs.
 7c. `attested_suffixes` lists every name suffix the signing server attests, each once, as one
     of:
     - `{suffix, root: "config", authorities}`: `authorities` is the delegation's DIDs, in
@@ -160,6 +176,9 @@ Non-goals for v0.2:
    - `contract-accept {server, channel_id, offer_id, sequencer, manifest, attested_suffixes,
      bot_dids}`, where `server` is the signing server and `bot_dids` is empty except on a
      sequencer move (11a).
+     - A **move accept** (11a) names `server` itself as `sequencer`, and also carries
+       `policy_approvals`, a list of byte strings (11b). No other accept carries that
+       key, so an ordinary accept's bytes are what they were before moves existed.
      - `offer_id` names the exact offer accepted, under the follower's signature. An
        accept binds only the grant in that offer.
      - `manifest` names its current `server-manifest`.
@@ -198,6 +217,80 @@ Non-goals for v0.2:
 
 11a. The owner moves the sequencer with a `sequencer-set` block. In v0.2 only
      the `owner` role holds that right.
+     - **Metadata:** `{channel_id, sequencer, head: {seq, hash}, accept, reinstalls}`.
+       - `sequencer` is the new sequencer's DID in canonical form.
+       - `head` is the cited head: the `seq` of the last record the old sequencer
+         signed, and that record's hash as the next record's `prev` names it (64
+         lowercase hex digits).
+       - `accept` is the new sequencer's **move accept**, base64: a `contract-accept`
+         (8) for the offer of this channel it accepted as a follower, naming itself as
+         `sequencer`. It carries `bot_dids` and `policy_approvals` (11b), and travels
+         only inside this block, so a move needs nothing from the old sequencer.
+       - `reinstalls` holds one owner-signed bot reinstall per entry of the accept's
+         `bot_dids`, base64.
+       - The block carries no `mls_` key and is sent in clear on every suite, like
+         `channel-share`. The kind name has no `opt-` prefix, so the block is critical
+         (14c). Its `seen` (JEP-0002) MUST be the cited head's record.
+     - **Who checks what.** Every carrier and client MUST check, before acting on the
+       block:
+       - the author held the `owner` right at the block's position;
+       - the move accept verifies, is signed by `sequencer`, names `sequencer` as the
+         channel's sequencer, and is for this channel;
+       - the block's own record is signed by `sequencer`, with `seq` = `head.seq` + 1
+         and `prev` = `head.hash`.
+
+       Because `head` sits inside the owner's signature, the new sequencer cannot
+       choose where the move cuts the chain.
+     - **The expected sequencer.** A reader keeps, per channel, a schedule of who signs
+       each range of `seq`:
+       - from `seq` 0, the server the `channel-create` names, along its public key
+         links (JEP-0012);
+       - from the `seq` of each `sequencer-set` record on, the DID that block names.
+
+       A record MUST be signed by the sequencer of the range its `seq` falls in. Inside
+       one range, the JEP-0012 link order holds. A record with `seq` above a cited head,
+       signed by a DID of an earlier range, MUST be refused. This holds whatever key
+       links that DID serves later, so a later rotation of the old sequencer never
+       extends its range. Such a refusal is a break, kept as evidence. It is not a
+       signed proof against either server, since it is two keys' words. Backfill is
+       positional: a record at or below a cited head is checked against the range it
+       falls in, whenever it arrives.
+     - **Records past the cited head.** A carrier may already hold records past the
+       cited head, signed by the old sequencer, when it receives the `sequencer-set`.
+       It MUST set those records aside: it keeps them as evidence, never delivers them,
+       and lands the `sequencer-set` in their place. This is not a fork, because the
+       owner's signature on `head` decides between the two chains. The writes in the
+       records set aside are lost, as the bullets below say. Two valid `sequencer-set`
+       blocks at one `seq` are the owner's own contradiction: the channel stops at that
+       `seq`, and both are kept.
+     - **Taking over.** Once the new sequencer has sequenced the block, it sequences the
+       channel. It sends each server that holds a live share (a `contract-accept` in the
+       chain without a later `contract-end`) a new `contract-offer` at the grant that
+       server had. Such a re-offer cites the channel's `sequencer-set`. A follower that
+       already carries the channel accepts it automatically when the new sequencer is a
+       configured peer and the grant is the same as before, or narrower. It holds a
+       wider grant for its operator (DJ 2026-11-26, revising the 2026-10-19 default).
+       An old sequencer that learns of the move refuses writes to the channel with
+       `SEQUENCER_MOVED`, naming the new sequencer.
+     - **Readers that predate the move.** A reader that does not implement
+       `sequencer-set` cannot verify the block's record, because a key it does not
+       expect signs it. The 14c stop therefore never reaches it. So:
+       - A client's hello MUST list, in `capabilities.block_kinds`, every block kind it
+         implements. A welcome's `block_kinds` stays the server's allow-list.
+       - A server MUST NOT deliver a client the `sequencer-set` record of a channel, or
+         any record after it, unless the client's hello lists `sequencer-set`. It
+         answers that channel's subscriptions and history reads from that `seq` on with
+         `CHANNEL_NEEDS_UPGRADE`, naming the kind and the `seq`, and delivers records
+         below it as usual. A `v0.2.0` client lists no kinds, so it is always answered
+         this way.
+       - A `v0.2.0` follower cannot accept the new sequencer's re-offer, because the
+         creation block names another server. It keeps the channel at the cited head
+         and shows nothing; the release notes say so (DJ 2026-11-26).
+       - A `v0.2.0` old sequencer never learns of the move, and goes on signing past
+         the cited head: the partitioned case below. A client SHOULD refuse to sign a
+         `sequencer-set` while the old sequencer is reachable and its welcome does not
+         list `sequencer-set`, unless its user states the old sequencer is unreachable
+         (DJ 2026-11-26).
      - *Note (D38):* a `v0.2.0` node does not implement this rule. It MUST fail closed on a
        channel whose chain holds a `sequencer-set`, rather than accept records from either
        sequencer. The expected-sequencer rule arrives in v0.2.x.
@@ -479,9 +572,17 @@ whether the author's signature verifies. The cases are: no marker; the `opt-` pr
 prefix with `mls_commit`; the prefix with only `mls_message` and `mls_epoch`; the prefix
 with an `mls_` key not yet named; and the prefix added after signing.
 
+`vectors/0005/sequencer-move.json` (7b, 11a): under fixed test keys, a `sequencer-set`'s
+metadata and its record's `seq`, `prev` and signer; the move accept it carries, with no bot
+and with one, as its deterministic payload and its `COSE_Sign1`, in hex; and a `key-link`'s
+metadata and author.
+
 To be added with F2:
 
-- a three-entry sequence chain;
+- a sequence chain across a `sequencer-set`: three records by the old sequencer, the set's
+  record by the new one, a record after it, and a record by the old sequencer past the
+  cited head, which is refused;
+- a hello that lists the block kinds its client implements (11a);
 - a `server-manifest` carrying peer policy.
 
 # Rejected Alternatives
