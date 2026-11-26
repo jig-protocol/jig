@@ -40,8 +40,9 @@ Draft. Field names are provisional. The design behind this revision is
    envelope versions it speaks, suites it implements, capabilities it wants, and a fresh
    random `nonce`. A server that dials another server adds `peer_did`, its own DID.
    In a hello, `capabilities.block_kinds` lists every block kind the client implements
-   (JEP-0005 rule 11a). A server serves a channel whose chain holds a kind added after
-   `v0.2.0` only to a client that lists it. Clients up to `v0.2.0` list none.
+   (JEP-0005 rule 11a). A server serves a client a channel only up to the first block
+   of a critical kind, added after `v0.2.0`, that the client does not list. Clients up
+   to `v0.2.0` list none.
 2. The server's first frame is `welcome`, signed by the server's DID key over its
    canonical bytes (domain `jig-handshake-welcome-v2`; v1 had no `server_nonce` or
    `tls_exporter`):

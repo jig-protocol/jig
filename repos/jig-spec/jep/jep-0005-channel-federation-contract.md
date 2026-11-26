@@ -255,14 +255,24 @@ Non-goals for v0.2:
        signed proof against either server, since it is two keys' words. Backfill is
        positional: a record at or below a cited head is checked against the range it
        falls in, whenever it arrives.
-     - **Records past the cited head.** A carrier may already hold records past the
-       cited head, signed by the old sequencer, when it receives the `sequencer-set`.
-       It MUST set those records aside: it keeps them as evidence, never delivers them,
-       and lands the `sequencer-set` in their place. This is not a fork, because the
-       owner's signature on `head` decides between the two chains. The writes in the
-       records set aside are lost, as the bullets below say. Two valid `sequencer-set`
-       blocks at one `seq` are the owner's own contradiction: the channel stops at that
-       `seq`, and both are kept.
+     - **Where the follower stands.** A follower may receive the `sequencer-set` from
+       the new sequencer before it holds any share with it, because the re-offer comes
+       after the move. It MUST take the set only from a configured peer, and only under
+       a live share with the sequencer the set moves from. It MUST charge the peer's
+       quota before it checks any signature.
+       - **Behind the cited head.** The follower keeps the set. It takes the records up
+         to the cited head from the new sequencer, which serves them, and checks each
+         against the range of the schedule it falls in: the old sequencer's, whoever
+         serves it. It lands the set once it holds the cited head exactly. A dead old
+         sequencer therefore cannot strand it.
+       - **Past the cited head.** The follower already holds records past the cited head,
+         signed by the old sequencer. Those records have applied their effects (members,
+         roles, the MLS group). A follower that holds records past the cited head MUST
+         stop the channel as for a fork, unless it can rebuild the carried state to the
+         cited head and set them aside. Records set aside are kept as evidence and never
+         delivered. Their writes are lost, as the bullets below say.
+       - Two valid `sequencer-set` blocks at one `seq` are the owner's own
+         contradiction: the channel stops at that `seq`, and both are kept.
      - **Taking over.** Once the new sequencer has sequenced the block, it sequences the
        channel. It sends each server that holds a live share (a `contract-accept` in the
        chain without a later `contract-end`) a new `contract-offer` at the grant that
@@ -274,15 +284,23 @@ Non-goals for v0.2:
        `SEQUENCER_MOVED`, naming the new sequencer.
      - **Readers that predate the move.** A reader that does not implement
        `sequencer-set` cannot verify the block's record, because a key it does not
-       expect signs it. The 14c stop therefore never reaches it. So:
-       - A client's hello MUST list, in `capabilities.block_kinds`, every block kind it
-         implements. A welcome's `block_kinds` stays the server's allow-list.
-       - A server MUST NOT deliver a client the `sequencer-set` record of a channel, or
-         any record after it, unless the client's hello lists `sequencer-set`. It
-         answers that channel's subscriptions and history reads from that `seq` on with
-         `CHANNEL_NEEDS_UPGRADE`, naming the kind and the `seq`, and delivers records
-         below it as usual. A `v0.2.0` client lists no kinds, so it is always answered
-         this way.
+       expect signs it. The 14c stop therefore never reaches it. Servers say it for
+       14c instead, for every kind added since `v0.2.0`:
+       - A client MUST declare every block kind it implements: in its hello's
+         `capabilities.block_kinds` on a connection, and in the `jig-capabilities`
+         header on a request, which carries no hello. A welcome's `block_kinds` stays
+         the server's allow-list.
+       - Let a channel's **gate** for a client be the first block in its chain whose kind
+         is critical (14c), is not one of the kinds `v0.2.0` implements, and is not one
+         the client declares. A non-critical (`opt-`) kind never gates.
+       - A server serves the client the channel's records before the gate as usual. It
+         MUST NOT deliver the gate's record or any record after it. A history or records
+         read that reaches the gate is cut there. A read that starts at or past it, a
+         live subscription when the gate lands, and a subscription made once the gate is
+         in the chain are answered with `CHANNEL_NEEDS_UPGRADE`, naming the kind and the
+         gate's `seq`.
+       - A `v0.2.0` client declares no kinds, so it is served each channel up to its
+         first `sequencer-set`.
        - A `v0.2.0` follower cannot accept the new sequencer's re-offer, because the
          creation block names another server. It keeps the channel at the cited head
          and shows nothing; the release notes say so (DJ 2026-11-26).

@@ -463,6 +463,7 @@ decisions below). It ships as these drafts, none merged before the `v0.2.0` tag:
 1. **Spec.** JEP-0005 rules 7b, 8 and 11a made exact, and JEP-0002 hello `block_kinds`.
 2. **#375.** The owner's key-link chain beside an offer (D37): #497.
 3. **`jig_core`.** `sequencer-set` and `key-link` metadata, and the move accept: #498.
+   Item 4 is #506.
 4. **Pipeline, the reader side:**
    - the schedule (`expected_sequencer(channel, seq)`, the one lookup F2-C calls);
    - setting aside the old sequencer's records past the cited head;
@@ -493,12 +494,15 @@ decisions below). It ships as these drafts, none merged before the `v0.2.0` tag:
   - the move accept lives inside the `sequencer-set`, so a move works when the old
     sequencer is down;
   - `policy_approvals` is present only on a move accept;
-  - a carrier sets aside the old sequencer's records past the cited head rather than
-    stopping on a fork;
+  - a follower holding the old sequencer's records past the cited head stops the channel
+    as for a fork, until it can rebuild the carried state (#507); a follower behind the
+    cited head catches up from the new sequencer, a configured peer;
   - a `key-link` to a DID that already holds standing in the channel is refused;
   - the #375 frame uses the welcome's link-list format;
   - the set's `seen` is the cited head's record;
-  - clients are gated on their hello's `block_kinds`.
+  - a client is served a channel up to the first block of a critical kind, added after
+    `v0.2.0`, that it does not declare (hello `block_kinds`, or `jig-capabilities` on a
+    request).
 - DJ 2026-11-26:
   - `jig channel move` refuses while the old sequencer is reachable and its welcome does
     not list `sequencer-set`, unless given `--old-sequencer-unreachable`. The release
