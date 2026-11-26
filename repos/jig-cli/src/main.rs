@@ -317,10 +317,25 @@ enum ChannelAction {
         #[arg()]
         slug: String,
         /// Only the members whose latest write the server with this DID
-        /// relayed: after its contract ended, those a member may want to
-        /// remove with `jig channel kick`.
+        /// relayed: after its contract ended, those `jig channel prune`
+        /// judges.
         #[arg(long, value_name = "SERVER_DID")]
         via: Option<String>,
+    },
+    /// After a server stopped carrying a channel, remove the members who
+    /// reached it only through that server (JEP-0005 rule 11): those whose
+    /// latest write it relayed, and whose reachability record lists no other
+    /// server. Lists them, and removes them only with `--yes`. Run against
+    /// the channel's own server, with the right to remove members.
+    Prune {
+        #[arg()]
+        slug: String,
+        /// The DID of the server whose share ended.
+        #[arg(long, value_name = "SERVER_DID")]
+        via: String,
+        /// Remove the members listed, rather than only listing them.
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Join an existing channel by adding the caller's DID as a member.
@@ -1047,6 +1062,9 @@ async fn run() -> Result<()> {
                 cmd::channel::unshare(&ctx, slug, server_did).await?
             }
             ChannelAction::Members { slug, via } => cmd::channel::members(&ctx, slug, via).await?,
+            ChannelAction::Prune { slug, via, yes } => {
+                cmd::channel::prune(&ctx, slug, via, yes).await?
+            }
             ChannelAction::Join { slug } => {
                 cmd::channel::join(&ctx, slug).await?;
             }
