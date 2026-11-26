@@ -4,9 +4,10 @@
 //! - `kp_policies`: each DID's newest release policy for this server, its
 //!   own `jig-kp-release-policy-v1`, kept only at a higher `seq`.
 //! - `kp_holds`: each request held for the DID, by `request_id`, with its
-//!   signed request, its state (`held`, `approved`, `refused`) and the
-//!   decision that settled it. Kept after it is decided, as the log of holds
-//!   and decisions.
+//!   signed request, its state (`held`, `approved`, `refused`, `expired`)
+//!   and the decision that settled it. Kept after it is settled, as the log
+//!   of holds and decisions. A request undecided for [`NewHold::ttl`]
+//!   expires, so a queue nobody decides drains by itself.
 //! - `kp_grants`: what an approval allows: one release to the requester, for
 //!   the DID and the channel, until it expires.
 //!
@@ -62,6 +63,12 @@ pub struct NewHold<'a> {
     /// The signed `jig-kp-request-v1`.
     pub request: &'a [u8],
     pub now: i64,
+    /// Seconds a request stays held undecided before it expires.
+    pub ttl: i64,
+    /// Most requests held for one DID at once.
+    pub max_per_did: usize,
+    /// Most requests held for one requester at once, across every DID.
+    pub max_per_requester: usize,
 }
 
 /// What became of a request to hold.
@@ -73,8 +80,13 @@ pub enum Held {
     /// that request's id. A requester asking again with a fresh request is
     /// not held twice.
     Already([u8; 32]),
-    /// The DID has [`NewHold`]s up to the bound waiting already.
-    Full,
+    /// As many requests wait on the DID as [`NewHold::max_per_did`]. Not
+    /// held; the oldest of them expires at `until`.
+    DidFull { until: i64 },
+    /// As many of the requester's requests wait, across every DID, as
+    /// [`NewHold::max_per_requester`]. Not held; the oldest expires at
+    /// `until`.
+    RequesterFull { until: i64 },
 }
 
 /// A request held for its DID.
@@ -94,8 +106,17 @@ pub enum Decided {
     Refused,
     /// No request with that id is held for that DID.
     NoSuchRequest,
-    /// The request was decided already.
+    /// The request was decided already, or expired undecided.
     AlreadyDecided,
+}
+
+/// Mark each request held since before `cutoff` expired.
+fn expire_on(conn: &rusqlite::Connection, cutoff: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE kp_holds SET state = 'expired' WHERE state = 'held' AND held_at <= ?1",
+        [cutoff],
+    )?;
+    Ok(())
 }
 
 /// A grant taken by a release, to put back if the release did not happen.
@@ -146,11 +167,13 @@ impl SqliteStore {
     }
 
     /// Hold `hold` for its DID's decision, unless the same requester already
-    /// waits on the DID for the same channel, or `max_held` requests already
-    /// wait on the DID.
-    pub fn hold_kp_request(&self, hold: &NewHold<'_>, max_held: usize) -> Result<Held> {
+    /// waits on the DID for the same channel, or the DID's or the
+    /// requester's holds are at their bound. Requests held past their `ttl`
+    /// expire first.
+    pub fn hold_kp_request(&self, hold: &NewHold<'_>) -> Result<Held> {
         let mut conn = self.conn.lock().expect("poisoned");
         let tx = conn.transaction()?;
+        expire_on(&tx, hold.now.saturating_sub(hold.ttl))?;
         let waiting: Option<Vec<u8>> = tx
             .query_row(
                 "SELECT request_id FROM kp_holds
@@ -160,15 +183,33 @@ impl SqliteStore {
             )
             .optional()?;
         if let Some(id) = waiting.and_then(|id| <[u8; 32]>::try_from(id).ok()) {
+            tx.commit()?;
             return Ok(Held::Already(id));
         }
-        let held: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM kp_holds WHERE did = ?1 AND state = 'held'",
-            [hold.did],
-            |r| r.get(0),
-        )?;
-        if usize::try_from(held).unwrap_or(usize::MAX) >= max_held {
-            return Ok(Held::Full);
+        // How many wait on `column = value`, and when the oldest expires.
+        let count = |column: &str, value: &str| -> Result<(usize, i64)> {
+            let (n, oldest): (i64, Option<i64>) = tx.query_row(
+                &format!(
+                    "SELECT COUNT(*), MIN(held_at) FROM kp_holds
+                     WHERE {column} = ?1 AND state = 'held'"
+                ),
+                [value],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            Ok((
+                usize::try_from(n).unwrap_or(usize::MAX),
+                oldest.unwrap_or(hold.now).saturating_add(hold.ttl),
+            ))
+        };
+        let (n, until) = count("did", hold.did)?;
+        if n >= hold.max_per_did {
+            tx.commit()?;
+            return Ok(Held::DidFull { until });
+        }
+        let (n, until) = count("requester", hold.requester)?;
+        if n >= hold.max_per_requester {
+            tx.commit()?;
+            return Ok(Held::RequesterFull { until });
         }
         tx.execute(
             "INSERT OR IGNORE INTO kp_holds
@@ -187,9 +228,11 @@ impl SqliteStore {
         Ok(Held::New(*hold.request_id))
     }
 
-    /// The requests held for `did`, oldest first, at most `limit`.
-    pub fn held_kp_requests(&self, did: &str, limit: u32) -> Result<Vec<HeldRequest>> {
+    /// The requests held for `did`, oldest first, at most `limit`; those
+    /// held since before `cutoff` expire first.
+    pub fn held_kp_requests(&self, did: &str, limit: u32, cutoff: i64) -> Result<Vec<HeldRequest>> {
         let conn = self.conn.lock().expect("poisoned");
+        expire_on(&conn, cutoff)?;
         let mut stmt = conn.prepare(
             "SELECT request_id, requester, channel_id, request, held_at FROM kp_holds
              WHERE did = ?1 AND state = 'held' ORDER BY held_at, rowid LIMIT ?2",
@@ -211,7 +254,9 @@ impl SqliteStore {
 
     /// Settle the request `request_id` held for `did` with `decision`, its
     /// signed envelope. An approval grants the requester one release for the
-    /// DID and the channel until `grant_until`.
+    /// DID and the channel until `grant_until`. Requests held since before
+    /// `cutoff` expire first: one expired is no longer decided.
+    #[allow(clippy::too_many_arguments)]
     pub fn decide_kp_request(
         &self,
         did: &str,
@@ -220,9 +265,11 @@ impl SqliteStore {
         decision: &[u8],
         now: i64,
         grant_until: i64,
+        cutoff: i64,
     ) -> Result<Decided> {
         let mut conn = self.conn.lock().expect("poisoned");
         let tx = conn.transaction()?;
+        expire_on(&tx, cutoff)?;
         let held: Option<(String, String, String)> = tx
             .query_row(
                 "SELECT state, requester, channel_id FROM kp_holds
@@ -324,6 +371,9 @@ impl SqliteStore {
 mod tests {
     use super::*;
 
+    const TTL: i64 = 1_000;
+    const D: &str = "did:jig:zD";
+
     fn store() -> SqliteStore {
         SqliteStore::open_in_memory().unwrap()
     }
@@ -331,121 +381,166 @@ mod tests {
     fn hold<'a>(id: &'a [u8; 32], requester: &'a str, channel: &'a str) -> NewHold<'a> {
         NewHold {
             request_id: id,
-            did: "did:jig:zD",
+            did: D,
             requester,
             channel_id: channel,
             request: b"signed request",
             now: 100,
+            ttl: TTL,
+            max_per_did: 8,
+            max_per_requester: 8,
         }
+    }
+
+    fn decide(s: &SqliteStore, did: &str, id: [u8; 32], approve: bool, now: i64) -> Decided {
+        s.decide_kp_request(did, &id, approve, b"d", now, 200, now - TTL)
+            .unwrap()
     }
 
     #[test]
     fn a_policy_is_kept_only_at_a_higher_seq() {
         let s = store();
-        assert_eq!(
-            s.put_release_policy("did:jig:zD", 2, b"two", 1).unwrap(),
-            (true, 2)
-        );
-        assert_eq!(
-            s.put_release_policy("did:jig:zD", 2, b"again", 1).unwrap(),
-            (false, 2)
-        );
-        assert_eq!(
-            s.put_release_policy("did:jig:zD", 1, b"one", 1).unwrap(),
-            (false, 2)
-        );
-        assert_eq!(s.release_policy("did:jig:zD").unwrap().unwrap(), b"two");
-        assert_eq!(
-            s.put_release_policy("did:jig:zD", 3, b"three", 1).unwrap(),
-            (true, 3)
-        );
-        assert_eq!(s.release_policy("did:jig:zD").unwrap().unwrap(), b"three");
+        assert_eq!(s.put_release_policy(D, 2, b"two", 1).unwrap(), (true, 2));
+        assert_eq!(s.put_release_policy(D, 2, b"again", 1).unwrap(), (false, 2));
+        assert_eq!(s.put_release_policy(D, 1, b"one", 1).unwrap(), (false, 2));
+        assert_eq!(s.release_policy(D).unwrap().unwrap(), b"two");
+        assert_eq!(s.put_release_policy(D, 3, b"three", 1).unwrap(), (true, 3));
+        assert_eq!(s.release_policy(D).unwrap().unwrap(), b"three");
         assert!(s.release_policy("did:jig:zE").unwrap().is_none());
     }
 
     #[test]
     fn a_requester_waits_once_per_did_and_channel_and_holds_are_bounded() {
         let s = store();
+        let h = |id, r, c| NewHold {
+            max_per_did: 2,
+            ..hold(id, r, c)
+        };
         assert_eq!(
-            s.hold_kp_request(&hold(&[1; 32], "did:jig:zR", "c1"), 2)
-                .unwrap(),
+            s.hold_kp_request(&h(&[1; 32], "did:jig:zR", "c1")).unwrap(),
             Held::New([1; 32])
         );
         // The same requester, a fresh request, the same channel.
         assert_eq!(
-            s.hold_kp_request(&hold(&[2; 32], "did:jig:zR", "c1"), 2)
-                .unwrap(),
+            s.hold_kp_request(&h(&[2; 32], "did:jig:zR", "c1")).unwrap(),
             Held::Already([1; 32])
         );
         assert_eq!(
-            s.hold_kp_request(&hold(&[3; 32], "did:jig:zR", "c2"), 2)
-                .unwrap(),
+            s.hold_kp_request(&h(&[3; 32], "did:jig:zR", "c2")).unwrap(),
             Held::New([3; 32])
         );
+        // The DID's queue is full: not held, with when its oldest expires.
         assert_eq!(
-            s.hold_kp_request(&hold(&[4; 32], "did:jig:zS", "c1"), 2)
-                .unwrap(),
-            Held::Full
+            s.hold_kp_request(&h(&[4; 32], "did:jig:zS", "c1")).unwrap(),
+            Held::DidFull { until: 100 + TTL }
         );
-        let held = s.held_kp_requests("did:jig:zD", 10).unwrap();
+        let held = s.held_kp_requests(D, 10, 0).unwrap();
         assert_eq!(held.len(), 2);
         assert_eq!(held[0].request_id, [1; 32]);
-        assert!(s.held_kp_requests("did:jig:zE", 10).unwrap().is_empty());
+        assert!(s.held_kp_requests("did:jig:zE", 10, 0).unwrap().is_empty());
+    }
+
+    /// One requester cannot fill every DID's queue on the custodian.
+    #[test]
+    fn a_requesters_holds_are_bounded_across_dids() {
+        let s = store();
+        let dids = ["did:jig:zD1", "did:jig:zD2", "did:jig:zD3"];
+        for (i, did) in dids.iter().enumerate() {
+            let id = [i as u8 + 1; 32];
+            let h = NewHold {
+                did,
+                max_per_requester: 2,
+                ..hold(&id, "did:jig:zR", "c1")
+            };
+            let got = s.hold_kp_request(&h).unwrap();
+            if i < 2 {
+                assert_eq!(got, Held::New(id));
+            } else {
+                assert_eq!(got, Held::RequesterFull { until: 100 + TTL });
+            }
+        }
+        // Another requester is not held up by it.
+        let h = NewHold {
+            did: dids[2],
+            max_per_requester: 2,
+            ..hold(&[9; 32], "did:jig:zS", "c1")
+        };
+        assert_eq!(s.hold_kp_request(&h).unwrap(), Held::New([9; 32]));
+    }
+
+    /// A request nobody decides expires: the queue drains by itself, and an
+    /// expired request is no longer decided.
+    #[test]
+    fn an_undecided_request_expires() {
+        let s = store();
+        let full = |id, r, now| NewHold {
+            max_per_did: 1,
+            now,
+            ..hold(id, r, "c1")
+        };
+        s.hold_kp_request(&full(&[1; 32], "did:jig:zR", 100))
+            .unwrap();
+        assert_eq!(
+            s.hold_kp_request(&full(&[2; 32], "did:jig:zS", 101))
+                .unwrap(),
+            Held::DidFull { until: 100 + TTL }
+        );
+        let later = 100 + TTL;
+        assert_eq!(
+            s.hold_kp_request(&full(&[2; 32], "did:jig:zS", later))
+                .unwrap(),
+            Held::New([2; 32])
+        );
+        let held = s.held_kp_requests(D, 10, later - TTL).unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].request_id, [2; 32]);
+        assert_eq!(decide(&s, D, [1; 32], true, later), Decided::AlreadyDecided);
+        assert!(
+            s.take_kp_grant(D, "did:jig:zR", "c1", later)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn an_approval_grants_one_release_until_it_expires() {
         let s = store();
-        s.hold_kp_request(&hold(&[1; 32], "did:jig:zR", "c1"), 8)
+        s.hold_kp_request(&hold(&[1; 32], "did:jig:zR", "c1"))
             .unwrap();
         // Not this DID's request.
         assert_eq!(
-            s.decide_kp_request("did:jig:zE", &[1; 32], true, b"d", 110, 200)
-                .unwrap(),
+            decide(&s, "did:jig:zE", [1; 32], true, 110),
             Decided::NoSuchRequest
         );
-        assert_eq!(
-            s.decide_kp_request("did:jig:zD", &[9; 32], true, b"d", 110, 200)
-                .unwrap(),
-            Decided::NoSuchRequest
-        );
-        assert_eq!(
-            s.decide_kp_request("did:jig:zD", &[1; 32], true, b"d", 110, 200)
-                .unwrap(),
-            Decided::Approved
-        );
-        assert_eq!(
-            s.decide_kp_request("did:jig:zD", &[1; 32], false, b"d", 111, 200)
-                .unwrap(),
-            Decided::AlreadyDecided
-        );
-        assert!(s.held_kp_requests("did:jig:zD", 10).unwrap().is_empty());
+        assert_eq!(decide(&s, D, [9; 32], true, 110), Decided::NoSuchRequest);
+        assert_eq!(decide(&s, D, [1; 32], true, 110), Decided::Approved);
+        assert_eq!(decide(&s, D, [1; 32], false, 111), Decided::AlreadyDecided);
+        assert!(s.held_kp_requests(D, 10, 0).unwrap().is_empty());
         // Another requester, another channel: nothing.
         assert!(
-            s.take_kp_grant("did:jig:zD", "did:jig:zS", "c1", 150)
+            s.take_kp_grant(D, "did:jig:zS", "c1", 150)
                 .unwrap()
                 .is_none()
         );
         assert!(
-            s.take_kp_grant("did:jig:zD", "did:jig:zR", "c2", 150)
+            s.take_kp_grant(D, "did:jig:zR", "c2", 150)
                 .unwrap()
                 .is_none()
         );
         // Taken once.
         let grant = s
-            .take_kp_grant("did:jig:zD", "did:jig:zR", "c1", 150)
+            .take_kp_grant(D, "did:jig:zR", "c1", 150)
             .unwrap()
             .unwrap();
         assert!(
-            s.take_kp_grant("did:jig:zD", "did:jig:zR", "c1", 150)
+            s.take_kp_grant(D, "did:jig:zR", "c1", 150)
                 .unwrap()
                 .is_none()
         );
         // Put back when no release followed, then expired.
-        s.restore_kp_grant("did:jig:zD", "did:jig:zR", "c1", &grant)
-            .unwrap();
+        s.restore_kp_grant(D, "did:jig:zR", "c1", &grant).unwrap();
         assert!(
-            s.take_kp_grant("did:jig:zD", "did:jig:zR", "c1", 200)
+            s.take_kp_grant(D, "did:jig:zR", "c1", 200)
                 .unwrap()
                 .is_none()
         );
@@ -454,20 +549,16 @@ mod tests {
     #[test]
     fn a_refusal_grants_nothing_and_a_new_request_is_held_again() {
         let s = store();
-        s.hold_kp_request(&hold(&[1; 32], "did:jig:zR", "c1"), 8)
+        s.hold_kp_request(&hold(&[1; 32], "did:jig:zR", "c1"))
             .unwrap();
-        assert_eq!(
-            s.decide_kp_request("did:jig:zD", &[1; 32], false, b"d", 110, 200)
-                .unwrap(),
-            Decided::Refused
-        );
+        assert_eq!(decide(&s, D, [1; 32], false, 110), Decided::Refused);
         assert!(
-            s.take_kp_grant("did:jig:zD", "did:jig:zR", "c1", 150)
+            s.take_kp_grant(D, "did:jig:zR", "c1", 150)
                 .unwrap()
                 .is_none()
         );
         assert_eq!(
-            s.hold_kp_request(&hold(&[2; 32], "did:jig:zR", "c1"), 8)
+            s.hold_kp_request(&hold(&[2; 32], "did:jig:zR", "c1"))
                 .unwrap(),
             Held::New([2; 32])
         );

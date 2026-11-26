@@ -61,6 +61,12 @@ pub const MAX_LOG_ENTRIES: u32 = 200;
 /// Most requests held for one DID at once (JEP-0005 rule 21c). Past it, a
 /// new request is refused, not held: the DID decides the ones it has first.
 pub const MAX_HELD_PER_DID: usize = 256;
+/// Most requests held for one requester at once, across every DID here, so
+/// that one requester cannot fill every DID's queue.
+pub const MAX_HELD_PER_REQUESTER: usize = 8;
+/// How long a request stays held undecided before it expires, so a queue
+/// its DID never reads drains by itself.
+pub const HOLD_SECS: i64 = 7 * 24 * 60 * 60;
 /// How long an approval stays good for (rule 21c).
 pub const GRANT_SECS: i64 = 24 * 60 * 60;
 
@@ -393,11 +399,11 @@ pub async fn request_key_package(
                 channel_id: &channel_id,
                 request: &envelope,
                 now,
+                ttl: HOLD_SECS,
+                max_per_did: MAX_HELD_PER_DID,
+                max_per_requester: MAX_HELD_PER_REQUESTER,
             };
-            return match store
-                .hold_kp_request(&hold, MAX_HELD_PER_DID)
-                .map_err(persist_err)?
-            {
+            return match store.hold_kp_request(&hold).map_err(persist_err)? {
                 Held::New(id) | Held::Already(id) => {
                     tracing::info!(
                         did = %did,
@@ -407,10 +413,17 @@ pub async fn request_key_package(
                     );
                     Err(held(&did, &id))
                 }
-                Held::Full => Err(err(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "RATE_LIMITED",
+                Held::DidFull { until } => Err(held_full(
                     format!("{MAX_HELD_PER_DID} requests already wait on {did}'s decision here"),
+                    until - now,
+                )),
+                Held::RequesterFull { until } => Err(held_full(
+                    format!(
+                        "{MAX_HELD_PER_REQUESTER} of {}'s requests already wait on a decision \
+                         here",
+                        request.requester
+                    ),
+                    until - now,
                 )),
             };
         }
@@ -540,6 +553,22 @@ fn held(did: &str, request_id: &[u8; 32]) -> Refusal {
     (status, Json(body))
 }
 
+/// A request not held because a queue is full (JEP-0005 rule 21c): never a
+/// release and never a silent drop, but a refusal saying when a place frees,
+/// at the latest when the oldest request in that queue expires.
+fn held_full(message: String, wait_secs: i64) -> Refusal {
+    let ms = u64::try_from(wait_secs.max(1))
+        .unwrap_or(u64::MAX)
+        .saturating_mul(1000);
+    let (status, Json(mut body)) = err(
+        StatusCode::TOO_MANY_REQUESTS,
+        "HELD_FULL",
+        format!("{message}; try again in {ms} ms (retry_after_ms={ms})"),
+    );
+    body.retry_after_ms = Some(ms);
+    (status, Json(body))
+}
+
 /// `did`'s own release policy as kept here, verified again on the way out.
 fn kept_policy(state: &AppState, did: &str) -> Result<Option<SignedPolicy>, Refusal> {
     let ours = state.server_did.to_did_jig_string();
@@ -624,7 +653,7 @@ pub async fn held_requests(
     let held = state
         .ingest_ctx
         .store
-        .held_kp_requests(&did, MAX_HELD_PER_DID as u32)
+        .held_kp_requests(&did, MAX_HELD_PER_DID as u32, now() - HOLD_SECS)
         .map_err(persist_err)?
         .into_iter()
         .map(|h| HeldEntryBody {
@@ -688,6 +717,7 @@ pub async fn decide(
             &envelope,
             now,
             now.saturating_add(GRANT_SECS),
+            now - HOLD_SECS,
         )
         .map_err(persist_err)?
     {
@@ -701,7 +731,7 @@ pub async fn decide(
         Decided::AlreadyDecided => Err(err(
             StatusCode::CONFLICT,
             "DECIDED",
-            format!("request {request_id} was decided already"),
+            format!("request {request_id} was decided already, or expired undecided"),
         )),
     }
 }
@@ -1808,5 +1838,50 @@ mod tests {
         stock(&state, 4, 2).await;
         // `[custody] release = open` by default: a stranger is released to.
         let _ = ask(&state, 8, 4, &ours(&state), now()).await.unwrap();
+    }
+
+    /// A requester past its holds across DIDs is refused `429 HELD_FULL`
+    /// with when to try again: not held, not released.
+    #[tokio::test]
+    async fn a_requester_past_its_holds_is_told_held_full() {
+        let state = state();
+        let custodian = ours(&state);
+        for i in 0..=MAX_HELD_PER_REQUESTER as u8 {
+            let member = 20 + i;
+            let _ = keep(
+                &state,
+                member,
+                vec![(custodian.clone(), "https://here".into())],
+                1,
+            )
+            .await
+            .unwrap();
+            stock(&state, member, 1).await;
+            let _ = put_policy_of(&state, member, &custodian, 1, vec![])
+                .await
+                .unwrap();
+            let refused = ask(&state, 8, member, &custodian, now()).await.unwrap_err();
+            if usize::from(i) < MAX_HELD_PER_REQUESTER {
+                held_id(&refused);
+            } else {
+                assert_eq!(
+                    code(&refused),
+                    (StatusCode::TOO_MANY_REQUESTS, "HELD_FULL".into())
+                );
+                let wait = refused.1.0.retry_after_ms.unwrap();
+                assert!(wait > 0 && wait <= HOLD_SECS as u64 * 1000, "{wait}");
+                // Nothing held for that member.
+                assert!(
+                    read_held(&state, member, member)
+                        .await
+                        .unwrap()
+                        .held
+                        .is_empty()
+                );
+            }
+        }
+        // Another requester still is held, not refused.
+        let refused = ask(&state, 9, 20, &custodian, now()).await.unwrap_err();
+        held_id(&refused);
     }
 }
