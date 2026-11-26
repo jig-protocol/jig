@@ -380,6 +380,7 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         ref e @ (IngestError::OwnerCannotLeave { .. }
         | IngestError::RemoveEndsStale { .. }
         | IngestError::RemoveEndsRequired { .. }
+        | IngestError::RemovePredatesMembership { .. }
         | IngestError::UnknownSuite { .. }
         | IngestError::SuiteMismatch { .. }
         | IngestError::RestrictedRequiresMls { .. }

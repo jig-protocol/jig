@@ -42,6 +42,13 @@ pub fn millis(wait: Duration) -> u64 {
 /// same draw ([`classify_with_wait`]).
 pub fn retry_after(e: &IngestError) -> Option<Duration> {
     match e {
+        // How far the author's clock is short: a remove it writes that much
+        // later lands. Worth saying only when it is soon.
+        IngestError::RemovePredatesMembership { wait_ms, .. }
+            if *wait_ms < REMOVE_WAIT_LIMIT_MS =>
+        {
+            Some(Duration::from_millis(*wait_ms))
+        }
         IngestError::RenderFailed {
             cause: RenderCause::DeadlineExceeded,
             ..
@@ -50,10 +57,25 @@ pub fn retry_after(e: &IngestError) -> Option<Duration> {
     }
 }
 
+/// The longest wait a `REMOVE_PREDATES_MEMBERSHIP` refusal names: an hour.
+/// A device whose clock is further behind than that is told to check it.
+pub const REMOVE_WAIT_LIMIT_MS: u64 = 60 * 60 * 1000;
+
+/// [`retry_after`], spread by [`jitter`] where this server picked the wait.
+/// A wait the failure itself fixes (how far an author's clock is short) is
+/// sent as it is: a shorter one would only be refused again.
+pub fn retry_after_spread(e: &IngestError) -> Option<Duration> {
+    let wait = retry_after(e)?;
+    Some(match e {
+        IngestError::RemovePredatesMembership { .. } => wait,
+        _ => jitter(wait),
+    })
+}
+
 /// Classify an ingest failure into `(status, error_code, message)`. Callers
 /// wrap this triple in whatever JSON body type their endpoint uses.
 pub fn classify_ingest_error(e: &IngestError) -> (StatusCode, &'static str, String) {
-    classify_with_wait(e, retry_after(e).map(jitter))
+    classify_with_wait(e, retry_after_spread(e))
 }
 
 /// [`classify_ingest_error`], its message naming `wait` for a failure that
@@ -238,6 +260,17 @@ pub fn classify_with_wait(
             StatusCode::BAD_REQUEST,
             "REMOVE_ENDS_REQUIRED",
             e.to_string(),
+        ),
+        // 409: well-formed, but timestamped before the membership it would
+        // end. The message names both causes; the wait, when there is one,
+        // is when a remove written again would land.
+        IngestError::RemovePredatesMembership { .. } => (
+            StatusCode::CONFLICT,
+            "REMOVE_PREDATES_MEMBERSHIP",
+            match wait {
+                Some(wait) => format!("{e} (retry_after_ms={})", millis(wait)),
+                None => e.to_string(),
+            },
         ),
         // 400: the slug is outside the canonical grammar or in a reserved
         // namespace (`#dm/`, `#jig/`, `#email/`) the author may not use.
@@ -498,6 +531,13 @@ mod tests {
                 slug: "#room".to_string(),
                 member: "did:jig:zMember".to_string(),
             },
+            IngestError::RemovePredatesMembership {
+                slug: "#room".to_string(),
+                member: "did:jig:zMember".to_string(),
+                written_ms: 1,
+                began_ms: 400_000,
+                wait_ms: 99_999,
+            },
             IngestError::InvalidSlug {
                 slug: "#General".to_string(),
                 reason: "uppercase".to_string(),
@@ -516,6 +556,35 @@ mod tests {
     /// A block too expensive for this server is a 422 that never suggests a
     /// retry; a missed deadline is a 503 that says how long to wait; a host
     /// fault keeps the 500 it always had.
+    /// A remove timestamped before the membership it would end names both
+    /// causes, and how long until a remove written again lands, exactly
+    /// and only when that is under an hour (DJ 2026-11-26).
+    #[test]
+    fn a_remove_that_predates_its_membership_says_when_to_write_it_again() {
+        let predates = |wait_ms| IngestError::RemovePredatesMembership {
+            slug: "#room".to_string(),
+            member: "did:jig:zMember".to_string(),
+            written_ms: 1,
+            began_ms: 2,
+            wait_ms,
+        };
+        let soon = crate::v0_0_2_relay::Refusal::of(&predates(90_000));
+        assert_eq!(soon.status, StatusCode::CONFLICT);
+        assert_eq!(soon.code, "REMOVE_PREDATES_MEMBERSHIP");
+        assert_eq!(soon.retry_after_ms, Some(90_000), "the gap, not jittered");
+        for cause in ["device clock", "`ends`"] {
+            assert!(soon.message.contains(cause), "{}", soon.message);
+        }
+        assert!(
+            soon.message.ends_with("(retry_after_ms=90000)"),
+            "{}",
+            soon.message
+        );
+        let late = crate::v0_0_2_relay::Refusal::of(&predates(REMOVE_WAIT_LIMIT_MS));
+        assert_eq!(late.retry_after_ms, None);
+        assert_eq!(late.code, "REMOVE_PREDATES_MEMBERSHIP");
+    }
+
     #[test]
     fn a_render_failure_is_classified_by_its_cause() {
         for cause in [RenderCause::FuelExhausted, RenderCause::StackExhausted] {

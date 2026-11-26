@@ -66,6 +66,18 @@ pub enum WriteRefusal {
     /// A `member-remove` without `ends`, on a server that requires it
     /// (`[server] require_remove_ends`).
     RemoveEndsRequired { slug: String, member: String },
+    /// A `member-remove` without `ends` whose `hlc_ts` is more than the
+    /// skew bound before the current membership began: written for an
+    /// earlier membership, or by a device whose clock is slow. `wait_ms` is
+    /// how far the author's clock is short of the earliest time a remove
+    /// written now would land.
+    RemovePredatesMembership {
+        slug: String,
+        member: String,
+        written_ms: u64,
+        began_ms: u64,
+        wait_ms: u64,
+    },
 }
 
 /// The metadata key under which a `member-remove` names the membership it
@@ -73,13 +85,6 @@ pub enum WriteRefusal {
 /// that is the `member-add` that added it; for a root owner, the
 /// `channel-create`.
 pub const ENDS_KEY: &str = "ends";
-
-/// How far an author's clock may run behind the sequencer's before a
-/// `member-remove` without `ends` is taken as written before the membership
-/// it would end began: one day. The past is not bounded for an author's
-/// clock (JEP-0002 rule 13), so this is generous rather than the future-skew
-/// bound: a client whose clock is minutes slow still leaves.
-pub const LEGACY_REMOVE_SLACK_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// The membership a `member-remove` would end, as the caller resolved it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,15 +104,18 @@ pub struct CurrentMembership<'a> {
 ///   the same slug, names a membership that is not this one.
 /// - `ends` absent: refused when `require` is set. Otherwise the remove is
 ///   from an author that predates `ends` (v0.2.0), and is taken unless its
-///   `hlc_ts` is more than [`LEGACY_REMOVE_SLACK_MS`] before `current`
-///   began: a remove written before a membership existed was not meant for
-///   it.
+///   `hlc_ts` is more than `skew_ms` (the server's `max_future_skew_ms`)
+///   before `current` began: a remove written before a membership existed
+///   was not meant for it. A device whose clock is slow by more than that
+///   is refused too, but only while its clock reads before the membership
+///   began: a remove it writes later lands (DJ 2026-11-26).
 pub fn check_remove_ends(
     manifest: &BlockManifest,
     slug: &str,
     member: &str,
     current: Option<CurrentMembership<'_>>,
     require: bool,
+    skew_ms: u64,
 ) -> Result<(), WriteRefusal> {
     let Some(current) = current else {
         return Ok(());
@@ -133,13 +141,14 @@ pub fn check_remove_ends(
             member: member.to_string(),
         }),
         None => match (manifest.hlc_ts.as_ref(), current.since_wall_ms) {
-            (Some(written), Some(began))
-                if written.wall_ms.saturating_add(LEGACY_REMOVE_SLACK_MS) < began =>
-            {
-                stale(format!(
-                    "it was written at {} ms, before the current membership began at {began} ms",
-                    written.wall_ms
-                ))
+            (Some(written), Some(began)) if written.wall_ms.saturating_add(skew_ms) < began => {
+                Err(WriteRefusal::RemovePredatesMembership {
+                    slug: slug.to_string(),
+                    member: member.to_string(),
+                    written_ms: written.wall_ms,
+                    began_ms: began,
+                    wait_ms: began - skew_ms - written.wall_ms,
+                })
             }
             _ => Ok(()),
         },
@@ -497,13 +506,14 @@ mod tests {
             });
             m
         };
-        let began = LEGACY_REMOVE_SLACK_MS + 1_000_000;
+        const SKEW: u64 = 300_000;
+        let began = 10_000_000;
         let current = Some(CurrentMembership {
             since: "bafy-add-2",
             since_wall_ms: Some(began),
         });
         let check = |m: &BlockManifest, current, require| {
-            check_remove_ends(m, "#room", MEMBER, current, require)
+            check_remove_ends(m, "#room", MEMBER, current, require, SKEW)
         };
         // Naming the current membership.
         assert_eq!(
@@ -525,17 +535,23 @@ mod tests {
             );
         }
         // No `ends`: refused only where it is required, or when the block
-        // was written more than a day before the membership began: an
-        // author's clock a day behind still leaves.
+        // was written more than the skew bound before the membership began,
+        // saying how far the author's clock is short.
         assert_eq!(check(&remove(None, Some(began)), current, false), Ok(()));
         assert_eq!(
-            check(&remove(None, Some(1_000_000)), current, false),
+            check(&remove(None, Some(began - SKEW)), current, false),
             Ok(())
         );
-        assert!(matches!(
-            check(&remove(None, Some(999_999)), current, false),
-            Err(WriteRefusal::RemoveEndsStale { .. })
-        ));
+        assert_eq!(
+            check(&remove(None, Some(began - SKEW - 1_000)), current, false),
+            Err(WriteRefusal::RemovePredatesMembership {
+                slug: "#room".into(),
+                member: MEMBER.into(),
+                written_ms: began - SKEW - 1_000,
+                began_ms: began,
+                wait_ms: 1_000,
+            })
+        );
         assert_eq!(check(&remove(None, None), current, false), Ok(()));
         assert!(matches!(
             check(&remove(None, Some(began)), current, true),

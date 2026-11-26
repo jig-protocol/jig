@@ -434,6 +434,21 @@ pub enum IngestError {
          server requires"
     )]
     RemoveEndsRequired { slug: String, member: String },
+    /// A `member-remove` without `ends`, timestamped more than the skew
+    /// bound before the membership it would end began (JEP-0002 rule 11).
+    /// `wait_ms` is how far the author's clock is short.
+    #[error(
+        "this remove of {member} from {slug} is timestamped before the membership it would end \
+         ({written_ms} ms, the membership began at {began_ms} ms): check the device clock and \
+         write the remove again, or upgrade so the client sends `ends`"
+    )]
+    RemovePredatesMembership {
+        slug: String,
+        member: String,
+        written_ms: u64,
+        began_ms: u64,
+        wait_ms: u64,
+    },
     /// A `channel-create` whose slug is outside the slug grammar, or in a
     /// reserved namespace its author may not create in
     /// ([`jig_core::slug::check_create`]).
@@ -897,6 +912,19 @@ pub async fn ingest(
             WriteRefusal::RemoveEndsRequired { slug, member } => {
                 IngestError::RemoveEndsRequired { slug, member }
             }
+            WriteRefusal::RemovePredatesMembership {
+                slug,
+                member,
+                written_ms,
+                began_ms,
+                wait_ms,
+            } => IngestError::RemovePredatesMembership {
+                slug,
+                member,
+                written_ms,
+                began_ms,
+                wait_ms,
+            },
         });
     }
 
@@ -927,12 +955,26 @@ pub async fn ingest(
                     since_wall_ms,
                 }),
             ctx.require_remove_ends,
+            ctx.hlc_clock.max_future_skew_ms(),
         ) {
             tracing::info!(kind = kind_str, refusal = ?refusal, "write refused");
             return Err(match refusal {
                 crate::authorize_write::WriteRefusal::RemoveEndsRequired { slug, member } => {
                     IngestError::RemoveEndsRequired { slug, member }
                 }
+                crate::authorize_write::WriteRefusal::RemovePredatesMembership {
+                    slug,
+                    member,
+                    written_ms,
+                    began_ms,
+                    wait_ms,
+                } => IngestError::RemovePredatesMembership {
+                    slug,
+                    member,
+                    written_ms,
+                    began_ms,
+                    wait_ms,
+                },
                 crate::authorize_write::WriteRefusal::RemoveEndsStale {
                     slug,
                     member,
