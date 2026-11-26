@@ -2570,6 +2570,99 @@ mod tests {
         assert!(contracts.judge(&offer_with(&third, Grant::Read)).is_err());
     }
 
+    /// A re-offer that came before its move landed here is held, then
+    /// accepted on the next tick once the move is in this server's chain, with
+    /// no operator: the gap a client sees (`CarriedUnproven`) closes by
+    /// itself. A wider grant stays held for the operator (decision 4).
+    #[tokio::test]
+    async fn a_reoffer_held_before_its_move_is_accepted_on_the_next_tick() {
+        let (old, new) = (
+            SigningKey::from_bytes(&[3; 32]),
+            SigningKey::from_bytes(&[6; 32]),
+        );
+        let state = state_with(
+            vec![peer("ws://127.0.0.1:1", did_of(&new), OfferPolicy::Hold)],
+            &[],
+        );
+        crate::v0_0_2_manifest_log::publish(&Arc::new(state.clone()))
+            .await
+            .unwrap();
+        let contracts = Contracts::new(&state);
+        let store = &state.ingest_ctx.store;
+        let created = creation(&old, serde_json::json!({}));
+        let channel = created.1.to_string();
+        let offer_with = |key: &SigningKey, grant: Grant| {
+            ContractOffer::sign(
+                key,
+                &state.server_did.to_did_jig_string(),
+                created.1,
+                grant,
+                created.0.clone(),
+                b"head".to_vec(),
+                ManifestRef {
+                    cid: created.1,
+                    seq: 0,
+                },
+                vec![],
+            )
+        };
+        let put = |offer: &ContractOffer, peer: &SigningKey, grant, state| {
+            store
+                .put_contract_offer(&StoredOffer {
+                    offer_id: offer.offer_id,
+                    channel_id: channel.clone(),
+                    side: Side::Follower,
+                    peer_did: did_of(peer),
+                    grant,
+                    state,
+                    offer: offer.envelope.clone(),
+                    answer: None,
+                    share_cid: None,
+                })
+                .unwrap()
+        };
+        put(
+            &offer_with(&old, Grant::Write),
+            &old,
+            Grant::Write,
+            OfferState::Accepted,
+        );
+        let same = offer_with(&new, Grant::Write);
+        let wider = offer_with(&new, Grant::Member);
+        put(&same, &new, Grant::Write, OfferState::Held);
+        put(&wider, &new, Grant::Member, OfferState::Held);
+        let held = |offer: &ContractOffer| {
+            store
+                .contract_offers_in(Side::Follower, OfferState::Held)
+                .unwrap()
+                .iter()
+                .any(|o| o.offer_id == offer.offer_id)
+        };
+
+        // Before the move: nothing to re-judge.
+        contracts.act_on_decisions().await;
+        assert!(held(&same) && held(&wider));
+
+        store
+            .record_move_for_tests(
+                &channel,
+                &jig_pipeline::follow::ChannelMove {
+                    seq: 4,
+                    sequencer: did_of(&new),
+                    previous: did_of(&old),
+                    block_cid: "bafkmove".to_string(),
+                },
+            )
+            .unwrap();
+        contracts.act_on_decisions().await;
+        assert!(!held(&same), "the same grant is accepted on the tick");
+        assert!(
+            store.has_accepted_share(&channel, &did_of(&new)).unwrap(),
+            "the new sequencer's share is accepted"
+        );
+        assert!(held(&wider), "a wider grant waits for the operator");
+    }
+
     /// The servers a sequencer re-offers a channel to are the ones the
     /// chain says hold a live share: a `contract-accept` with no later
     /// `contract-end`.

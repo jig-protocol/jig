@@ -1331,7 +1331,19 @@ pub fn prove_carried_after_move(
     offer_b64: Option<&str>,
     moved_to: &str,
 ) -> Result<CarriedOwner, PinError> {
-    prove_carried_by(
+    // The move landed here before this server accepted the new sequencer's
+    // re-offer: said so, since it usually closes by itself (a same or
+    // narrower grant is accepted on the server's next tick; a wider one
+    // waits for its operator).
+    let not_yet = || PinError::CarriedUnproven {
+        server: server.to_string(),
+        slug: slug.to_string(),
+        sequencer: sequencer.to_string(),
+        reason: format!(
+            "the channel moved to {sequencer}, and this server has not accepted its re-offer yet"
+        ),
+    };
+    match prove_carried_by(
         server,
         slug,
         channel_id,
@@ -1340,8 +1352,18 @@ pub fn prove_carried_after_move(
         offer_b64,
         &[],
         Some(moved_to),
-    )
+    ) {
+        Err(PinError::CarriedUnproven { reason, .. })
+            if reason == NO_OFFER || reason == OFFER_FROM_ANOTHER =>
+        {
+            Err(not_yet())
+        }
+        proven => proven,
+    }
 }
+
+const NO_OFFER: &str = "it shows no offer from that server";
+const OFFER_FROM_ANOTHER: &str = "the offer is signed by another server";
 
 #[allow(clippy::too_many_arguments)]
 fn prove_carried_by(
@@ -1361,14 +1383,14 @@ fn prove_carried_by(
         reason: reason.to_string(),
     };
     let canonical = jig_pipeline::effect::canonical_did_string;
-    let offer_b64 = offer_b64.ok_or_else(|| unproven("it shows no offer from that server"))?;
+    let offer_b64 = offer_b64.ok_or_else(|| unproven(NO_OFFER))?;
     let envelope = base64::engine::general_purpose::STANDARD
         .decode(offer_b64)
         .map_err(|_| unproven("its offer is not base64"))?;
     let offer = jig_core::contract::ContractOffer::from_envelope(&envelope)
         .map_err(|e| unproven(&format!("its offer does not verify: {e}")))?;
     if canonical(&offer.owner) != canonical(sequencer) {
-        return Err(unproven("the offer is signed by another server"));
+        return Err(unproven(OFFER_FROM_ANOTHER));
     }
     if offer.channel_id.to_string() != channel_id {
         return Err(unproven("the offer is for another channel"));
@@ -2434,11 +2456,23 @@ mod tests {
             error.to_string().contains("named another server"),
             "{error}"
         );
-        // The move is no proof without the new sequencer's offer.
-        assert!(matches!(
-            prove(&did_of_key(&new), None),
-            Err(PinError::CarriedUnproven { .. })
-        ));
+        // The move is no proof without the new sequencer's offer; the
+        // message says the re-offer is not accepted yet.
+        let error = prove(&did_of_key(&new), None).unwrap_err();
+        assert!(
+            error.to_string().contains(&format!(
+                "moved to {}, and this server has not accepted its re-offer yet",
+                did_of_key(&new)
+            )),
+            "{error}"
+        );
+        // The old sequencer's offer still listed: the same.
+        let from_old = carried_naming(
+            jig_core::crypto::ed25519::generate_signing_key(),
+            Some(&old),
+        );
+        let error = prove(&did_of_key(&new), Some(&from_old.offer_b64)).unwrap_err();
+        assert!(error.to_string().contains("re-offer yet"), "{error}");
     }
 
     /// The pin answers where its verified chain moved the channel, and never

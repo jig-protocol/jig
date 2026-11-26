@@ -695,7 +695,8 @@ impl ChannelChain {
             .any(|o| jig_pipeline::handshake::same_did(o, &opened.sender))
         {
             return Err(bad(format!(
-                "it is signed by {}, not by an owner of the channel this client knows",
+                "it is signed by {}, a key that is not the channel's creation-block owner; \
+                 owner key links are not yet followed",
                 opened.sender
             )));
         }
@@ -916,10 +917,16 @@ mod tests {
         };
         let (bundle, sig) = move_block(&at, &new, &stranger);
         at.key = new;
-        assert!(matches!(
-            by_stranger.accept_block(&set, None, &bundle, Some(&sig)),
-            Err(ChainBreak::BadMove { .. })
-        ));
+        let refused = by_stranger
+            .accept_block(&set, None, &bundle, Some(&sig))
+            .unwrap_err();
+        assert!(matches!(refused, ChainBreak::BadMove { .. }));
+        assert!(
+            refused
+                .to_string()
+                .contains("not the channel's creation-block owner"),
+            "{refused}"
+        );
         assert!(matches!(
             read(vec![]).accept_block(&set, None, &bundle, Some(&sig)),
             Err(ChainBreak::BadMove { .. })
