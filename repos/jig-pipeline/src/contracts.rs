@@ -363,6 +363,15 @@ pub(crate) fn migrate(conn: &rusqlite::Connection) -> crate::persist::Result<()>
         CREATE INDEX IF NOT EXISTS contract_offers_share
             ON contract_offers(channel_id, peer_did, side, state);
 
+        -- The owner's key-link chain that came with an offer (JEP-0005
+        -- rule 7, D37), as the frame carried it: from the DID the channel's
+        -- creation block names to the offer's signer. Kept by the offered
+        -- side, verified before it is kept.
+        CREATE TABLE IF NOT EXISTS offer_key_links (
+            offer_id BLOB PRIMARY KEY,
+            body     BLOB NOT NULL
+        );
+
         -- A copy of a channel the federation relay made, set aside when this
         -- server came to follow the channel's owner for it
         -- ([`SqliteStore::quarantine_relayed_copy`]): kept, never relayed or
@@ -505,6 +514,82 @@ impl SqliteStore {
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Keep the owner's key-link chain for an offer, verified already. A
+    /// chain already kept for that offer stays as it is.
+    pub fn put_offer_key_links(
+        &self,
+        chain: &jig_core::contract::OwnerKeyLinks,
+    ) -> crate::persist::Result<()> {
+        self.conn.lock().expect("poisoned").execute(
+            "INSERT OR IGNORE INTO offer_key_links (offer_id, body) VALUES (?1, ?2)",
+            params![chain.offer_id.as_slice(), chain.to_bytes()],
+        )?;
+        Ok(())
+    }
+
+    /// The key links kept with offer `offer_id`, oldest first, as COSE_Sign
+    /// bytes: none for an offer that came without a chain.
+    pub fn offer_key_links(&self, offer_id: &[u8; 32]) -> crate::persist::Result<Vec<Vec<u8>>> {
+        let body: Option<Vec<u8>> = self
+            .conn
+            .lock()
+            .expect("poisoned")
+            .query_row(
+                "SELECT body FROM offer_key_links WHERE offer_id = ?1",
+                [offer_id.as_slice()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(body
+            .and_then(|b| jig_core::contract::OwnerKeyLinks::from_bytes(&b).ok())
+            .map(|chain| chain.links)
+            .unwrap_or_default())
+    }
+
+    /// The DIDs `owner_did` signed as before, oldest first, along the key
+    /// links that came with the offer of `channel_id` this server accepted
+    /// from it (live or since ended): the DIDs its records for the channel
+    /// may be signed by, in that order, before `owner_did` itself. Empty for
+    /// an owner whose offer came with no chain.
+    pub fn owner_predecessors(
+        &self,
+        channel_id: &str,
+        owner_did: &str,
+    ) -> crate::persist::Result<Vec<String>> {
+        let canonical = crate::effect::canonical_did_string(owner_did);
+        let body: Option<Vec<u8>> = self
+            .conn
+            .lock()
+            .expect("poisoned")
+            .query_row(
+                "SELECT k.body FROM contract_offers o
+                 JOIN offer_key_links k ON k.offer_id = o.offer_id
+                 WHERE o.channel_id = ?1 AND o.peer_did IN (?2, ?3) AND o.side = ?4
+                   AND o.state IN (?5, ?6, ?7)
+                 LIMIT 1",
+                params![
+                    channel_id,
+                    owner_did,
+                    canonical,
+                    Side::Follower.as_str(),
+                    OfferState::Accepted.as_str(),
+                    OfferState::Ending.as_str(),
+                    OfferState::Ended.as_str()
+                ],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let links = body
+            .and_then(|b| jig_core::contract::OwnerKeyLinks::from_bytes(&b).ok())
+            .map(|chain| chain.links)
+            .unwrap_or_default();
+        Ok(links
+            .iter()
+            .filter_map(|bytes| jig_core::key_link::SignedKeyLink::from_envelope(bytes).ok())
+            .map(|link| link.link().old.clone())
+            .collect())
     }
 
     /// Whether this server follows `channel_id` for `owner_did` under an

@@ -145,6 +145,7 @@ fn apply_channel_create(
         m,
         block_cid,
         &sequencer,
+        &[],
     )
 }
 
@@ -156,6 +157,7 @@ fn apply_channel_create_under(
     m: &BlockManifest,
     block_cid: &str,
     sequencer: &str,
+    predecessors: &[String],
 ) -> anyhow::Result<()> {
     let slug = meta_str(m, "slug")
         .ok_or_else(|| anyhow::anyhow!("channel-create missing `slug` in metadata"))?;
@@ -163,7 +165,7 @@ fn apply_channel_create_under(
         .map_err(|_| anyhow::anyhow!("channel-create names an unknown suite"))?;
     let now = chrono::Utc::now().timestamp();
     let owner_did = sender_did_string(m);
-    let terms = crate::ingest::channel_terms(m, sequencer)
+    let terms = crate::ingest::channel_terms_from(m, sequencer, predecessors)
         .map_err(|e| anyhow::anyhow!("channel-create terms: {e}"))?;
     let declared = meta_str(m, "visibility").unwrap_or("open");
     let tiering = terms.stored_tiering(slug, declared, suite.as_str());
@@ -369,19 +371,26 @@ fn archive_on(conn: &rusqlite::Connection, channel: &StoredChannel) -> anyhow::R
 /// block, and its signed order is what this server follows. Kinds that are
 /// not channel content, the nameserver's and the federation handshake's,
 /// are refused: they have no place in a channel's chain.
+///
+/// `predecessors` are the DIDs `sequencer` signed as before, along the key
+/// links its offer came with (JEP-0005 rule 7, D37): a `channel-create` may
+/// name any of them as its sequencer.
 pub fn apply_carried_effect(
     conn: &rusqlite::Connection,
     m: &BlockManifest,
     block_cid: &str,
     channel: Option<&StoredChannel>,
     sequencer: &str,
+    predecessors: &[String],
 ) -> anyhow::Result<()> {
     let kind = m
         .kind
         .ok_or_else(|| anyhow::anyhow!("a carried block declares no kind"))?;
     let carried = || channel.ok_or_else(|| anyhow::anyhow!("no carried channel for the block"));
     match kind {
-        BlockKind::ChannelCreate => apply_channel_create_under(conn, m, block_cid, sequencer),
+        BlockKind::ChannelCreate => {
+            apply_channel_create_under(conn, m, block_cid, sequencer, predecessors)
+        }
         BlockKind::MemberAdd => member_add_on(conn, m, block_cid, carried()?),
         BlockKind::MemberRemove => member_remove_on(conn, m, channel),
         BlockKind::ChannelPromote => promote_on(conn, carried()?.clone()),

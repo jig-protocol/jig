@@ -161,8 +161,12 @@ of every channel it sequences (JEP-0005). A server that changed its key:
 A server that leaves a DID out of the chain it serves (a broken or pruned link) also
 loses that DID's standing: its channels are no longer the server's.
 
-How a server that follows another server's channel follows that sequencer's key change
-is not specified yet. Until it is, a follower holds the sequencer it agreed terms with.
+A server that follows another server's channel holds the sequencer it agreed terms with.
+When that sequencer changed its key before it offered the channel, its offer comes with
+the links from the DID the channel's creation block names to the offer's signer (JEP-0005
+rule 7, note D37). The follower checks the channel's records against those links as below.
+How a follower follows a key change made after it accepted the share is not specified
+yet.
 
 ### Checking a chain across a key change
 

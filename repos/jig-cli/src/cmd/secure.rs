@@ -162,6 +162,11 @@ pub struct ChannelInfo {
     /// The owner's signed offer, for a channel the server carries.
     #[serde(default)]
     pub share: Option<String>,
+    /// The owner's key links beside `share`, when the owner changed its key
+    /// after it created the channel (base64, oldest first). Checked, never
+    /// trusted ([`prove_carried`]).
+    #[serde(default)]
+    pub share_key_links: Vec<String>,
     /// The channel's tier (JEP-0014), or `frozen`, as the listing says.
     /// Absent from servers before tiers. Unsigned: shown, never trusted.
     #[serde(default)]
@@ -208,7 +213,7 @@ pub async fn connect_pinned(server: &str, identity: Identity) -> Result<Client> 
             .server(server)
             .map(|p| p.links.clone())
             .unwrap_or_default(),
-        carried: pins.carried(server),
+        carried: pins.carried_signers(server),
     };
     let client = Client::connect_with_options(server, identity, options)
         .await
@@ -923,15 +928,16 @@ impl Secure {
                 sequencer,
                 &ours,
                 info.share.as_deref(),
+                &info.share_key_links,
             )?),
             None => None,
         };
-        if pins.anchor_channel(&self.server, &info.slug, &info.id, owner.as_deref())? {
+        if pins.anchor_carried(&self.server, &info.slug, &info.id, owner.as_ref())? {
             eprintln!(
                 "note: {} is now carried here for {}, which orders it; its history is checked \
                  against that server's records from now on",
                 info.slug,
-                owner.as_deref().unwrap_or_default()
+                owner.as_ref().map(|o| o.did.as_str()).unwrap_or_default()
             );
         }
         Ok(())
@@ -974,29 +980,38 @@ impl Secure {
             .server(&self.server)
             .map(|p| p.sequencers())
             .unwrap_or_default();
-        let carried = names_another_server(&ours, &info.sequencer);
-        let orders = if carried {
-            vec![info.sequencer.clone()]
-        } else {
-            ours.clone()
-        };
-        let mut proven =
-            prove_channel_ordered_by(&info.slug, &info.id, &served.bundle_b64, &sig, &orders)?;
         // Which server orders it is part of what is pinned: a carried channel
         // may share its slug with one of this server's own (#388), and only
         // a channel of the same orderer can replace it. The owner is taken
-        // only as its signed offer proves ([`Self::anchor`] does the same).
-        if carried {
-            proven.sequencer = Some(prove_carried(
+        // only as its signed offer proves ([`Self::anchor`] does the same),
+        // and the creation block may name it under a DID its key links lead
+        // from (#375).
+        let owner = if names_another_server(&ours, &info.sequencer) {
+            Some(prove_carried(
                 &self.server,
                 &info.slug,
                 &info.id,
                 &info.sequencer,
                 &ours,
                 info.share.as_deref(),
-            )?);
-        }
+                &info.share_key_links,
+            )?)
+        } else {
+            None
+        };
+        let orders = match &owner {
+            Some(owner) => jig_client::pins::dids_along(&owner.links, &owner.did),
+            None => ours.clone(),
+        };
+        let mut proven =
+            prove_channel_ordered_by(&info.slug, &info.id, &served.bundle_b64, &sig, &orders)?;
+        proven.sequencer = owner.as_ref().map(|o| o.did.clone());
         let pinned = pins.check_channel(&self.server, &info.slug, proven)?;
+        if let Some(owner) = &owner
+            && pinned.sequencer.as_deref() == Some(owner.did.as_str())
+        {
+            pins.keep_carried_links(&self.server, &info.id, &owner.links)?;
+        }
         if let Some(owner) = &pinned.sequencer {
             eprintln!(
                 "note: {} is now carried here for {owner}, which orders it; its history is \
@@ -3145,6 +3160,7 @@ mod tests {
             suite: "none".to_string(),
             sequencer: sequencer.to_string(),
             share: None,
+            share_key_links: Vec::new(),
             tier: None,
         }
     }

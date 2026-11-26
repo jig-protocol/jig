@@ -189,6 +189,14 @@ pub struct ServerPin {
     /// ones its earlier records are checked against ([`Self::sequencers`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<String>,
+    /// For a channel carried here whose owner changed its key after it
+    /// created the channel, by channel id: the owner's key links
+    /// [`prove_carried`] proved, from the DID the creation block names to the
+    /// pinned owner ([`ChannelPin::sequencer`]), base64, oldest first. The
+    /// channel's earlier records are checked against the DIDs they leave
+    /// ([`Pins::carried_signers`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub carried_links: BTreeMap<String, Vec<String>>,
 }
 
 impl ServerPin {
@@ -840,6 +848,72 @@ impl Pins {
             .unwrap_or_default()
     }
 
+    /// The channels pinned on `server` as carried for their owners, by
+    /// channel id, each with the DIDs its owner signed its records as, in
+    /// key-link order, ending at the pinned owner: what a live session holds
+    /// their records to ([`crate::connection::ConnectOptions::carried`]).
+    pub fn carried_signers(&self, server: &str) -> std::collections::HashMap<String, Vec<String>> {
+        self.server(server)
+            .map(|p| {
+                p.channels
+                    .values()
+                    .filter_map(|c| {
+                        let owner = c.sequencer.as_deref()?;
+                        let links = p
+                            .carried_links
+                            .get(&c.create_cid)
+                            .map(Vec::as_slice)
+                            .unwrap_or_default();
+                        Some((c.create_cid.clone(), dids_along(links, owner)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// [`Self::anchor_channel`] for an owner [`prove_carried`] proved, keeping
+    /// the key links that proof followed, if any, beside the pin: the
+    /// channel's records from before the owner's key change are held to the
+    /// DIDs they leave. The links are kept only while the pin names `owner`.
+    pub fn anchor_carried(
+        &mut self,
+        server: &str,
+        slug: &str,
+        create_cid: &str,
+        owner: Option<&CarriedOwner>,
+    ) -> Result<bool, PinError> {
+        let moved = self.anchor_channel(server, slug, create_cid, owner.map(|o| o.did.as_str()))?;
+        let links = owner.map(|o| o.links.as_slice()).unwrap_or_default();
+        self.keep_carried_links(server, create_cid, links)?;
+        Ok(moved)
+    }
+
+    /// Keep `links`, the key links [`prove_carried`] followed to the owner of
+    /// channel `create_cid` on `server`, beside its pin ([`ServerPin::
+    /// carried_links`]); none forgets the ones kept. The caller has pinned
+    /// the channel to that owner.
+    pub fn keep_carried_links(
+        &mut self,
+        server: &str,
+        create_cid: &str,
+        links: &[String],
+    ) -> Result<(), PinError> {
+        self.update(|file| {
+            let Some(pin) = file.servers.get_mut(&server_key(server)) else {
+                return Ok(((), false));
+            };
+            let changed = if links.is_empty() {
+                pin.carried_links.remove(create_cid).is_some()
+            } else {
+                pin.carried_links
+                    .insert(create_cid.to_string(), links.to_vec())
+                    .as_deref()
+                    != Some(links)
+            };
+            Ok(((), changed))
+        })
+    }
+
     /// Hold the channel `create_cid` (pinned as `slug`) on `server` to the
     /// server that orders it: `None` for `server` itself, else a DID
     /// [`prove_carried`] proved for that channel. The proof is for that
@@ -1183,7 +1257,13 @@ pub fn names_another_server(server_dids: &[String], sequencer: &str) -> bool {
 /// - be made to the serving server, one of `server_dids` (its DID and the
 ///   ones its key links lead from).
 ///
-/// Returns the sequencer's DID, canonical.
+/// The creation block must name `sequencer` as the channel's sequencer, or a
+/// DID that `owner_key_links` (base64, oldest first, as the serving server
+/// lists them beside the offer) lead from to `sequencer`: the owner changed
+/// its key after it created the channel (JEP-0005 rule 7, D37; JEP-0012).
+///
+/// Returns the sequencer's DID, canonical, and the links from the named DID
+/// to it: what the channel's records may be signed by, in that order.
 pub fn prove_carried(
     server: &str,
     slug: &str,
@@ -1191,7 +1271,8 @@ pub fn prove_carried(
     sequencer: &str,
     server_dids: &[String],
     offer_b64: Option<&str>,
-) -> Result<String, PinError> {
+    owner_key_links: &[String],
+) -> Result<CarriedOwner, PinError> {
     let unproven = |reason: &str| PinError::CarriedUnproven {
         server: server.to_string(),
         slug: slug.to_string(),
@@ -1234,16 +1315,40 @@ pub fn prove_carried(
     // signed: the offer's signer must be that server.
     let manifest: jig_core::BlockManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|_| unproven("the offer's creation block is malformed"))?;
-    match manifest
+    let links = match manifest
         .metadata
         .get(jig_pipeline::ingest::SEQUENCER_KEY)
         .and_then(|v| v.as_str())
     {
-        Some(named) if canonical(named) == canonical(sequencer) => {}
+        Some(named) if canonical(named) == canonical(sequencer) => Vec::new(),
+        Some(named) if !owner_key_links.is_empty() => {
+            jig_pipeline::handshake::chain_moves(owner_key_links, named, &offer.owner).map_err(
+                |reason| {
+                    unproven(&format!(
+                        "the channel's creator named another server, and the key links \
+                         shown do not lead from it to the offer's signer: {reason}"
+                    ))
+                },
+            )?
+        }
         Some(_) => return Err(unproven("the channel's creator named another server")),
         None => return Err(unproven("the channel's creation block names no server")),
-    }
-    Ok(canonical(sequencer))
+    };
+    Ok(CarriedOwner {
+        did: canonical(sequencer),
+        links,
+    })
+}
+
+/// Who orders a carried channel, as [`prove_carried`] proved it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CarriedOwner {
+    /// The owner's DID, canonical: the one that signed the offer.
+    pub did: String,
+    /// The owner's key links from the DID the channel's creation block names
+    /// to [`Self::did`], base64, oldest first. Empty when the block names
+    /// `did` itself.
+    pub links: Vec<String>,
 }
 
 /// The resolver's view of the pins (JEP-0004 rule 17): lookup only; the
@@ -2158,6 +2263,128 @@ mod tests {
         Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string()
     }
 
+    /// #375: an owner that changed its key after it created the channel
+    /// signs its offer as the new DID. The creation block names the old one,
+    /// so the owner is proven only with key links from that DID to the
+    /// signer; those links are what the channel's earlier records are held
+    /// to. Links from another DID, or not reaching the signer, prove nothing.
+    #[test]
+    fn an_owner_that_changed_its_key_is_proven_along_its_links() {
+        use base64::Engine as _;
+        let link = |old: &ed25519_dalek::SigningKey, new: &ed25519_dalek::SigningKey| {
+            base64::engine::general_purpose::STANDARD.encode(
+                jig_core::key_link::SignedKeyLink::sign(
+                    old,
+                    new,
+                    jig_core::key_link::Audience::Public,
+                    1_700_000_000,
+                )
+                .unwrap()
+                .envelope(),
+            )
+        };
+        let old = jig_core::crypto::ed25519::generate_signing_key();
+        let new = jig_core::crypto::ed25519::generate_signing_key();
+        let c = carried_naming(new.clone(), Some(&did_of_key(&old)));
+        let prove = |links: &[String]| {
+            prove_carried(
+                "wss://follower",
+                "#team",
+                &c.channel_id,
+                &did_of_key(&new),
+                std::slice::from_ref(&c.follower),
+                Some(&c.offer_b64),
+                links,
+            )
+        };
+        assert!(prove(&[]).is_err(), "no links: another server");
+
+        let links = vec![link(&old, &new)];
+        let proven = prove(&links).unwrap();
+        assert_eq!(proven.did, did_of_key(&new));
+        assert_eq!(proven.links, links);
+        assert_eq!(
+            dids_along(&proven.links, &proven.did),
+            vec![did_of_key(&old), did_of_key(&new)]
+        );
+
+        let stranger = jig_core::crypto::ed25519::generate_signing_key();
+        for wrong in [vec![link(&stranger, &new)], vec![link(&old, &stranger)]] {
+            let error = prove(&wrong).unwrap_err();
+            assert!(error.to_string().contains("key links"), "{error}");
+        }
+    }
+
+    /// The links a carried pin was proven along are kept beside it, and give
+    /// a session the DIDs its records are held to, oldest first. Pinning the
+    /// same owner without links forgets them.
+    #[test]
+    fn a_carried_pin_keeps_the_owners_links() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let mut pins = Pins::load(&dir.path().join("pins.json")).unwrap();
+        let server = "wss://follower";
+        pins.check_channel(
+            server,
+            "#team",
+            ChannelPin {
+                create_cid: "bafycreate".to_string(),
+                slug: String::new(),
+                suite: "none".to_string(),
+                owner_did: "did:jig:zuser".to_string(),
+                chain_head: None,
+                sequencer: None,
+            },
+        )
+        .unwrap();
+        let (old, new) = (
+            jig_core::crypto::ed25519::generate_signing_key(),
+            jig_core::crypto::ed25519::generate_signing_key(),
+        );
+        let link = base64::engine::general_purpose::STANDARD.encode(
+            jig_core::key_link::SignedKeyLink::sign(
+                &old,
+                &new,
+                jig_core::key_link::Audience::Public,
+                1_700_000_000,
+            )
+            .unwrap()
+            .envelope(),
+        );
+        let owner = CarriedOwner {
+            did: did_of_key(&new),
+            links: vec![link],
+        };
+        assert!(
+            pins.anchor_carried(server, "#team", "bafycreate", Some(&owner))
+                .unwrap()
+        );
+        assert_eq!(
+            pins.carried_signers(server).get("bafycreate"),
+            Some(&vec![did_of_key(&old), did_of_key(&new)])
+        );
+        // Kept across a reload.
+        let pins_again = Pins::load(&dir.path().join("pins.json")).unwrap();
+        assert_eq!(
+            pins_again.carried_signers(server),
+            pins.carried_signers(server)
+        );
+
+        let bare = CarriedOwner {
+            links: vec![],
+            ..owner
+        };
+        assert!(
+            !pins
+                .anchor_carried(server, "#team", "bafycreate", Some(&bare))
+                .unwrap()
+        );
+        assert_eq!(
+            pins.carried_signers(server).get("bafycreate"),
+            Some(&vec![did_of_key(&new)])
+        );
+    }
+
     /// The offer proves who orders a channel only together with the creation
     /// block: its signed `sequencer` must name the offer's signer. A server
     /// that mints a key and offers itself another server's channel proves
@@ -2174,6 +2401,7 @@ mod tests {
             &did_of_key(&minted),
             std::slice::from_ref(&c.follower),
             Some(&c.offer_b64),
+            &[],
         )
         .unwrap_err();
         assert!(
@@ -2189,6 +2417,7 @@ mod tests {
             &did_of_key(&minted),
             std::slice::from_ref(&c.follower),
             Some(&c.offer_b64),
+            &[],
         )
         .unwrap_err();
         assert!(error.to_string().contains("names no server"), "{error}");
@@ -2199,7 +2428,16 @@ mod tests {
         let c = carried();
         let owner = did_of_key(&c.owner);
         let prove = |sequencer: &str, to: &[String], offer: Option<&str>, channel: &str| {
-            prove_carried("wss://follower", "#team", channel, sequencer, to, offer)
+            prove_carried(
+                "wss://follower",
+                "#team",
+                channel,
+                sequencer,
+                to,
+                offer,
+                &[],
+            )
+            .map(|proven| proven.did)
         };
         let ours = vec![c.follower.clone()];
         assert_eq!(
@@ -2351,9 +2589,11 @@ mod tests {
                 &x.channel_id,
                 &owner,
                 std::slice::from_ref(&x.follower),
-                Some(&x.offer_b64)
+                Some(&x.offer_b64),
+                &[],
             )
-            .unwrap(),
+            .unwrap()
+            .did,
             owner
         );
         // Listed as the follower's own, X would replace Y: refused.

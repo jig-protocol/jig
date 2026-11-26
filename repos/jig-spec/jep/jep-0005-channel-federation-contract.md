@@ -121,6 +121,25 @@ Non-goals for v0.2:
    signer, in its own peer frame beside the `contract-offer`, not inside the offer. A server
    MUST ignore a peer frame kind it does not know, so this frame is additive; a receiver
    that does not verify the chain refuses the offer as it does today.
+   - **The frame** is `owner-key-links`, sent just before the `contract-offer` it is for, on
+     the same connection. Its body is deterministic CBOR
+     `{domain: "jig-owner-key-links-v1", offer_id, links}`. `offer_id` names the offer.
+     `links` holds 1 to 16 public key links (JEP-0012), as COSE_Sign bytes, oldest first,
+     as a welcome serves them. The body is not signed: each link is signed by both its
+     keys, and the chain's ends are fixed by the creation block's `sequencer` and the
+     offer's `owner`. A body in any other shape is a protocol violation.
+   - **The receiver** follows the chain as a client follows a welcome's chain (JEP-0012):
+     one link must leave the named DID, and the last must move to the offer's `owner`. It
+     keeps the links from that one on with the offer. A chain that does not lead from the
+     named DID to the signer is dropped, and the offer is judged without it.
+   - **With the chain kept,** the creation block's `sequencer` counts as the offer's
+     signer, for the offer and for the stream that follows it. Records the owner signed
+     before its key changed are checked against the chain's DIDs in link order (JEP-0012,
+     "Checking a chain across a key change"). Once a record by a later DID is in the
+     chain, a record by an earlier DID after it is refused.
+   - **Clients** check the same chain. A follower that lists a carried channel lists the
+     kept links beside the offer, and a client proves the owner with both.
+   - A key change by the owner after the share is accepted is not covered by this note.
 7a. A grant is one of:
     - `read`: the follower relays only protocol traffic (MLS self-updates, self-leave) and
       no content;
@@ -472,6 +491,10 @@ deterministic payload and its `COSE_Sign1`, in hex, under fixed test keys. The o
 
 `vectors/0005/kp-request.json`: a `jig-kp-request-v1` (21a) under fixed test keys, as its
 deterministic payload and its `COSE_Sign1`, in hex.
+
+`vectors/0005/owner-key-links.json` (7, note D37): an `owner-key-links` frame body for a
+two-hop chain under fixed test keys, with its `offer_id`, each link and the whole body, in
+hex.
 
 `vectors/0005/unknown-kinds.json` (14c): manifests of kinds that no v0.2 build implements,
 each signed under a fixed test key. For each it gives whether the block is critical and

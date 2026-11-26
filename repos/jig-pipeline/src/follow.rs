@@ -678,6 +678,12 @@ pub async fn ingest_sequenced(
         sequencer: sequencer.to_string(),
     };
 
+    // The DIDs the owner signed as before `sequencer`, along the key links
+    // its offer came with (JEP-0005 rule 7, D37): the channel's creation
+    // block may name one of them, and the records signed before the owner's
+    // key changed are theirs.
+    let predecessors = ctx.store.owner_predecessors(&channel_id, sequencer)?;
+
     // The channel the record puts the block in, and the block's own word for
     // it, must agree.
     let channel = if kind.known() == Some(BlockKind::ChannelCreate) {
@@ -686,7 +692,7 @@ pub async fn ingest_sequenced(
                 "a channel-create's record names another channel",
             ));
         }
-        let terms = crate::ingest::channel_terms(&manifest, sequencer)?;
+        let terms = crate::ingest::channel_terms_from(&manifest, sequencer, &predecessors)?;
         if terms.sequencer != crate::effect::canonical_did_string(sequencer) {
             return Err(not_carried());
         }
@@ -731,8 +737,33 @@ pub async fn ingest_sequenced(
             sequencer: sequencer.to_string(),
         });
     }
-    // Rule 12: the owner's signature, exactly, and nothing of this server's.
-    record.verify(sequencer)?;
+    // Rule 12: the owner's signature, exactly, and nothing of this server's:
+    // under `sequencer`, or under a DID it signed as before (JEP-0012). Each
+    // signs only in link order: once a record by a later DID is in the
+    // chain, an earlier one signs nothing after it. Records land in `seq`
+    // order, so the record before this one is the one to compare with.
+    let signers: Vec<&str> = predecessors
+        .iter()
+        .map(String::as_str)
+        .chain([sequencer])
+        .collect();
+    let rank = signers
+        .iter()
+        .rposition(|did| crate::handshake::same_did(did, &record.sequencer));
+    record.verify(rank.map_or(sequencer, |i| signers[i]))?;
+    if let Some(rank) = rank
+        && rank + 1 < signers.len()
+        && let Some(before) = record.seq.checked_sub(1)
+        && let Some(held) = ctx.store.ingest_record_bytes(&channel_id, before)?
+        && let Ok(held) = IngestRecord::decode(&held)
+        && signers[rank + 1..]
+            .iter()
+            .any(|did| crate::handshake::same_did(did, &held.sequencer))
+    {
+        return Err(FollowError::Mismatch(
+            "a record signed by a key its owner has since moved on from",
+        ));
+    }
     // A channel stopped for an upgrade takes nothing more: not a gap to fill.
     if let Some(stop) = ctx.store.carried_upgrade(&channel_id)? {
         return Err(FollowError::NeedsUpgrade {
@@ -792,6 +823,7 @@ pub async fn ingest_sequenced(
                 &block_cid,
                 channel.as_ref(),
                 sequencer,
+                &predecessors,
             )?;
         }
         advance_mirror(conn, &channel_id, mls)
@@ -1482,6 +1514,129 @@ mod tests {
         assert!(matches!(
             take(&follower, &owner, &owner.sent[1]).await.unwrap(),
             Followed::Duplicate { seq: 1, .. }
+        ));
+    }
+
+    /// #375: an owner that changed its key after it created the channel is
+    /// followed under its new DID, with the key links its offer came with.
+    /// The creation block names the old DID, and the records from before the
+    /// change are the old key's: they land under the links. After the first
+    /// record by the new key, the old one signs nothing more (JEP-0012).
+    /// Without the links, the block names another server.
+    #[tokio::test]
+    async fn an_owner_that_changed_its_key_is_followed_along_its_links() {
+        let mut owner = Owner::new().await;
+        owner.text("before the change").await;
+        let new_key = SigningKey::from_bytes(&[42; 32]);
+        let new_did = did(&new_key);
+        let link = jig_core::key_link::SignedKeyLink::sign(
+            &owner.ctx.server_key,
+            &new_key,
+            jig_core::key_link::Audience::Public,
+            1_700_000_000,
+        )
+        .unwrap()
+        .envelope()
+        .to_vec();
+
+        // Without the links: the creation block names another server.
+        let unlinked = ctx();
+        share(&unlinked, &owner.channel, &new_did);
+        assert!(
+            ingest_sequenced(
+                &unlinked,
+                bundle(&owner.sent[0].parts),
+                owner.sent[0].parts.2.clone(),
+                &owner.sent[0].record,
+                &new_did,
+            )
+            .await
+            .is_err()
+        );
+
+        let follower = ctx();
+        let offer_id = share(&follower, &owner.channel, &new_did);
+        follower
+            .store
+            .put_offer_key_links(&jig_core::contract::OwnerKeyLinks {
+                offer_id,
+                links: vec![link],
+            })
+            .unwrap();
+        async fn take_as(
+            follower: &IngestContext,
+            sent: &Sent,
+            sequencer: &str,
+        ) -> Result<Followed, FollowError> {
+            ingest_sequenced(
+                follower,
+                bundle(&sent.parts),
+                sent.parts.2.clone(),
+                &sent.record,
+                sequencer,
+            )
+            .await
+        }
+        for (seq, sent) in owner.sent.iter().enumerate() {
+            match take_as(&follower, sent, &new_did).await.unwrap() {
+                Followed::Landed { seq: got, .. } => assert_eq!(got, seq as u64),
+                other => panic!("{other:?}"),
+            }
+        }
+        // The carried row is under the DID that signs for it now.
+        let row = follower
+            .store
+            .get_channel_by_id(&owner.channel)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.sequencer_did, new_did);
+
+        // The new key goes on from the old key's last record.
+        let sign = |key: &SigningKey, parts: &(Vec<u8>, Vec<u8>, Vec<u8>), after: &[u8]| {
+            let last = IngestRecord::decode(after).unwrap();
+            RecordSigner {
+                channel_id: owner.channel.clone(),
+                key,
+                ingest_wall_ms: last.ingest_wall_ms + 1,
+                ingest_logical: 0,
+            }
+            .sign(
+                last.seq + 1,
+                &bundle(parts).block_cid().unwrap().to_string(),
+                last.hash(),
+            )
+            .unwrap()
+            .encode()
+        };
+        let parts = owner.text_parts("after the change");
+        let after = Sent {
+            record: sign(&new_key, &parts, &owner.sent.last().unwrap().record),
+            parts,
+        };
+        assert!(matches!(
+            take_as(&follower, &after, &new_did).await.unwrap(),
+            Followed::Landed { seq: 2, .. }
+        ));
+
+        // The old key, after the new one has signed: refused.
+        let parts = owner.text_parts("the old key again");
+        let stale = Sent {
+            record: sign(&owner.ctx.server_key, &parts, &after.record),
+            parts,
+        };
+        assert!(matches!(
+            take_as(&follower, &stale, &new_did).await,
+            Err(FollowError::Mismatch(_))
+        ));
+        // A key on no link: refused, as before.
+        let parts = owner.text_parts("a stranger");
+        let stranger = Sent {
+            record: sign(&SigningKey::from_bytes(&[43; 32]), &parts, &after.record),
+            parts,
+        };
+        assert!(matches!(
+            take_as(&follower, &stranger, &new_did).await,
+            Err(FollowError::Record(_))
         ));
     }
 
