@@ -138,9 +138,10 @@ reviewed now.
 - **Key-package custodians (Task 8)** are partly done (#440). These shipped: signed custody
   requests (JEP-0005 rule 21a), hourly limits, the release log, and the operator's interim
   release policy, now the fallback for a DID with no policy of its own (rule 21b). Release
-  policies that DIDs sign (21b), and held requests and their decisions (21c), are specified,
-  with their signed objects in `jig-core/src/contract.rs`; the custodian's routes and the
-  client are not built yet. The Welcome mailbox and one package per device are later work.
+  policies that DIDs sign (21b), and held requests and their decisions (21c), are built on the
+  custodian (`jig-server/src/v0_0_2_custody.rs`, `jig-pipeline/src/custody_policy.rs`), with
+  their signed objects in `jig-core/src/contract.rs`; the client does not use them yet. The
+  Welcome mailbox and one package per device are later work.
 - **Leaving a server (JEP-0017)** is specified. R1, ending custody, is built: the server side
   in #440, and `jig server custody off|on` with its key rotation in #461. R2, ending local
   adds, is built in #463 (`jig server local-adds off|on`). R3, erasure, is not built.

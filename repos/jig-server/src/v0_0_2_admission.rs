@@ -140,6 +140,7 @@ fn refuse(status: StatusCode, code: &str, message: impl Into<String>) -> Refusal
             code: code.to_string(),
             message: message.into(),
             retry_after_ms: None,
+            request_id_hex: None,
         }),
     )
 }

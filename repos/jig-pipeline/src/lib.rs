@@ -8,6 +8,7 @@
 
 pub mod authorize_write;
 pub mod contracts;
+pub mod custody_policy;
 pub mod effect;
 pub mod envelope;
 #[cfg(feature = "executor")]

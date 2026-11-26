@@ -50,6 +50,10 @@ pub struct ErrorBody {
     /// the REST counterpart of the `Error` frame's `retry_after_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<u64>,
+    /// The held request's id, on a custodian's `409 HELD` (JEP-0005 rule
+    /// 21c), lowercase hex: what its DID decides it by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id_hex: Option<String>,
 }
 
 pub(crate) fn err(
@@ -63,6 +67,7 @@ pub(crate) fn err(
             code: code.to_string(),
             message: msg.into(),
             retry_after_ms: None,
+            request_id_hex: None,
         }),
     )
 }
@@ -77,6 +82,7 @@ fn refusal_response(refusal: crate::v0_0_2_relay::Refusal) -> (StatusCode, Json<
             code: refusal.code,
             message: refusal.message,
             retry_after_ms: refusal.retry_after_ms,
+            request_id_hex: None,
         }),
     )
 }

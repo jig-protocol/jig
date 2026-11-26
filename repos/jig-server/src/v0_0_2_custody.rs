@@ -6,6 +6,12 @@
 //! - `POST /api/v1/custody/:did/requests` — release one of the DID's key
 //!   packages to a signed request
 //! - `GET  /api/v1/custody/:did/releases` — the DID reads its release log
+//! - `PUT  /api/v1/custody/:did/policy` — keep the DID's own release policy
+//!   (JEP-0005 rule 21b)
+//! - `GET  /api/v1/custody/:did/requests?state=held` — the DID reads the
+//!   requests held for its decision (rule 21c)
+//! - `POST /api/v1/custody/:did/requests/:request_id/decision` — the DID
+//!   approves or refuses one
 //!
 //! A custodian of `D` is a server `D`'s reachability record lists and that
 //! holds `D`'s packages (published through `v0_0_2_mls`). Another server's
@@ -14,9 +20,15 @@
 //! withhold one but never substitute one: the adder checks the package's
 //! signature and DID before it commits.
 //!
-//! Until DIDs sign release policies, `[custody] release` is this server's
-//! policy for every DID it holds, and the limits below bound how fast any
-//! requester, or all of them together, can draw down a DID's stock. A DID's
+//! A DID that stored its own release policy here is released by it: a
+//! requester it names, or any if it says so, is released to; anyone else is
+//! held, answered `409 HELD`, until the DID decides. An approval lets that
+//! requester's next request for the DID and channel through, once. For a DID
+//! with no policy of its own, `[custody] release` is this server's policy
+//! (DJ 2026-11-26). `closed` releases nothing whatever a DID's policy says:
+//! the operator's choice not to serve others comes first. The limits below
+//! bound how fast any requester, or all of them together, can draw down a
+//! DID's stock, with a policy or without. A DID's
 //! last-resort package is handed out but never consumed, so a drained stock
 //! leaves the DID reachable.
 
@@ -30,8 +42,9 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use jig_config::v0_0_2_server::ReleasePolicy;
-use jig_core::contract::{KpRequest, LocalAdds};
+use jig_core::contract::{KpDecision, KpRequest, LocalAdds, ReleasePolicy as SignedPolicy};
 use jig_core::naming::ReachabilityRecord;
+use jig_pipeline::custody_policy::{Decided, Held, NewHold};
 use jig_pipeline::persist::{LimitHit, Release, ReleaseAsk};
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +58,11 @@ pub const MAX_RECORD_SERVERS: usize = 16;
 pub const REPEAT_WINDOW_SECS: i64 = 600;
 /// Most release-log entries one read returns.
 pub const MAX_LOG_ENTRIES: u32 = 200;
+/// Most requests held for one DID at once (JEP-0005 rule 21c). Past it, a
+/// new request is refused, not held: the DID decides the ones it has first.
+pub const MAX_HELD_PER_DID: usize = 256;
+/// How long an approval stays good for (rule 21c).
+pub const GRANT_SECS: i64 = 24 * 60 * 60;
 
 type Refusal = (StatusCode, Json<ErrorBody>);
 
@@ -65,6 +83,45 @@ pub struct StoredBody {
 pub struct RequestBody {
     /// A `jig-kp-request-v1`, base64.
     pub request_b64: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PolicyBody {
+    /// `did`'s `jig-kp-release-policy-v1`, base64.
+    pub policy_b64: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DecisionBody {
+    /// `did`'s `jig-kp-decision-v1`, base64.
+    pub decision_b64: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DecidedBody {
+    pub approved: bool,
+}
+
+/// `?state=held`, the one state listed.
+#[derive(Debug, Default, Deserialize)]
+pub struct HeldQuery {
+    #[serde(default)]
+    pub state: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HeldEntryBody {
+    pub request_id_hex: String,
+    pub requester: String,
+    pub channel_id: String,
+    pub held_at: i64,
+    /// The signed request, base64.
+    pub request_b64: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HeldBody {
+    pub held: Vec<HeldEntryBody>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -309,31 +366,81 @@ pub async fn request_key_package(
             "this server releases no key packages to other servers' members",
         ));
     }
-    let hash = blake3::hash(&envelope);
+    let store = &state.ingest_ctx.store;
     let channel_id = request.channel_id.to_string();
-    let ask = ReleaseAsk {
-        did: &did,
-        requester: &request.requester,
-        channel_id: &channel_id,
-        request_hash: hash.as_bytes(),
-        request: &envelope,
-        now,
-        repeat_window: REPEAT_WINDOW_SECS,
-        repeat: true,
-        per_did: custody.per_member_per_hour,
-        per_requester: custody.per_requester_per_hour,
-        // Re-checked inside the release's transaction: a withdrawal stored
-        // since `listing_record` read it stops this release.
-        listing: Some(&listing.envelope),
-        kind: jig_pipeline::persist::ReleaseKind::Custody,
-        server_did: &ours,
-    };
-    match state
-        .ingest_ctx
-        .store
-        .release_key_package(&ask)
-        .map_err(persist_err)?
+    // The DID's own policy, if it stored one: a requester it does not
+    // release to is held, unless the DID approved this requester's earlier
+    // request for the channel.
+    let mut grant = None;
+    if let Some(policy) = kept_policy(&state, &did)?
+        && !policy.releases_to(&request.requester)
     {
+        // A lost answer is answered again (rule 21a), before anything is
+        // held or a grant is used.
+        if let again @ Release::Again { .. } =
+            release(&state, &did, &request, &envelope, &listing, now, false)?
+        {
+            return answer(&state, &did, &request, &channel_id, again);
+        }
+        grant = store
+            .take_kp_grant(&did, &request.requester, &channel_id, now)
+            .map_err(persist_err)?;
+        if grant.is_none() {
+            let hold = NewHold {
+                request_id: &request.request_id(),
+                did: &did,
+                requester: &request.requester,
+                channel_id: &channel_id,
+                request: &envelope,
+                now,
+            };
+            return match store
+                .hold_kp_request(&hold, MAX_HELD_PER_DID)
+                .map_err(persist_err)?
+            {
+                Held::New(id) | Held::Already(id) => {
+                    tracing::info!(
+                        did = %did,
+                        requester = %request.requester,
+                        channel = %channel_id,
+                        "key-package request held for the DID's decision"
+                    );
+                    Err(held(&did, &id))
+                }
+                Held::Full => Err(err(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "RATE_LIMITED",
+                    format!("{MAX_HELD_PER_DID} requests already wait on {did}'s decision here"),
+                )),
+            };
+        }
+    }
+    let released = release(&state, &did, &request, &envelope, &listing, now, true);
+    // An approval is used by a release; one the release did not happen for
+    // stays for the next request.
+    if let Some(grant) = grant
+        && !matches!(
+            released,
+            Ok(Release::Released { .. } | Release::Again { .. })
+        )
+    {
+        store
+            .restore_kp_grant(&did, &request.requester, &channel_id, &grant)
+            .map_err(persist_err)?;
+    }
+    answer(&state, &did, &request, &channel_id, released?)
+}
+
+/// The answer to a request, for what [`release`] did.
+fn answer(
+    state: &AppState,
+    did: &str,
+    request: &KpRequest,
+    channel_id: &str,
+    released: Release,
+) -> Result<Json<ReleasedBody>, Refusal> {
+    let custody = &state.config.custody;
+    match released {
         Release::Released {
             package,
             last_resort,
@@ -371,8 +478,231 @@ pub async fn request_key_package(
                 ),
             },
         )),
-        Release::Empty | Release::NotListed => Err(no_custody(&did)),
-        Release::LocalAddsEnded => Err(local_adds_ended(&did)),
+        Release::Empty | Release::NotListed | Release::NotARepeat => Err(no_custody(did)),
+        Release::LocalAddsEnded => Err(local_adds_ended(did)),
+    }
+}
+
+/// Release one of `did`'s packages to `request`, within the limits: a new
+/// one only if `fresh`, else only the one already released to it.
+fn release(
+    state: &AppState,
+    did: &str,
+    request: &KpRequest,
+    envelope: &[u8],
+    listing: &ReachabilityRecord,
+    now: i64,
+    fresh: bool,
+) -> Result<Release, Refusal> {
+    let custody = &state.config.custody;
+    let hash = blake3::hash(envelope);
+    let channel_id = request.channel_id.to_string();
+    let ours = state.server_did.to_did_jig_string();
+    let ask = ReleaseAsk {
+        did,
+        requester: &request.requester,
+        channel_id: &channel_id,
+        request_hash: hash.as_bytes(),
+        request: envelope,
+        now,
+        repeat_window: REPEAT_WINDOW_SECS,
+        repeat: true,
+        fresh,
+        per_did: custody.per_member_per_hour,
+        per_requester: custody.per_requester_per_hour,
+        // Re-checked inside the release's transaction: a withdrawal stored
+        // since `listing_record` read it stops this release.
+        listing: Some(&listing.envelope),
+        kind: jig_pipeline::persist::ReleaseKind::Custody,
+        server_did: &ours,
+    };
+    state
+        .ingest_ctx
+        .store
+        .release_key_package(&ask)
+        .map_err(persist_err)
+}
+
+/// A request held for `did`'s decision (JEP-0005 rule 21c): a refusal, so a
+/// requester that does not know holds reports it as one, carrying the id
+/// the DID decides it by.
+fn held(did: &str, request_id: &[u8; 32]) -> Refusal {
+    let id = hex::encode(request_id);
+    let (status, Json(mut body)) = err(
+        StatusCode::CONFLICT,
+        "HELD",
+        format!(
+            "{did} releases key packages to you only with their approval; your request \
+             {id} waits on it. Ask again once they approve"
+        ),
+    );
+    body.request_id_hex = Some(id);
+    (status, Json(body))
+}
+
+/// `did`'s own release policy as kept here, verified again on the way out.
+fn kept_policy(state: &AppState, did: &str) -> Result<Option<SignedPolicy>, Refusal> {
+    let ours = state.server_did.to_did_jig_string();
+    Ok(state
+        .ingest_ctx
+        .store
+        .release_policy(did)
+        .map_err(persist_err)?
+        .and_then(|e| SignedPolicy::from_envelope(&e).ok())
+        .filter(|p| p.did == did && p.custodian == ours))
+}
+
+/// PUT /api/v1/custody/:did/policy (JEP-0005 rule 21b)
+///
+/// The body is `did`'s own `jig-kp-release-policy-v1`, naming this server.
+/// Kept only at a `seq` above the one kept, and only for a DID whose record
+/// lists this server: a policy is for a custodian. The answer is the `seq`
+/// kept afterwards.
+pub async fn put_policy(
+    State(state): State<Arc<AppState>>,
+    Path(did): Path<String>,
+    Json(body): Json<PolicyBody>,
+) -> Result<Json<StoredBody>, Refusal> {
+    let did = jig_pipeline::effect::canonical_did_string(&did);
+    let envelope = STANDARD
+        .decode(&body.policy_b64)
+        .map_err(|e| bad("BAD_REQUEST", format!("policy_b64: {e}")))?;
+    let policy = SignedPolicy::from_envelope(&envelope)
+        .map_err(|e| bad("BAD_REQUEST", format!("release policy: {e}")))?;
+    if policy.did != did {
+        return Err(bad(
+            "BAD_REQUEST",
+            format!("the policy is {}'s, not {did}'s", policy.did),
+        ));
+    }
+    let ours = state.server_did.to_did_jig_string();
+    if policy.custodian != ours {
+        return Err(bad(
+            "WRONG_CUSTODIAN",
+            format!(
+                "the policy is addressed to {}, not this server ({ours})",
+                policy.custodian
+            ),
+        ));
+    }
+    if listing_record(&state, &did)?.is_none() {
+        return Err(no_custody(&did));
+    }
+    let (stored, seq) = state
+        .ingest_ctx
+        .store
+        .put_release_policy(&did, policy.seq, &envelope, now())
+        .map_err(persist_err)?;
+    Ok(Json(StoredBody { stored, seq }))
+}
+
+/// GET /api/v1/custody/:did/requests?state=held (JEP-0005 rule 21c)
+///
+/// The requests held for `did`'s decision, oldest first. Only `did` reads
+/// them, with a read proof addressed to this server: they say who is trying
+/// to add `did`, and to which channel.
+pub async fn held_requests(
+    State(state): State<Arc<AppState>>,
+    Path(did): Path<String>,
+    Query(query): Query<HeldQuery>,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<HeldBody>, Refusal> {
+    let started = std::time::Instant::now();
+    let caller = optional_caller(&state, &headers, "GET", uri.path(), started)?;
+    let did = jig_pipeline::effect::canonical_did_string(&did);
+    if caller.as_ref().map(|c| c.as_str()) != Some(did.as_str()) {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "NOT_YOURS",
+            "only the DID itself reads the requests held for it, with a signed request",
+        ));
+    }
+    if query.state.as_deref().is_some_and(|s| s != "held") {
+        return Err(bad("BAD_REQUEST", "only `state=held` is listed"));
+    }
+    let held = state
+        .ingest_ctx
+        .store
+        .held_kp_requests(&did, MAX_HELD_PER_DID as u32)
+        .map_err(persist_err)?
+        .into_iter()
+        .map(|h| HeldEntryBody {
+            request_id_hex: hex::encode(h.request_id),
+            requester: h.requester,
+            channel_id: h.channel_id,
+            held_at: h.held_at,
+            request_b64: STANDARD.encode(h.request),
+        })
+        .collect();
+    Ok(Json(HeldBody { held }))
+}
+
+/// POST /api/v1/custody/:did/requests/:request_id/decision (rule 21c)
+///
+/// The body is `did`'s own `jig-kp-decision-v1`, naming this server and the
+/// request. A request held for another DID, or none, is `404 NO_SUCH_REQUEST`,
+/// whichever it is, so a decision tells nothing of another DID's holds; one
+/// decided already is `409 DECIDED`.
+pub async fn decide(
+    State(state): State<Arc<AppState>>,
+    Path((did, request_id)): Path<(String, String)>,
+    Json(body): Json<DecisionBody>,
+) -> Result<Json<DecidedBody>, Refusal> {
+    let did = jig_pipeline::effect::canonical_did_string(&did);
+    let envelope = STANDARD
+        .decode(&body.decision_b64)
+        .map_err(|e| bad("BAD_REQUEST", format!("decision_b64: {e}")))?;
+    let decision = KpDecision::from_envelope(&envelope)
+        .map_err(|e| bad("BAD_REQUEST", format!("decision: {e}")))?;
+    if decision.did != did {
+        return Err(bad(
+            "BAD_REQUEST",
+            format!("the decision is {}'s, not {did}'s", decision.did),
+        ));
+    }
+    let ours = state.server_did.to_did_jig_string();
+    if decision.custodian != ours {
+        return Err(bad(
+            "WRONG_CUSTODIAN",
+            format!(
+                "the decision is addressed to {}, not this server ({ours})",
+                decision.custodian
+            ),
+        ));
+    }
+    if hex::encode(decision.request_id) != request_id.to_ascii_lowercase() {
+        return Err(bad(
+            "BAD_REQUEST",
+            "the decision names another request than the route",
+        ));
+    }
+    let now = now();
+    match state
+        .ingest_ctx
+        .store
+        .decide_kp_request(
+            &did,
+            &decision.request_id,
+            decision.approve,
+            &envelope,
+            now,
+            now.saturating_add(GRANT_SECS),
+        )
+        .map_err(persist_err)?
+    {
+        Decided::Approved => Ok(Json(DecidedBody { approved: true })),
+        Decided::Refused => Ok(Json(DecidedBody { approved: false })),
+        Decided::NoSuchRequest => Err(err(
+            StatusCode::NOT_FOUND,
+            "NO_SUCH_REQUEST",
+            format!("no request {request_id} is held here for {did}"),
+        )),
+        Decided::AlreadyDecided => Err(err(
+            StatusCode::CONFLICT,
+            "DECIDED",
+            format!("request {request_id} was decided already"),
+        )),
     }
 }
 
@@ -475,7 +805,15 @@ pub fn build_custody_router(state: Arc<AppState>) -> Router {
             get(get_reachability).put(put_reachability),
         )
         .route("/api/v1/local-adds/{did}", put(put_local_adds))
-        .route("/api/v1/custody/{did}/requests", post(request_key_package))
+        .route(
+            "/api/v1/custody/{did}/requests",
+            post(request_key_package).get(held_requests),
+        )
+        .route("/api/v1/custody/{did}/policy", put(put_policy))
+        .route(
+            "/api/v1/custody/{did}/requests/{request_id}/decision",
+            post(decide),
+        )
         .route("/api/v1/custody/{did}/releases", get(release_log))
         .with_state(state)
 }
@@ -1228,5 +1566,247 @@ mod tests {
             code(&refused),
             (StatusCode::FORBIDDEN, "OUT_OF_POLICY".into())
         );
+    }
+
+    // ---- Release policies and held requests (JEP-0005 rules 21b, 21c) ----
+
+    async fn put_policy_of(
+        state: &Arc<AppState>,
+        seed: u8,
+        custodian: &str,
+        seq: u64,
+        release_to: Vec<String>,
+    ) -> Result<Json<StoredBody>, Refusal> {
+        let policy = SignedPolicy::sign(&key(seed), custodian, seq, now(), release_to, false);
+        put_policy(
+            State(state.clone()),
+            Path(did_of(seed)),
+            Json(PolicyBody {
+                policy_b64: STANDARD.encode(&policy.envelope),
+            }),
+        )
+        .await
+    }
+
+    async fn read_held(state: &Arc<AppState>, reader: u8, did: u8) -> Result<HeldBody, Refusal> {
+        let path = format!("/api/v1/custody/{}/requests", did_of(did));
+        let identity = jig_client::identity::Identity::from_signing_key(key(reader));
+        let mut headers = axum::http::HeaderMap::new();
+        for (name, value) in jig_client::read_auth::ReadProof::sign(
+            &identity,
+            &state.server_did.to_did_jig_string(),
+            "GET",
+            &path,
+        )
+        .headers()
+        {
+            headers.insert(name, value.parse().unwrap());
+        }
+        held_requests(
+            State(state.clone()),
+            Path(did_of(did)),
+            Query(HeldQuery {
+                state: Some("held".into()),
+            }),
+            path.parse().unwrap(),
+            headers,
+        )
+        .await
+        .map(|Json(b)| b)
+    }
+
+    async fn decide_as(
+        state: &Arc<AppState>,
+        seed: u8,
+        custodian: &str,
+        request_id: [u8; 32],
+        approve: bool,
+    ) -> Result<Json<DecidedBody>, Refusal> {
+        let decision = KpDecision::sign(&key(seed), custodian, request_id, approve, now());
+        decide(
+            State(state.clone()),
+            Path((did_of(seed), hex::encode(request_id))),
+            Json(DecisionBody {
+                decision_b64: STANDARD.encode(&decision.envelope),
+            }),
+        )
+        .await
+    }
+
+    /// A custodian of `member` (seed 4), with its packages stocked, and a
+    /// policy releasing to `named` (seed 3) alone.
+    async fn custodian_with_policy() -> Arc<AppState> {
+        let state = state();
+        let _ = keep(&state, 4, vec![(ours(&state), "https://here".into())], 1)
+            .await
+            .unwrap();
+        stock(&state, 4, 4).await;
+        let _ = put_policy_of(&state, 4, &ours(&state), 1, vec![did_of(3)])
+            .await
+            .unwrap();
+        state
+    }
+
+    fn held_id(refusal: &Refusal) -> [u8; 32] {
+        assert_eq!(code(refusal), (StatusCode::CONFLICT, "HELD".into()));
+        hex::decode(refusal.1.0.request_id_hex.as_deref().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_policy_releases_to_whom_it_names_and_holds_everyone_else() {
+        let state = custodian_with_policy().await;
+        let custodian = ours(&state);
+        // Named: released.
+        let _ = ask(&state, 3, 4, &custodian, now()).await.unwrap();
+        // Not named: held, as a refusal carrying the request's id.
+        let refused = ask(&state, 8, 4, &custodian, now()).await.unwrap_err();
+        let id = held_id(&refused);
+        // Asking again is the same hold.
+        let again = ask(&state, 8, 4, &custodian, now()).await.unwrap_err();
+        assert_eq!(held_id(&again), id);
+        // Only the DID reads what is held for it.
+        let held = read_held(&state, 4, 4).await.unwrap().held;
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].request_id_hex, hex::encode(id));
+        assert_eq!(held[0].requester, did_of(8));
+        let refused = read_held(&state, 8, 4).await.unwrap_err();
+        assert_eq!(code(&refused), (StatusCode::FORBIDDEN, "NOT_YOURS".into()));
+    }
+
+    #[tokio::test]
+    async fn an_approval_lets_the_next_request_through_once() {
+        let state = custodian_with_policy().await;
+        let custodian = ours(&state);
+        let id = held_id(&ask(&state, 8, 4, &custodian, now()).await.unwrap_err());
+        assert!(
+            decide_as(&state, 4, &custodian, id, true)
+                .await
+                .unwrap()
+                .approved
+        );
+        // Decided once.
+        let refused = decide_as(&state, 4, &custodian, id, false)
+            .await
+            .unwrap_err();
+        assert_eq!(code(&refused), (StatusCode::CONFLICT, "DECIDED".into()));
+        assert!(read_held(&state, 4, 4).await.unwrap().held.is_empty());
+        // The approved requester's next request is released, using the
+        // approval up.
+        let Json(first) = ask(&state, 8, 4, &custodian, now()).await.unwrap();
+        let store = &state.ingest_ctx.store;
+        let channel = channel().to_string();
+        assert!(
+            store
+                .take_kp_grant(&did_of(4), &did_of(8), &channel, now())
+                .unwrap()
+                .is_none()
+        );
+        // A lost answer is answered again with the same package (rule 21a),
+        // not held.
+        let Json(again) = ask(&state, 8, 4, &custodian, now()).await.unwrap();
+        assert_eq!(again.key_package_b64, first.key_package_b64);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_releases_nothing() {
+        let state = custodian_with_policy().await;
+        let custodian = ours(&state);
+        let id = held_id(&ask(&state, 8, 4, &custodian, now()).await.unwrap_err());
+        assert!(
+            !decide_as(&state, 4, &custodian, id, false)
+                .await
+                .unwrap()
+                .approved
+        );
+        let next = held_id(&ask(&state, 8, 4, &custodian, now()).await.unwrap_err());
+        assert_ne!(next, id, "a new request is held anew");
+    }
+
+    #[tokio::test]
+    async fn a_decision_answers_only_its_dids_hold_here() {
+        let state = custodian_with_policy().await;
+        let custodian = ours(&state);
+        let id = held_id(&ask(&state, 8, 4, &custodian, now()).await.unwrap_err());
+        // Another DID deciding 4's request: as though there were none.
+        let refused = decide_as(&state, 9, &custodian, id, true)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            code(&refused),
+            (StatusCode::NOT_FOUND, "NO_SUCH_REQUEST".into())
+        );
+        let refused = decide_as(&state, 4, &custodian, [7; 32], true)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            code(&refused),
+            (StatusCode::NOT_FOUND, "NO_SUCH_REQUEST".into())
+        );
+        // Addressed to another custodian.
+        let refused = decide_as(&state, 4, &did_of(90), id, true)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            code(&refused),
+            (StatusCode::BAD_REQUEST, "WRONG_CUSTODIAN".into())
+        );
+        // The route and the decision must name the same request.
+        let decision = KpDecision::sign(&key(4), &custodian, id, true, now());
+        let refused = decide(
+            State(state.clone()),
+            Path((did_of(4), hex::encode([7; 32]))),
+            Json(DecisionBody {
+                decision_b64: STANDARD.encode(&decision.envelope),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            code(&refused),
+            (StatusCode::BAD_REQUEST, "BAD_REQUEST".into())
+        );
+        assert_eq!(read_held(&state, 4, 4).await.unwrap().held.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_policy_is_kept_only_for_this_custodian_and_a_listed_did() {
+        let state = state();
+        // No record lists this server for the DID: not its custodian.
+        let refused = put_policy_of(&state, 4, &ours(&state), 1, vec![])
+            .await
+            .unwrap_err();
+        assert_eq!(code(&refused), (StatusCode::NOT_FOUND, "NO_CUSTODY".into()));
+        let _ = keep(&state, 4, vec![(ours(&state), "https://here".into())], 1)
+            .await
+            .unwrap();
+        let refused = put_policy_of(&state, 4, &did_of(90), 1, vec![])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            code(&refused),
+            (StatusCode::BAD_REQUEST, "WRONG_CUSTODIAN".into())
+        );
+        let Json(kept) = put_policy_of(&state, 4, &ours(&state), 2, vec![])
+            .await
+            .unwrap();
+        assert_eq!((kept.stored, kept.seq), (true, 2));
+        let Json(kept) = put_policy_of(&state, 4, &ours(&state), 1, vec![did_of(3)])
+            .await
+            .unwrap();
+        assert_eq!((kept.stored, kept.seq), (false, 2));
+    }
+
+    #[tokio::test]
+    async fn without_a_policy_the_servers_own_applies() {
+        let state = state();
+        let _ = keep(&state, 4, vec![(ours(&state), "https://here".into())], 1)
+            .await
+            .unwrap();
+        stock(&state, 4, 2).await;
+        // `[custody] release = open` by default: a stranger is released to.
+        let _ = ask(&state, 8, 4, &ours(&state), now()).await.unwrap();
     }
 }
