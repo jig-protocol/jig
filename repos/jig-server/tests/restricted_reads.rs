@@ -808,3 +808,34 @@ async fn an_archive_with_a_recased_owner_did_is_refused() {
         .await;
     assert_eq!(status, StatusCode::OK, "the channel is still live: {body}");
 }
+
+/// A restricted channel's group info, what an external join needs, goes to
+/// its members only (JEP-0005 rule 7b relies on it: a DID off the roster
+/// cannot rejoin): a member reads it, and once off the roster is refused.
+#[tokio::test]
+async fn a_member_removed_from_a_restricted_channel_cannot_fetch_its_group_info() {
+    let server = TestServer::authenticated();
+    let owner = Identity::new(1);
+    let dave = Identity::new(2);
+    server
+        .create_channel(&owner, "#private", "restricted")
+        .await;
+    server.add_member(&owner, "#private", &dave).await;
+    let path = format!(
+        "/api/v1/channels/{}/mls/group-info",
+        server.channel_id("#private")
+    );
+
+    let (status, body) = server.send_full(&server.sign_get(&dave, &path)).await;
+    assert_eq!(status, StatusCode::OK, "a member reads it: {body}");
+
+    assert!(
+        server
+            .store()
+            .remove_membership("#private", &dave.did().to_did_jig_string())
+            .unwrap()
+    );
+    let (status, body) = server.send_full(&server.sign_get(&dave, &path)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "off the roster: {body}");
+    assert_eq!(body["code"], "NOT_A_MEMBER");
+}

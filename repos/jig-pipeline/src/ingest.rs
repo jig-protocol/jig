@@ -6252,6 +6252,54 @@ mod tests {
         drop((a, b));
     }
 
+    /// The rejoin rule admits a member on the roster only: a member removed
+    /// by `member-remove` loses its leaf and its roster entry together, so
+    /// its external commit back into a private channel is refused by the
+    /// write gate, not by a stale epoch.
+    #[tokio::test]
+    async fn a_removed_member_cannot_rejoin_a_private_channel() {
+        let ctx = all_channel_kinds();
+        let (alice, dave) = (person(), person());
+        let gid = create_sealed(&ctx, &alice).await;
+        add_to_sealed(&ctx, &alice, &dave, &gid).await;
+        let removed = alice.mls.remove(&gid, &dave.did).unwrap();
+        submit(
+            &ctx,
+            &alice,
+            BlockKind::MemberRemove,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"channel": "#sealed", "member_did": dave.did,
+                "mls_commit": b64(&removed.commit),
+                "mls_group_info": b64(removed.group_info.as_ref().unwrap())}),
+        )
+        .await
+        .unwrap();
+        alice.mls.confirm(&gid).unwrap();
+        assert!(!ctx.store.is_member("#sealed", &dave.did).unwrap());
+
+        // The current group info, so only the write gate can refuse.
+        let group = ctx.store.get_mls_group("#sealed").unwrap().unwrap();
+        dave.mls.forget(&gid).unwrap();
+        let (_, back) = dave
+            .mls
+            .join_external(group.group_info.as_ref().unwrap())
+            .unwrap();
+        let rejoin = submit(
+            &ctx,
+            &dave,
+            BlockKind::MemberAdd,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"channel": "#sealed", "member_did": dave.did,
+                "mls_commit": b64(&back.commit)}),
+        )
+        .await;
+        assert!(
+            matches!(rejoin, Err(IngestError::NotChannelOwner { .. })),
+            "{rejoin:?}"
+        );
+        assert!(!ctx.store.is_member("#sealed", &dave.did).unwrap());
+    }
+
     /// JEP-0005 rule 7b on an encrypted channel: the key link moves the
     /// roster; the new DID joins by its own external commit, which a private
     /// channel takes only because the roster lists it; then its client

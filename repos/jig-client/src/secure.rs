@@ -56,6 +56,14 @@ use crate::open::{Authenticity, OpenedBlock};
 pub enum SecureError {
     #[error(transparent)]
     Mls(#[from] jig_mls::MlsError),
+    /// A key link moved `did` to a new key (JEP-0005 rule 7b), and `did`'s
+    /// old leaf is still in this member's copy of the group: anything sent
+    /// now would be readable with the old key. It is committed out first.
+    #[error(
+        "{did} moved to a new key, and its old leaf is still in this member's copy of the \
+         group; it must be committed out before anything is sent"
+    )]
+    LinkedLeafInGroup { did: String },
     #[error("MLS state at {path:?}: {source}")]
     Io {
         path: PathBuf,
@@ -200,6 +208,11 @@ struct Groups {
     /// and the old DID's leaf is out.
     #[serde(default)]
     linked: HashMap<String, String>,
+    /// `server|slug` → DIDs a key link moved away from in that channel
+    /// (JEP-0005 rule 7b). While one's leaf is still in this member's copy
+    /// of the group, nothing is encrypted for it ([`Session::encrypt`]).
+    #[serde(default)]
+    linked_away: HashMap<String, Vec<String>>,
 }
 
 /// Epochs `from..until` of one group this device was in; `until` is unset
@@ -677,8 +690,36 @@ impl Session {
     }
 
     /// Encrypt `text` for the channel. Returns the MLS message and its epoch.
+    ///
+    /// Refused while a DID a key link moved away from still has a leaf in
+    /// this member's copy of the group ([`SecureError::LinkedLeafInGroup`]):
+    /// the old key would read it. [`Self::linked_leaves`] names them.
     pub fn encrypt(&self, server: &str, slug: &str, text: &str) -> Result<(Vec<u8>, u64)> {
+        if let Some(did) = self.linked_leaves(server, slug)?.into_iter().next() {
+            return Err(SecureError::LinkedLeafInGroup { did });
+        }
         self.with_group(server, slug, |m, gid| Ok(m.encrypt(gid, text.as_bytes())?))
+    }
+
+    /// The DIDs a key link moved away from in `server`/`slug` whose leaves
+    /// are still in this member's copy of the group (JEP-0005 rule 7b): what
+    /// must be committed out before this member sends.
+    pub fn linked_leaves(&self, server: &str, slug: &str) -> Result<Vec<String>> {
+        let key = group_key(server, slug);
+        self.with_member(|m, g| {
+            let Some(away) = g.linked_away.get(&key) else {
+                return Ok(Vec::new());
+            };
+            let Some(gid) = group_of(g, &key).filter(|gid| m.has_group(gid)) else {
+                return Ok(Vec::new());
+            };
+            let members = m.members(&gid)?;
+            Ok(away
+                .iter()
+                .filter(|d| members.contains(d))
+                .cloned()
+                .collect())
+        })
     }
 
     /// File the plaintext of a block this member sent or read.
@@ -1022,6 +1063,10 @@ impl Session {
                 let (old, new) = (canonical(&old), canonical(&new));
                 self.once(block, &key, |m, g| {
                     let gid = group_of(g, &key).filter(|gid| m.has_group(gid));
+                    let away = g.linked_away.entry(key.clone()).or_default();
+                    if !away.contains(&old) {
+                        away.push(old.clone());
+                    }
                     if new == me {
                         // This device's new key: it rejoins, then commits the
                         // old leaf out, unless it holds the group already.
@@ -2389,6 +2434,65 @@ mod tests {
             HlcTimestamp::now_wall(jig_core::Did::from_ed25519_pubkey(&[1; 32])),
             serde_json::Value::Object(meta.into_iter().collect()),
         )
+    }
+
+    /// A member that read a key link sends nothing while the old leaf is in
+    /// its copy of the group (JEP-0005 rule 7b): Carol's tidy-up did not land,
+    /// so her send is refused rather than encrypted for the old key; once the
+    /// leaf is out, she sends.
+    #[test]
+    fn a_member_sends_nothing_while_a_linked_leaf_is_in_its_group() {
+        let root = tempfile::tempdir().unwrap();
+        let (bob_key, bob2_key) = (
+            jig_core::crypto::ed25519::generate_signing_key(),
+            jig_core::crypto::ed25519::generate_signing_key(),
+        );
+        let alice = session(root.path());
+        let carol = session(root.path());
+        let bob = Session::open(root.path(), Identity::from_signing_key(bob_key.clone())).unwrap();
+        alice.create_group(SERVER, "#sealed").unwrap();
+        let add_bob = add_block(&alice, "#sealed", &bob);
+        bob.observe(SERVER, &deliver(&add_bob));
+        let add_carol = add_block(&alice, "#sealed", &carol);
+        carol.observe(SERVER, &deliver(&add_carol));
+
+        let chan = jig_pipeline::ingest_record::label_cid("#sealed-channel");
+        let read = ReadIn {
+            key: "#sealed",
+            id: &chan,
+            slug: "#sealed",
+        };
+        let link = deliver(&key_link_block(&bob_key, &bob2_key, &chan));
+        assert!(matches!(
+            carol.observe_in(SERVER, Some(&read), &link),
+            Seen::Linked { tidy: true, .. }
+        ));
+        assert_eq!(
+            carol.linked_leaves(SERVER, "#sealed").unwrap(),
+            vec![bob.did().to_string()]
+        );
+        // Her tidy-up did not land: nothing is encrypted for the old key.
+        assert!(matches!(
+            carol.encrypt(SERVER, "#sealed", "hi"),
+            Err(SecureError::LinkedLeafInGroup { did }) if did == bob.did()
+        ));
+
+        // Alice's lands, and Carol follows it.
+        let removed = alice.prepare_remove(SERVER, "#sealed", bob.did()).unwrap();
+        alice.confirm(SERVER, "#sealed").unwrap();
+        let remove = build_with_metadata(
+            identity_of(&alice),
+            BlockKind::MemberRemove,
+            hlc(&alice),
+            json!({"channel": "#sealed", "member_did": bob.did(),
+                "mls_commit": STANDARD.encode(&removed.commit)}),
+        );
+        assert!(matches!(
+            carol.observe(SERVER, &deliver(&remove)),
+            Seen::Removed { .. }
+        ));
+        assert!(carol.linked_leaves(SERVER, "#sealed").unwrap().is_empty());
+        carol.encrypt(SERVER, "#sealed", "hi").unwrap();
     }
 
     /// JEP-0005 rule 7b on an encrypted channel, as members see it. A

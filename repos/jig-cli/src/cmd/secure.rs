@@ -2637,12 +2637,20 @@ impl Secure {
 
     /// Encrypt and send `text`. Returns the block CID.
     pub async fn send(&self, slug: &str, text: &str) -> Result<String> {
-        // A key link moved this device's place here (JEP-0005 rule 7b): the
-        // old leaf is out before anything is sent under the new key.
-        if let Some(old) = self.session.linked_from(&self.server, &self.key(slug))? {
+        // A key link moved this device's place here, or moved another
+        // member's (JEP-0005 rule 7b): the old leaf is out before anything is
+        // sent. A tidy-up that does not take it out leaves the send refused
+        // by the session, never encrypted for the old key.
+        let key = self.key(slug);
+        if let Some(old) = self.session.linked_from(&self.server, &key)? {
             self.tidy(slug, &old)
                 .await
                 .with_context(|| format!("taking the old key's leaf out of {slug}"))?;
+        }
+        for old in self.session.linked_leaves(&self.server, &key)? {
+            self.tidy(slug, &old)
+                .await
+                .with_context(|| format!("taking {old}'s old leaf out of {slug}"))?;
         }
         let (message, epoch) = self
             .session
