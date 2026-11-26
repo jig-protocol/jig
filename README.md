@@ -20,10 +20,10 @@ off is not settled.
 
 ---
 
-## Status: pre-alpha. Do not put this on a public IP.
+## Status: v0.2, pre-1.0. Do not put this on a public IP.
 
-Workspace version is `0.0.1`; the newest tag is `v0.1.0-alpha.1`, and the tree carries the
-v0.2 (M2) work on top of it. Crate versions have not been bumped to match the tags. This has never been deployed
+The workspace version is `0.2.0`. `v0.2.0` is the first final release, after seven signed
+`v0.2.0-alpha.N` prereleases; the federation contract ships in v0.2.x. This has never been deployed
 publicly — `jig.onl` is registered but serves nothing — and it has been exercised only on
 loopback and private tailnets.
 
@@ -91,8 +91,8 @@ loopback and private tailnets.
 | Authentication / authorization | Signed proof of possession on every read; `restricted` channels membership-gated for reading, listing, live delivery and posting; membership changes owner-signed; operator admission policy, with optional proof-of-work for new DIDs; per-DID and per-address rate limits |
 | Graphical client | None |
 | `jig read` | Works: the signed history endpoint, decrypting encrypted channels you belong to |
-| `jig --version` | Works (prints the crate version, which still says `0.0.1`; see below) |
-| Prebuilt release binaries | `release.yml` builds static musl Linux (x86_64, aarch64) and Apple Silicon macOS tarballs with a signed `SHA256SUMS`, gated on the install smoke test. No real tag has been cut with it yet; the repo is private, so anonymous downloads don't work |
+| `jig --version` | Works (prints the workspace version) |
+| Prebuilt release binaries | `release.yml` builds static musl Linux (x86_64, aarch64) and Apple Silicon macOS tarballs with a signed `SHA256SUMS`, gated on the install smoke test, and publishes a pre-release tag as a prerelease and a bare `vX.Y.Z` as the latest release |
 
 A design target that has **not been measured** and should not be read as a result: 10,000
 messages/second on a $5 VPS.
@@ -194,8 +194,8 @@ curl -fsSL https://raw.githubusercontent.com/jig-protocol/jig/main/install.sh | 
 # private repo: JIG_GITHUB_TOKEN=$(gh auth token) bash install.sh
 ```
 
-It downloads `jig-<os>-<arch>.tar.gz` from the newest GitHub Release (`JIG_VERSION=<tag>` to
-pin), verifies `SHA256SUMS.sig` with `ssh-keygen -Y` against the pinned release key and the
+It downloads `jig-<os>-<arch>.tar.gz` from the latest final GitHub Release, or the newest
+prerelease when there is no final one (`JIG_VERSION=<tag>` to pin), verifies `SHA256SUMS.sig` with `ssh-keygen -Y` against the pinned release key and the
 tarball against `SHA256SUMS`, and installs into `~/.jig/bin`. It then starts `jig-server` on
 `127.0.0.1:7117`, creates `#hello`, posts "hello, world", and opens `jig chat` if a terminal
 is attached. `JIG_INSTALL_FROM=source` builds from a checkout instead (minutes, not seconds).
