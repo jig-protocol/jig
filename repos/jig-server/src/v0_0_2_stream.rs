@@ -499,15 +499,31 @@ impl Stream {
             .is_empty();
         // A server this one re-offered a channel it took over (JEP-0005 rule
         // 11a) may be behind the head the move cites: it catches up from
-        // here before it can judge the re-offer.
+        // here before it can judge the re-offer. Only a configured peer that
+        // held a live share of the channel at the move, and so carried it
+        // already: never a server that did not have the channel.
         let me = self.ctx.server_did.to_did_jig_string();
         let reoffered = || -> anyhow::Result<bool> {
-            let moved_here = self
+            let Some(moved) = self
                 .store()
                 .channel_moves(&ask.channel_id)?
                 .last()
-                .is_some_and(|m| jig_pipeline::handshake::same_did(&m.sequencer, &me));
-            Ok(moved_here
+                .cloned()
+                .filter(|m| jig_pipeline::handshake::same_did(&m.sequencer, &me))
+            else {
+                return Ok(false);
+            };
+            if crate::v0_0_2_federation::configured_peer(&self.federation, peer).is_none() {
+                return Ok(false);
+            }
+            let carried = crate::v0_0_2_contract::live_followers_before(
+                self.store(),
+                &ask.channel_id,
+                moved.seq,
+            )?
+            .iter()
+            .any(|(f, _)| jig_pipeline::handshake::same_did(f, peer));
+            Ok(carried
                 && !self
                     .store()
                     .contract_offers_for(&ask.channel_id, peer, Side::Owner, OfferState::Offered)?

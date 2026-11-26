@@ -300,8 +300,9 @@ enum ChannelAction {
     /// (JEP-0005 rule 11a). The configured server is its sequencer now.
     ///
     /// Only a root owner may. The other server must carry the channel under
-    /// an accepted share. A current sequencer that answers but predates moves
-    /// is refused: it would go on taking writes the channel then loses.
+    /// an accepted share. A current sequencer that predates moves, or does
+    /// not answer, is refused: it would go on taking writes the channel then
+    /// loses.
     Move {
         /// The channel's id (the CID of its creation block).
         #[arg()]
@@ -309,8 +310,9 @@ enum ChannelAction {
         /// The URL of the server to move it to.
         #[arg(long)]
         to: String,
-        /// Move it even though the current sequencer answers and predates
-        /// moves: only when no one who writes to the channel can reach it.
+        /// Move it even though the current sequencer predates moves or does
+        /// not answer: only when it is gone for everyone who writes to the
+        /// channel.
         #[arg(long)]
         old_sequencer_unreachable: bool,
     },

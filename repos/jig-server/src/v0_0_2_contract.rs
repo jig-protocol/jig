@@ -432,53 +432,10 @@ impl Contracts {
     }
 
     /// The servers holding a live share of `channel_id`, each with its
-    /// grant, as the channel's chain records them (rule 10): a
-    /// `contract-accept` with no later `contract-end` for the same server.
+    /// grant, as the channel's chain records them (rule 10)
+    /// ([`live_followers_before`]).
     fn live_followers(&self, channel_id: &str) -> anyhow::Result<Vec<(String, Grant)>> {
-        let store = self.store();
-        let mut live: std::collections::BTreeMap<String, Grant> = Default::default();
-        let mut from = 0;
-        loop {
-            let page = store.list_ingest_records_by_id(channel_id, from, 200)?;
-            let Some(last) = page.last() else { break };
-            from = last.seq + 1;
-            for record in &page {
-                let Some(block) = store.get_block(&record.block_cid)? else {
-                    continue;
-                };
-                let kind = block.block_kind.parse::<BlockKind>().ok();
-                if !matches!(
-                    kind,
-                    Some(BlockKind::ContractAccept | BlockKind::ContractEnd)
-                ) {
-                    continue;
-                }
-                let manifest = manifest_of(&block.bundle_bytes)?;
-                let Some(to) = manifest
-                    .metadata
-                    .get(contracts::TO_KEY)
-                    .and_then(|v| v.as_str())
-                    .map(jig_pipeline::effect::canonical_did_string)
-                else {
-                    continue;
-                };
-                if kind == Some(BlockKind::ContractEnd) {
-                    live.remove(&to);
-                    continue;
-                }
-                let grant = manifest
-                    .metadata
-                    .get(contracts::OFFER_KEY)
-                    .and_then(|v| v.as_str())
-                    .and_then(|o| base64::engine::general_purpose::STANDARD.decode(o).ok())
-                    .and_then(|o| ContractOffer::from_envelope(&o).ok())
-                    .map(|o| o.grant);
-                if let Some(grant) = grant {
-                    live.insert(to, grant);
-                }
-            }
-        }
-        Ok(live.into_iter().collect())
+        live_followers_before(self.store(), channel_id, u64::MAX)
     }
 
     async fn offer(
@@ -1556,6 +1513,62 @@ fn manifest_of(bundle_bytes: &[u8]) -> anyhow::Result<BlockManifest> {
     Ok(serde_json::from_slice(&manifest_bytes)?)
 }
 
+/// The servers holding a live share of `channel_id` before record `seq` of
+/// its chain, each with its grant, as the chain records them (rule 10): a
+/// `contract-accept` with no later `contract-end` for the same server.
+pub(crate) fn live_followers_before(
+    store: &SqliteStore,
+    channel_id: &str,
+    seq: u64,
+) -> anyhow::Result<Vec<(String, Grant)>> {
+    let mut live: std::collections::BTreeMap<String, Grant> = Default::default();
+    let mut from = 0;
+    'chain: loop {
+        let page = store.list_ingest_records_by_id(channel_id, from, 200)?;
+        let Some(last) = page.last() else { break };
+        from = last.seq + 1;
+        for record in &page {
+            if record.seq >= seq {
+                break 'chain;
+            }
+            let Some(block) = store.get_block(&record.block_cid)? else {
+                continue;
+            };
+            let kind = block.block_kind.parse::<BlockKind>().ok();
+            if !matches!(
+                kind,
+                Some(BlockKind::ContractAccept | BlockKind::ContractEnd)
+            ) {
+                continue;
+            }
+            let manifest = manifest_of(&block.bundle_bytes)?;
+            let Some(to) = manifest
+                .metadata
+                .get(contracts::TO_KEY)
+                .and_then(|v| v.as_str())
+                .map(jig_pipeline::effect::canonical_did_string)
+            else {
+                continue;
+            };
+            if kind == Some(BlockKind::ContractEnd) {
+                live.remove(&to);
+                continue;
+            }
+            let grant = manifest
+                .metadata
+                .get(contracts::OFFER_KEY)
+                .and_then(|v| v.as_str())
+                .and_then(|o| base64::engine::general_purpose::STANDARD.decode(o).ok())
+                .and_then(|o| ContractOffer::from_envelope(&o).ok())
+                .map(|o| o.grant);
+            if let Some(grant) = grant {
+                live.insert(to, grant);
+            }
+        }
+    }
+    Ok(live.into_iter().collect())
+}
+
 /// The DID a creation block names as its channel's sequencer, canonical.
 fn named_sequencer(creation_block: &[u8]) -> Option<String> {
     let (manifest, _) = creation_of(creation_block)?;
@@ -2573,6 +2586,14 @@ mod tests {
         assert_eq!(
             owner.live_followers(&channel).unwrap(),
             vec![(follower, Grant::Read)]
+        );
+        // Counted only from the accept on: at the start of the chain, no
+        // server held a share. This is what limits who a new sequencer
+        // serves records to before its re-offer is accepted.
+        assert!(
+            live_followers_before(&p.owner.ingest_ctx.store, &channel, 1)
+                .unwrap()
+                .is_empty()
         );
     }
 

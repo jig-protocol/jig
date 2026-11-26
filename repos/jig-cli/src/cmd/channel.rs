@@ -837,25 +837,34 @@ struct MoveAccept {
 }
 
 /// Whether the move may go ahead, given what the channel's current
-/// sequencer's welcome lists (`None`: it did not answer). A sequencer that
-/// answers but does not list `sequencer-set` predates moves, so it would
-/// never learn of this one and would go on taking writes the channel then
-/// loses (JEP-0005 rule 11a): refused, unless the caller states that server
-/// is out of reach of everyone who writes to the channel (DJ 2026-11-26).
+/// sequencer's welcome lists (`None`: it did not answer). Only a sequencer
+/// that answers and lists `sequencer-set` learns of the move. One that does
+/// not, or that cannot be told because it did not answer, would go on
+/// taking writes the channel then loses (JEP-0005 rule 11a): refused, unless
+/// the caller states that server is gone (DJ 2026-11-26). A blip that hides
+/// a live server must not split its channel.
 fn old_sequencer_allows_the_move(
     server: &str,
     kinds: Option<&[String]>,
     unreachable: bool,
 ) -> Result<()> {
     let kind = BlockKind::SequencerSet.as_str();
+    if unreachable {
+        return Ok(());
+    }
     match kinds {
-        Some(kinds) if !kinds.iter().any(|k| k == kind) && !unreachable => anyhow::bail!(
+        Some(kinds) if kinds.iter().any(|k| k == kind) => Ok(()),
+        Some(_) => anyhow::bail!(
             "{server} sequences the channel and answers, but does not implement `{kind}`: it \
              would never learn of the move, and would go on taking writes the channel then \
              loses. Move it once that server is upgraded, or pass \
              --old-sequencer-unreachable if no one can reach it any more"
         ),
-        _ => Ok(()),
+        None => anyhow::bail!(
+            "{server} sequences the channel and could not be reached, so it cannot be told of \
+             the move. Try again, or pass --old-sequencer-unreachable if it is gone: then \
+             followers on versions before moves stall at the move without notice"
+        ),
     }
 }
 
@@ -874,7 +883,7 @@ pub async fn move_channel(
     let kinds = match crate::cmd::secure::connect_unpinned(&old, identity.duplicate()).await {
         Ok(client) => client.welcome().map(|w| w.capabilities.block_kinds.clone()),
         Err(e) => {
-            eprintln!("note: {old} does not answer ({e:#}); moving the channel without it");
+            eprintln!("note: {old} does not answer: {e:#}");
             None
         }
     };
@@ -1415,23 +1424,32 @@ fn channel_lines(channels: &[ChannelView]) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// `jig channel move` refuses while the current sequencer answers and
-    /// does not implement `sequencer-set`, unless told it is out of reach
-    /// (DJ 2026-11-26). One that implements it, or does not answer, is no
-    /// reason to stop.
+    /// `jig channel move` goes ahead only when the current sequencer
+    /// answers and implements `sequencer-set`; one that does not, or does not
+    /// answer, needs the operator to say it is gone (DJ 2026-11-26).
     #[test]
     fn a_move_off_a_sequencer_that_predates_moves_needs_the_flag() {
         let old = "https://old.example";
         let without = vec!["text-render".to_string(), "channel-create".to_string()];
         let with = vec!["text-render".to_string(), "sequencer-set".to_string()];
-        let refused = old_sequencer_allows_the_move(old, Some(&without), false).unwrap_err();
-        assert!(
-            refused.to_string().contains("--old-sequencer-unreachable"),
-            "{refused}"
-        );
-        assert!(old_sequencer_allows_the_move(old, Some(&without), true).is_ok());
+        // Answers and implements moves: go ahead.
         assert!(old_sequencer_allows_the_move(old, Some(&with), false).is_ok());
-        assert!(old_sequencer_allows_the_move(old, None, false).is_ok());
+        // Answers without implementing them, or does not answer: only with
+        // the flag.
+        for kinds in [Some(without.as_slice()), None] {
+            let refused = old_sequencer_allows_the_move(old, kinds, false).unwrap_err();
+            assert!(
+                refused.to_string().contains("--old-sequencer-unreachable"),
+                "{refused}"
+            );
+            assert!(old_sequencer_allows_the_move(old, kinds, true).is_ok());
+        }
+        assert!(
+            old_sequencer_allows_the_move(old, None, false)
+                .unwrap_err()
+                .to_string()
+                .contains("could not be reached")
+        );
     }
 
     #[test]
