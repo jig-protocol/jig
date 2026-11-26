@@ -1736,7 +1736,7 @@ mod tests {
     /// last.
     #[test]
     fn a_welcome_without_heads_signs_what_it_always_did() {
-        let mut view = hello_view("bm9uY2U=");
+        let mut view = hello_view(&fresh_nonce());
         view.capabilities.request_auth = vec![jig_core::request_auth::VERSION.to_string()];
         let mut server = offer_server();
         server.capabilities.request_auth = vec![jig_core::request_auth::VERSION.to_string()];
@@ -2096,7 +2096,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(v["feature"].as_str(), Some(HEADS_FEATURE));
-        let statement = negotiate(&hello_view("bm9uY2U="), &offer_server()).unwrap();
+        let statement = negotiate(&hello_view(&fresh_nonce()), &offer_server()).unwrap();
         let before = statement.canonical_bytes();
         let mut with = statement.clone();
         with.capabilities.heads = true;
