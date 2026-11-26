@@ -95,6 +95,8 @@ pub enum Taken {
 /// forwards.
 pub struct Heads {
     ctx: Arc<IngestContext>,
+    /// Who this server federates with: heads go only to configured peers.
+    federation: Arc<jig_config::v0_0_2_server::FederationSection>,
     peers: Arc<PeerRegistry>,
     /// The follower's stream, to fetch up to a head past its chain.
     stream: OnceLock<Stream>,
@@ -106,9 +108,14 @@ pub struct Heads {
 }
 
 impl Heads {
-    pub fn new(ctx: Arc<IngestContext>, peers: Arc<PeerRegistry>) -> Self {
+    pub fn new(
+        ctx: Arc<IngestContext>,
+        federation: Arc<jig_config::v0_0_2_server::FederationSection>,
+        peers: Arc<PeerRegistry>,
+    ) -> Self {
         Heads {
             ctx,
+            federation,
             peers,
             stream: OnceLock::new(),
             from_peers: RequestLimit::new(PEER_HEADS),
@@ -229,8 +236,10 @@ impl Heads {
         targets
     }
 
-    /// Send `envelope` on to every target but `from`, on links that take
-    /// heads, at most once every [`FORWARD_EVERY`] per peer and channel.
+    /// Send `envelope` on to every target but `from` that is a configured
+    /// peer, on links that take heads, at most once every [`FORWARD_EVERY`]
+    /// per peer and channel. A share-holder the operator has since delisted
+    /// is told nothing, whatever its share's state.
     fn forward(&self, channel_id: &str, envelope: &[u8], from: Option<&str>) {
         let body = ChannelHead {
             channel_id: channel_id.to_string(),
@@ -239,7 +248,9 @@ impl Heads {
         .encode();
         let now = tokio::time::Instant::now();
         for target in self.targets(channel_id) {
-            if from.is_some_and(|f| jig_pipeline::handshake::same_did(f, &target)) {
+            if from.is_some_and(|f| jig_pipeline::handshake::same_did(f, &target))
+                || crate::v0_0_2_federation::configured_peer(&self.federation, &target).is_none()
+            {
                 continue;
             }
             let Some(sender) = Did::from_did_jig_string(&target)
@@ -271,6 +282,14 @@ impl Heads {
     /// under it again. Neither closes the connection, which carries every
     /// contract between the two servers.
     pub fn on_peer_frame(&self, peer: &Did, body: &[u8]) {
+        // Only from a configured peer: a DID the operator never listed, or
+        // has since delisted, costs nothing and is told nothing.
+        if crate::v0_0_2_federation::configured_peer(&self.federation, &peer.to_did_jig_string())
+            .is_none()
+        {
+            tracing::debug!(peer = %peer.to_did_jig_string(), "a channel-head from a peer not configured");
+            return;
+        }
         let Some(head) = ChannelHead::decode(body) else {
             tracing::debug!(peer = %peer.to_did_jig_string(), "a channel-head that does not decode");
             return;
@@ -453,7 +472,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_flood_of_heads_costs_no_more_signatures_than_its_allowance() {
         let (state, channel, held) = sequencing().await;
-        let heads = Heads::new(state.ingest_ctx.clone(), state.peers.clone());
+        let heads = Heads::new(
+            state.ingest_ctx.clone(),
+            Arc::new(state.config.federation.clone()),
+            state.peers.clone(),
+        );
         let duplicate = held.cose_bytes().unwrap();
         let burst = CLIENT_HEADS.burst as usize;
 
@@ -531,17 +554,39 @@ mod tests {
     }
 
     /// A head past the chain goes on to the servers holding a share of the
-    /// channel, on links that take heads, never back to whoever sent it,
-    /// and at most once every [`FORWARD_EVERY`] per peer and channel.
+    /// channel that are configured peers, on links that take heads, never
+    /// back to whoever sent it, and at most once every [`FORWARD_EVERY`] per
+    /// peer and channel. A share-holder the operator delisted gets nothing.
     #[tokio::test(start_paused = true)]
     async fn a_head_past_the_chain_goes_on_to_the_channels_other_servers() {
         use crate::v0_0_2_peer::PeerSender;
         let (state, channel, held) = sequencing().await;
-        let heads = Heads::new(state.ingest_ctx.clone(), state.peers.clone());
         let peer = |n: u8| Did::from_ed25519_pubkey(&[n; 32]);
-        let (takes, others, source) = (peer(1), peer(2), peer(3));
+        let (takes, others, source, delisted) = (peer(1), peer(2), peer(3), peer(4));
+        let mut federation = state.config.federation.clone();
+        federation.peers = [&takes, &others, &source]
+            .into_iter()
+            .map(|did| jig_config::v0_0_2_server::FederationPeer {
+                url: "wss://peer.invalid".into(),
+                expected_did: did.to_did_jig_string(),
+                alias: None,
+                publish: false,
+                quota: None,
+                offers: Default::default(),
+            })
+            .collect();
+        let heads = Heads::new(
+            state.ingest_ctx.clone(),
+            Arc::new(federation),
+            state.peers.clone(),
+        );
         let mut inboxes = Vec::new();
-        for (did, takes_heads) in [(&takes, true), (&others, false), (&source, true)] {
+        for (did, takes_heads) in [
+            (&takes, true),
+            (&others, false),
+            (&source, true),
+            (&delisted, true),
+        ] {
             let (sender, rx) = PeerSender::with_features(did.clone(), true, takes_heads);
             state.peers.register(sender);
             inboxes.push(rx);
@@ -595,6 +640,23 @@ mod tests {
         assert_eq!(sent(&mut inboxes[0]).len(), 1, "a link that takes heads");
         assert!(sent(&mut inboxes[1]).is_empty(), "a link that does not");
         assert!(sent(&mut inboxes[2]).is_empty(), "never back to the sender");
+        assert!(
+            sent(&mut inboxes[3]).is_empty(),
+            "an accepted share-holder that is no longer a configured peer"
+        );
+        // And a head from a peer that is not configured costs nothing and
+        // goes nowhere.
+        let before = heads.verifications();
+        heads.on_peer_frame(
+            &delisted,
+            &ChannelHead {
+                channel_id: channel.clone(),
+                record: ahead(9),
+            }
+            .encode(),
+        );
+        assert_eq!(heads.verifications(), before);
+        assert!(inboxes.iter_mut().all(|i| sent(i).is_empty()));
 
         // Coalesced: a higher head within the interval is not sent again.
         heads.take_from_peer(&source, &channel, &ahead(6));
@@ -621,7 +683,11 @@ mod tests {
         }
         .sign(3, &channel, held.hash())
         .unwrap();
-        let heads = Heads::new(state.ingest_ctx.clone(), state.peers.clone());
+        let heads = Heads::new(
+            state.ingest_ctx.clone(),
+            Arc::new(state.config.federation.clone()),
+            state.peers.clone(),
+        );
         heads.take_from_peer(
             &Did::from_ed25519_pubkey(&[4; 32]),
             &channel,

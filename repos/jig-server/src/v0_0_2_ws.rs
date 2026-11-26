@@ -3396,6 +3396,7 @@ mod tests {
                 .heads
                 .set(Arc::new(crate::v0_0_2_heads::Heads::new(
                     state.ingest_ctx.clone(),
+                    Arc::new(state.config.federation.clone()),
                     state.peers.clone(),
                 )))
                 .is_ok()

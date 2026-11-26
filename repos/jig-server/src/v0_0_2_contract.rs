@@ -142,6 +142,7 @@ fn handle(state: &AppState) -> Contracts {
     // follower fetches up to a head with the contract's stream.
     let heads = Arc::new(crate::v0_0_2_heads::Heads::new(
         state.ingest_ctx.clone(),
+        contracts.federation.clone(),
         state.peers.clone(),
     ));
     heads.set_stream(contracts.stream.clone());
