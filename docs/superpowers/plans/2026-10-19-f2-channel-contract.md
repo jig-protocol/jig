@@ -480,9 +480,20 @@ plus the server's `/.well-known/jig` naming that DID).
   duplicate frames.
 - [ ] Handshake attempts are limited per source address, and no block processing happens
   before the mutual handshake.
-- [ ] Writes queued while the sequencer is down are capped at 1000 blocks or 10 MiB per channel
-  and 100 MiB per server (DJ, 2026-10-19). A write past a cap is refused with a code, never
-  dropped. Head gossip is rate-limited and deduplicated.
+- [ ] ~~Writes queued while the sequencer is down are capped at 1000 blocks or 10 MiB per channel
+  and 100 MiB per server (DJ, 2026-10-19).~~ **Retired (DJ, 2026-11-26):** nothing is queued.
+  A follower holds a relayed write only while it waits on the owner, at most `RELAY_TIMEOUT`
+  (10 s), and otherwise answers `OWNER_UNREACHABLE` or `RELAY_PENDING` (`v0_0_2_relay.rs`).
+  What it holds is bounded instead: 4 per client connection, 16 per client, 1024 per server,
+  each refused with `429 RELAY_BUSY` and `retry_after_ms`. On the owner's side, a follower's
+  relayed writes count against its manifest quota (shared with what it streams) and at most 64
+  are taken at once, both checked before any work. A write past any bound is refused with a
+  code, never dropped.
+- [ ] Only a configured peer streams or relays (DJ, 2026-11-26). Any server that proves its DID
+  may hold a peer connection, so that its offer is answered `NOT_A_PEER` (rule 17), but its
+  stream and relay frames are dropped before any work. A peer delisted while its share is
+  accepted is treated the same, and its share is left for the operator to end.
+- [ ] Head gossip is rate-limited and deduplicated (with D11 slice 5, lane F2-C).
 - [ ] Commit `feat(federation): layered abuse defences on peer links`.
 
 ---
@@ -512,12 +523,12 @@ plus the server's `/.well-known/jig` naming that DID).
    match.
 2. **A follower holds every incoming offer for its operator by default.** It auto-accepts only
    from peers explicitly configured to auto-accept (Task 4).
-3. **Caps on writes queued while a sequencer is down** (Task 10), configured per server:
-   - per channel: 1000 blocks or 10 MiB, whichever comes first;
-   - per server, across every channel: 100 MiB.
-
-   A write past either cap is refused back to the client with a clear code. It is never
-   dropped silently.
+3. ~~**Caps on writes queued while a sequencer is down** (Task 10), configured per server:
+   per channel 1000 blocks or 10 MiB; per server 100 MiB.~~ **Retired as moot (DJ,
+   2026-11-26):** relayed writes are never queued. They are bounded while in flight instead
+   (4 per connection, 16 per client, 1024 per server, `RELAY_BUSY`), as Task 10 says. What
+   the decision protected still holds: a write past a bound is refused back to the client with
+   a clear code, never dropped silently.
 
 ## Done when
 
