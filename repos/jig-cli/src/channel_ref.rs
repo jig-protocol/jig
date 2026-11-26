@@ -76,6 +76,11 @@ fn parse_link(raw: &str, link: &str) -> Result<Link, String> {
             continue;
         }
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        // A hint this build does not read is skipped before its value is
+        // decoded, so a later build's hint never makes the link unreadable.
+        if !matches!(key, "sequencer" | "slug") {
+            continue;
+        }
         let value = percent_decode(value).map_err(|why| format!("`{raw}`: {key}: {why}"))?;
         let (field, value) = match key {
             "sequencer" => {
@@ -89,8 +94,7 @@ fn parse_link(raw: &str, link: &str) -> Result<Link, String> {
                 }
                 (&mut out.slug, value)
             }
-            // A hint this build does not read.
-            _ => continue,
+            _ => unreachable!("only the hints read above get here"),
         };
         if field.replace(value).is_some() {
             return Err(format!("`{raw}`: `{key}` is given twice"));
@@ -164,6 +168,10 @@ mod tests {
             format!("jig:{}?slug=%23ops", id()),
             format!("jig:{}?slug=%23elsewhere&sequencer={other}", id()),
             format!("jig:{}?later=1&&slug=%23ops", id()),
+            // An unknown hint's value is not read, even if it is not UTF-8
+            // or not percent-encoded.
+            format!("jig:{}?later=%FF&slug=%23ops", id()),
+            format!("jig:{}?later=%zz", id()),
         ] {
             assert_eq!(parse(&link).unwrap(), id(), "{link}");
         }
