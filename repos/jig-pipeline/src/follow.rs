@@ -2681,12 +2681,12 @@ mod tests {
         let moved = move_to(&owner, &new.server_key, &owner.user);
         // The old sequencer's next record, past that head.
         owner.text("past the cited head").await;
-        let next = owner.sent.last().unwrap().clone();
+        let next = owner.sent.last().unwrap();
         let next_seq = IngestRecord::decode(&next.record).unwrap().seq;
 
         // The takeover is in flight: it holds the gate.
         let gate = new.store.gate_channel(&owner.channel, true).await;
-        let carried = take(&new, &owner, &next);
+        let carried = take(&new, &owner, next);
         tokio::pin!(carried);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(50), &mut carried)
