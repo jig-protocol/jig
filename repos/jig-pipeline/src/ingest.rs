@@ -321,6 +321,13 @@ pub enum IngestError {
         channel_id: String,
         sequencer: String,
     },
+    /// The owner moved the channel away from this server (JEP-0005 rule
+    /// 11a): it sequences nothing of it any more.
+    #[error("channel {channel_id} moved to `{sequencer}`: post it there")]
+    SequencerMoved {
+        channel_id: String,
+        sequencer: String,
+    },
     /// A `sequencer-set` this server cannot take the channel over by
     /// (JEP-0005 rule 11a).
     #[error("the sequencer move is refused: {detail}")]
@@ -723,6 +730,22 @@ pub async fn ingest(
     // A channel another server sequences takes its blocks only from that
     // server, with that server's records (`crate::follow`): this server never
     // signs a record for it (JEP-0005 rule 12), so nothing lands here.
+    // A channel the owner moved away from this server is the new
+    // sequencer's: said so, rather than relayed as a carried channel's write.
+    if takeover.is_none()
+        && let Some(chan) = resolved_channel.as_ref()
+        && let Some(moved) = ctx
+            .store
+            .channel_moves(&chan.id)?
+            .into_iter()
+            .rev()
+            .find(|m| crate::handshake::same_did(&m.previous, &server_did))
+    {
+        return Err(IngestError::SequencerMoved {
+            channel_id: chan.id.clone(),
+            sequencer: moved.sequencer,
+        });
+    }
     if takeover.is_none()
         && let Some(chan) = resolved_channel.as_ref()
         && !chan.sequencer_did.is_empty()

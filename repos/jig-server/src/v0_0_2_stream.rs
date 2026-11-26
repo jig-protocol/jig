@@ -427,6 +427,26 @@ impl Stream {
             .collect())
     }
 
+    /// Send `block`, which this server sequenced, to `peers` whatever their
+    /// shares: the `sequencer-set` by which this server took a channel over
+    /// (JEP-0005 rule 11a), to the servers that carried it and to the one it
+    /// moved from, none of which holds a share with this server yet.
+    pub fn push_to(&self, block: &StoredBlock, peers: &[String]) -> anyhow::Result<()> {
+        let Some((channel_id, _, entry)) = self.entry(block)? else {
+            return Ok(());
+        };
+        let body = Records {
+            channel_id,
+            entries: vec![entry],
+            more: false,
+        }
+        .encode();
+        for peer in peers {
+            self.send(peer, RECORDS_FRAME, body.clone());
+        }
+        Ok(())
+    }
+
     /// Send a block this server just sequenced to every server following its
     /// channel.
     pub fn on_block(&self, block: &StoredBlock) -> anyhow::Result<()> {
@@ -473,10 +493,27 @@ impl Stream {
     }
 
     fn answer(&self, peer: &str, ask: &RecordsFrom, out: &PeerSender) -> anyhow::Result<()> {
-        let shared = !self
+        let accepted = !self
             .store()
             .contract_offers_for(&ask.channel_id, peer, Side::Owner, OfferState::Accepted)?
             .is_empty();
+        // A server this one re-offered a channel it took over (JEP-0005 rule
+        // 11a) may be behind the head the move cites: it catches up from
+        // here before it can judge the re-offer.
+        let me = self.ctx.server_did.to_did_jig_string();
+        let reoffered = || -> anyhow::Result<bool> {
+            let moved_here = self
+                .store()
+                .channel_moves(&ask.channel_id)?
+                .last()
+                .is_some_and(|m| jig_pipeline::handshake::same_did(&m.sequencer, &me));
+            Ok(moved_here
+                && !self
+                    .store()
+                    .contract_offers_for(&ask.channel_id, peer, Side::Owner, OfferState::Offered)?
+                    .is_empty())
+        };
+        let shared = accepted || reoffered()?;
         if !shared {
             tracing::debug!(
                 peer,
@@ -637,6 +674,16 @@ impl Stream {
                 return;
             }
         };
+        // A move kept until this server holds the head it cites: catch up
+        // from its new sequencer (JEP-0005 rule 11a).
+        match self.store().pending_moves() {
+            Ok(pending) => {
+                for (channel_id, moved) in pending {
+                    self.pull_from_head(&moved.sequencer, &channel_id);
+                }
+            }
+            Err(e) => tracing::warn!("listing kept moves: {e}"),
+        }
         for share in shares {
             let stopped = self
                 .store()
@@ -704,6 +751,25 @@ impl Stream {
     /// evidence is kept by the pipeline).
     pub(crate) async fn land(&self, peer: &Did, records: Records) {
         let sequencer = peer.to_did_jig_string();
+        // Only a peer the operator configured is a source of any channel's
+        // records; the owner's signature on a move does not make another one
+        // (JEP-0005 rule 11a).
+        if crate::v0_0_2_federation::configured_peer(&self.federation, &sequencer).is_none() {
+            tracing::info!(
+                peer = sequencer,
+                "channel-records from a peer that is not configured"
+            );
+            return;
+        }
+        // A channel this server sequences takes nothing from a peer but the
+        // owner's move away from it.
+        let me = self.ctx.server_did.to_did_jig_string();
+        let sequenced_here = self
+            .store()
+            .get_channel_by_id(&records.channel_id)
+            .ok()
+            .flatten()
+            .is_some_and(|c| jig_pipeline::handshake::same_did(&c.sequencer_did, &me));
         let mut last = None;
         for entry in records.entries {
             let Ok((manifest_bytes, code_bytes)) =
@@ -724,6 +790,31 @@ impl Stream {
                 code_bytes: &code_bytes,
                 resources: vec![],
             };
+            if sequenced_here {
+                match jig_pipeline::follow::record_moved_away(
+                    &self.ctx.store,
+                    bundle,
+                    &entry.sig,
+                    &entry.record,
+                    &sequencer,
+                    &me,
+                ) {
+                    Ok(past) => tracing::warn!(
+                        channel_id = records.channel_id,
+                        to = sequencer,
+                        records_past_the_move = past,
+                        "the owner moved this channel to another sequencer; this server \
+                         sequences it no more, and the records it signed past the move are \
+                         not the channel's"
+                    ),
+                    Err(e) => tracing::warn!(
+                        peer = sequencer,
+                        channel_id = records.channel_id,
+                        "channel-records for a channel this server sequences: {e}"
+                    ),
+                }
+                return;
+            }
             match ingest_sequenced(&self.ctx, bundle, entry.sig, &entry.record, &sequencer).await {
                 Ok(Followed::Landed { seq, .. } | Followed::Duplicate { seq, .. }) => {
                     last = Some(seq);

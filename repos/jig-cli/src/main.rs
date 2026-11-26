@@ -296,6 +296,25 @@ enum ChannelAction {
         grant: String,
     },
 
+    /// Move a channel's sequencer to another server that carries it
+    /// (JEP-0005 rule 11a). The configured server is its sequencer now.
+    ///
+    /// Only a root owner may. The other server must carry the channel under
+    /// an accepted share. A current sequencer that answers but predates moves
+    /// is refused: it would go on taking writes the channel then loses.
+    Move {
+        /// The channel's id (the CID of its creation block).
+        #[arg()]
+        channel_id: String,
+        /// The URL of the server to move it to.
+        #[arg(long)]
+        to: String,
+        /// Move it even though the current sequencer answers and predates
+        /// moves: only when no one who writes to the channel can reach it.
+        #[arg(long)]
+        old_sequencer_unreachable: bool,
+    },
+
     /// Stop sharing a channel with another server.
     ///
     /// An offer not yet answered is withdrawn. A live share ends at once
@@ -1043,6 +1062,13 @@ async fn run() -> Result<()> {
                 server_did,
                 grant,
             } => cmd::channel::share(&ctx, slug, server_did, grant).await?,
+            ChannelAction::Move {
+                channel_id,
+                to,
+                old_sequencer_unreachable,
+            } => {
+                cmd::channel::move_channel(&ctx, channel_id, to, old_sequencer_unreachable).await?
+            }
             ChannelAction::Unshare { slug, server_did } => {
                 cmd::channel::unshare(&ctx, slug, server_did).await?
             }

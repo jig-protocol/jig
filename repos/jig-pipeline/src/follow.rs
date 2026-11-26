@@ -531,6 +531,31 @@ impl SqliteStore {
             .optional()?)
     }
 
+    /// Every kept move, by channel: the channels to ask its new sequencer
+    /// for the records up to the head it cites.
+    pub fn pending_moves(&self) -> crate::persist::Result<Vec<(String, PendingMove)>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT channel_id, seq, sequencer, manifest, code, sig, record FROM pending_moves",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    PendingMove {
+                        seq: r.get::<_, i64>(1)? as u64,
+                        sequencer: r.get(2)?,
+                        manifest: r.get(3)?,
+                        code: r.get(4)?,
+                        sig: r.get(5)?,
+                        record: r.get(6)?,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     fn keep_pending_move(
         &self,
         channel_id: &str,
@@ -927,6 +952,84 @@ impl SqliteStore {
         tx.commit()?;
         Ok(Landing::Landed)
     }
+}
+
+/// This server, `me`, sequenced `channel_id` and its owner moved it away
+/// (JEP-0005 rule 11a): `bundle` is the owner's `sequencer-set`, and
+/// `record_bytes` its record, as the new sequencer `link` sent them. Checked
+/// as every reader checks a move, against the head this server signed; then
+/// kept as the channel's move, so this server refuses writes to it
+/// (`IngestError::SequencerMoved`) and never sequences it again. The block
+/// itself is not stored: its `seq` may hold a record of this server's own.
+///
+/// Returns how many records this server signed past the cited head: the
+/// writes the move left behind, for the operator.
+pub fn record_moved_away(
+    store: &SqliteStore,
+    bundle: BlockBundle<'_>,
+    sig: &[u8],
+    record_bytes: &[u8],
+    link: &str,
+    me: &str,
+) -> Result<u64, FollowError> {
+    let (manifest, kind) = carried_manifest(bundle.manifest_bytes)?;
+    if kind.known() != Some(BlockKind::SequencerSet) {
+        return Err(FollowError::Mismatch("not a sequencer move"));
+    }
+    let sender =
+        crate::ingest::verify_sig(bundle.manifest_bytes, bundle.code_bytes, &manifest, sig)?;
+    let record = IngestRecord::decode(record_bytes)?;
+    let set = jig_core::sequencer_move::SequencerSet::from_metadata(&manifest.metadata)?;
+    let chan = store
+        .get_channel_by_id_including_archived(&record.channel_id)?
+        .filter(|c| crate::handshake::same_did(&c.sequencer_did, me))
+        .ok_or(FollowError::Mismatch(
+            "a move of a channel this server does not sequence",
+        ))?;
+    if set.channel_id != chan.id || !crate::handshake::same_did(&set.sequencer, link) {
+        return Err(FollowError::Mismatch(
+            "the move names another channel or server",
+        ));
+    }
+    let block_cid = bundle
+        .block_cid()
+        .map_err(|e| IngestError::BundleMalformed(e.to_string()))?
+        .to_string();
+    if record.block_cid != block_cid {
+        return Err(FollowError::Mismatch("the record is for another block"));
+    }
+    if !chan.is_root_owner(&crate::effect::canonical_did_string(
+        &sender.to_did_jig_string(),
+    )) {
+        return Err(FollowError::Mismatch(
+            "a sequencer move signed by a DID that is not the channel's owner",
+        ));
+    }
+    record.verify(&set.sequencer)?;
+    set.check_record(record.seq, &record.prev, &record.sequencer)?;
+    let cited = store
+        .ingest_record_bytes(&chan.id, set.head.seq)?
+        .and_then(|b| IngestRecord::decode(&b).ok())
+        .filter(|h| h.hash() == set.head.hash && crate::handshake::same_did(&h.sequencer, me))
+        .ok_or(FollowError::Mismatch(
+            "the move cites a head this server did not sign",
+        ))?;
+    let past = store.chain_head_seq(&chan.id)?.unwrap_or(cited.seq) - cited.seq;
+    {
+        let conn = store.conn.lock().expect("poisoned");
+        conn.execute(
+            "INSERT OR IGNORE INTO channel_moves (channel_id, seq, sequencer, previous, block_cid)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![chan.id, record.seq as i64, set.sequencer, me, block_cid],
+        )
+        .map_err(crate::persist::PersistError::from)?;
+        conn.execute(
+            "UPDATE channels SET sequencer_did = ?1 WHERE id = ?2",
+            params![set.sequencer, chan.id],
+        )
+        .map_err(crate::persist::PersistError::from)?;
+    }
+    Ok(past)
 }
 
 /// Check that this server, `me`, can take `chan` over by the `sequencer-set`

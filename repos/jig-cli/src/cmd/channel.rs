@@ -826,6 +826,143 @@ pub async fn share(ctx: &CliContext, slug: String, to: String, grant: String) ->
     Ok(())
 }
 
+/// What the server a channel moves to answers for its move accept
+/// (`POST /api/v1/channels/{channel}/move-accept`).
+#[derive(Debug, Deserialize)]
+struct MoveAccept {
+    sequencer: String,
+    accept: String,
+    head_seq: u64,
+    head_hash: String,
+}
+
+/// Whether the move may go ahead, given what the channel's current
+/// sequencer's welcome lists (`None`: it did not answer). A sequencer that
+/// answers but does not list `sequencer-set` predates moves, so it would
+/// never learn of this one and would go on taking writes the channel then
+/// loses (JEP-0005 rule 11a): refused, unless the caller states that server
+/// is out of reach of everyone who writes to the channel (DJ 2026-11-26).
+fn old_sequencer_allows_the_move(
+    server: &str,
+    kinds: Option<&[String]>,
+    unreachable: bool,
+) -> Result<()> {
+    let kind = BlockKind::SequencerSet.as_str();
+    match kinds {
+        Some(kinds) if !kinds.iter().any(|k| k == kind) && !unreachable => anyhow::bail!(
+            "{server} sequences the channel and answers, but does not implement `{kind}`: it \
+             would never learn of the move, and would go on taking writes the channel then \
+             loses. Move it once that server is upgraded, or pass \
+             --old-sequencer-unreachable if no one can reach it any more"
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// Apply `jig channel move <channel-id> --to <url>` (JEP-0005 rule 11a): ask
+/// the server at `to`, which carries the channel, for its move accept; sign
+/// the `sequencer-set` naming it and citing the head it holds; and submit it
+/// there. The configured server is the channel's current sequencer.
+pub async fn move_channel(
+    ctx: &CliContext,
+    channel_id: String,
+    to: String,
+    old_sequencer_unreachable: bool,
+) -> Result<()> {
+    let identity = ctx.identity()?;
+    let old = ctx.server_url()?;
+    let kinds = match crate::cmd::secure::connect_unpinned(&old, identity.duplicate()).await {
+        Ok(client) => client.welcome().map(|w| w.capabilities.block_kinds.clone()),
+        Err(e) => {
+            eprintln!("note: {old} does not answer ({e:#}); moving the channel without it");
+            None
+        }
+    };
+    old_sequencer_allows_the_move(&old, kinds.as_deref(), old_sequencer_unreachable)?;
+
+    let base = crate::cmd::channel::base_http_url(&to);
+    let http = crate::cmd::trust::http(&to, std::time::Duration::from_secs(15)).await?;
+    let url = format!("{base}/api/v1/channels/{channel_id}/move-accept");
+    let resp = crate::cmd::request_proof::send_as(
+        &to,
+        crate::cmd::request_proof::Trust::Unpinned,
+        &identity,
+        "POST",
+        &url,
+        b"",
+        || http.post(&url),
+    )
+    .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        anyhow::bail!(
+            "{to} gave no move accept ({status}): {} {}",
+            body["code"].as_str().unwrap_or_default(),
+            body["message"].as_str().unwrap_or_default()
+        );
+    }
+    let moved: MoveAccept = resp.json().await.context("reading the move accept")?;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let accept = jig_core::contract::ContractAccept::from_envelope(
+        &b64.decode(&moved.accept)
+            .context("the move accept is not base64")?,
+    )
+    .context("the move accept does not verify")?;
+    let hash: [u8; 32] = hex::decode(&moved.head_hash)
+        .ok()
+        .and_then(|h| h.try_into().ok())
+        .context("the head hash is not 32 bytes of hex")?;
+    let set = jig_core::sequencer_move::SequencerSet {
+        channel_id: channel_id.clone(),
+        sequencer: moved.sequencer.clone(),
+        head: jig_core::sequencer_move::CitedHead {
+            seq: moved.head_seq,
+            hash,
+        },
+        accept,
+        reinstalls: Vec::new(),
+    };
+    // Checked as every reader checks it, before it is signed.
+    let metadata: serde_json::Map<String, serde_json::Value> =
+        set.to_metadata().into_iter().collect();
+    jig_core::sequencer_move::SequencerSet::from_metadata(&set.to_metadata())
+        .context("the move accept is not one this channel can move by")?;
+    let block = jig_client::blocks::build_with_metadata(
+        &identity,
+        BlockKind::SequencerSet,
+        now(&identity),
+        serde_json::Value::Object(metadata),
+    );
+    let body = json!({
+        "bundle_b64": b64.encode(block.canonical_bytes()),
+        "sig_b64": b64.encode(&block.sender_sig),
+    });
+    let resp = http
+        .post(format!("{base}/api/v1/blocks"))
+        .header("jig-capabilities", jig_core::tier::TIERS_FEATURE)
+        .json(&body)
+        .send()
+        .await
+        .context("submitting the move")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        anyhow::bail!(
+            "{to} refused the move ({status}): {} {}",
+            body["code"].as_str().unwrap_or_default(),
+            body["message"].as_str().unwrap_or_default()
+        );
+    }
+    println!(
+        "moved {channel_id} to {} at seq {}",
+        moved.sequencer,
+        moved.head_seq + 1
+    );
+    println!("  its followers are offered it again; read it there from now on");
+    Ok(())
+}
+
 /// Apply `jig channel unshare <slug> <server-did>` (JEP-0005 rule 11).
 pub async fn unshare(ctx: &CliContext, slug: String, to: String) -> Result<()> {
     let to = canonical_did(&to)?;
@@ -1277,6 +1414,25 @@ fn channel_lines(channels: &[ChannelView]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `jig channel move` refuses while the current sequencer answers and
+    /// does not implement `sequencer-set`, unless told it is out of reach
+    /// (DJ 2026-11-26). One that implements it, or does not answer, is no
+    /// reason to stop.
+    #[test]
+    fn a_move_off_a_sequencer_that_predates_moves_needs_the_flag() {
+        let old = "https://old.example";
+        let without = vec!["text-render".to_string(), "channel-create".to_string()];
+        let with = vec!["text-render".to_string(), "sequencer-set".to_string()];
+        let refused = old_sequencer_allows_the_move(old, Some(&without), false).unwrap_err();
+        assert!(
+            refused.to_string().contains("--old-sequencer-unreachable"),
+            "{refused}"
+        );
+        assert!(old_sequencer_allows_the_move(old, Some(&without), true).is_ok());
+        assert!(old_sequencer_allows_the_move(old, Some(&with), false).is_ok());
+        assert!(old_sequencer_allows_the_move(old, None, false).is_ok());
+    }
 
     #[test]
     fn a_dm_is_not_grown_in_place() {

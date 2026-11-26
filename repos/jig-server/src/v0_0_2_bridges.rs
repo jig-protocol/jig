@@ -330,6 +330,7 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         | IngestError::SequencerRequired { .. }
         | IngestError::CarriedChannel { .. }
         | IngestError::MoveRefused { .. }
+        | IngestError::SequencerMoved { .. }
         | IngestError::RelayedOutsideShare { .. }
         | IngestError::GrantRefused { .. }
         | IngestError::InvalidTerms { .. }
