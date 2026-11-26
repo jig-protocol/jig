@@ -161,6 +161,19 @@ Non-goals for v0.2:
       - On an MLS channel the link moves the roster and the roles, not the leaf. The
         new DID joins by an external commit that also removes the old DID's leaf. The
         owner's gate admits that removal because the link ties the two DIDs.
+      - A refusal is `KEY_LINK_REFUSED`. A sequencer that cannot yet validate the leaf
+        swap MUST refuse every `key-link` on an MLS channel with
+        `MLS_KEY_LINK_UNSUPPORTED`, and MUST NOT move the roster without it.
+      - The sequencer MUST judge a block's rights and give it its `seq` as one step
+        with respect to the channel's `key-link`s. No link may land between the check
+        of a block signed by `old` and that block's `seq`.
+      - **Root owners, for every reader.** The channel's root owners are the creator
+        and the co-owners its `channel-create` lists, each carried along the
+        `key-link`s that follow it, in chain order. A link from a DID that is not a
+        root owner at that point moves no root, and a root owner linked away is no
+        longer one. Servers and clients MUST use this one reading wherever they ask
+        who is an owner, including who may sign a `sequencer-set` (11a). A client
+        keeps each `key-link` it verifies in the chain for this purpose.
 7c. `attested_suffixes` lists every name suffix the signing server attests, each once, as one
     of:
     - `{suffix, root: "config", authorities}`: `authorities` is the delegation's DIDs, in
