@@ -103,6 +103,7 @@ pub fn changes_the_channel(kind: BlockKind) -> bool {
             | BlockKind::ContractAccept
             | BlockKind::ContractRefuse
             | BlockKind::ContractEnd
+            | BlockKind::SequencerSet
     )
 }
 
@@ -260,6 +261,19 @@ pub fn authorize_block_with(
                 Ok(())
             } else {
                 refuse(sender)
+            }
+        }
+        // JEP-0005 rule 11a: only an owner moves the sequencer. What the move
+        // says is checked before this gate (`follow::check_takeover`).
+        BlockKind::SequencerSet => {
+            if rights.owner {
+                Ok(())
+            } else {
+                Err(WriteRefusal::MissingRight {
+                    slug: channel.slug.clone(),
+                    sender,
+                    right: Right::Owner,
+                })
             }
         }
         BlockKind::RoleAssign | BlockKind::RoleUnassign => {

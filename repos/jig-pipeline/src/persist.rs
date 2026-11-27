@@ -985,7 +985,9 @@ fn sequence_on(
 ) -> Result<IngestRecord> {
     let last: Option<Vec<u8>> = conn
         .query_row(
-            "SELECT record FROM ingest_records WHERE channel_id = ? ORDER BY seq DESC LIMIT 1",
+            // The chain as this server holds it: a channel it took over
+            // (JEP-0005 rule 11a) goes on from the head it carried.
+            "SELECT record FROM chain_records WHERE channel_id = ? ORDER BY seq DESC LIMIT 1",
             [signer.channel_id.as_str()],
             |r| r.get(0),
         )
@@ -1620,6 +1622,82 @@ impl SqliteStore {
         let record = sequence_on(&tx, &b.cid, signer)?;
         tx.commit()?;
         Ok(record)
+    }
+
+    /// Land the `sequencer-set` `b` by which this server takes a channel
+    /// over (JEP-0005 rule 11a), in one transaction: the block, its record,
+    /// the move and the channel's row, which names this server from then on.
+    /// What [`crate::follow::check_takeover`] checked before is checked again
+    /// under the same lock: the chain's head is still the one the set cites,
+    /// and this server orders no other channel of `slug`, archived or not.
+    /// If either fails, nothing is written and the refusal is returned.
+    pub fn insert_takeover_sequenced(
+        &self,
+        b: &StoredBlock,
+        signer: &RecordSigner<'_>,
+        cited: (u64, [u8; 32]),
+        slug: &str,
+        me: &str,
+    ) -> Result<std::result::Result<IngestRecord, String>> {
+        let channel_id = signer.channel_id.as_str();
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        let head: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT record FROM chain_records WHERE channel_id = ? ORDER BY seq DESC LIMIT 1",
+                [channel_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let head = head
+            .map(|bytes| IngestRecord::decode(&bytes))
+            .transpose()
+            .map_err(|e| PersistError::Corrupt(format!("ingest record: {e}")))?;
+        match head {
+            Some(head) if head.seq == cited.0 && head.hash() == cited.1 => {}
+            Some(head) => {
+                return Ok(Err(format!(
+                    "it cites seq {}, and this server's newest record is seq {} now",
+                    cited.0, head.seq
+                )));
+            }
+            None => return Ok(Err("this server holds none of the channel's chain".into())),
+        }
+        let taken: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM channels
+             WHERE (sequencer_did = ?1 OR sequencer_did = ?2) AND slug = ?3 AND id != ?4)",
+            params![self.local_sequencer(), me, slug, channel_id],
+            |r| r.get(0),
+        )?;
+        if taken {
+            return Ok(Err(format!(
+                "this server already orders a channel `{slug}`"
+            )));
+        }
+        insert_block_on(&tx, b)?;
+        let record = sequence_on(&tx, &b.cid, signer)?;
+        let previous: String = tx.query_row(
+            "SELECT sequencer_did FROM channels WHERE id = ?1",
+            [channel_id],
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO channel_moves (channel_id, seq, sequencer, previous, block_cid)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                channel_id,
+                record.seq as i64,
+                record.sequencer,
+                crate::effect::canonical_did_string(&previous),
+                b.cid
+            ],
+        )?;
+        tx.execute(
+            "UPDATE channels SET sequencer_did = ?1 WHERE id = ?2",
+            params![record.sequencer, channel_id],
+        )?;
+        tx.commit()?;
+        Ok(Ok(record))
     }
 
     /// The record of `block_cid`, when this server sequenced it.

@@ -202,6 +202,10 @@ pub fn classify_with_wait(
         IngestError::CarriedChannel { .. } => {
             (StatusCode::FORBIDDEN, "CARRIED_CHANNEL", e.to_string())
         }
+        // 409: a sequencer move this server cannot take the channel over by
+        // as it stands (JEP-0005 rule 11a), such as one citing a head it
+        // does not hold yet.
+        IngestError::MoveRefused { .. } => (StatusCode::CONFLICT, "MOVE_REFUSED", e.to_string()),
         // 403: a follower relayed past its share, or past its grant
         // (JEP-0005 rules 7a, 15).
         IngestError::RelayedOutsideShare { .. } => {

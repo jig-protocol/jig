@@ -321,6 +321,10 @@ pub enum IngestError {
         channel_id: String,
         sequencer: String,
     },
+    /// A `sequencer-set` this server cannot take the channel over by
+    /// (JEP-0005 rule 11a).
+    #[error("the sequencer move is refused: {detail}")]
+    MoveRefused { detail: String },
     /// A relayed block for a channel the relaying server's share does not
     /// cover (JEP-0005 rule 15).
     #[error("`{kind}` refused: `{via}` relayed it outside its share of channel {channel_id}")]
@@ -618,14 +622,6 @@ pub async fn ingest(
             kind: kind_str.to_string(),
         });
     }
-    // A sequencer move is read from the owner's stream (JEP-0005 rule 11a),
-    // but this server does not yet take a channel over: submitted to it, a
-    // `sequencer-set` is refused whatever the allow-list says.
-    if kind == BlockKind::SequencerSet {
-        return Err(IngestError::DisallowedBlockKind {
-            kind: kind_str.to_string(),
-        });
-    }
 
     // The store's local channels are the ones this server sequences; make
     // sure it knows which server that is before any slug is resolved (a
@@ -706,10 +702,29 @@ pub async fn ingest(
             slug: chan.slug.clone(),
         });
     }
+    // JEP-0005 rule 11a: the owner moves a channel this server carries to
+    // this server. It is the one block this server sequences into a channel
+    // another server sequenced, signing its record right after the head the
+    // block cites; from then on it sequences the channel.
+    let takeover = match (kind, resolved_channel.as_ref()) {
+        (BlockKind::SequencerSet, Some(chan)) => Some(crate::follow::check_takeover(
+            &ctx.store,
+            chan,
+            &manifest,
+            &server_did,
+        )?),
+        (BlockKind::SequencerSet, None) => {
+            return Err(IngestError::MoveRefused {
+                detail: "it names no channel this server carries".to_string(),
+            });
+        }
+        _ => None,
+    };
     // A channel another server sequences takes its blocks only from that
     // server, with that server's records (`crate::follow`): this server never
     // signs a record for it (JEP-0005 rule 12), so nothing lands here.
-    if let Some(chan) = resolved_channel.as_ref()
+    if takeover.is_none()
+        && let Some(chan) = resolved_channel.as_ref()
         && !chan.sequencer_did.is_empty()
         && crate::effect::canonical_did_string(&chan.sequencer_did) != server_did
     {
@@ -1257,9 +1272,34 @@ pub async fn ingest(
                 },
             )?;
             // Step 6: persist block (+ its record) + receipt
-            let record = match signer.as_ref() {
-                Some(signer) => Some(ctx.store.insert_block_sequenced(&stored_block, signer)?),
-                None => {
+            let record = match (
+                signer.as_ref(),
+                takeover.as_ref(),
+                resolved_channel.as_ref(),
+            ) {
+                // JEP-0005 rule 11a: the move lands with its record, and from
+                // it on this server sequences the channel, in one write that
+                // checks the head and the slug again.
+                (Some(signer), Some(set), Some(chan)) => Some(
+                    ctx.store
+                        .insert_takeover_sequenced(
+                            &stored_block,
+                            signer,
+                            (set.head.seq, set.head.hash),
+                            &chan.slug,
+                            &server_did,
+                        )?
+                        .map_err(|detail| IngestError::MoveRefused { detail })?,
+                ),
+                (_, Some(_), _) => {
+                    return Err(IngestError::MoveRefused {
+                        detail: "this server signs no records for the channel".to_string(),
+                    });
+                }
+                (Some(signer), None, _) => {
+                    Some(ctx.store.insert_block_sequenced(&stored_block, signer)?)
+                }
+                (None, _, _) => {
                     ctx.store.insert_block(&stored_block)?;
                     None
                 }
@@ -1392,7 +1432,7 @@ fn refused_at_landing(refusal: Option<IngestError>, kind: &str) -> IngestError {
 thread_local! {
     /// Runs once, between the write gate and the landing transaction, so a
     /// test can sequence another block in exactly that window.
-    static BEFORE_LANDING: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+    pub(crate) static BEFORE_LANDING: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -1656,7 +1696,8 @@ pub fn channel_metadata_key(kind: BlockKind) -> &'static str {
 fn requires_existing_channel(kind: BlockKind, _source: &IngestSource) -> bool {
     matches!(
         kind,
-        BlockKind::TextRender
+        BlockKind::SequencerSet
+            | BlockKind::TextRender
             | BlockKind::MemberAdd
             | BlockKind::MemberRemove
             | BlockKind::ChannelPromote
