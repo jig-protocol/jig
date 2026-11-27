@@ -562,16 +562,25 @@ async fn check_chain_in(
             match filled {
                 Ok(filler) if filler.len() as u64 == to - from => {
                     for missing in &filler {
-                        // A gap's records come without their blocks. One the
-                        // chain does not take as it stands is checked again
-                        // with its block, which may be the move it crosses.
-                        let mut plain = chain.clone();
-                        if plain.accept(missing, None).is_ok() {
-                            chain = plain;
-                            continue;
-                        }
+                        // A gap's records come without their blocks: each is
+                        // checked with its own, which may carry a key link or
+                        // be the move the gap crosses. The block must be the
+                        // one the record names. One the server does not serve
+                        // is checked as a record alone.
                         let block = fetch_block(who, server, &missing.block_cid).await.ok();
-                        accept(&mut chain, missing, None, block.as_ref())?;
+                        let cid = block.as_ref().and_then(|(bundle, sig)| {
+                            jig_client::open::open(&jig_client::DeliveredBlock {
+                                bundle_b64: bundle.clone(),
+                                sig_b64: sig.clone(),
+                                receipts: Vec::new(),
+                                delivery_cid: String::new(),
+                                ingest: None,
+                            })
+                            .ok()
+                            .map(|o| o.cid)
+                        });
+                        let block = block.filter(|_| cid.is_some());
+                        accept(&mut chain, missing, cid.as_deref(), block.as_ref())?;
                     }
                     accept(
                         &mut chain,

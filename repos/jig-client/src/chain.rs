@@ -399,9 +399,12 @@ pub struct ChannelChain {
 
 /// A record [`ChannelChain::fill_gap`] connected: inside the run ending at
 /// `run`, still open, or (`None`) the one that closed its run whole.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Connected {
     seq: u64,
+    /// The connected record's hash, hex: only that record keeps a link by
+    /// it, not another at the same `seq`.
+    hash: String,
     run: Option<u64>,
 }
 
@@ -538,6 +541,7 @@ impl ChannelChain {
         record: &IngestRecord,
         block_cid: Option<&str>,
     ) -> Result<Step, ChainBreak> {
+        self.connected = None;
         // Which of the sequencer's DIDs signed it; one outside the chain is
         // held to the current DID, and fails as before. Past a move
         // (JEP-0005 rule 11a), the record is the new sequencer's alone, and
@@ -791,10 +795,15 @@ impl ChannelChain {
     /// head holds: the head itself, or a record [`Self::fill_gap`] connected
     /// below it. A record that does not connect keeps nothing.
     fn keep_key_link(&mut self, record: &IngestRecord, link: Option<(String, String)>) {
+        // Taken whatever the record carries: what one record connected is
+        // never another's.
+        let connected = self
+            .connected
+            .take()
+            .filter(|c| c.seq == record.seq && c.hash == hex::encode(record.hash()));
         let Some((old, new)) = link else {
             return;
         };
-        let connected = self.connected.take().filter(|c| c.seq == record.seq);
         let Some(head) = self.head.as_mut() else {
             return;
         };
@@ -849,6 +858,7 @@ impl ChannelChain {
         if gap.from < gap.to {
             self.connected = Some(Connected {
                 seq: record.seq,
+                hash: gap.prev.clone(),
                 run: Some(gap.to),
             });
             return;
@@ -865,6 +875,7 @@ impl ChannelChain {
         head.key_links.sort_by_key(|l| l.seq);
         self.connected = Some(Connected {
             seq: record.seq,
+            hash: hex::encode(record.hash()),
             run: None,
         });
     }
@@ -961,7 +972,19 @@ impl ChannelChain {
                     });
                     next
                 }
-                None => self.first_head(record),
+                // No head yet: the run from the channel's start, which
+                // connects from the genesis record's fixed `prev`.
+                None => {
+                    let mut first = self.first_head(record);
+                    first.gaps.push(HeadGap {
+                        from,
+                        to,
+                        prev: hex::encode(GENESIS_PREV),
+                        end: record.prev.clone(),
+                        links: Vec::new(),
+                    });
+                    first
+                }
             });
         }
         Ok(step)
@@ -1304,6 +1327,68 @@ mod tests {
         );
         assert_eq!(forked.owners_at(set.seq), [did(&owner)]);
         assert!(forked.head().unwrap().gaps.is_empty());
+    }
+
+    /// The run filled in below the head holds across the edges: a live
+    /// stream's first record past the start, anchored at the genesis
+    /// `prev`; a head saved and resumed with a run half filled; and a record
+    /// at a seq already connected, which keeps nothing by it.
+    #[test]
+    fn a_filled_in_run_holds_from_the_start_across_a_resume_and_once_per_record() {
+        let did = |k: &ed25519_dalek::SigningKey| {
+            jig_core::Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        };
+        let (owner, rotated) = (generate_signing_key(), generate_signing_key());
+        let mut server = Seq::new();
+        let old = server.did();
+        let create = server.push("bafyCreate", 10);
+        let b1 = server.push("b1", 20);
+        let (link_bundle, link_sig, link_cid, _) = key_link_block(&owner, &rotated);
+        let linked = server.push_cid(&link_cid, 30);
+        let b3 = server.push("b3", 40);
+        let fresh = |head: Option<ChainHead>| {
+            ChannelChain::new(&label_cid("bafyCreate"), &old, head).with_owners(vec![did(&owner)])
+        };
+
+        // A live stream's first record is b3: the run 0..3 connects from
+        // the genesis record, and the link in it counts.
+        let mut chain = fresh(None);
+        assert_eq!(
+            chain.accept_live(&b3, None),
+            Ok(Step::Gap { from: 0, to: 3 })
+        );
+        assert_eq!(chain.accept(&create, None), Ok(Step::Behind));
+        // Saved and resumed with the run half filled.
+        let mut chain = fresh(chain.head().cloned());
+        assert_eq!(chain.accept(&b1, None), Ok(Step::Behind));
+        assert_eq!(
+            chain.accept_block(&linked, None, &link_bundle, Some(&link_sig)),
+            Ok(Step::Behind)
+        );
+        assert_eq!(chain.owners_at(b3.seq + 1), [did(&rotated)]);
+
+        // Another record 1, carrying the link, after the real record 1
+        // connected: it is not the record that connected, and keeps nothing.
+        let mut once = fresh(None);
+        once.accept_live(&b3, None).unwrap();
+        once.accept(&create, None).unwrap();
+        once.accept(&b1, None).unwrap();
+        let stranger = generate_signing_key();
+        let (other_bundle, other_sig, other_cid, _) = key_link_block(&owner, &stranger);
+        let other_b1 = Seq {
+            key: server.key.clone(),
+            records: vec![create.clone()],
+        }
+        .push_cid(&other_cid, 21);
+        assert_eq!(
+            once.accept_block(&other_b1, None, &other_bundle, Some(&other_sig)),
+            Ok(Step::Behind)
+        );
+        // The run completes with the real record 2, read without its block:
+        // nothing the other record 1 carried is in it.
+        assert_eq!(once.accept(&linked, None), Ok(Step::Behind));
+        assert!(once.head().unwrap().gaps.is_empty());
+        assert_eq!(once.owners_at(b3.seq + 1), [did(&owner)]);
     }
 
     /// The runs a head keeps open are capped ([`MAX_HEAD_GAPS`]): past it the
