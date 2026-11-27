@@ -26,6 +26,7 @@ pub mod executor {
 pub mod fanout;
 pub mod follow;
 pub mod handshake;
+pub mod heads;
 pub mod hlc;
 pub mod identity;
 pub mod ingest;

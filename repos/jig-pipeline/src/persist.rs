@@ -1581,6 +1581,7 @@ impl SqliteStore {
         rebuild_alias_attestations_with_suffix(conn)?;
         crate::contracts::migrate(conn)?;
         crate::follow::migrate(conn)?;
+        crate::heads::migrate(conn)?;
         Ok(())
     }
 

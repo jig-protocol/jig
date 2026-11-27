@@ -246,6 +246,8 @@ impl Default for ClientOffer {
                 ruleset: true,
                 // It signs request proofs bound to their audience.
                 request_auth: vec![jig_core::request_auth::VERSION.to_string()],
+                // It sends the heads it verifies (JEP-0002 rule 10).
+                heads: true,
                 ..Capabilities::default()
             },
             pinned_server_did: None,
@@ -2444,7 +2446,10 @@ mod tests {
     fn a_kept_heads_grant_verifies_offline() {
         let key = generate_signing_key();
         let did = Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
-        let (hello, pending) = begin(&ClientOffer::default());
+        // A client that does not ask for `heads`.
+        let mut asks = ClientOffer::default();
+        asks.capabilities.heads = false;
+        let (hello, pending) = begin(&asks);
         let Frame::Hello { nonce, .. } = hello.frame else {
             panic!("hello");
         };

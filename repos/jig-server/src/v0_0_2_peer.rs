@@ -77,6 +77,9 @@ pub struct PeerSender {
     /// Whether the peer implements channel tiers (JEP-0014), as its handshake
     /// on this connection said.
     tiers: bool,
+    /// Whether the handshake on this connection granted head gossip
+    /// (JEP-0002 rule 10): only then are `channel-head` frames sent on it.
+    heads: bool,
     tx: mpsc::Sender<Envelope>,
 }
 
@@ -90,8 +93,27 @@ impl PeerSender {
     /// [`Self::new`], for a peer whose handshake said whether it implements
     /// tiers.
     pub fn with_tiers(peer: Did, tiers: bool) -> (Self, mpsc::Receiver<Envelope>) {
+        Self::with_features(peer, tiers, false)
+    }
+
+    /// [`Self::with_tiers`], for a peer whose handshake also said whether it
+    /// takes head gossip.
+    pub fn with_features(peer: Did, tiers: bool, heads: bool) -> (Self, mpsc::Receiver<Envelope>) {
         let (tx, rx) = mpsc::channel(PEER_QUEUE);
-        (Self { peer, tiers, tx }, rx)
+        (
+            Self {
+                peer,
+                tiers,
+                heads,
+                tx,
+            },
+            rx,
+        )
+    }
+
+    /// Whether the peer takes head gossip on this connection.
+    pub fn heads(&self) -> bool {
+        self.heads
     }
 
     /// The DID this connection's peer proved.
@@ -151,6 +173,18 @@ impl PeerRegistry {
         self.lock()
             .iter()
             .filter(|(_, s)| s.peer.to_did_jig_string() == key && !s.is_closed())
+            .max_by_key(|(id, _)| **id)
+            .map(|(_, s)| s.clone())
+    }
+
+    /// The newest live connection to `peer` whose handshake granted head
+    /// gossip: an older link that granted it is used over a newer one that
+    /// did not. Other frames go by [`Self::sender_for`].
+    pub fn heads_sender_for(&self, peer: &Did) -> Option<PeerSender> {
+        let key = peer.to_did_jig_string();
+        self.lock()
+            .iter()
+            .filter(|(_, s)| s.peer.to_did_jig_string() == key && !s.is_closed() && s.heads)
             .max_by_key(|(id, _)| **id)
             .map(|(_, s)| s.clone())
     }
