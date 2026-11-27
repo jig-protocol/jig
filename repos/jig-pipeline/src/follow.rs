@@ -115,6 +115,20 @@ pub enum FollowError {
         sequencer: String,
         signer: String,
     },
+    /// A `sequencer-set` to a sequencer that already orders another channel
+    /// of this slug, an archived one included (JEP-0005 rule 11a). Two
+    /// channels of one slug under one sequencer would make the slug name
+    /// either, so the channel stops here, with the evidence kept, as at a
+    /// block its group refuses.
+    #[error(
+        "channel {channel_id} stopped at seq {seq}: it moved to {sequencer}, which already orders a channel `{slug}`"
+    )]
+    SlugTaken {
+        channel_id: String,
+        seq: u64,
+        sequencer: String,
+        slug: String,
+    },
     /// A `sequencer-set` that is not a move this server can follow.
     #[error("the sequencer move is refused: {0}")]
     Move(#[from] jig_core::sequencer_move::MoveError),
@@ -576,6 +590,23 @@ impl SqliteStore {
             ],
         )?;
         Ok(())
+    }
+
+    /// Whether `sequencer` orders a channel of `slug` here other than
+    /// `except`, archived or not: the rows `UNIQUE (sequencer_did, slug)`
+    /// would hold against a move of `except` to `sequencer`.
+    pub fn slug_held_by(
+        &self,
+        sequencer: &str,
+        slug: &str,
+        except: &str,
+    ) -> crate::persist::Result<bool> {
+        Ok(self.conn.lock().expect("poisoned").query_row(
+            "SELECT EXISTS(SELECT 1 FROM channels
+             WHERE sequencer_did = ?1 AND slug = ?2 AND id != ?3)",
+            params![sequencer, slug, except],
+            |r| r.get(0),
+        )?)
     }
 
     /// The highest `seq` of `channel_id`'s chain this server holds.
@@ -1067,6 +1098,17 @@ pub fn check_takeover(
             "this server holds no accepted share of the channel",
         ));
     }
+    // Rule 11a: a slug names one channel per sequencer. A channel of this
+    // slug here, archived or not, taken since this server's move accept,
+    // refuses the move.
+    if store.slug_held_by(store.local_sequencer(), &chan.slug, &chan.id)?
+        || store.slug_held_by(me, &chan.slug, &chan.id)?
+    {
+        return Err(refused(&format!(
+            "this server already orders a channel `{}`",
+            chan.slug
+        )));
+    }
     let head = store
         .chain_head_seq(&chan.id)?
         .ok_or_else(|| refused("this server holds none of the channel's chain"))?;
@@ -1383,6 +1425,41 @@ pub async fn ingest_sequenced(
             channel_id,
             seq: stop.seq,
             kind: stop.kind,
+        });
+    }
+    // Rule 11a: a move to a sequencer that orders another channel of this
+    // slug, archived or not, would give the slug two channels. It stops
+    // here, with the evidence kept, rather than fail its landing on every
+    // retry. Only a move whose record verified gets this far, so no one
+    // but the owner can stop a channel this way.
+    if let (Some(set), Some(chan)) = (&moving, &channel)
+        && ctx.store.chain_evidence(&channel_id)?.is_empty()
+        && ctx
+            .store
+            .slug_held_by(&set.sequencer, &chan.slug, &channel_id)?
+    {
+        let held = match record.seq.checked_sub(1) {
+            Some(before) => ctx
+                .store
+                .ingest_record_bytes(&channel_id, before)?
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        ctx.store
+            .keep_unapplied(&channel_id, record.seq, &held, record_bytes)?;
+        tracing::warn!(
+            channel_id,
+            seq = record.seq,
+            sequencer = set.sequencer,
+            slug = chan.slug,
+            "the owner moved the channel to a sequencer that already orders a channel of \
+             this slug; the channel is stopped"
+        );
+        return Err(FollowError::SlugTaken {
+            channel_id,
+            seq: record.seq,
+            sequencer: set.sequencer.clone(),
+            slug: chan.slug.clone(),
         });
     }
     let (mls, needs_upgrade) = match &kind {
@@ -2406,6 +2483,64 @@ mod tests {
             sequencer,
         )
         .await
+    }
+
+    /// Rule 11a: a move to a sequencer that already orders a channel of this
+    /// slug, an archived one included, stops the channel with the evidence
+    /// kept. It does not fail its landing on the constraint and come again.
+    #[tokio::test]
+    async fn a_move_onto_a_slug_the_new_sequencer_holds_stops_the_channel() {
+        let mut owner = Owner::new().await;
+        owner.text("before the move").await;
+        let follower = owner.follower();
+        for sent in &owner.sent {
+            take(&follower, &owner, sent).await.unwrap();
+        }
+        let new = SigningKey::from_bytes(&[50; 32]);
+        // The new sequencer already orders an archived channel of this slug.
+        {
+            let conn = follower.store.conn.lock().unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TEMP TABLE other AS SELECT * FROM channels WHERE id = '{channel}';
+                 UPDATE other SET id = 'bafyother', sequencer_did = '{new}', archived_at = 1;
+                 INSERT INTO channels SELECT * FROM other;
+                 DROP TABLE other;",
+                channel = owner.channel,
+                new = did(&new),
+            ))
+            .unwrap();
+        }
+        let moved = move_to(&owner, &new, &owner.user);
+        let got = take_from(&follower, &moved, &did(&new)).await;
+        assert!(
+            matches!(got, Err(FollowError::SlugTaken { seq: 2, .. })),
+            "{got:?}"
+        );
+        // Stopped, not refused again on every retry.
+        assert!(matches!(
+            take_from(&follower, &moved, &did(&new)).await,
+            Err(FollowError::Stopped { .. })
+        ));
+        assert_eq!(
+            follower.store.chain_evidence(&owner.channel).unwrap().len(),
+            1
+        );
+        assert!(
+            follower
+                .store
+                .channel_moves(&owner.channel)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            follower
+                .store
+                .get_channel_by_id(&owner.channel)
+                .unwrap()
+                .unwrap()
+                .sequencer_did,
+            owner.did()
+        );
     }
 
     /// The owner moves its channel to a new sequencer. The follower takes
