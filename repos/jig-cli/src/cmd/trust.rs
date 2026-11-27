@@ -429,8 +429,22 @@ pub async fn check_channel_chain(
     slug: &str,
     records: &[jig_client::chain::IngestRecord],
 ) -> Result<ChainCheck> {
-    check_chain_in(&Pins::default_path(), who, None, server, slug, records).await
+    check_chain_in(
+        &Pins::default_path(),
+        who,
+        None,
+        server,
+        slug,
+        records,
+        &Default::default(),
+    )
+    .await
 }
+
+/// A delivered block's bundle and signature, by block CID: what lets a
+/// chain check take the owner's `sequencer-set` in history (JEP-0005 rule
+/// 11a) rather than hold the new sequencer's record to the old one.
+pub type DeliveredBundles = std::collections::HashMap<String, (String, Option<String>)>;
 
 /// `audience` is the DID gap-filling reads are addressed to, when the caller
 /// holds a welcome that proves it; `None` proves it with a handshake, if a
@@ -442,6 +456,7 @@ async fn check_chain_in(
     server: &str,
     slug: &str,
     records: &[jig_client::chain::IngestRecord],
+    bundles: &DeliveredBundles,
 ) -> Result<ChainCheck> {
     use jig_client::chain::{ChannelChain, Step};
     let mut pins = Pins::load(pins_path)?;
@@ -493,20 +508,36 @@ async fn check_chain_in(
             .unwrap_or_else(|| vec![owner.clone()]),
         None => sequencers,
     };
-    let mut chain = ChannelChain::across(&channel.create_cid, sequencers, head);
+    // The pinned owners may move the channel's sequencer; the pinned head
+    // keeps the moves this device verified.
+    let owners = pins
+        .owners(server)
+        .remove(&channel.create_cid)
+        .unwrap_or_default();
+    let mut chain = ChannelChain::across(&channel.create_cid, sequencers, head).with_owners(owners);
     let mut sorted: Vec<_> = records.iter().collect();
     sorted.sort_by_key(|r| r.seq);
     let mut outcome = ChainCheck::Verified;
     for record in sorted {
+        // With its block when this check holds it: a `sequencer-set` is then
+        // taken as the move it is (JEP-0005 rule 11a).
         let accept = |chain: &mut ChannelChain,
                       record: &jig_client::chain::IngestRecord,
-                      block: Option<&str>| {
+                      block: Option<&str>,
+                      bundle: Option<&(String, Option<String>)>| {
             let before = chain.clone();
-            chain
-                .accept(record, block)
-                .map_err(|e| chain_contradiction(pins_path, server, slug, &before, record, &e))
+            match bundle {
+                Some((bundle, sig)) => chain.accept_block(record, block, bundle, sig.as_deref()),
+                None => chain.accept(record, block),
+            }
+            .map_err(|e| chain_contradiction(pins_path, server, slug, &before, record, &e))
         };
-        let step = accept(&mut chain, record, Some(&record.block_cid))?;
+        let step = accept(
+            &mut chain,
+            record,
+            Some(&record.block_cid),
+            bundles.get(&record.block_cid),
+        )?;
         if let Step::Gap { from, to } = step {
             // A carried channel is named by its id on this server.
             let reference = match channel.sequencer {
@@ -531,9 +562,23 @@ async fn check_chain_in(
             match filled {
                 Ok(filler) if filler.len() as u64 == to - from => {
                     for missing in &filler {
-                        accept(&mut chain, missing, None)?;
+                        // A gap's records come without their blocks. One the
+                        // chain does not take as it stands is checked again
+                        // with its block, which may be the move it crosses.
+                        let mut plain = chain.clone();
+                        if plain.accept(missing, None).is_ok() {
+                            chain = plain;
+                            continue;
+                        }
+                        let block = fetch_block(who, server, &missing.block_cid).await.ok();
+                        accept(&mut chain, missing, None, block.as_ref())?;
                     }
-                    accept(&mut chain, record, Some(&record.block_cid))?;
+                    accept(
+                        &mut chain,
+                        record,
+                        Some(&record.block_cid),
+                        bundles.get(&record.block_cid),
+                    )?;
                 }
                 // Short, refused or unreachable: what follows stays unchecked.
                 _ => {
@@ -567,8 +612,26 @@ pub async fn check_history(
     if records.is_empty() {
         return Ok(());
     }
-    if let ChainCheck::Unfilled { from, to } =
-        check_channel_chain(who, server, slug, &records).await?
+    let bundles: DeliveredBundles = blocks
+        .iter()
+        .filter_map(|b| {
+            let record = b.ingest.as_ref()?;
+            Some((
+                record.block_cid.clone(),
+                (b.bundle_b64.clone(), b.sig_b64.clone()),
+            ))
+        })
+        .collect();
+    if let ChainCheck::Unfilled { from, to } = check_chain_in(
+        &Pins::default_path(),
+        who,
+        None,
+        server,
+        slug,
+        &records,
+        &bundles,
+    )
+    .await?
     {
         eprintln!(
             "warning: {server} did not serve records {from}..{to} of {slug}; \
@@ -739,8 +802,16 @@ async fn check_manifest_in(
             sequencer: None,
         },
     )?;
-    if let ChainCheck::Unfilled { from, to } =
-        check_chain_in(pins_path, who, Some(&audience), server, LOG_SLUG, &[record]).await?
+    if let ChainCheck::Unfilled { from, to } = check_chain_in(
+        pins_path,
+        who,
+        Some(&audience),
+        server,
+        LOG_SLUG,
+        &[record],
+        &Default::default(),
+    )
+    .await?
     {
         eprintln!(
             "warning: {server} did not serve records {from}..{to} of its manifest log; the \
@@ -849,6 +920,48 @@ pub async fn show(who: &jig_client::Identity, server: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Block `cid` of `server`, its bundle and signature, read with a proof
+/// addressed to the server's pinned DID.
+async fn fetch_block(
+    who: &jig_client::Identity,
+    server: &str,
+    cid: &str,
+) -> Result<(String, Option<String>)> {
+    #[derive(serde::Deserialize)]
+    struct Served {
+        bundle_b64: String,
+        sig_b64: Option<String>,
+    }
+    let audience =
+        crate::cmd::request_proof::audience(server, who, crate::cmd::request_proof::Trust::Pinned)
+            .await?;
+    let base = crate::cmd::channel::base_http_url(server);
+    let url = format!("{base}/api/v1/blocks/{cid}");
+    let proof = jig_client::read_auth::ReadProof::sign(
+        who,
+        &audience,
+        "GET",
+        jig_client::read_auth::signable_path(&url),
+    );
+    let mut req = http(server, std::time::Duration::from_secs(10))
+        .await?
+        .get(&url);
+    for (name, value) in proof.headers() {
+        req = req.header(name, value);
+    }
+    let resp = req.send().await.with_context(|| format!("GET {url}"))?;
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "GET {url} returned {}",
+        resp.status()
+    );
+    let served: Served =
+        jig_client::limits::json_capped(resp, jig_client::limits::history_page_bytes(1))
+            .await
+            .with_context(|| format!("reading {url}"))?;
+    Ok((served.bundle_b64, served.sig_b64))
 }
 
 /// Records `from..to` of `slug`, signed as `who` for `audience`.
@@ -1138,6 +1251,114 @@ mod tests {
         );
     }
 
+    /// History that crosses the owner's move of the sequencer (JEP-0005 rule
+    /// 11a), delivered with its blocks: the `sequencer-set` is taken as the
+    /// move, the new sequencer's records after it verify, and the pin keeps
+    /// the move. Without the block, the new sequencer's record is not the
+    /// pinned one's.
+    #[tokio::test]
+    async fn history_across_a_move_is_held_to_the_new_sequencer() {
+        use base64::Engine as _;
+        use jig_core::contract::{ContractAccept, ContractOffer, Grant, ManifestRef};
+        let dir = tempfile::tempdir().unwrap();
+        let who = jig_client::Identity::generate_for_tests(dir.path());
+        let [key, new] = std::array::from_fn(|_| jig_core::crypto::ed25519::generate_signing_key());
+        let did = |k: &ed25519_dalek::SigningKey| {
+            jig_core::Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        };
+        let r0 = sign(&key, 0, "bafyCreate", GENESIS_PREV);
+        let r1 = sign(&key, 1, "bafyA", r0.hash());
+        let r2 = sign(&new, 2, "set", r1.hash());
+        let r3 = sign(&new, 3, "bafyB", r2.hash());
+        let channel: cid::Cid = label_cid("bafyCreate").parse().unwrap();
+        let held = ContractOffer::sign(
+            &key,
+            &did(&new),
+            channel,
+            Grant::Read,
+            b"create".to_vec(),
+            b"head".to_vec(),
+            ManifestRef {
+                cid: channel,
+                seq: 0,
+            },
+            vec![],
+        );
+        let set = jig_core::sequencer_move::SequencerSet {
+            channel_id: label_cid("bafyCreate"),
+            sequencer: did(&new),
+            head: jig_core::sequencer_move::CitedHead {
+                seq: 1,
+                hash: r1.hash(),
+            },
+            accept: ContractAccept::sign_move(
+                &new,
+                &held,
+                ManifestRef {
+                    cid: channel,
+                    seq: 1,
+                },
+                vec![],
+                vec![],
+                vec![],
+            ),
+            reinstalls: vec![],
+        };
+        let block = jig_client::blocks::build_with_metadata(
+            &jig_client::Identity::from_signing_key(key.clone()),
+            jig_core::BlockKind::SequencerSet,
+            jig_core::HlcTimestamp::now_wall(jig_core::Did::from_ed25519_pubkey(&[1; 32])),
+            serde_json::Value::Object(set.to_metadata().into_iter().collect()),
+        );
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let bundles: DeliveredBundles = [(
+            r2.block_cid.clone(),
+            (
+                b64.encode(block.canonical_bytes()),
+                Some(b64.encode(&block.sender_sig)),
+            ),
+        )]
+        .into_iter()
+        .collect();
+
+        let path = pinned(dir.path(), &key, Some(&r1));
+        let got = check_chain_in(
+            &path,
+            &who,
+            None,
+            SERVER,
+            "#ops",
+            &[r3.clone(), r2.clone()],
+            &bundles,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, ChainCheck::Verified);
+        assert_eq!(head_seq(&path), Some(3));
+        let pins = Pins::load(&path).unwrap();
+        assert_eq!(
+            pins.moved_to(SERVER, &label_cid("bafyCreate")),
+            Some(did(&new).as_str())
+        );
+
+        let bare = tempfile::tempdir().unwrap();
+        let path = pinned(bare.path(), &key, Some(&r1));
+        assert!(
+            check_chain_in(
+                &path,
+                &who,
+                None,
+                SERVER,
+                "#ops",
+                &[r2, r3],
+                &Default::default()
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(head_seq(&path), Some(1));
+    }
+
     #[tokio::test]
     async fn history_that_continues_the_pin_moves_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -1148,9 +1369,17 @@ mod tests {
         let r2 = sign(&key, 2, "bafyB", r1.hash());
         let path = pinned(dir.path(), &key, Some(&r0));
         // Out of order, with a re-delivery of the pinned head: a page of history.
-        let got = check_chain_in(&path, &who, None, SERVER, "#ops", &[r2, r0, r1])
-            .await
-            .unwrap();
+        let got = check_chain_in(
+            &path,
+            &who,
+            None,
+            SERVER,
+            "#ops",
+            &[r2, r0, r1],
+            &Default::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(got, ChainCheck::Verified);
         assert_eq!(head_seq(&path), Some(2));
     }
@@ -1179,16 +1408,32 @@ mod tests {
         let r1 = sign(&owner, 1, "bafyA", r0.hash());
         // Read by its id, as a carried channel is on the server carrying it.
         let id = label_cid("bafyCreate");
-        let got = check_chain_in(&path, &who, None, SERVER, &id, &[r0.clone(), r1.clone()])
-            .await
-            .unwrap();
+        let got = check_chain_in(
+            &path,
+            &who,
+            None,
+            SERVER,
+            &id,
+            &[r0.clone(), r1.clone()],
+            &Default::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(got, ChainCheck::Verified);
         assert_eq!(head_seq(&path), Some(1));
 
         let forged = sign(&server, 2, "bafyB", r1.hash());
-        let e = check_chain_in(&path, &who, None, SERVER, "#ops", &[forged])
-            .await
-            .unwrap_err();
+        let e = check_chain_in(
+            &path,
+            &who,
+            None,
+            SERVER,
+            "#ops",
+            &[forged],
+            &Default::default(),
+        )
+        .await
+        .unwrap_err();
         assert!(e.to_string().contains("contradicted"), "{e}");
         assert_eq!(head_seq(&path), Some(1));
         assert!(
@@ -1230,9 +1475,17 @@ mod tests {
             .unwrap()
             .anchor_channel(SERVER, "#ops", &id, Some(&did(&new)))
             .unwrap();
-        let e = check_chain_in(&path, &who, None, SERVER, &id, std::slice::from_ref(&r0))
-            .await
-            .unwrap_err();
+        let e = check_chain_in(
+            &path,
+            &who,
+            None,
+            SERVER,
+            &id,
+            std::slice::from_ref(&r0),
+            &Default::default(),
+        )
+        .await
+        .unwrap_err();
         assert!(e.to_string().contains("contradicted"), "{e}");
 
         let owner = jig_client::pins::CarriedOwner {
@@ -1243,16 +1496,24 @@ mod tests {
             .unwrap()
             .anchor_carried(SERVER, "#ops", &id, Some(&owner))
             .unwrap();
-        let got = check_chain_in(&path, &who, None, SERVER, &id, &[r0.clone(), r1.clone()])
-            .await
-            .unwrap();
+        let got = check_chain_in(
+            &path,
+            &who,
+            None,
+            SERVER,
+            &id,
+            &[r0.clone(), r1.clone()],
+            &Default::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(got, ChainCheck::Verified);
         assert_eq!(head_seq(&path), Some(1));
 
         // Past the new key's record, the old key is retired.
         let late = sign(&old, 2, "bafyB", r1.hash());
         assert!(
-            check_chain_in(&path, &who, None, SERVER, &id, &[late])
+            check_chain_in(&path, &who, None, SERVER, &id, &[late], &Default::default())
                 .await
                 .is_err()
         );
@@ -1269,9 +1530,17 @@ mod tests {
         let path = pinned(dir.path(), &key, Some(&r1));
         // The server signs another entry 1 and builds on it.
         let other = sign(&key, 1, "bafyOther", r0.hash());
-        let e = check_chain_in(&path, &who, None, SERVER, "#ops", &[other])
-            .await
-            .unwrap_err();
+        let e = check_chain_in(
+            &path,
+            &who,
+            None,
+            SERVER,
+            "#ops",
+            &[other],
+            &Default::default(),
+        )
+        .await
+        .unwrap_err();
         assert!(e.to_string().contains("contradicted"), "{e}");
         assert_eq!(head_seq(&path), Some(1), "a break never moves the pin");
 
@@ -1308,9 +1577,17 @@ mod tests {
         let stranger = jig_core::crypto::ed25519::generate_signing_key();
         let forged = sign(&stranger, 1, "bafyA", r0.hash());
         assert!(
-            check_chain_in(&path, &who, None, SERVER, "#ops", &[forged])
-                .await
-                .is_err()
+            check_chain_in(
+                &path,
+                &who,
+                None,
+                SERVER,
+                "#ops",
+                &[forged],
+                &Default::default()
+            )
+            .await
+            .is_err()
         );
 
         // A fork against a head pinned without its record cannot be shown.
@@ -1320,9 +1597,17 @@ mod tests {
         pins.advance_chain(SERVER, "#ops", &bare).unwrap();
         let other = sign(&key, 1, "bafyOther", r0.hash());
         assert!(
-            check_chain_in(&path, &who, None, SERVER, "#ops", &[other])
-                .await
-                .is_err()
+            check_chain_in(
+                &path,
+                &who,
+                None,
+                SERVER,
+                "#ops",
+                &[other],
+                &Default::default()
+            )
+            .await
+            .is_err()
         );
 
         let store = jig_client::evidence::EvidenceStore::new(&evidence_dir(&path));
@@ -1348,9 +1633,17 @@ mod tests {
         let r1 = sign(&key, 1, "bafyA", r0.hash());
         let r2 = sign(&key, 2, "bafyB", r1.hash());
         let path = pinned(dir.path(), &key, Some(&r0));
-        let got = check_chain_in(&path, &who, None, SERVER, "#ops", &[r2])
-            .await
-            .unwrap();
+        let got = check_chain_in(
+            &path,
+            &who,
+            None,
+            SERVER,
+            "#ops",
+            &[r2],
+            &Default::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(got, ChainCheck::Unfilled { from: 1, to: 2 });
         assert_eq!(head_seq(&path), Some(0));
     }
@@ -1381,9 +1674,17 @@ mod tests {
             },
         )
         .unwrap();
-        let got = check_chain_in(&path, &who, None, SERVER, "#ops", &[r0, r1])
-            .await
-            .unwrap();
+        let got = check_chain_in(
+            &path,
+            &who,
+            None,
+            SERVER,
+            "#ops",
+            &[r0, r1],
+            &Default::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(got, ChainCheck::Verified);
         assert_eq!(
             head_seq(&path),
@@ -1404,9 +1705,17 @@ mod tests {
         let path = pinned(dir.path(), &key, Some(&r1));
         let rewritten = sign(&key, 1, "bafyOther", r0.hash());
         assert!(
-            check_chain_in(&path, &who, None, SERVER, "#ops", &[r0, rewritten])
-                .await
-                .is_err()
+            check_chain_in(
+                &path,
+                &who,
+                None,
+                SERVER,
+                "#ops",
+                &[r0, rewritten],
+                &Default::default()
+            )
+            .await
+            .is_err()
         );
         assert_eq!(head_seq(&path), Some(1));
     }
@@ -1418,9 +1727,17 @@ mod tests {
         let key = jig_core::crypto::ed25519::generate_signing_key();
         let r0 = sign(&key, 0, "bafyCreate", GENESIS_PREV);
         let path = dir.path().join("pins.json");
-        let got = check_chain_in(&path, &who, None, SERVER, "#ops", &[r0])
-            .await
-            .unwrap();
+        let got = check_chain_in(
+            &path,
+            &who,
+            None,
+            SERVER,
+            "#ops",
+            &[r0],
+            &Default::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(got, ChainCheck::Unpinned);
     }
 
