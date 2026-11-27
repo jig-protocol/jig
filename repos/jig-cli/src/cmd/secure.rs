@@ -1589,23 +1589,54 @@ impl Secure {
     /// releases our key packages to `release_to`, or to anyone with
     /// `release_any`, and holds every other request for our decision. Its
     /// `seq` is the clock, so a later policy from any device replaces it.
+    /// If the server keeps one at that `seq` or later (two runs in one
+    /// second, or a device whose clock is behind), it is signed once more
+    /// just past the kept one: the policy set last is the one that holds.
     /// The `seq` kept.
     pub async fn put_release_policy(
         &self,
         release_to: Vec<String>,
         release_any: bool,
     ) -> Result<u64> {
-        #[derive(Deserialize)]
-        struct Stored {
-            stored: bool,
-            seq: u64,
-        }
         let server_did = self.server_did().await?;
         let now = chrono::Utc::now().timestamp();
-        let seq = u64::try_from(now).unwrap_or(0);
-        let policy =
-            self.identity
-                .sign_release_policy(&server_did, seq, now, release_to, release_any);
+        let mut seq = u64::try_from(now).unwrap_or(0);
+        let answer = self
+            .send_release_policy(&server_did, seq, now, &release_to, release_any)
+            .await?;
+        if answer.stored {
+            return Ok(answer.seq);
+        }
+        seq = answer.seq.saturating_add(1);
+        let answer = self
+            .send_release_policy(&server_did, seq, now, &release_to, release_any)
+            .await?;
+        if !answer.stored {
+            anyhow::bail!(
+                "{} kept a later policy (seq {}), not this one (seq {seq}): another device \
+                 set one meanwhile; run this again to replace it",
+                self.server,
+                answer.seq
+            );
+        }
+        Ok(answer.seq)
+    }
+
+    async fn send_release_policy(
+        &self,
+        server_did: &str,
+        seq: u64,
+        now: i64,
+        release_to: &[String],
+        release_any: bool,
+    ) -> Result<StoredPolicy> {
+        let policy = self.identity.sign_release_policy(
+            server_did,
+            seq,
+            now,
+            release_to.to_vec(),
+            release_any,
+        );
         let url = format!("{}/api/v1/custody/{}/policy", self.base, policy.did);
         let resp = crate::cmd::trust::http(&self.base, std::time::Duration::from_secs(15))
             .await?
@@ -1617,17 +1648,9 @@ impl Secure {
         if !resp.status().is_success() {
             return Err(Self::refusal(resp).await.into());
         }
-        let answer: Stored = limits::json_capped(resp, limits::MAX_DOCUMENT_BYTES)
+        limits::json_capped(resp, limits::MAX_DOCUMENT_BYTES)
             .await
-            .with_context(|| format!("reading {url}"))?;
-        if !answer.stored {
-            anyhow::bail!(
-                "{} kept a later policy (seq {}), not this one (seq {seq})",
-                self.server,
-                answer.seq
-            );
-        }
-        Ok(answer.seq)
+            .with_context(|| format!("reading {url}"))
     }
 
     /// The key-package requests this server holds for our decision
@@ -2762,6 +2785,14 @@ fn shadow_note(reference: &str, own: &ChannelInfo, carried: &ChannelInfo) -> Str
          Name it by its id to read it.",
         own.id, carried.id, carried.sequencer
     )
+}
+
+/// A custodian's answer to a release policy: whether it kept this one, and
+/// the `seq` it keeps.
+#[derive(Deserialize)]
+struct StoredPolicy {
+    stored: bool,
+    seq: u64,
 }
 
 #[cfg(test)]

@@ -266,6 +266,9 @@ async fn a_member_s_policy_holds_an_add_until_they_approve_it() {
 
     let set = ok(member_home.path(), &["server", "policy"]);
     assert!(set.contains("holds every request"), "{set}");
+    // Set again at once, within the same second: the later one still holds.
+    let again = ok(member_home.path(), &["server", "policy"]);
+    assert!(again.contains("holds every request"), "{again}");
     ok(owner_home.path(), &["channel", "create", "#sec"]);
 
     // Held: refused, nothing released, nothing committed.
