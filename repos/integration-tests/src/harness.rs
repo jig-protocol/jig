@@ -100,6 +100,9 @@ pub struct TestJigServer {
     pub bound_addr: std::net::SocketAddr,
     pub state: Arc<jig_server::v0_0_2::AppState>,
     pub server_did_string: String,
+    /// Whether it runs the channel contract ([`Self::start_federated_pair`]),
+    /// kept across [`Self::restart`].
+    contract: bool,
     _tempdir: TempDir,
     _handle: JoinHandle<()>,
 }
@@ -149,6 +152,83 @@ impl TestJigServer {
         Self::boot(config, tempdir).await
     }
 
+    /// Two servers, each a configured peer of the other (JEP-0005 rule 17),
+    /// with the channel contract running on both as `jig-server` runs it:
+    /// the manifest published, the contract's frames handled and its timers
+    /// started, and each side dialing the other. `a_offers` and `b_offers`
+    /// are what each does with an offer from the other: hold it for the
+    /// operator, or accept it.
+    ///
+    /// Each server is booted once to mint its key, so that the other's
+    /// config can name its DID, then again over the same tempdir on a port
+    /// bound in advance, so that the other's config can name its URL. Both
+    /// links are plaintext loopback.
+    pub async fn start_federated_pair(
+        a_offers: jig_config::v0_0_2_server::OfferPolicy,
+        b_offers: jig_config::v0_0_2_server::OfferPolicy,
+    ) -> Result<(Self, Self)> {
+        let (dir_a, did_a) = Self::mint_key().await?;
+        let (dir_b, did_b) = Self::mint_key().await?;
+        let listener_a = TcpListener::bind("127.0.0.1:0").await.context("bind")?;
+        let listener_b = TcpListener::bind("127.0.0.1:0").await.context("bind")?;
+        let url = |l: &TcpListener| -> Result<String> {
+            Ok(format!("ws://{}", l.local_addr().context("local_addr")?))
+        };
+        let peer = |url: String, did: &str, offers| jig_config::v0_0_2_server::FederationPeer {
+            url,
+            expected_did: did.to_string(),
+            alias: None,
+            publish: false,
+            quota: None,
+            offers,
+        };
+        let config_for = |peer| -> Result<JigServerConfig> {
+            let mut config = base_config()?;
+            // The kinds a deployed server takes, the contract's records
+            // among them, which the harness's narrower list leaves out.
+            config.server.allowed_block_kinds =
+                JigServerConfig::default().server.allowed_block_kinds;
+            config.federation.dangerously_allow_plaintext_federation = true;
+            config.federation.peers = vec![peer];
+            Ok(config)
+        };
+        let config_a = config_for(peer(url(&listener_b)?, &did_b, a_offers))?;
+        let config_b = config_for(peer(url(&listener_a)?, &did_a, b_offers))?;
+        let a = Self::boot_on(config_a, dir_a, listener_a, true).await?;
+        let b = Self::boot_on(config_b, dir_b, listener_b, true).await?;
+        anyhow::ensure!(
+            a.server_did_string == did_a && b.server_did_string == did_b,
+            "a server came back under another DID"
+        );
+        Ok((a, b))
+    }
+
+    /// A tempdir holding a fresh server key, and its server's DID.
+    async fn mint_key() -> Result<(TempDir, String)> {
+        let server = Self::start().await?;
+        let did = server.server_did_string.clone();
+        let handle = server._handle;
+        handle.abort();
+        // Wait for the aborted task to finish, so nothing of it still holds
+        // the store when the pair boots over the same tempdir.
+        let _ = handle.await;
+        Ok((server._tempdir, did))
+    }
+
+    /// Whether `self` and `other` each have a live peer connection to the
+    /// other.
+    pub fn connected_to(&self, other: &Self) -> bool {
+        self.state
+            .peers
+            .sender_for(&other.state.server_did)
+            .is_some()
+            && other
+                .state
+                .peers
+                .sender_for(&self.state.server_did)
+                .is_some()
+    }
+
     /// Stop this server and boot a fresh one over the SAME tempdir — same
     /// `server.db` and same `server.key`. This is the restart-persistence
     /// path: the process is new, the on-disk state is not.
@@ -158,14 +238,30 @@ impl TestJigServer {
     pub async fn restart(self) -> Result<Self> {
         let config = self.state.config.clone();
         let tempdir = self._tempdir;
+        let contract = self.contract;
         self._handle.abort();
         // Let the aborted task release the old listener before we rebind.
         tokio::time::sleep(Duration::from_millis(20)).await;
-        Self::boot(config, tempdir).await
+        let listener = TcpListener::bind("127.0.0.1:0").await.context("bind")?;
+        Self::boot_on(config, tempdir, listener, contract).await
     }
 
     /// Shared boot path for [`Self::start_with_config`] and [`Self::restart`].
     async fn boot(config: JigServerConfig, tempdir: TempDir) -> Result<Self> {
+        // Bind ephemeral port BEFORE spawning so we can record it.
+        let listener = TcpListener::bind("127.0.0.1:0").await.context("bind")?;
+        Self::boot_on(config, tempdir, listener, false).await
+    }
+
+    /// [`Self::boot`] on `listener`. With `contract`, the server also
+    /// publishes its manifest and runs the channel contract, as
+    /// `jig-server`'s main does.
+    async fn boot_on(
+        config: JigServerConfig,
+        tempdir: TempDir,
+        listener: TcpListener,
+        contract: bool,
+    ) -> Result<Self> {
         let db_path = tempdir.path().join("server.db");
 
         // Override the keyfile path to live inside the tempdir so multiple
@@ -192,9 +288,15 @@ impl TestJigServer {
         )?);
         let server_did_string = state.server_did.to_did_jig_string();
 
-        // Bind ephemeral port BEFORE spawning so we can record it.
-        let listener = TcpListener::bind("127.0.0.1:0").await.context("bind")?;
         let bound_addr = listener.local_addr().context("local_addr")?;
+        if contract {
+            // Before anything is served, as in `jig-server`'s main: every
+            // welcome cites the manifest, and every offer.
+            jig_server::v0_0_2_manifest_log::publish(&state)
+                .await
+                .context("manifest log")?;
+            jig_server::v0_0_2_contract::start(&state);
+        }
 
         // The router itself is built in jig-server::v0_0_2_ws.
         let router = jig_server::v0_0_2_ws::build_v0_0_2_router(state.clone())
@@ -226,6 +328,7 @@ impl TestJigServer {
             bound_addr,
             state,
             server_did_string,
+            contract,
             _tempdir: tempdir,
             _handle: handle,
         })
