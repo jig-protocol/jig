@@ -385,6 +385,7 @@ impl Contracts {
             Ok(offers) => {
                 for offer in offers {
                     if self.may_offer(&offer.channel_id, &offer.peer_did) {
+                        self.push_move_for(&offer);
                         let links = ContractOffer::from_envelope(&offer.offer)
                             .ok()
                             .and_then(|o| self.key_links_for(&o));
@@ -393,6 +394,28 @@ impl Contracts {
                 }
             }
             Err(e) => tracing::warn!("listing unanswered offers: {e}"),
+        }
+    }
+
+    /// A re-offer after a move (JEP-0005 rule 11a) goes with its
+    /// `sequencer-set` each time it is sent: a follower that was not
+    /// connected when the set was first pushed judges the re-offer by it,
+    /// and has no share yet to pull it by.
+    fn push_move_for(&self, offer: &StoredOffer) {
+        let Some(share_cid) = offer.share_cid.as_deref() else {
+            return;
+        };
+        match self.store().get_block(share_cid) {
+            Ok(Some(block)) if block.block_kind == BlockKind::SequencerSet.as_str() => {
+                if let Err(e) = self
+                    .stream
+                    .push_to(&block, std::slice::from_ref(&offer.peer_did))
+                {
+                    tracing::info!(peer = %offer.peer_did, "the move not sent with its re-offer: {e:#}");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(peer = %offer.peer_did, "reading a re-offer's share: {e}"),
         }
     }
 
@@ -2689,6 +2712,76 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(next.seq, record.seq + 1);
+    }
+
+    /// A re-offer after a move goes with its `sequencer-set` each time it is
+    /// sent (JEP-0005 rule 11a): a follower that was not connected when the
+    /// set was first pushed gets it before the re-offer it judges by it.
+    #[tokio::test]
+    async fn a_resent_reoffer_goes_after_its_move() {
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.shared(1).await;
+        p.follows.stream.pull_all();
+        p.caught_up(&channel).await;
+        let new = p.follower.server_did.to_did_jig_string();
+        let (status, body) = ask_move_accept(&p.follower, &channel, &p.user, &new).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        let moved: MoveAcceptBody = serde_json::from_value(body).unwrap();
+        let set = jig_core::sequencer_move::SequencerSet {
+            channel_id: channel.clone(),
+            sequencer: moved.sequencer.clone(),
+            head: jig_core::sequencer_move::CitedHead {
+                seq: moved.head_seq,
+                hash: hex::decode(&moved.head_hash).unwrap().try_into().unwrap(),
+            },
+            accept: ContractAccept::from_envelope(
+                &base64::engine::general_purpose::STANDARD
+                    .decode(&moved.accept)
+                    .unwrap(),
+            )
+            .unwrap(),
+            reinstalls: vec![],
+        };
+        let meta = serde_json::Value::Object(set.to_metadata().into_iter().collect());
+        let cid = post(&p.follower, &p.user, BlockKind::SequencerSet, meta)
+            .await
+            .unwrap();
+
+        // A follower that was away: its re-offer is kept, unanswered.
+        let away = Did::from_did_jig_string(&did_of(&SigningKey::from_bytes(&[44; 32]))).unwrap();
+        let away_did = away.to_did_jig_string();
+        p.follower
+            .ingest_ctx
+            .store
+            .put_contract_offer(&StoredOffer {
+                offer_id: [44; 32],
+                channel_id: channel.clone(),
+                side: Side::Owner,
+                peer_did: away_did.clone(),
+                grant: Grant::Read,
+                state: OfferState::Offered,
+                offer: b"the re-offer".to_vec(),
+                answer: None,
+                share_cid: Some(cid.clone()),
+            })
+            .unwrap();
+        // It connects, and the resend reaches it.
+        let (sender, mut rx) = crate::v0_0_2_peer::PeerSender::with_tiers(away, true);
+        p.follower.peers.register(sender);
+        Contracts::new(&p.follower).resend_offers();
+        let mut kinds = Vec::new();
+        while let Ok(envelope) = rx.try_recv() {
+            if let jig_pipeline::envelope::Frame::Peer { kind, .. } = envelope.frame {
+                kinds.push(kind);
+            }
+        }
+        assert_eq!(
+            kinds,
+            vec![
+                crate::v0_0_2_stream::RECORDS_FRAME.to_string(),
+                OFFER_FRAME.to_string()
+            ]
+        );
     }
 
     /// After a move (JEP-0005 rule 11a), the new sequencer re-offers the
