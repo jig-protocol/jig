@@ -66,11 +66,9 @@ pub async fn apply_effect(
         // the block has landed (`SqliteStore::take_over`).
         BlockKind::SequencerSet => Ok(()),
         // Roles follow the link in the chain (`roles::standing`); the
-        // membership row moves here.
-        BlockKind::KeyLink => {
-            let (_, channel) = channel_of(store, BlockKind::KeyLink, &manifest, block_cid, false)?;
-            key_link_on(&store.conn.lock().expect("poisoned"), &manifest, channel.as_ref())
-        }
+        // membership row moves in the transaction the link lands in
+        // (`MembershipChange::Move`), so a link refused there moves nothing.
+        BlockKind::KeyLink => Ok(()),
         BlockKind::FedHello => apply_fed_hello(store, &manifest, block_cid),
 
         BlockKind::NsRegister | BlockKind::NsAttestation => apply_ns_attestation(store, &manifest),

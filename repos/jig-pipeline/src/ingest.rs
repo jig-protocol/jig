@@ -514,6 +514,9 @@ impl From<crate::persist::PersistError> for IngestError {
                 channel_id,
                 sequencer,
             },
+            crate::persist::PersistError::KeyLinkNotMoved { detail } => {
+                IngestError::KeyLinkRefused { detail }
+            }
             e => IngestError::Persist(e),
         }
     }
@@ -1337,7 +1340,9 @@ pub async fn ingest(
         // A membership or share block whose authority rests on a role: its
         // effect, block and record land in one transaction, and only if the
         // role still holds at the seq it is given.
-        _ if guard.is_some() => {
+        // A `key-link`'s membership move lands with it, in the same
+        // transaction (JEP-0005 rule 7b).
+        _ if guard.is_some() || kind == BlockKind::KeyLink => {
             let Some(signer) = signer.as_ref() else {
                 return Err(refused_at_landing(guard_refusal, kind_str));
             };
@@ -2269,6 +2274,18 @@ fn membership_change(
     block_cid: &str,
 ) -> crate::persist::MembershipChange {
     use crate::persist::{MembershipChange, StoredMembership};
+    if kind == BlockKind::KeyLink {
+        return match channel
+            .and_then(|c| crate::roles::key_link_of(manifest, &c.id).map(|l| (c, l)))
+        {
+            Some((channel, (old, new))) => MembershipChange::Move {
+                channel_id: channel.id.clone(),
+                old,
+                new,
+            },
+            None => MembershipChange::None,
+        };
+    }
     let (Some(channel), Some(member)) = (
         channel,
         manifest.metadata.get("member_did").and_then(|v| v.as_str()),
@@ -5748,6 +5765,61 @@ mod tests {
             .to_metadata(),
         )
         .unwrap()
+    }
+
+    /// A key link lands with its membership move, in one transaction
+    /// (JEP-0005 rule 7b): if the new DID became a member after the link was
+    /// checked, the member's link is refused at landing and nothing of it is
+    /// written; its author stays the member it was.
+    #[tokio::test]
+    async fn a_key_link_whose_membership_cannot_move_at_landing_is_refused_whole() {
+        let ctx = test_ctx_allowing(&["channel-create", "member-add", "key-link"]);
+        let (owner, member, member2) = (person(), person(), person());
+        let chan = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#team"}),
+        )
+        .await
+        .unwrap();
+        plain(
+            &ctx,
+            &owner,
+            BlockKind::MemberAdd,
+            serde_json::json!({"channel_id": chan, "member_did": member.did}),
+        )
+        .await
+        .unwrap();
+        let head = ctx.store.chain_head_seq(&chan).unwrap();
+        let store = ctx.store.clone();
+        let (channel_id, new_did) = (chan.clone(), member2.did.clone());
+        super::BEFORE_LANDING.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                store
+                    .upsert_membership(&crate::persist::StoredMembership {
+                        channel_id,
+                        member_did: new_did,
+                        role: "member".to_string(),
+                        joined_at: 0,
+                        source_block_cid: "elsewhere".to_string(),
+                    })
+                    .unwrap();
+            }));
+        });
+        let linked = plain(
+            &ctx,
+            &member2,
+            BlockKind::KeyLink,
+            key_link(&member, &member2, &chan, None),
+        )
+        .await;
+        assert!(
+            matches!(linked, Err(IngestError::KeyLinkRefused { .. })),
+            "{linked:?}"
+        );
+        assert!(ctx.store.is_member_by_id(&chan, &member.did).unwrap());
+        assert_eq!(ctx.store.chain_head_seq(&chan).unwrap(), head);
     }
 
     /// JEP-0005 rule 7b: from a key link's `seq`, the old DID's role,

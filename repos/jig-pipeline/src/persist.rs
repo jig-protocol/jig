@@ -41,6 +41,10 @@ pub enum PersistError {
         channel_id: String,
         sequencer: String,
     },
+    /// A `key-link` whose author's membership could not move to the new DID
+    /// at landing (JEP-0005 rule 7b): nothing was written.
+    #[error("the key link is refused: {detail}")]
+    KeyLinkNotMoved { detail: String },
 }
 
 pub type Result<T> = std::result::Result<T, PersistError>;
@@ -981,6 +985,15 @@ pub enum MembershipChange {
         channel_id: String,
         member_did: String,
     },
+    /// A `key-link`'s (JEP-0005 rule 7b): `old`'s membership, if it has
+    /// one, is `new`'s. A member whose membership cannot move (`new` is a
+    /// member already) refuses the link; a DID with standing and no
+    /// membership moves nothing.
+    Move {
+        channel_id: String,
+        old: String,
+        new: String,
+    },
 }
 
 /// Give `block_cid` the next entry of its channel's chain, signed by
@@ -1182,6 +1195,22 @@ fn apply_membership_on(conn: &Connection, membership: &MembershipChange) -> Resu
                 "DELETE FROM memberships WHERE channel_id = ? AND member_did = ?",
                 [channel_id.as_str(), member_did.as_str()],
             )?;
+        }
+        MembershipChange::Move {
+            channel_id,
+            old,
+            new,
+        } => {
+            let member: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM memberships WHERE channel_id = ?1 AND member_did = ?2)",
+                [channel_id.as_str(), old.as_str()],
+                |r| r.get(0),
+            )?;
+            if member && !move_membership_on(conn, channel_id, old, new)? {
+                return Err(PersistError::KeyLinkNotMoved {
+                    detail: format!("{new} is a member of the channel already"),
+                });
+            }
         }
     }
     Ok(())
