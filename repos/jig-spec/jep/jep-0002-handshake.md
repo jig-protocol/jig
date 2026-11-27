@@ -58,7 +58,7 @@ Draft. Field names are provisional. The design behind this revision is
    | `nonce` | Echo of the client's nonce | replayed `welcome` |
    | `server_nonce` | A fresh random value from the server | replayed `peer_proof` |
    | `tls_exporter` | 32 bytes exported from the TLS session (RFC 9266, label `EXPORTER-jig-handshake`); empty over plaintext | relayed handshake |
-   | `sig` | ed25519 over the above. The optional `key_link`, `admit` and `prior_key_links` come last, in that order, each only when present and each under its own tag (1, 2 and 3), so no two can be read as one another and a welcome without them signs what it did before they existed. Then the features a hello asks for, each under its own tag and only when granted: `tiers` (4, JEP-0014), `ruleset` (5) and `request_auth` (6, JEP-0015 §8). Under tag 5 the server signs its ruleset or, with a 0, that it declares none Under tag 6, present only when the `welcome` lists any request-proof version, the server signs those versions as a list. Every part of the signed bytes is a little-endian `u64` length and then its bytes: the tag is the one byte `6`, and the list is a `u64` count followed by each version's length and bytes, in the order the `welcome` lists them (vector: `vectors/0015/welcome-request-auth.json`) | OP-02 |
+   | `sig` | ed25519 over the above. The optional `key_link`, `admit` and `prior_key_links` come last, in that order, each only when present and each under its own tag (1, 2 and 3), so no two can be read as one another and a welcome without them signs what it did before they existed. Then the features a hello asks for, each under its own tag and only when granted: `tiers` (4, JEP-0014), `ruleset` (5), `request_auth` (6, JEP-0015 §8) and `heads` (7, rule 10). Under tag 5 the server signs its ruleset or, with a 0, that it declares none Under tag 6, present only when the `welcome` lists any request-proof version, the server signs those versions as a list. Every part of the signed bytes is a little-endian `u64` length and then its bytes: the tag is the one byte `6`, and the list is a `u64` count followed by each version's length and bytes, in the order the `welcome` lists them (vector: `vectors/0015/welcome-request-auth.json`). Under tag 7, present only when the `welcome` grants `heads`, the server signs the feature name `jig-heads-v1` (vector: `vectors/0002/welcome-heads.json`) | OP-02 |
 
    A client that predates a feature never asks for it, and is answered with the bytes it
    always verified. A client that asked MUST refuse a welcome that grants a feature it did
@@ -167,13 +167,31 @@ Draft. Field names are provisional. The design behind this revision is
    clock accepted. A client that kept the previous record's hash but not the record
    itself cannot tell who signed it, and treats any decrease as a contradiction. History is ordered by `seq`. A block's `hlc_ts` is its author's
    claim.
-10. Every block a member authors into a channel, except the `channel-create`, carries
-    `seen`: the latest `ingest` record its author verified for that channel. A client,
-    including a member that only reads, SHOULD send its server a `head` frame holding the
-    latest record it verified, with no
-    identity attached; servers verify heads and forward them toward the sequencer and
-    other carriers. Two records signed by one sequencer for the same `channel_id` and
-    `seq` with different contents are proof of a fork.
+10. A block a member authors into a channel, except the `channel-create`, SHOULD carry
+    `seen`: the latest `ingest` record its author verified for that channel, as base64 of
+    the record's COSE_Sign1 envelope under the manifest metadata key `seen`. The envelope's
+    payload holds every field of the record, and its BLAKE3 hash is the record's hash. An
+    author that has verified no record of the channel sends none, and a block from an
+    author that predates `seen` has none; a reader MUST NOT refuse a block for lacking it.
+    A reader verifies `seen` against the channel's sequencer at that `seq` before relying
+    on it. One that does not verify, or names another channel, is its author's word and
+    never evidence against a server.
+
+    A client SHOULD send each server it is connected to that holds a channel, including
+    as a member that only reads, a `head` frame `{channel_id, record_b64}` holding the
+    latest record it verified for the channel, with no identity attached. A hello asks
+    for this with `capabilities.heads`; the welcome grants it, under tag 7 (rule 2), only
+    when the server implements it and the hello asked. Neither side sends a `head` frame
+    on a connection whose welcome does not grant it, and a server answers one there with
+    an ordinary error. Servers verify heads and forward them toward the sequencer and the
+    other carriers of the channel, as the peer frame `channel-head`, whose body is the
+    deterministic-CBOR map `{channel_id, record}` (vector: `vectors/0002/heads.json`).
+
+    Two records signed by one sequencer for the same `channel_id` and `seq` with different
+    contents are proof of a fork. So is a block whose own record's `seq` is not greater than
+    the `seq` of the `seen` it carries: the record names the block, the block embeds `seen`,
+    and `seen`'s chain commits to the record at the earlier `seq`, so the block's record is
+    not on that chain.
 11. A `member-remove` block, including a self-leave, SHOULD carry `ends`, under the manifest
     metadata key `ends`: the CID of the block that began the membership it ends (the
     `member-add`, or the `channel-create` for a root owner). A server lists it as `since`

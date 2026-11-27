@@ -1,6 +1,6 @@
 # Security policy
 
-jig is pre-alpha. **Every channel created under tiers, and every DM, is end-to-end
+jig is v0.2, pre-1.0. **Every channel created under tiers, and every DM, is end-to-end
 encrypted except a `public` channel.** Each is one MLS group (RFC 9420), and the server holds
 no group secret, so a passive operator cannot read it. In a `server` or `shared` channel the
 server decides who may join: an operator who controls membership can add a member and read
@@ -47,9 +47,11 @@ reports.
 
 ## Supported versions
 
-Only the latest v0.x release and `main` receive fixes. v0.x makes **no compatibility
-guarantee**: a fix may change the wire format, the receipt format or the configuration
-without a migration path.
+Only the latest v0.2.x release and `main` receive security fixes. Prereleases
+(`-alpha.N`, `-rc.N`) are not supported once a final release of their line exists: from
+`v0.2.0`, upgrade from any `v0.2.0-alpha.N` to the latest v0.2.x. v0.x makes **no
+compatibility guarantee**: a fix may change the wire format, the receipt format or the
+configuration without a migration path.
 
 ## Scope
 
