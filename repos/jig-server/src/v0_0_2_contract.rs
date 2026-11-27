@@ -2842,31 +2842,37 @@ mod tests {
     async fn only_the_connections_peer_sequences_what_it_streams() {
         let p = pair(OfferPolicy::Accept).await;
         let channel = p.shared(1).await;
+        // The owner sends an accepted follower the channel at once; wait for
+        // it, so what follows does not race that push.
+        let head = p.caught_up(&channel).await;
+        let follower = &p.follower.ingest_ctx.store;
+        let before = follower
+            .list_ingest_records_by_id(&channel, 0, usize::MAX)
+            .unwrap()
+            .len();
+        // The owner's own blocks and records, landed as if another server
+        // sent them: the sequencer is the connection's peer, and this one
+        // holds no share and sequences nothing.
         let records = Contracts::new(&p.owner)
             .stream
             .records_from(&channel, 0)
             .unwrap()
             .unwrap();
-        // The owner's own blocks and records, landed as if another server
-        // sent them: the sequencer is the connection's peer, and this one
-        // holds no share and sequences nothing.
         let stranger = Did::from_ed25519_pubkey(
             SigningKey::from_bytes(&rand::random())
                 .verifying_key()
                 .as_bytes(),
         );
-        p.follows.stream.land(&stranger, records.clone()).await;
-        let follower = &p.follower.ingest_ctx.store;
-        assert!(
+        p.follows.stream.land(&stranger, records).await;
+        assert_eq!(Pair::head(&p.follower, &channel), Some(head));
+        assert_eq!(
             follower
-                .get_channel_by_id_including_archived(&channel)
+                .list_ingest_records_by_id(&channel, 0, usize::MAX)
                 .unwrap()
-                .is_none(),
-            "no row for a stream from a server that does not own the channel"
+                .len(),
+            before,
+            "a stream from a server that does not own the channel changes nothing"
         );
-        // From the owner, the same frame lands.
-        p.follows.stream.land(&p.owner.server_did, records).await;
-        assert!(follower.get_channel_by_id(&channel).unwrap().is_some());
     }
 
     #[tokio::test]
