@@ -105,7 +105,11 @@ impl RecentHashes {
 
     /// The hash kept for `seq`, if it is.
     pub fn at(&self, seq: u64) -> Option<[u8; 32]> {
-        let i = usize::try_from(seq.checked_sub(self.start)?).ok()?;
+        let i = seq.checked_sub(self.start)?;
+        if i >= self.len() {
+            return None;
+        }
+        let i = usize::try_from(i).ok()?;
         self.hashes
             .get(i * 32..i * 32 + 32)
             .map(|h| h.try_into().expect("32 bytes"))
@@ -178,6 +182,15 @@ impl ChainHead {
         let mut next = Self::of(record);
         if (record.ingest_wall_ms, record.ingest_logical) < self.clock_high() {
             next.high = self.high_record().cloned();
+        }
+        // A head pinned before the ring was kept has none: start it at the
+        // head itself, so the record this device last verified stays in it.
+        if self.recent.is_empty()
+            && let Some(hash) = hex::decode(&self.hash)
+                .ok()
+                .and_then(|h| <[u8; 32]>::try_from(h).ok())
+        {
+            self.recent.push(self.seq, hash);
         }
         self.recent.push(record.seq, record.hash());
         next.recent = std::mem::take(&mut self.recent);
@@ -392,6 +405,21 @@ impl ChannelChain {
                 _ => SeenCheck::Differs { seq: seen.seq },
             },
         }
+    }
+
+    /// [`Self::check_seen`] for a delivered block: `bundle_b64` its bytes,
+    /// `record` the record it came with. The record is held against the
+    /// block only when it is the block's own: a record for another block
+    /// proves no reorder, and would hide a fork of `seen` behind one.
+    pub fn check_block_seen(
+        &self,
+        seen: &IngestRecord,
+        bundle_b64: &str,
+        record: Option<&IngestRecord>,
+    ) -> SeenCheck {
+        let bound =
+            record.filter(|r| r.seq > seen.seq || ReorderProof::of(bundle_b64, r).is_some());
+        self.check_seen(seen, bound)
     }
 
     /// The proof that `ours`, this device's record at a `seq`, and `seen`,
@@ -1438,6 +1466,35 @@ mod tests {
         assert_eq!(&pinned, head);
     }
 
+    /// A `seq` far past the hashes kept is not one of them, however large.
+    #[test]
+    fn a_seq_far_past_the_kept_hashes_is_none() {
+        let (_, chain) = chain_of(3);
+        let recent = &chain.head().unwrap().recent;
+        for seq in [3, 1 << 59, u64::MAX] {
+            assert_eq!(recent.at(seq), None, "seq {seq}");
+        }
+    }
+
+    /// A head pinned before the hashes were kept starts them at itself, so
+    /// the record it was stays checkable once the chain moves on.
+    #[test]
+    fn a_head_pinned_without_hashes_keeps_its_own() {
+        let (mut server, chain) = chain_of(3);
+        let mut bare = chain.head().unwrap().clone();
+        bare.recent = RecentHashes::default();
+        let mut pinned = ChannelChain::new(&label_cid("bafyCreate"), &server.did(), Some(bare));
+        let next = server.push("b3", 40);
+        assert_eq!(pinned.accept(&next, None), Ok(Step::Next));
+        let head = pinned.head().unwrap();
+        assert_eq!(head.recent.at(2), Some(server.records[2].hash()));
+        assert_eq!(head.recent.at(3), Some(next.hash()));
+        assert_eq!(
+            pinned.check_seen(&server.records[2], None),
+            SeenCheck::Agrees
+        );
+    }
+
     #[test]
     fn a_seen_past_the_head_asks_for_the_records_up_to_it() {
         let (mut server, chain) = chain_of(3);
@@ -1562,5 +1619,47 @@ mod tests {
         let mut wrong = proof.clone();
         wrong.record = server.records[2].clone();
         assert!(wrong.verify().is_err());
+        assert_eq!(
+            chain.check_block_seen(&seen, &block_b64, Some(&early)),
+            SeenCheck::Reordered { record: 2, seen: 3 }
+        );
+    }
+
+    /// A record delivered with a block that is not the block's own cannot
+    /// stand in for a reorder, and so cannot hide a fork of its `seen`.
+    #[test]
+    fn another_blocks_record_does_not_hide_a_fork() {
+        let (server, chain) = chain_of(4);
+        let mut other = Seq {
+            key: server.key.clone(),
+            records: server.records[..3].to_vec(),
+        };
+        let forked = other.push("bOther3", 40);
+        let dir = tempfile::tempdir().unwrap();
+        let author = crate::identity::Identity::generate_for_tests(dir.path());
+        let block = crate::blocks::build_with_metadata(
+            &author,
+            jig_core::BlockKind::TextRender,
+            jig_core::HlcTimestamp::now_wall(author.did().clone()),
+            serde_json::json!({
+                "channel": "#c",
+                "body": "hi",
+                jig_pipeline::ingest_record::SEEN_KEY:
+                    jig_pipeline::ingest_record::seen_value(&forked).unwrap(),
+            }),
+        );
+        let block_b64 = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes())
+        };
+        let unrelated = &server.records[1];
+        assert!(matches!(
+            chain.check_seen(&forked, Some(unrelated)),
+            SeenCheck::Reordered { .. }
+        ));
+        assert!(matches!(
+            chain.check_block_seen(&forked, &block_b64, Some(unrelated)),
+            SeenCheck::Forked(_)
+        ));
     }
 }
