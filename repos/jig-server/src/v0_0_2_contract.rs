@@ -1354,6 +1354,26 @@ pub async fn issue_move_accept(
             "this server sequences the channel already",
         ));
     }
+    // Rule 11a: a slug names one channel per sequencer. This server orders
+    // another channel of this slug, archived or not, so the channel cannot
+    // move here under it; its owner renames it first.
+    if store
+        .slug_held_by(store.local_sequencer(), &channel.slug, &channel.id)
+        .map_err(persist_err)?
+        || store
+            .slug_held_by(&me, &channel.slug, &channel.id)
+            .map_err(persist_err)?
+    {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "SLUG_TAKEN",
+            format!(
+                "this server already orders a channel `{}`, archived or not; \
+                 rename the channel before moving it here",
+                channel.slug
+            ),
+        ));
+    }
     let held = store
         .contract_offers_for(&channel.id, &current, Side::Follower, OfferState::Accepted)
         .map_err(persist_err)?
@@ -2834,6 +2854,23 @@ mod tests {
         // The server that sequences the channel has no move accept to give.
         let (status, body) = ask_move_accept(&p.owner, &channel, &p.user, &owner).await;
         assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body}");
+
+        // A carrier that orders a channel of the slug itself, archived
+        // included, gives none either (rule 11a): the slug would name two.
+        let store = &p.follower.ingest_ctx.store;
+        let carried = store.get_channel_by_id(&channel).unwrap().unwrap();
+        let mine = jig_pipeline::ingest_record::label_cid("the carrier's own");
+        store
+            .upsert_channel(&jig_pipeline::persist::StoredChannel {
+                id: mine.clone(),
+                sequencer_did: store.local_sequencer().to_string(),
+                ..carried
+            })
+            .unwrap();
+        assert!(store.archive_channel_by_id(&mine, 1).unwrap());
+        let (status, body) = ask_move_accept(&p.follower, &channel, &p.user, &follower).await;
+        assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "SLUG_TAKEN");
     }
 
     /// A public key link from `old` to `new` (JEP-0012), as a welcome serves
