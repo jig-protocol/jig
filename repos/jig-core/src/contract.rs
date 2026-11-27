@@ -28,6 +28,11 @@ pub const ACCEPT_DOMAIN: &str = "jig-contract-accept-v1";
 pub const REFUSE_DOMAIN: &str = "jig-contract-refuse-v1";
 pub const END_DOMAIN: &str = "jig-contract-end-v1";
 pub const KP_REQUEST_DOMAIN: &str = "jig-kp-request-v1";
+pub const KP_RELEASE_POLICY_DOMAIN: &str = "jig-kp-release-policy-v1";
+pub const KP_DECISION_DOMAIN: &str = "jig-kp-decision-v1";
+
+/// Most requester DIDs one release policy may name.
+pub const MAX_RELEASE_TO: usize = 256;
 pub const LOCAL_ADDS_DOMAIN: &str = "jig-local-adds-v1";
 pub const OWNER_KEY_LINKS_DOMAIN: &str = "jig-owner-key-links-v1";
 
@@ -409,6 +414,12 @@ pub struct ContractAccept {
     /// On a sequencer move, the bot DIDs the new sequencer minted (rule
     /// 11a); otherwise empty.
     pub bot_dids: Vec<String>,
+    /// On a sequencer move, the new sequencer's `policy-approval`s (rule
+    /// 11b), as COSE_Sign1 bytes: for the channel's current `channel-policy`
+    /// and every live `block-install`. Signed only in a move accept
+    /// ([`Self::is_move`]): an accept that is not one has no such key, so
+    /// its bytes are what they were before moves existed.
+    pub policy_approvals: Vec<Vec<u8>>,
     /// `server`'s COSE_Sign1 over [`ContractAccept::payload`].
     pub envelope: Vec<u8>,
 }
@@ -417,7 +428,7 @@ impl ContractAccept {
     const WHAT: &'static str = "contract accept";
 
     pub fn payload(&self) -> Vec<u8> {
-        encode(Value::text_map([
+        let mut fields = vec![
             ("domain", Value::text(ACCEPT_DOMAIN)),
             ("server", Value::text(self.server.clone())),
             ("channel_id", Value::Bytes(self.channel_id.to_bytes())),
@@ -426,7 +437,56 @@ impl ContractAccept {
             ("manifest", self.manifest.value()),
             ("attested_suffixes", suffix_values(&self.attested_suffixes)),
             ("bot_dids", texts(&self.bot_dids)),
-        ]))
+        ];
+        if self.is_move() {
+            fields.push((
+                "policy_approvals",
+                Value::Array(
+                    self.policy_approvals
+                        .iter()
+                        .cloned()
+                        .map(Value::Bytes)
+                        .collect(),
+                ),
+            ));
+        }
+        encode(Value::text_map(fields))
+    }
+
+    /// Whether this is a move accept (JEP-0005 rule 11a): the accepting
+    /// server names itself as the channel's sequencer, which only a server
+    /// taking the channel over does. It travels inside the owner's
+    /// `sequencer-set` block, never as a `contract-answer`.
+    pub fn is_move(&self) -> bool {
+        self.server == self.sequencer
+    }
+
+    /// A move accept (rule 11a) as `server_key`, the new sequencer: of
+    /// `held`, the offer of the channel it already accepted as a follower,
+    /// naming itself as the sequencer, with the bot DIDs it minted for the
+    /// channel's bots and its `policy-approval`s (rule 11b).
+    pub fn sign_move(
+        server_key: &SigningKey,
+        held: &ContractOffer,
+        manifest: ManifestRef,
+        attested_suffixes: Vec<AttestedSuffix>,
+        bot_dids: Vec<String>,
+        policy_approvals: Vec<Vec<u8>>,
+    ) -> Self {
+        let server = did_of(server_key);
+        let mut accept = Self {
+            server: server.clone(),
+            channel_id: held.channel_id,
+            offer_id: held.offer_id,
+            sequencer: server,
+            manifest,
+            attested_suffixes,
+            bot_dids,
+            policy_approvals,
+            envelope: Vec::new(),
+        };
+        accept.envelope = cose::sign1(server_key, &accept.payload());
+        accept
     }
 
     /// Accept `offer` as `server_key`.
@@ -445,6 +505,7 @@ impl ContractAccept {
             manifest,
             attested_suffixes,
             bot_dids,
+            policy_approvals: Vec::new(),
             envelope: Vec::new(),
         };
         accept.envelope = cose::sign1(server_key, &accept.payload());
@@ -458,6 +519,18 @@ impl ContractAccept {
             .map(|v| v.as_text().map(str::to_string))
             .collect::<Option<_>>()
             .ok_or(ContractError::BadPayload(Self::WHAT))?;
+        // Read when present; `verify` then refuses it on an accept that is not
+        // a move, and its absence on one that is, by re-encoding.
+        let policy_approvals = match p.get("policy_approvals") {
+            None => Vec::new(),
+            Some(v) => v
+                .as_array()
+                .ok_or(ContractError::BadPayload(Self::WHAT))?
+                .iter()
+                .map(|a| a.as_bytes().map(<[u8]>::to_vec))
+                .collect::<Option<_>>()
+                .ok_or(ContractError::BadPayload(Self::WHAT))?,
+        };
         let accept = Self {
             server: text(&p, "server", Self::WHAT)?,
             channel_id: cid(&p, "channel_id", Self::WHAT)?,
@@ -466,13 +539,20 @@ impl ContractAccept {
             manifest: ManifestRef::read(field(&p, "manifest", Self::WHAT)?, Self::WHAT)?,
             attested_suffixes: suffixes(&p, Self::WHAT)?,
             bot_dids,
+            policy_approvals,
             envelope: envelope.to_vec(),
         };
         accept.verify()?;
         Ok(accept)
     }
 
+    /// `server` signed this accept. An accept that is not a move signs no
+    /// `policy_approvals`, so one that carries some is refused: they would be
+    /// unsigned.
     pub fn verify(&self) -> Result<(), ContractError> {
+        if !self.is_move() && !self.policy_approvals.is_empty() {
+            return Err(ContractError::BadPayload(Self::WHAT));
+        }
         verify_envelope(&self.envelope, &self.payload(), &self.server)
     }
 
@@ -747,6 +827,216 @@ impl KpRequest {
         }
         verify_envelope(&self.envelope, &self.payload(), &self.requester)
     }
+
+    /// The request's identity: BLAKE3-256 over its deterministic payload, as
+    /// an `offer_id` is over an offer's (rule 21c). The nonce makes it unique
+    /// per request. A custodian names a held request by it, and the DID's
+    /// [`KpDecision`] answers it by it.
+    pub fn request_id(&self) -> [u8; 32] {
+        *blake3::hash(&self.payload()).as_bytes()
+    }
+}
+
+/// A DID's release policy for one custodian (JEP-0005 rule 21b): which
+/// requesters the custodian releases `did`'s key packages to without asking.
+/// A request from anyone else is held for `did`'s [`KpDecision`]. Signed by
+/// `did`, it names the custodian, so it cannot be replayed to another, and
+/// carries a `seq`: a custodian keeps only a higher one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleasePolicy {
+    /// The DID whose packages the policy governs, which signs.
+    pub did: String,
+    /// The custodian's server DID.
+    pub custodian: String,
+    pub seq: u64,
+    /// When `did` signed it, in Unix seconds on its clock.
+    pub issued_at: i64,
+    /// Every requester released to without asking: at most
+    /// [`MAX_RELEASE_TO`] canonical did:jig keys, sorted by their
+    /// deterministic encoding, no repeats.
+    pub release_to: Vec<String>,
+    /// Release to any requester. `release_to` must then be empty.
+    pub release_any: bool,
+    /// `did`'s COSE_Sign1 over [`ReleasePolicy::payload`].
+    pub envelope: Vec<u8>,
+}
+
+impl ReleasePolicy {
+    const WHAT: &'static str = "release policy";
+
+    pub fn payload(&self) -> Vec<u8> {
+        encode(Value::text_map([
+            ("domain", Value::text(KP_RELEASE_POLICY_DOMAIN)),
+            ("did", Value::text(self.did.clone())),
+            ("custodian", Value::text(self.custodian.clone())),
+            ("seq", Value::Unsigned(self.seq)),
+            ("issued_at", Value::int(self.issued_at)),
+            ("release_to", texts(&self.release_to)),
+            ("release_any", Value::Bool(self.release_any)),
+        ]))
+    }
+
+    /// Sign a policy. `release_to` is put in its one order, without repeats.
+    pub fn sign(
+        key: &SigningKey,
+        custodian: &str,
+        seq: u64,
+        issued_at: i64,
+        release_to: Vec<String>,
+        release_any: bool,
+    ) -> Self {
+        let mut policy = Self {
+            did: did_of(key),
+            custodian: custodian.to_string(),
+            seq,
+            issued_at,
+            release_to: in_order(release_to),
+            release_any,
+            envelope: Vec::new(),
+        };
+        policy.envelope = cose::sign1(key, &policy.payload());
+        policy
+    }
+
+    pub fn from_envelope(envelope: &[u8]) -> Result<Self, ContractError> {
+        let p = open(envelope, KP_RELEASE_POLICY_DOMAIN, Self::WHAT)?;
+        let release_to = array(&p, "release_to", Self::WHAT)?
+            .iter()
+            .map(|v| v.as_text().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+            .ok_or(ContractError::BadPayload(Self::WHAT))?;
+        let release_any = match field(&p, "release_any", Self::WHAT)? {
+            Value::Bool(b) => *b,
+            _ => return Err(ContractError::BadPayload(Self::WHAT)),
+        };
+        let policy = Self {
+            did: text(&p, "did", Self::WHAT)?,
+            custodian: text(&p, "custodian", Self::WHAT)?,
+            seq: field(&p, "seq", Self::WHAT)?
+                .as_u64()
+                .ok_or(ContractError::BadPayload(Self::WHAT))?,
+            issued_at: field(&p, "issued_at", Self::WHAT)?
+                .as_i64()
+                .ok_or(ContractError::BadPayload(Self::WHAT))?,
+            release_to,
+            release_any,
+            envelope: envelope.to_vec(),
+        };
+        policy.verify()?;
+        Ok(policy)
+    }
+
+    /// `did` signed exactly these fields, every DID is a key in its canonical
+    /// spelling, and `release_to` is in its one order, short enough, and
+    /// empty when `release_any` is set, so each policy has one encoding.
+    pub fn verify(&self) -> Result<(), ContractError> {
+        for did in std::iter::once(&self.custodian).chain(&self.release_to) {
+            if !is_canonical_did(did) {
+                return Err(ContractError::BadDid(did.clone()));
+            }
+        }
+        if self.release_to.len() > MAX_RELEASE_TO
+            || in_order(self.release_to.clone()) != self.release_to
+            || (self.release_any && !self.release_to.is_empty())
+        {
+            return Err(ContractError::BadPayload(Self::WHAT));
+        }
+        verify_envelope(&self.envelope, &self.payload(), &self.did)
+    }
+
+    /// Whether the policy releases to `requester` without asking `did`.
+    pub fn releases_to(&self, requester: &str) -> bool {
+        self.release_any || self.release_to.iter().any(|r| r == requester)
+    }
+}
+
+/// A DID's answer to a request its custodian held (JEP-0005 rule 21c):
+/// approve, or refuse. Signed by `did`, it names the custodian and the
+/// request by its [`KpRequest::request_id`], so it answers that request
+/// there and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KpDecision {
+    /// The DID the held request asked packages of, which signs.
+    pub did: String,
+    /// The custodian's server DID.
+    pub custodian: String,
+    pub request_id: [u8; 32],
+    pub approve: bool,
+    /// When `did` signed it, in Unix seconds on its clock.
+    pub issued_at: i64,
+    /// `did`'s COSE_Sign1 over [`KpDecision::payload`].
+    pub envelope: Vec<u8>,
+}
+
+impl KpDecision {
+    const WHAT: &'static str = "key-package decision";
+
+    pub fn payload(&self) -> Vec<u8> {
+        encode(Value::text_map([
+            ("domain", Value::text(KP_DECISION_DOMAIN)),
+            ("did", Value::text(self.did.clone())),
+            ("custodian", Value::text(self.custodian.clone())),
+            ("request_id", Value::Bytes(self.request_id.to_vec())),
+            ("approve", Value::Bool(self.approve)),
+            ("issued_at", Value::int(self.issued_at)),
+        ]))
+    }
+
+    pub fn sign(
+        key: &SigningKey,
+        custodian: &str,
+        request_id: [u8; 32],
+        approve: bool,
+        issued_at: i64,
+    ) -> Self {
+        let mut decision = Self {
+            did: did_of(key),
+            custodian: custodian.to_string(),
+            request_id,
+            approve,
+            issued_at,
+            envelope: Vec::new(),
+        };
+        decision.envelope = cose::sign1(key, &decision.payload());
+        decision
+    }
+
+    pub fn from_envelope(envelope: &[u8]) -> Result<Self, ContractError> {
+        let p = open(envelope, KP_DECISION_DOMAIN, Self::WHAT)?;
+        let approve = match field(&p, "approve", Self::WHAT)? {
+            Value::Bool(b) => *b,
+            _ => return Err(ContractError::BadPayload(Self::WHAT)),
+        };
+        let decision = Self {
+            did: text(&p, "did", Self::WHAT)?,
+            custodian: text(&p, "custodian", Self::WHAT)?,
+            request_id: digest(&p, "request_id", Self::WHAT)?,
+            approve,
+            issued_at: field(&p, "issued_at", Self::WHAT)?
+                .as_i64()
+                .ok_or(ContractError::BadPayload(Self::WHAT))?,
+            envelope: envelope.to_vec(),
+        };
+        decision.verify()?;
+        Ok(decision)
+    }
+
+    /// `did` signed exactly these fields, and the custodian is a key in its
+    /// canonical spelling.
+    pub fn verify(&self) -> Result<(), ContractError> {
+        if !is_canonical_did(&self.custodian) {
+            return Err(ContractError::BadDid(self.custodian.clone()));
+        }
+        verify_envelope(&self.envelope, &self.payload(), &self.did)
+    }
+}
+
+/// `items` sorted by their deterministic encoding as CBOR text, without
+/// repeats: a list's one order in a signed payload.
+fn in_order(mut items: Vec<String>) -> Vec<String> {
+    items.sort_by_cached_key(|s| encode(Value::text(s.clone())));
+    items.dedup();
+    items
 }
 
 /// A member's word to one server on whether others may add it to the
@@ -1630,6 +1920,239 @@ mod tests {
         println!(
             "{}",
             serde_json::to_string_pretty(&owner_key_links_vectors()).unwrap()
+        );
+    }
+
+    fn release_policy() -> ReleasePolicy {
+        ReleasePolicy::sign(
+            &key(4),
+            &did_of(&key(5)),
+            2,
+            1_800_000_000,
+            vec![did_of(&key(3)), did_of(&key(8))],
+            false,
+        )
+    }
+
+    fn kp_decision() -> KpDecision {
+        KpDecision::sign(
+            &key(4),
+            &did_of(&key(5)),
+            kp_request().request_id(),
+            true,
+            1_800_000_060,
+        )
+    }
+
+    #[test]
+    fn a_release_policy_round_trips_in_one_order() {
+        let p = release_policy();
+        let back = ReleasePolicy::from_envelope(&p.envelope).unwrap();
+        assert_eq!(back, p);
+        assert!(back.releases_to(&did_of(&key(3))));
+        assert!(!back.releases_to(&did_of(&key(9))));
+        // Given in any order, with repeats: signed in its one order.
+        let shuffled = ReleasePolicy::sign(
+            &key(4),
+            &did_of(&key(5)),
+            2,
+            1_800_000_000,
+            vec![did_of(&key(8)), did_of(&key(3)), did_of(&key(8))],
+            false,
+        );
+        assert_eq!(shuffled.envelope, p.envelope);
+        let any = ReleasePolicy::sign(&key(4), &did_of(&key(5)), 3, 1, vec![], true);
+        assert!(
+            ReleasePolicy::from_envelope(&any.envelope)
+                .unwrap()
+                .releases_to(&did_of(&key(9)))
+        );
+    }
+
+    #[test]
+    fn a_release_policy_in_another_form_is_refused() {
+        let resign = |p: &mut ReleasePolicy| p.envelope = cose::sign1(&key(4), &p.payload());
+        // Out of order.
+        let mut p = release_policy();
+        p.release_to.reverse();
+        resign(&mut p);
+        assert!(matches!(
+            ReleasePolicy::from_envelope(&p.envelope),
+            Err(ContractError::BadPayload(_))
+        ));
+        // Repeated.
+        let mut p = release_policy();
+        p.release_to.push(p.release_to[1].clone());
+        resign(&mut p);
+        assert!(ReleasePolicy::from_envelope(&p.envelope).is_err());
+        // Any, with a list besides.
+        let mut p = release_policy();
+        p.release_any = true;
+        resign(&mut p);
+        assert!(ReleasePolicy::from_envelope(&p.envelope).is_err());
+        // Too many.
+        let mut p = release_policy();
+        p.release_to = in_order(
+            (0..=MAX_RELEASE_TO)
+                .map(|i| {
+                    let k = SigningKey::from_bytes(blake3::hash(&i.to_le_bytes()).as_bytes());
+                    did_of(&k)
+                })
+                .collect(),
+        );
+        resign(&mut p);
+        assert!(ReleasePolicy::from_envelope(&p.envelope).is_err());
+        // A requester that is not a key.
+        let mut p = release_policy();
+        p.release_to = vec!["did:jig:not-a-key".into()];
+        resign(&mut p);
+        assert!(matches!(
+            ReleasePolicy::from_envelope(&p.envelope),
+            Err(ContractError::BadDid(_))
+        ));
+        // Signed by another than the DID it governs.
+        let mut p = release_policy();
+        p.did = did_of(&key(9));
+        resign(&mut p);
+        assert!(matches!(
+            ReleasePolicy::from_envelope(&p.envelope),
+            Err(ContractError::BadSignature(_))
+        ));
+    }
+
+    #[test]
+    fn a_decision_answers_one_request_by_its_id() {
+        let d = kp_decision();
+        let back = KpDecision::from_envelope(&d.envelope).unwrap();
+        assert_eq!(back, d);
+        assert_eq!(back.request_id, kp_request().request_id());
+        // Another request, even with every field but the nonce the same, has
+        // another id.
+        let r = kp_request();
+        // Derived, not a literal, as in `kp_request`.
+        let digest = blake3::hash(b"kp-request vector: another nonce");
+        let nonce: [u8; 16] = digest.as_bytes()[..16]
+            .try_into()
+            .expect("a blake3 digest is 32 bytes");
+        let other = KpRequest::sign(
+            &key(3),
+            &r.did,
+            r.channel_id,
+            &r.custodian,
+            nonce,
+            r.issued_at,
+        );
+        assert_ne!(other.request_id(), r.request_id());
+        // Signed by another than the DID.
+        let mut forged = kp_decision();
+        forged.did = did_of(&key(9));
+        forged.envelope = cose::sign1(&key(4), &forged.payload());
+        assert!(matches!(
+            KpDecision::from_envelope(&forged.envelope),
+            Err(ContractError::BadSignature(_))
+        ));
+        // A policy is not a decision.
+        assert!(matches!(
+            KpDecision::from_envelope(&release_policy().envelope),
+            Err(ContractError::BadPayload(_))
+        ));
+    }
+
+    /// Each object signed for another custodian than `custodian` in the
+    /// vectors: a custodian MUST refuse it (rules 21b, 21c), so that one
+    /// uploaded or sent to one custodian cannot be replayed to another.
+    fn for_another_custodian() -> (ReleasePolicy, KpDecision) {
+        let other = did_of(&key(9));
+        let p = release_policy();
+        (
+            ReleasePolicy::sign(&key(4), &other, p.seq, p.issued_at, p.release_to, false),
+            KpDecision::sign(
+                &key(4),
+                &other,
+                kp_request().request_id(),
+                true,
+                1_800_000_060,
+            ),
+        )
+    }
+
+    #[test]
+    fn each_object_names_the_custodian_it_is_for() {
+        let (p, d) = for_another_custodian();
+        // Valid objects, for the custodian they name, and only that one.
+        let p = ReleasePolicy::from_envelope(&p.envelope).unwrap();
+        let d = KpDecision::from_envelope(&d.envelope).unwrap();
+        assert_ne!(p.custodian, release_policy().custodian);
+        assert_ne!(d.custodian, kp_decision().custodian);
+        // Moving either to another custodian breaks its signature.
+        let mut moved = release_policy();
+        moved.custodian = p.custodian.clone();
+        assert!(matches!(
+            moved.verify(),
+            Err(ContractError::BadSignature(_))
+        ));
+        let mut moved = kp_decision();
+        moved.custodian = d.custodian.clone();
+        assert!(matches!(
+            moved.verify(),
+            Err(ContractError::BadSignature(_))
+        ));
+    }
+
+    fn kp_custody_vectors() -> serde_json::Value {
+        let (p, r, d) = (release_policy(), kp_request(), kp_decision());
+        let (other_p, other_d) = for_another_custodian();
+        serde_json::json!({
+            "comment": "A jig-kp-release-policy-v1 and a jig-kp-decision-v1 (JEP-0005 rules 21b, 21c), approving the request in kp-request.json by its request_id. payload_hex is the deterministic CBOR payload; cose_sign1_hex is the envelope.",
+            "keys": {
+                "comment": "Ed25519 seeds: every byte set to the given value",
+                "did": {"seed_byte": 4, "did": did_of(&key(4))},
+                "custodian": {"seed_byte": 5, "did": did_of(&key(5))},
+                "release_to": [
+                    {"seed_byte": 3, "did": did_of(&key(3))},
+                    {"seed_byte": 8, "did": did_of(&key(8))},
+                ],
+            },
+            "policy": {
+                "payload_hex": hex::encode(p.payload()),
+                "cose_sign1_hex": hex::encode(&p.envelope),
+            },
+            "request_id_hex": hex::encode(r.request_id()),
+            "decision": {
+                "payload_hex": hex::encode(d.payload()),
+                "cose_sign1_hex": hex::encode(&d.envelope),
+            },
+            "refused": {
+                "comment": "Each signed by did for another custodian (seed byte 9): valid objects that the custodian above MUST refuse, because each names another custodian.",
+                "other_custodian": {"seed_byte": 9, "did": did_of(&key(9))},
+                "policy": {
+                    "payload_hex": hex::encode(other_p.payload()),
+                    "cose_sign1_hex": hex::encode(&other_p.envelope),
+                },
+                "decision": {
+                    "payload_hex": hex::encode(other_d.payload()),
+                    "cose_sign1_hex": hex::encode(&other_d.envelope),
+                },
+            },
+        })
+    }
+
+    #[test]
+    fn kp_custody_bytes_match_the_committed_vectors() {
+        let v: serde_json::Value = serde_json::from_str(include_str!(
+            "../../jig-spec/jep/vectors/0005/kp-custody.json"
+        ))
+        .unwrap();
+        assert_eq!(kp_custody_vectors(), v);
+    }
+
+    /// `cargo test -p jig-core --features ed25519 contract::tests::print_kp_custody_vectors -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn print_kp_custody_vectors() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&kp_custody_vectors()).unwrap()
         );
     }
 
