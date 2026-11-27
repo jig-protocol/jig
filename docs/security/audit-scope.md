@@ -132,9 +132,11 @@ rest).
 reviewed now.
 - **MLS channels across servers (F2 Task 7)** are partly done. An encrypted channel federates
   under a share, and the follower checks each commit against its public copy of the group
-  (JEP-0005 rule 19). Still missing: after a `contract-end`, members are not removed. The
-  client shows a notice and removes no one, though JEP-0005 rule 11 calls for removing leaves
-  reachable only through that follower.
+  (JEP-0005 rule 19). After a `contract-end`, JEP-0005 rule 11 calls for removing leaves
+  reachable only through that follower. This is a prompted client command,
+  `jig channel prune <channel> --via <server-did> [--yes]`, not automatic (DJ 2026-11-26). It
+  judges from the owner's `last_via` and the members' reachability records, and keeps anyone a
+  record places on another server (`jig-cli/src/cmd/prune.rs`).
 - **Key-package custodians (Task 8)** are partly done (#440). These shipped: signed custody
   requests (JEP-0005 rule 21a), hourly limits, the release log, and the operator's interim
   release policy, now the fallback for a DID with no policy of its own (rule 21b). Release

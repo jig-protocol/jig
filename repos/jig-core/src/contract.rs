@@ -413,6 +413,12 @@ pub struct ContractAccept {
     /// On a sequencer move, the bot DIDs the new sequencer minted (rule
     /// 11a); otherwise empty.
     pub bot_dids: Vec<String>,
+    /// On a sequencer move, the new sequencer's `policy-approval`s (rule
+    /// 11b), as COSE_Sign1 bytes: for the channel's current `channel-policy`
+    /// and every live `block-install`. Signed only in a move accept
+    /// ([`Self::is_move`]): an accept that is not one has no such key, so
+    /// its bytes are what they were before moves existed.
+    pub policy_approvals: Vec<Vec<u8>>,
     /// `server`'s COSE_Sign1 over [`ContractAccept::payload`].
     pub envelope: Vec<u8>,
 }
@@ -421,7 +427,7 @@ impl ContractAccept {
     const WHAT: &'static str = "contract accept";
 
     pub fn payload(&self) -> Vec<u8> {
-        encode(Value::text_map([
+        let mut fields = vec![
             ("domain", Value::text(ACCEPT_DOMAIN)),
             ("server", Value::text(self.server.clone())),
             ("channel_id", Value::Bytes(self.channel_id.to_bytes())),
@@ -430,7 +436,56 @@ impl ContractAccept {
             ("manifest", self.manifest.value()),
             ("attested_suffixes", suffix_values(&self.attested_suffixes)),
             ("bot_dids", texts(&self.bot_dids)),
-        ]))
+        ];
+        if self.is_move() {
+            fields.push((
+                "policy_approvals",
+                Value::Array(
+                    self.policy_approvals
+                        .iter()
+                        .cloned()
+                        .map(Value::Bytes)
+                        .collect(),
+                ),
+            ));
+        }
+        encode(Value::text_map(fields))
+    }
+
+    /// Whether this is a move accept (JEP-0005 rule 11a): the accepting
+    /// server names itself as the channel's sequencer, which only a server
+    /// taking the channel over does. It travels inside the owner's
+    /// `sequencer-set` block, never as a `contract-answer`.
+    pub fn is_move(&self) -> bool {
+        self.server == self.sequencer
+    }
+
+    /// A move accept (rule 11a) as `server_key`, the new sequencer: of
+    /// `held`, the offer of the channel it already accepted as a follower,
+    /// naming itself as the sequencer, with the bot DIDs it minted for the
+    /// channel's bots and its `policy-approval`s (rule 11b).
+    pub fn sign_move(
+        server_key: &SigningKey,
+        held: &ContractOffer,
+        manifest: ManifestRef,
+        attested_suffixes: Vec<AttestedSuffix>,
+        bot_dids: Vec<String>,
+        policy_approvals: Vec<Vec<u8>>,
+    ) -> Self {
+        let server = did_of(server_key);
+        let mut accept = Self {
+            server: server.clone(),
+            channel_id: held.channel_id,
+            offer_id: held.offer_id,
+            sequencer: server,
+            manifest,
+            attested_suffixes,
+            bot_dids,
+            policy_approvals,
+            envelope: Vec::new(),
+        };
+        accept.envelope = cose::sign1(server_key, &accept.payload());
+        accept
     }
 
     /// Accept `offer` as `server_key`.
@@ -449,6 +504,7 @@ impl ContractAccept {
             manifest,
             attested_suffixes,
             bot_dids,
+            policy_approvals: Vec::new(),
             envelope: Vec::new(),
         };
         accept.envelope = cose::sign1(server_key, &accept.payload());
@@ -462,6 +518,18 @@ impl ContractAccept {
             .map(|v| v.as_text().map(str::to_string))
             .collect::<Option<_>>()
             .ok_or(ContractError::BadPayload(Self::WHAT))?;
+        // Read when present; `verify` then refuses it on an accept that is not
+        // a move, and its absence on one that is, by re-encoding.
+        let policy_approvals = match p.get("policy_approvals") {
+            None => Vec::new(),
+            Some(v) => v
+                .as_array()
+                .ok_or(ContractError::BadPayload(Self::WHAT))?
+                .iter()
+                .map(|a| a.as_bytes().map(<[u8]>::to_vec))
+                .collect::<Option<_>>()
+                .ok_or(ContractError::BadPayload(Self::WHAT))?,
+        };
         let accept = Self {
             server: text(&p, "server", Self::WHAT)?,
             channel_id: cid(&p, "channel_id", Self::WHAT)?,
@@ -470,13 +538,20 @@ impl ContractAccept {
             manifest: ManifestRef::read(field(&p, "manifest", Self::WHAT)?, Self::WHAT)?,
             attested_suffixes: suffixes(&p, Self::WHAT)?,
             bot_dids,
+            policy_approvals,
             envelope: envelope.to_vec(),
         };
         accept.verify()?;
         Ok(accept)
     }
 
+    /// `server` signed this accept. An accept that is not a move signs no
+    /// `policy_approvals`, so one that carries some is refused: they would be
+    /// unsigned.
     pub fn verify(&self) -> Result<(), ContractError> {
+        if !self.is_move() && !self.policy_approvals.is_empty() {
+            return Err(ContractError::BadPayload(Self::WHAT));
+        }
         verify_envelope(&self.envelope, &self.payload(), &self.server)
     }
 
