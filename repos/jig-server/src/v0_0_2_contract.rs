@@ -101,7 +101,9 @@ pub struct Contracts {
 /// - resend unanswered offers every [`RESEND_EVERY`];
 /// - act on the operator's decisions every [`DECIDE_EVERY`];
 /// - ask each followed channel's owner for its new records every
-///   [`crate::v0_0_2_stream::PULL_EVERY`].
+///   [`crate::v0_0_2_stream::PULL_EVERY`];
+/// - send again, every [`crate::v0_0_2_heads::FORWARD_EVERY`], the forks a
+///   peer could not take when they were found.
 ///
 /// Call once, at boot.
 pub fn start(state: &AppState) -> Contracts {
@@ -130,6 +132,15 @@ pub fn start(state: &AppState) -> Contracts {
             puller.pull_all();
         }
     });
+    if let Some(heads) = contracts.heads.get().cloned() {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(crate::v0_0_2_heads::FORWARD_EVERY);
+            loop {
+                tick.tick().await;
+                heads.retry_pending();
+            }
+        });
+    }
     contracts
 }
 

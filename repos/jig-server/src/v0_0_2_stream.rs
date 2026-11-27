@@ -638,19 +638,6 @@ impl Stream {
             }
         };
         for share in shares {
-            let stopped = self
-                .store()
-                .chain_evidence(&share.channel_id)
-                .map(|e| !e.is_empty())
-                .unwrap_or(true)
-                || self
-                    .store()
-                    .carried_upgrade(&share.channel_id)
-                    .map(|stop| stop.is_some())
-                    .unwrap_or(true);
-            if stopped {
-                continue;
-            }
             self.pull_from_head(&share.peer_did, &share.channel_id);
         }
     }
@@ -660,6 +647,15 @@ impl Stream {
         // Stopped for an upgrade (JEP-0005 rule 14c): asked for nothing, on
         // the periodic pull or on a retry the owner scheduled before the stop.
         if !matches!(self.store().carried_upgrade(channel_id), Ok(None)) {
+            return;
+        }
+        // Stopped at a fork (JEP-0005 rule 14): it takes nothing more, so
+        // nothing is asked for, whether by the periodic pull or for a head.
+        if !self
+            .store()
+            .chain_evidence(channel_id)
+            .is_ok_and(|e| e.is_empty())
+        {
             return;
         }
         match self.store().latest_ingest_record(channel_id) {

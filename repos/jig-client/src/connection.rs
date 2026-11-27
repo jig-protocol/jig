@@ -133,6 +133,50 @@ fn lock_defects(
 /// How often a client sends one channel's head (JEP-0002 rule 10).
 pub const HEAD_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The most heads kept for a channel this session holds no chain of yet,
+/// and the most such channels: a server sends a subscriber the heads it holds
+/// before the first block, which is what starts the chain.
+const PENDING_HEADS: usize = 8;
+const PENDING_HEAD_CHANNELS: usize = 16;
+
+/// What a head the server passed on shows against this session's chain.
+enum HeadShows {
+    /// A record its sequencer signed at a `seq` where the chain holds
+    /// another: the proof.
+    Forked(Box<crate::evidence::Proof>),
+    /// Past the chain's head: a gap to fill.
+    Ahead(ChainGap),
+    Nothing,
+}
+
+/// Hold `record`, a head of `channel_id`, to `chain`. The chain's signers
+/// came from the welcome or the share, never from a head.
+fn head_shows(
+    chain: &crate::chain::ChannelChain,
+    channel_id: &str,
+    record: &crate::chain::IngestRecord,
+) -> HeadShows {
+    match chain.check_seen(record, None) {
+        crate::chain::SeenCheck::Forked(proof) => {
+            HeadShows::Forked(Box::new(crate::evidence::Proof::Chain(proof)))
+        }
+        crate::chain::SeenCheck::Differs { seq } => {
+            tracing::warn!(
+                channel = %channel_id,
+                seq,
+                "a head is not the record this session verified at that seq"
+            );
+            HeadShows::Nothing
+        }
+        crate::chain::SeenCheck::Ahead { to } => HeadShows::Ahead(ChainGap {
+            channel_id: channel_id.to_string(),
+            from: chain.head().map_or(0, |h| h.seq + 1),
+            to: to + 1,
+        }),
+        _ => HeadShows::Nothing,
+    }
+}
+
 /// The `head` frame for `record`, the latest this session verified of its
 /// channel.
 fn head_frame(record: &crate::chain::IngestRecord) -> Option<Message> {
@@ -589,6 +633,9 @@ impl Client {
         // `HEAD_EVERY` per channel.
         let send_heads = welcome.capabilities.heads;
         let mut heads_sent: HashMap<String, std::time::Instant> = HashMap::new();
+        // Heads passed on for a channel before its first block: held to the
+        // chain once that block starts it.
+        let mut heads_waiting: HashMap<String, Vec<crate::chain::IngestRecord>> = HashMap::new();
         tokio::spawn(async move {
             let _cleanup = ReaderCleanup {
                 pending_subscriptions: pending_subs_for_reader.clone(),
@@ -764,6 +811,37 @@ impl Client {
                                     contradict_with(code, reason, &text, Some(Box::new(proof)));
                                     break;
                                 }
+                                let mut waiting_fork = None;
+                                if step.is_ok()
+                                    && let Some(waiting) = heads_waiting.remove(&record.channel_id)
+                                {
+                                    for head in waiting {
+                                        match head_shows(chain, &record.channel_id, &head) {
+                                            HeadShows::Forked(proof) => {
+                                                waiting_fork = Some((head.seq, proof));
+                                                break;
+                                            }
+                                            HeadShows::Ahead(gap) => {
+                                                lock_gaps(&gaps_for_reader).push(gap)
+                                            }
+                                            HeadShows::Nothing => {}
+                                        }
+                                    }
+                                }
+                                if let Some((seq, proof)) = waiting_fork {
+                                    drop(chains);
+                                    contradict_with(
+                                        "chain-seen-forked",
+                                        format!(
+                                            "a head of channel {} is record {seq} signed by its \
+                                             sequencer, and not the one this session verified",
+                                            record.channel_id
+                                        ),
+                                        &text,
+                                        Some(proof),
+                                    );
+                                    break;
+                                }
                                 if send_heads
                                     && step.is_ok()
                                     && let Some(head) = chain.head().and_then(|h| h.record.as_ref())
@@ -878,10 +956,19 @@ impl Client {
                             };
                             let chains = lock_chains(&chains_for_reader);
                             let Some(chain) = chains.get(&channel_id) else {
+                                drop(chains);
+                                if heads_waiting.len() < PENDING_HEAD_CHANNELS
+                                    || heads_waiting.contains_key(&channel_id)
+                                {
+                                    let waiting = heads_waiting.entry(channel_id).or_default();
+                                    if waiting.len() < PENDING_HEADS {
+                                        waiting.push(record);
+                                    }
+                                }
                                 continue;
                             };
-                            match chain.check_seen(&record, None) {
-                                crate::chain::SeenCheck::Forked(proof) => {
+                            match head_shows(chain, &channel_id, &record) {
+                                HeadShows::Forked(proof) => {
                                     drop(chains);
                                     contradict_with(
                                         "chain-seen-forked",
@@ -892,26 +979,28 @@ impl Client {
                                             record.seq
                                         ),
                                         &text,
-                                        Some(Box::new(crate::evidence::Proof::Chain(proof))),
+                                        Some(proof),
                                     );
                                     break;
                                 }
-                                crate::chain::SeenCheck::Differs { seq } => tracing::warn!(
-                                    channel = %channel_id,
-                                    seq,
-                                    "a head is not the record this session verified at that seq"
-                                ),
-                                crate::chain::SeenCheck::Ahead { to } => {
-                                    let from = chain.head().map_or(0, |h| h.seq + 1);
+                                HeadShows::Ahead(gap) => {
                                     drop(chains);
-                                    lock_gaps(&gaps_for_reader).push(ChainGap {
-                                        channel_id: channel_id.clone(),
-                                        from,
-                                        to: to + 1,
-                                    });
+                                    lock_gaps(&gaps_for_reader).push(gap);
                                 }
-                                _ => {}
+                                HeadShows::Nothing => {}
                             }
+                        }
+                        // The answers to a head, which is no request: never
+                        // taken as a subscribe's or a submit's. Heads go at
+                        // most once every `HEAD_EVERY` per channel already.
+                        Frame::Error {
+                            code,
+                            retry_after_ms,
+                            ..
+                        } if code == jig_pipeline::heads::HEADS_RATE_LIMITED
+                            || code == jig_pipeline::heads::HEADS_NOT_NEGOTIATED =>
+                        {
+                            tracing::debug!(code, ?retry_after_ms, "a head was refused");
                         }
                         Frame::Error { code, message, .. }
                             if code == jig_pipeline::fanout::CHANNEL_NEEDS_UPGRADE =>
@@ -1435,6 +1524,17 @@ mod tests {
         key: &ed25519_dalek::SigningKey,
         request_auth: Vec<String>,
     ) -> Option<String> {
+        welcome_reply_granting(text, key, request_auth, false)
+    }
+
+    /// [`welcome_reply_accepting`], from a server that implements head
+    /// gossip when `heads`.
+    fn welcome_reply_granting(
+        text: &str,
+        key: &ed25519_dalek::SigningKey,
+        request_auth: Vec<String>,
+        heads: bool,
+    ) -> Option<String> {
         let env: Envelope = serde_json::from_str(text).ok()?;
         let Frame::Hello {
             versions,
@@ -1460,6 +1560,7 @@ mod tests {
                     execution: true,
                     federation: false,
                     request_auth,
+                    heads,
                     ..Default::default()
                 },
                 ..Default::default()
@@ -1492,6 +1593,15 @@ mod tests {
         key: ed25519_dalek::SigningKey,
         after_welcome: Vec<String>,
     ) -> (String, Arc<StdMutex<Option<u16>>>) {
+        start_scripted_server_granting(key, after_welcome, false).await
+    }
+
+    /// [`start_scripted_server_with_key`], granting head gossip when `heads`.
+    async fn start_scripted_server_granting(
+        key: ed25519_dalek::SigningKey,
+        after_welcome: Vec<String>,
+        heads: bool,
+    ) -> (String, Arc<StdMutex<Option<u16>>>) {
         use tokio::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
@@ -1506,7 +1616,12 @@ mod tests {
             };
             while let Some(Ok(msg)) = ws.next().await {
                 if let Message::Text(text) = msg
-                    && let Some(reply) = welcome_reply(&text, &key)
+                    && let Some(reply) = welcome_reply_granting(
+                        &text,
+                        &key,
+                        vec![jig_core::request_auth::VERSION.to_string()],
+                        heads,
+                    )
                 {
                     let _ = ws.send(Message::Text(reply.into())).await;
                     break;
@@ -2440,6 +2555,64 @@ mod tests {
             }]
         );
         assert_eq!(*close_code.lock().unwrap(), None);
+    }
+
+    /// The heads a server passes on at subscribe arrive before the first
+    /// block, which starts the channel's chain: they are kept, and held to
+    /// the chain once it exists. One past it is a gap to fill.
+    #[tokio::test]
+    async fn a_head_before_the_first_block_is_held_to_the_chain_it_starts() {
+        use base64::Engine as _;
+        let key = test_signing_key();
+        let blocks = bundles(6);
+        let cids: Vec<&str> = blocks.iter().map(|(_, c)| c.as_str()).collect();
+        let records = records_for(&key, &cids);
+        let head = serde_json::to_string(&Envelope::new(Frame::Head {
+            channel_id: records[5].channel_id.clone(),
+            record_b64: base64::engine::general_purpose::STANDARD
+                .encode(records[5].cose_bytes().unwrap()),
+        }))
+        .unwrap();
+        let frames = vec![head, block_frame(&records[0], &blocks[0].0)];
+        let (url, _) = start_scripted_server_granting(key, frames, true).await;
+        let client = Client::connect(&url, test_identity()).await.unwrap();
+        let mut stream = client.subscribe_channel("#hello").await.unwrap();
+        assert_eq!(stream.next().await.unwrap().ingest.unwrap().seq, 0);
+        assert!(client.contradiction().is_none());
+        assert_eq!(
+            client.take_chain_gaps(),
+            vec![ChainGap {
+                channel_id: records[0].channel_id.clone(),
+                from: 1,
+                to: 6
+            }]
+        );
+    }
+
+    /// A refused head answers no request: a submit waiting when it arrives
+    /// gets its own answer, not that refusal.
+    #[tokio::test]
+    async fn a_refused_head_is_not_read_as_a_submits_answer() {
+        let (url, _) = start_test_server(|env| async move {
+            match env.frame {
+                Frame::Submit { bundle_b64, .. } => vec![
+                    Envelope::new(Frame::Error {
+                        status: Some(429),
+                        code: jig_pipeline::heads::HEADS_RATE_LIMITED.to_string(),
+                        ref_cid: None,
+                        message: "head frames past this connection's limit".into(),
+                        retry_after_ms: Some(1000),
+                    }),
+                    ack(&bundle_b64),
+                ],
+                _ => vec![],
+            }
+        })
+        .await;
+        let client = Client::connect(&url, test_identity()).await.unwrap();
+        let block = text_block(&client, "hello");
+        let expected = block.cid();
+        assert_eq!(client.submit(block).await.unwrap(), expected);
     }
 
     /// A channel the server carries for its owner: its records are the

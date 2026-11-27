@@ -39,6 +39,15 @@ pub(crate) fn migrate(conn: &rusqlite::Connection) -> crate::persist::Result<()>
     Ok(())
 }
 
+/// The refusal of a head past its sender's allowance. It answers no request
+/// the client made, so the client handles it apart from the errors that
+/// answer a subscribe or a submit, and it is no other refusal's code.
+pub const HEADS_RATE_LIMITED: &str = "HEADS_RATE_LIMITED";
+
+/// The answer to a head on a connection whose welcome did not grant `heads`.
+/// Like [`HEADS_RATE_LIMITED`], it answers no request.
+pub const HEADS_NOT_NEGOTIATED: &str = "HEADS_NOT_NEGOTIATED";
+
 /// What a head showed against this server's chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeadCheck {
@@ -107,9 +116,13 @@ impl SqliteStore {
             .list_ingest_records_by_id(channel_id, head.seq, 1)?
             .into_iter()
             .find(|r| r.seq == head.seq);
-        if held.as_ref().is_some_and(|h| h.cose == sent)
-            || self.kept_head(channel_id)? == Some(sent)
-        {
+        // The kept head again is nothing new only while no other record is
+        // held at its `seq`: once the chain lands one there, it is compared.
+        let duplicate = match &held {
+            Some(h) => h.cose == sent,
+            None => self.kept_head(channel_id)? == Some(sent),
+        };
+        if duplicate {
             return Ok(HeadCheck::Duplicate);
         }
         let sequencer = if channel.sequencer_did.is_empty() {
@@ -375,6 +388,49 @@ mod tests {
                 advanced: false
             }
         );
+    }
+
+    #[test]
+    fn the_kept_head_again_is_a_fork_once_another_record_is_held_there() {
+        let owner = generate_signing_key();
+        let (store, held) = follower(&owner);
+        let channel = label_cid("Create");
+        let kept = sign_at(&owner, 2, "b2", held[1].hash());
+        let envelope = kept.cose_bytes().unwrap();
+        assert!(matches!(
+            store.check_head(&channel, &envelope).unwrap(),
+            HeadCheck::Ahead { advanced: true, .. }
+        ));
+        // The chain then holds another record at that seq.
+        let landed = sign_at(&owner, 2, "b2Other", held[1].hash());
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+            conn.execute(
+                "INSERT INTO carried_records (block_cid, channel_id, seq, record)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    landed.block_cid,
+                    landed.channel_id,
+                    landed.seq as i64,
+                    landed.encode()
+                ],
+            )
+            .unwrap();
+        }
+        let check = store.check_head(&channel, &envelope).unwrap();
+        assert!(
+            matches!(
+                check,
+                HeadCheck::Fork {
+                    seq: 2,
+                    first: true,
+                    ..
+                }
+            ),
+            "{check:?}"
+        );
+        assert_eq!(store.chain_evidence(&channel).unwrap().len(), 1);
     }
 
     #[test]

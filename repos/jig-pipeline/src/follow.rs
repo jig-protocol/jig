@@ -552,6 +552,24 @@ impl SqliteStore {
             }
             None => {}
         }
+        // A head kept at this seq ([`crate::heads`]), verified as the
+        // sequencer's when it was kept, and not this record: the sequencer
+        // signed two records for one seq, whichever arrived first.
+        let kept: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT record FROM channel_heads WHERE channel_id = ?1 AND seq = ?2",
+                params![channel_id, record.seq as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(kept) = kept
+            && let Ok(kept) = IngestRecord::from_cose(&kept)
+            && kept.cose != record.cose
+        {
+            keep(&kept.encode())?;
+            tx.commit()?;
+            return Ok(Landing::Fork);
+        }
         if let Some(kind) = needs_upgrade {
             tx.execute(
                 "INSERT OR IGNORE INTO carried_upgrades (channel_id, seq, block_cid, kind, found_at)
@@ -1740,6 +1758,43 @@ mod tests {
             take(&follower, &owner, &forged).await,
             Err(FollowError::Fork { seq: 1, .. })
         ));
+    }
+
+    /// A head kept at a seq the chain has not reached, and then another
+    /// record landing there: the fork is kept whichever arrived first.
+    #[tokio::test]
+    async fn a_record_landing_where_another_head_is_kept_is_a_fork() {
+        let mut owner = Owner::new().await;
+        owner.text("one").await;
+        owner.text("two").await;
+        let follower = owner.follower();
+        take(&follower, &owner, &owner.sent[0]).await.unwrap();
+
+        let other = signed(
+            &owner.user,
+            BlockKind::TextRender,
+            serde_json::json!({"channel_id": owner.channel, "body": "other"}),
+        );
+        let genesis = IngestRecord::decode(&owner.sent[0].record).unwrap();
+        let head = IngestRecord::decode(&owner.sign_at(&other, 1, genesis.hash())).unwrap();
+        assert!(matches!(
+            follower
+                .store
+                .check_head(&owner.channel, &head.cose_bytes().unwrap())
+                .unwrap(),
+            crate::heads::HeadCheck::Ahead {
+                seq: 1,
+                advanced: true
+            }
+        ));
+        match take(&follower, &owner, &owner.sent[1]).await {
+            Err(FollowError::Fork { seq: 1, .. }) => {}
+            other => panic!("a fork: {other:?}"),
+        }
+        let evidence = follower.store.chain_evidence(&owner.channel).unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(IngestRecord::decode(&evidence[0].held).unwrap(), head);
+        assert_eq!(evidence[0].offered, owner.sent[1].record);
     }
 
     #[tokio::test]

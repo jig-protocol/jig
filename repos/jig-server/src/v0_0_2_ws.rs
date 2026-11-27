@@ -674,7 +674,7 @@ fn authorize_subscribe(
 
 /// The error code for a `head` frame on a connection whose welcome did not
 /// grant `heads`.
-pub(crate) const HEADS_NOT_NEGOTIATED: &str = "HEADS_NOT_NEGOTIATED";
+pub(crate) use jig_pipeline::heads::HEADS_NOT_NEGOTIATED;
 
 async fn handle_client_frame(
     text: &str,
@@ -1240,7 +1240,7 @@ async fn handle_client_frame(
                 let _ = send_error_after(
                     socket,
                     Some(429),
-                    "RATE_LIMITED",
+                    jig_pipeline::heads::HEADS_RATE_LIMITED,
                     None,
                     &format!("head frames past this connection's limit; try again in {ms} ms"),
                     Some(ms),
@@ -1482,10 +1482,13 @@ fn channel_label(state: &AppState, manifest_bytes: &[u8]) -> Option<String> {
 pub const RESTRICTED_LABEL: &str = "(restricted)";
 
 /// Invariant: every Error answers exactly one client frame (Subscribe or
-/// Submit), and names it by `ref_cid` where it can. The client matches
-/// an unnamed Error to the oldest request still open, so a server-initiated
-/// Error would be taken as that request's answer. None exists today; adding
-/// one needs a code the client (`jig_client::connection::answer`) skips.
+/// Submit), and names it by `ref_cid` where it can, except the answers to a
+/// `head` frame, which is not a request: `HEADS_RATE_LIMITED` and
+/// `HEADS_NOT_NEGOTIATED` ([`jig_pipeline::heads`]). The client matches an
+/// unnamed Error to the oldest request still open, so any other Error that
+/// answers no request would be taken as that request's answer; adding one
+/// needs a code the client's reader handles before
+/// `jig_client::connection::answer`, as it does those two.
 async fn send_error(
     socket: &mut WebSocket,
     status: Option<u16>,
@@ -3386,8 +3389,10 @@ mod tests {
     }
 
     /// On a connection whose welcome granted `heads`, a head is taken and
-    /// nothing is said back; past the connection's allowance, `RATE_LIMITED`
-    /// with when to send again, whether or not the channel is held here.
+    /// nothing is said back; past the connection's allowance,
+    /// `HEADS_RATE_LIMITED` with when to send again, whether or not the
+    /// channel is held here. The allowance's refill is checked on its own
+    /// clock in `v0_0_2_heads`.
     #[tokio::test]
     async fn heads_past_a_connections_allowance_are_refused_with_a_wait() {
         let (state, url) = start_test_server().await;
@@ -3408,11 +3413,17 @@ mod tests {
             record_b64: "AAAA".into(),
         });
         let text = serde_json::to_string(&head).unwrap();
-        for _ in 0..=crate::v0_0_2_heads::CLIENT_HEADS.burst {
+        for _ in 0..crate::v0_0_2_heads::CLIENT_HEADS.burst {
             ws.send(TMessage::Text(text.clone().into())).await.unwrap();
         }
-        // The first frame back is the refusal of the one past the allowance:
-        // the ones within it were taken silently.
+        // The burst is taken silently: the first answer is the one to a
+        // frame sent after it.
+        ws.send(TMessage::Text("{not json".into())).await.unwrap();
+        match next_frame(&mut ws).await.frame {
+            Frame::Error { code, .. } => assert_eq!(code, "BAD_JSON"),
+            other => panic!("expected BAD_JSON, got {other:?}"),
+        }
+        ws.send(TMessage::Text(text.into())).await.unwrap();
         match next_frame(&mut ws).await.frame {
             Frame::Error {
                 code,
@@ -3420,11 +3431,11 @@ mod tests {
                 retry_after_ms,
                 ..
             } => {
-                assert_eq!(code, "RATE_LIMITED");
+                assert_eq!(code, jig_pipeline::heads::HEADS_RATE_LIMITED);
                 assert_eq!(status, Some(429));
                 assert!(retry_after_ms.is_some_and(|ms| ms > 0));
             }
-            other => panic!("expected RATE_LIMITED, got {other:?}"),
+            other => panic!("expected HEADS_RATE_LIMITED, got {other:?}"),
         }
     }
 

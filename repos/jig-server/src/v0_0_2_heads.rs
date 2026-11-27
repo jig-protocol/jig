@@ -44,6 +44,11 @@ pub const PEER_HEADS: RateLimit = RateLimit {
 /// The most often this server forwards one channel's head to one peer.
 pub const FORWARD_EVERY: Duration = Duration::from_secs(5);
 
+/// The most first-fork frames held for a peer that could not take them,
+/// across peers and channels. A fork is kept once per channel, so this is
+/// reached only with that many forked channels at once.
+pub const MAX_PENDING_FORKS: usize = 1024;
+
 /// The most often a client sends one channel's head.
 pub const CLIENT_SEND_EVERY: Duration = Duration::from_secs(30);
 
@@ -101,8 +106,10 @@ pub struct Heads {
     /// The follower's stream, to fetch up to a head past its chain.
     stream: OnceLock<Stream>,
     from_peers: RequestLimit,
-    /// When each channel's head was last forwarded to each peer.
-    forwarded: Mutex<HashMap<(String, String), tokio::time::Instant>>,
+    /// When each channel's head was last forwarded to each peer, and the
+    /// first-fork frames a peer has not yet taken, by peer and channel. One
+    /// lock, held from the choice of a link to the frame's admission.
+    forwarded: Mutex<Forwarded>,
     /// Signatures checked: what a flood of heads cost.
     verifications: AtomicU64,
 }
@@ -119,7 +126,7 @@ impl Heads {
             peers,
             stream: OnceLock::new(),
             from_peers: RequestLimit::new(PEER_HEADS),
-            forwarded: Mutex::new(HashMap::new()),
+            forwarded: Mutex::new(Forwarded::default()),
             verifications: AtomicU64::new(0),
         }
     }
@@ -181,7 +188,7 @@ impl Heads {
         match &check {
             HeadCheck::Ahead { advanced: true, .. } => {
                 self.fetch_up_to(channel_id);
-                self.forward(channel_id, envelope, from);
+                self.forward(channel_id, envelope, from, false);
             }
             HeadCheck::Fork {
                 first: true, seq, ..
@@ -191,7 +198,7 @@ impl Heads {
                     seq,
                     "a head shows the channel's sequencer forked"
                 );
-                self.forward(channel_id, envelope, from);
+                self.forward(channel_id, envelope, from, true);
             }
             _ => {}
         }
@@ -237,10 +244,13 @@ impl Heads {
     }
 
     /// Send `envelope` on to every target but `from` that is a configured
-    /// peer, on links that take heads, at most once every [`FORWARD_EVERY`]
-    /// per peer and channel. A share-holder the operator has since delisted
-    /// is told nothing, whatever its share's state.
-    fn forward(&self, channel_id: &str, envelope: &[u8], from: Option<&str>) {
+    /// peer, on links that take heads. An ordinary head goes at most once
+    /// every [`FORWARD_EVERY`] per peer and channel. A `fork`, the first kept
+    /// for the channel, goes whatever the interval, and is held for a peer
+    /// that cannot take it now, to be sent again ([`Self::retry_pending`]).
+    /// A share-holder the operator has since delisted is told nothing,
+    /// whatever its share's state.
+    fn forward(&self, channel_id: &str, envelope: &[u8], from: Option<&str>, fork: bool) {
         let body = ChannelHead {
             channel_id: channel_id.to_string(),
             record: envelope.to_vec(),
@@ -253,28 +263,71 @@ impl Heads {
             {
                 continue;
             }
-            let Some(sender) = Did::from_did_jig_string(&target)
-                .ok()
-                .and_then(|did| self.peers.sender_for(&did))
-                .filter(|s| s.heads())
-            else {
-                continue;
-            };
-            {
-                let mut forwarded = self.forwarded.lock().unwrap_or_else(|p| p.into_inner());
-                let key = (target.clone(), channel_id.to_string());
-                if forwarded
+            let key = (target.clone(), channel_id.to_string());
+            let mut forwarded = self.forwarded.lock().unwrap_or_else(|p| p.into_inner());
+            if !fork
+                && forwarded
+                    .at
                     .get(&key)
                     .is_some_and(|at| now.saturating_duration_since(*at) < FORWARD_EVERY)
-                {
-                    continue;
-                }
-                forwarded.insert(key, now);
+            {
+                continue;
             }
-            if let Err(e) = sender.send(HEAD_FRAME, body.clone()) {
-                tracing::debug!(peer = target, "head not forwarded: {e}");
+            if self.send_to(&target, &body) {
+                forwarded.at.insert(key.clone(), now);
+                forwarded.forks.remove(&key);
+            } else if fork {
+                forwarded.hold(key, body.clone());
             }
         }
+    }
+
+    /// Queue `body` on `target`'s newest live link that granted heads.
+    /// Whether it was queued.
+    fn send_to(&self, target: &str, body: &[u8]) -> bool {
+        let Some(sender) = Did::from_did_jig_string(target)
+            .ok()
+            .and_then(|did| self.peers.heads_sender_for(&did))
+        else {
+            return false;
+        };
+        match sender.send(HEAD_FRAME, body.to_vec()) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::debug!(peer = target, "head not forwarded: {e}");
+                false
+            }
+        }
+    }
+
+    /// Send again the first-fork frames a peer could not take: no link that
+    /// takes heads, or a full queue. A peer the operator has since delisted
+    /// is dropped from them.
+    pub fn retry_pending(&self) {
+        let now = tokio::time::Instant::now();
+        let mut forwarded = self.forwarded.lock().unwrap_or_else(|p| p.into_inner());
+        let pending: Vec<_> = forwarded
+            .forks
+            .iter()
+            .map(|(k, b)| (k.clone(), b.clone()))
+            .collect();
+        for (key, body) in pending {
+            if crate::v0_0_2_federation::configured_peer(&self.federation, &key.0).is_none() {
+                forwarded.forks.remove(&key);
+            } else if self.send_to(&key.0, &body) {
+                forwarded.forks.remove(&key);
+                forwarded.at.insert(key, now);
+            }
+        }
+    }
+
+    /// How many first-fork frames wait for a peer.
+    pub fn pending_forks(&self) -> usize {
+        self.forwarded
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .forks
+            .len()
     }
 
     /// A [`HEAD_FRAME`] from `peer`. A body that does not decode is
@@ -301,6 +354,29 @@ impl Heads {
                 "heads past the limit, dropped for {wait:?}"
             );
         }
+    }
+}
+
+/// What [`Heads::forward`] keeps between calls.
+#[derive(Default)]
+struct Forwarded {
+    /// When each channel's head was last queued for each peer.
+    at: HashMap<(String, String), tokio::time::Instant>,
+    /// First-fork frames a peer has not taken, by peer and channel.
+    forks: HashMap<(String, String), Vec<u8>>,
+}
+
+impl Forwarded {
+    fn hold(&mut self, key: (String, String), body: Vec<u8>) {
+        if self.forks.len() >= MAX_PENDING_FORKS && !self.forks.contains_key(&key) {
+            tracing::warn!(
+                peer = key.0,
+                channel_id = key.1,
+                "a fork not forwarded: {MAX_PENDING_FORKS} already wait"
+            );
+            return;
+        }
+        self.forks.insert(key, body);
     }
 }
 
@@ -666,6 +742,95 @@ mod tests {
         let got = sent(&mut inboxes[0]);
         assert_eq!(got.len(), 1);
         assert_eq!(IngestRecord::from_cose(&got[0].record).unwrap().seq, 7);
+    }
+
+    /// A first fork goes on whatever the interval, and one a peer cannot
+    /// take now (its queue full, or no link that takes heads) is held and
+    /// sent again. The link is the newest of those that granted heads.
+    #[tokio::test(start_paused = true)]
+    async fn a_fork_is_forwarded_inside_the_interval_and_retried_until_taken() {
+        use crate::v0_0_2_peer::{PEER_QUEUE, PeerSender};
+        let (state, channel, held) = sequencing().await;
+        let target = Did::from_ed25519_pubkey(&[1; 32]);
+        let mut federation = state.config.federation.clone();
+        federation.peers = vec![jig_config::v0_0_2_server::FederationPeer {
+            url: "wss://peer.invalid".into(),
+            expected_did: target.to_did_jig_string(),
+            alias: None,
+            publish: false,
+            quota: None,
+            offers: Default::default(),
+        }];
+        state
+            .ingest_ctx
+            .store
+            .put_contract_offer(&jig_pipeline::contracts::StoredOffer {
+                offer_id: [1; 32],
+                channel_id: channel.clone(),
+                side: Side::Owner,
+                peer_did: target.to_did_jig_string(),
+                grant: jig_core::contract::Grant::Write,
+                state: OfferState::Accepted,
+                offer: Vec::new(),
+                answer: None,
+                share_cid: None,
+            })
+            .unwrap();
+        let heads = Heads::new(
+            state.ingest_ctx.clone(),
+            Arc::new(federation),
+            state.peers.clone(),
+        );
+        // An older link that takes heads, and a newer one that does not.
+        let (takes, mut inbox) = PeerSender::with_features(target.clone(), true, true);
+        state.peers.register(takes.clone());
+        let (newer, mut newer_inbox) = PeerSender::with_features(target.clone(), true, false);
+        state.peers.register(newer);
+        let heads_in = |inbox: &mut tokio::sync::mpsc::Receiver<jig_pipeline::Envelope>| {
+            std::iter::from_fn(|| inbox.try_recv().ok())
+                .filter(|e| matches!(&e.frame, jig_pipeline::Frame::Peer { kind, .. } if kind == HEAD_FRAME))
+                .count()
+        };
+        let record = held.cose_bytes().unwrap();
+
+        heads.forward(&channel, &record, None, false);
+        assert_eq!(heads_in(&mut inbox), 1, "on the link that granted heads");
+        assert_eq!(heads_in(&mut newer_inbox), 0);
+        // A fork inside the interval still goes.
+        heads.forward(&channel, &record, None, true);
+        assert_eq!(heads_in(&mut inbox), 1);
+
+        // A full queue: the fork is held, and sent once there is room.
+        for _ in 0..PEER_QUEUE {
+            takes.send("filler", Vec::new()).unwrap();
+        }
+        heads.forward(&channel, &record, None, true);
+        assert_eq!(heads.pending_forks(), 1);
+        heads.retry_pending();
+        assert_eq!(heads.pending_forks(), 1, "still no room");
+        assert_eq!(heads_in(&mut inbox), 0, "only the filler was queued");
+        heads.retry_pending();
+        assert_eq!(heads.pending_forks(), 0);
+        assert_eq!(heads_in(&mut inbox), 1);
+    }
+
+    /// A connection's allowance takes its burst, then refuses with the wait
+    /// for one head, and takes one again after it.
+    #[test]
+    fn a_client_allowance_takes_its_burst_then_refills_at_its_rate() {
+        let start = tokio::time::Instant::now();
+        let mut allowance = ClientAllowance {
+            tokens: f64::from(CLIENT_HEADS.burst),
+            at: start,
+        };
+        for _ in 0..CLIENT_HEADS.burst {
+            assert_eq!(allowance.take(start), Ok(()));
+        }
+        let per_head = Duration::from_secs(60) / CLIENT_HEADS.per_min;
+        assert_eq!(allowance.take(start), Err(per_head));
+        assert!(allowance.take(start + per_head / 2).is_err());
+        assert_eq!(allowance.take(start + per_head), Ok(()));
+        assert!(allowance.take(start + per_head).is_err());
     }
 
     /// A subscriber is told the highest head this server was handed, when

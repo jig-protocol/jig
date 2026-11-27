@@ -177,6 +177,18 @@ impl PeerRegistry {
             .map(|(_, s)| s.clone())
     }
 
+    /// The newest live connection to `peer` whose handshake granted head
+    /// gossip: an older link that granted it is used over a newer one that
+    /// did not. Other frames go by [`Self::sender_for`].
+    pub fn heads_sender_for(&self, peer: &Did) -> Option<PeerSender> {
+        let key = peer.to_did_jig_string();
+        self.lock()
+            .iter()
+            .filter(|(_, s)| s.peer.to_did_jig_string() == key && !s.is_closed() && s.heads)
+            .max_by_key(|(id, _)| **id)
+            .map(|(_, s)| s.clone())
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, PeerSender>> {
         self.live
             .lock()
