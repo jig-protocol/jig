@@ -108,6 +108,9 @@ pub const RESEND_EVERY: Duration = Duration::from_secs(30);
 /// ([`operate`]) and sends the ends still waiting for a connection.
 pub const DECIDE_EVERY: Duration = Duration::from_secs(5);
 
+/// Re-offers still to make, each as (channel id, `sequencer-set` CID).
+type DueReoffers = std::collections::BTreeSet<(String, String)>;
+
 /// One server's side of every contract it takes part in.
 #[derive(Clone)]
 pub struct Contracts {
@@ -126,6 +129,10 @@ pub struct Contracts {
     /// Key-link chains peers sent for offers still to come, by peer and
     /// `offer_id`.
     pending_key_links: Arc<std::sync::Mutex<PendingKeyLinks>>,
+    /// Channels this server took over whose re-offers are not all made yet,
+    /// each with its `sequencer-set`: `None` until the decider's first tick
+    /// fills it from the channels' moves, so a restart resumes them.
+    reoffers: Arc<std::sync::Mutex<Option<DueReoffers>>>,
 }
 
 /// Run the contract on `state`'s server:
@@ -294,6 +301,7 @@ impl Contracts {
                     .collect(),
             ),
             pending_key_links: Arc::default(),
+            reoffers: Arc::default(),
         }
     }
 
@@ -418,29 +426,133 @@ impl Contracts {
     /// the same grant again, now from this server. A follower that already
     /// carries the channel accepts a re-offer of the same grant or less
     /// without its operator.
+    ///
+    /// Each follower is offered on its own: one that fails is logged and the
+    /// rest are still offered, and the channel stays in [`Self::reoffers`]
+    /// until every follower has its offer. A follower offered already for
+    /// `set_cid` is not offered again.
     async fn reoffer(&self, channel: &StoredChannel, set_cid: &str) -> anyhow::Result<()> {
+        if !self.reoffer_each(channel, set_cid).await {
+            self.keep_reoffer(channel.id.clone(), set_cid.to_string());
+        }
+        Ok(())
+    }
+
+    /// Offer each live follower of `channel` that has no offer for `set_cid`
+    /// yet; whether every one now has it.
+    async fn reoffer_each(&self, channel: &StoredChannel, set_cid: &str) -> bool {
         let me = self.me();
-        let followers = self.live_followers(&channel.id)?;
+        let followers = match self.live_followers(&channel.id) {
+            Ok(followers) => followers,
+            Err(e) => {
+                tracing::warn!(channel = %channel.id, "listing the followers to re-offer: {e:#}");
+                return false;
+            }
+        };
+        let mut all = true;
         // The move first, to the followers and to the sequencer it moves
         // from: a follower judges the re-offer by the move in its chain.
-        if let Some(block) = self.store().get_block(set_cid)? {
-            let mut to: Vec<String> = followers
-                .iter()
-                .map(|(f, _)| f.clone())
-                .filter(|f| !jig_pipeline::handshake::same_did(f, &me))
-                .collect();
-            if let Some(moved) = self.store().channel_moves(&channel.id)?.last() {
-                to.push(moved.previous.clone());
+        let pushed = (|| -> anyhow::Result<()> {
+            if let Some(block) = self.store().get_block(set_cid)? {
+                let mut to: Vec<String> = followers
+                    .iter()
+                    .map(|(f, _)| f.clone())
+                    .filter(|f| !jig_pipeline::handshake::same_did(f, &me))
+                    .collect();
+                if let Some(moved) = self.store().channel_moves(&channel.id)?.last() {
+                    to.push(moved.previous.clone());
+                }
+                self.stream.push_to(&block, &to)?;
             }
-            self.stream.push_to(&block, &to)?;
+            Ok(())
+        })();
+        if let Err(e) = pushed {
+            tracing::warn!(channel = %channel.id, "the move not pushed to the followers: {e:#}");
+            all = false;
         }
         for (to, grant) in followers {
             if jig_pipeline::handshake::same_did(&to, &me) {
                 continue;
             }
-            self.offer(channel, set_cid, &to, grant).await?;
+            match self.store().has_owner_offer_for(&channel.id, &to, set_cid) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(channel = %channel.id, peer = %to, "re-offer not checked: {e}");
+                    all = false;
+                    continue;
+                }
+            }
+            if let Err(e) = self.offer(channel, set_cid, &to, grant).await {
+                tracing::warn!(channel = %channel.id, peer = %to, "re-offer not made: {e:#}");
+                all = false;
+            }
         }
-        Ok(())
+        all
+    }
+
+    /// The re-offers still to make, filled on first use from every channel
+    /// this server sequences whose newest move names it.
+    fn reoffers_due(&self) -> std::sync::MutexGuard<'_, Option<DueReoffers>> {
+        let mut due = self.reoffers.lock().expect("poisoned");
+        if due.is_none() {
+            let me = self.me();
+            let store = self.store();
+            let mut seeded = std::collections::BTreeSet::new();
+            match store.list_channels_including_archived() {
+                Ok(channels) => {
+                    for channel in channels {
+                        if jig_pipeline::effect::canonical_did_string(&channel.sequencer_did) != me
+                        {
+                            continue;
+                        }
+                        if let Ok(moves) = store.channel_moves(&channel.id)
+                            && let Some(last) = moves.into_iter().last()
+                            && jig_pipeline::handshake::same_did(&last.sequencer, &me)
+                        {
+                            seeded.insert((channel.id, last.block_cid));
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("listing channels to resume re-offers: {e}");
+                    return due;
+                }
+            }
+            *due = Some(seeded);
+        }
+        due
+    }
+
+    fn keep_reoffer(&self, channel_id: String, set_cid: String) {
+        self.reoffers_due()
+            .get_or_insert_default()
+            .insert((channel_id, set_cid));
+    }
+
+    /// Make the re-offers a failure or a restart left unmade.
+    async fn resume_reoffers(&self) {
+        let pending: Vec<(String, String)> = match self.reoffers_due().as_mut() {
+            Some(due) => std::mem::take(due).into_iter().collect(),
+            None => return,
+        };
+        for (channel_id, set_cid) in pending {
+            let channel = match self.store().get_channel_by_id(&channel_id) {
+                Ok(Some(channel)) => channel,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(channel = %channel_id, "resuming re-offers: {e}");
+                    self.keep_reoffer(channel_id, set_cid);
+                    continue;
+                }
+            };
+            if jig_pipeline::effect::canonical_did_string(&channel.sequencer_did) != self.me() {
+                continue;
+            }
+            if !self.reoffer_each(&channel, &set_cid).await {
+                self.keep_reoffer(channel_id, set_cid);
+            }
+        }
     }
 
     /// The servers holding a live share of `channel_id`, each with its
@@ -889,11 +1001,11 @@ impl Contracts {
         if self.suffix_conflict(&offer.attested_suffixes).is_some() {
             return Err(RefuseCode::SuffixConflict);
         }
-        // A re-offer of the grant this server held, or less, is accepted
-        // without its operator; a wider one waits as any offer does (DJ
-        // 2026-11-26).
+        // The takeover's re-offer of the grant this server held, or less, is
+        // accepted without its operator; a wider one, or any later offer from
+        // the new sequencer, waits as any offer does (DJ 2026-11-26).
         if let Some(earlier) = reoffer {
-            return Ok(if offer.grant.within(earlier.grant) {
+            return Ok(if earlier.first && offer.grant.within(earlier.grant) {
                 OfferPolicy::Accept
             } else {
                 policy
@@ -982,10 +1094,23 @@ impl Contracts {
                     .into_iter()
                     .next()
             })?;
+        // The re-offer is the first share with the new sequencer. A later
+        // offer from it changes a share this server holds with it: the move
+        // still names the sequencer, and the operator decides the offer
+        // (rule 11).
+        let held_with_new = [OfferState::Accepted, OfferState::Ending, OfferState::Ended]
+            .into_iter()
+            .any(|state| {
+                store
+                    .contract_offers_for(&channel_id, &moved.sequencer, Side::Follower, state)
+                    .map(|offers| !offers.is_empty())
+                    .unwrap_or(true)
+            });
         let named = named_sequencer(&offer.creation_block)?;
         Some(Reoffer {
             grant: earlier.grant,
             named,
+            first: !held_with_new,
         })
     }
 
@@ -1063,6 +1188,7 @@ impl Contracts {
             }
         }
         self.deliver_ends().await;
+        self.resume_reoffers().await;
     }
 
     /// Send each end this server decided on to the other side, and once it
@@ -1140,6 +1266,9 @@ impl Contracts {
 struct Reoffer {
     grant: Grant,
     named: String,
+    /// No share with the new sequencer yet: this is the takeover's re-offer,
+    /// which a grant within the earlier one accepts without the operator.
+    first: bool,
 }
 
 /// A `contract-answer`'s message.
@@ -1577,7 +1706,7 @@ pub(crate) fn live_followers_before(
     channel_id: &str,
     seq: u64,
 ) -> anyhow::Result<Vec<(String, Grant)>> {
-    let mut live: std::collections::BTreeMap<String, Grant> = Default::default();
+    let mut live: std::collections::BTreeMap<String, ([u8; 32], Grant)> = Default::default();
     let mut from = 0;
     'chain: loop {
         let page = store.list_ingest_records_by_id(channel_id, from, 200)?;
@@ -1607,22 +1736,34 @@ pub(crate) fn live_followers_before(
                 continue;
             };
             if kind == Some(BlockKind::ContractEnd) {
-                live.remove(&to);
+                // An end closes the share it names, and only that one: an
+                // end of an older offer leaves a later accept live.
+                let ended = contracts::envelope(&manifest, contracts::END_KEY)
+                    .ok()
+                    .and_then(|e| ContractEnd::from_envelope(&e).ok())
+                    .map(|e| e.offer_id);
+                if let Some(ended) = ended
+                    && live.get(&to).is_some_and(|(id, _)| *id == ended)
+                {
+                    live.remove(&to);
+                }
                 continue;
             }
-            let grant = manifest
+            let offer = manifest
                 .metadata
                 .get(contracts::OFFER_KEY)
                 .and_then(|v| v.as_str())
                 .and_then(|o| base64::engine::general_purpose::STANDARD.decode(o).ok())
-                .and_then(|o| ContractOffer::from_envelope(&o).ok())
-                .map(|o| o.grant);
-            if let Some(grant) = grant {
-                live.insert(to, grant);
+                .and_then(|o| ContractOffer::from_envelope(&o).ok());
+            if let Some(offer) = offer {
+                live.insert(to, (offer.offer_id, offer.grant));
             }
         }
     }
-    Ok(live.into_iter().collect())
+    Ok(live
+        .into_iter()
+        .map(|(to, (_, grant))| (to, grant))
+        .collect())
 }
 
 /// The DID a creation block names as its channel's sequencer, canonical.
@@ -2624,6 +2765,27 @@ mod tests {
         // A server the channel did not move to.
         let third = SigningKey::from_bytes(&[8; 32]);
         assert!(contracts.judge(&offer_with(&third, Grant::Read)).is_err());
+
+        // Once this server holds a share with the new sequencer, a later
+        // offer from it is a change of that share: its operator decides it.
+        let reoffered = offer_with(&new, Grant::Write);
+        store
+            .put_contract_offer(&StoredOffer {
+                offer_id: reoffered.offer_id,
+                channel_id: channel.clone(),
+                side: Side::Follower,
+                peer_did: did_of(&new),
+                grant: Grant::Write,
+                state: OfferState::Accepted,
+                offer: reoffered.envelope.clone(),
+                answer: None,
+                share_cid: None,
+            })
+            .unwrap();
+        assert_eq!(
+            contracts.judge(&offer_with(&new, Grant::Read)),
+            Ok(OfferPolicy::Hold)
+        );
     }
 
     /// A re-offer that came before its move landed here is held, then

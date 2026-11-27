@@ -516,6 +516,22 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    /// Whether this server made an offer of `channel_id` to `peer_did` for
+    /// the share block `share_cid`, in any state.
+    pub fn has_owner_offer_for(
+        &self,
+        channel_id: &str,
+        peer_did: &str,
+        share_cid: &str,
+    ) -> crate::persist::Result<bool> {
+        Ok(self.conn.lock().expect("poisoned").query_row(
+            "SELECT EXISTS(SELECT 1 FROM contract_offers
+             WHERE channel_id = ?1 AND peer_did = ?2 AND side = ?3 AND share_cid = ?4)",
+            params![channel_id, peer_did, Side::Owner.as_str(), share_cid],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Keep the owner's key-link chain for an offer, verified already. A
     /// chain already kept for that offer stays as it is.
     pub fn put_offer_key_links(

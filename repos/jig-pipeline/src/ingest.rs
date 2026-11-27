@@ -1295,19 +1295,39 @@ pub async fn ingest(
                 },
             )?;
             // Step 6: persist block (+ its record) + receipt
-            let record = match signer.as_ref() {
-                Some(signer) => Some(ctx.store.insert_block_sequenced(&stored_block, signer)?),
-                None => {
+            let record = match (
+                signer.as_ref(),
+                takeover.as_ref(),
+                resolved_channel.as_ref(),
+            ) {
+                // JEP-0005 rule 11a: the move lands with its record, and from
+                // it on this server sequences the channel, in one write that
+                // checks the head and the slug again.
+                (Some(signer), Some(set), Some(chan)) => Some(
+                    ctx.store
+                        .insert_takeover_sequenced(
+                            &stored_block,
+                            signer,
+                            (set.head.seq, set.head.hash),
+                            &chan.slug,
+                            &server_did,
+                        )?
+                        .map_err(|detail| IngestError::MoveRefused { detail })?,
+                ),
+                (_, Some(_), _) => {
+                    return Err(IngestError::MoveRefused {
+                        detail: "this server signs no records for the channel".to_string(),
+                    });
+                }
+                (Some(signer), None, _) => {
+                    Some(ctx.store.insert_block_sequenced(&stored_block, signer)?)
+                }
+                (None, _, _) => {
                     ctx.store.insert_block(&stored_block)?;
                     None
                 }
             };
             witness_record(ctx, record.as_ref());
-            // JEP-0005 rule 11a: the move has its record, so from it on this
-            // server sequences the channel.
-            if takeover.is_some() {
-                ctx.store.take_over(&block_cid)?;
-            }
             // The receipt is written before fanout below, so no subscriber or peer sees the
             // block without it.
             if let Some(input) = render_input.take() {
@@ -1435,7 +1455,7 @@ fn refused_at_landing(refusal: Option<IngestError>, kind: &str) -> IngestError {
 thread_local! {
     /// Runs once, between the write gate and the landing transaction, so a
     /// test can sequence another block in exactly that window.
-    static BEFORE_LANDING: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+    pub(crate) static BEFORE_LANDING: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
 
