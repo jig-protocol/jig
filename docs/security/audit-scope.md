@@ -132,13 +132,17 @@ rest).
 reviewed now.
 - **MLS channels across servers (F2 Task 7)** are partly done. An encrypted channel federates
   under a share, and the follower checks each commit against its public copy of the group
-  (JEP-0005 rule 19). Still missing: after a `contract-end`, members are not removed. The
-  client shows a notice and removes no one, though JEP-0005 rule 11 calls for removing leaves
-  reachable only through that follower.
+  (JEP-0005 rule 19). After a `contract-end`, JEP-0005 rule 11 calls for removing leaves
+  reachable only through that follower. This is a prompted client command,
+  `jig channel prune <channel> --via <server-did> [--yes]`, not automatic (DJ 2026-11-26). It
+  judges from the owner's `last_via` and the members' reachability records, and keeps anyone a
+  record places on another server (`jig-cli/src/cmd/prune.rs`).
 - **Key-package custodians (Task 8)** are partly done (#440). These shipped: signed custody
   requests (JEP-0005 rule 21a), hourly limits, the release log, and the operator's interim
-  release policy (rule 21b). Still missing: release policies that DIDs sign, held requests and
-  approvals, the Welcome mailbox, and one package per device (rule 21b).
+  release policy, now the fallback for a DID with no policy of its own (rule 21b). Release
+  policies that DIDs sign (21b), and held requests and their decisions (21c), are specified,
+  with their signed objects in `jig-core/src/contract.rs`; the custodian's routes and the
+  client are not built yet. The Welcome mailbox and one package per device are later work.
 - **Leaving a server (JEP-0017)** is specified. R1, ending custody, is built: the server side
   in #440, and `jig server custody off|on` with its key rotation in #461. R2, ending local
   adds, is built in #463 (`jig server local-adds off|on`). R3, erasure, is not built.

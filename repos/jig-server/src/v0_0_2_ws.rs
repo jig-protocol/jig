@@ -671,6 +671,10 @@ fn authorize_subscribe(
 
 // ---- Per-frame dispatch ----------------------------------------------------
 
+/// The error code for a `head` frame on a connection whose welcome did not
+/// grant `heads`.
+pub(crate) const HEADS_NOT_NEGOTIATED: &str = "HEADS_NOT_NEGOTIATED";
+
 async fn handle_client_frame(
     text: &str,
     state: &Arc<AppState>,
@@ -1198,6 +1202,23 @@ async fn handle_client_frame(
             Ok(())
         }
 
+        // ------------------------------------------------------------------ Head
+        // Head gossip (JEP-0002 rule 10), on a connection whose welcome
+        // granted it. This server grants it to none yet, so every `head` is
+        // answered with an ordinary error and the connection stays up, as it
+        // does for a frame a server predating heads cannot parse.
+        Frame::Head { .. } => {
+            let _ = send_error(
+                socket,
+                Some(400),
+                HEADS_NOT_NEGOTIATED,
+                None,
+                "head frames need the heads capability, which this welcome did not grant",
+            )
+            .await;
+            Ok(())
+        }
+
         // ------------------------------------------------------------------ CatchUp
         Frame::CatchUp { since_hlc: _ } => {
             // v0.0.2 stub: cursor-based replay is deferred to Phase D6 / Phase F.
@@ -1236,6 +1257,9 @@ pub(crate) fn handshake_capabilities(state: &AppState) -> jig_pipeline::handshak
         // The request-proof versions this server accepts; `negotiate` signs
         // those the hello listed.
         request_auth: vec![jig_core::request_auth::VERSION.to_string()],
+        // Not yet: this server neither checks nor forwards `head` frames, so
+        // it grants none.
+        heads: false,
     }
 }
 
@@ -2362,14 +2386,18 @@ mod tests {
 
     /// A drain that runs out cuts a session that is still open (here, one
     /// waiting for a Close reply that never comes), and the session's cleanup
-    /// still runs before the server returns: the connection gauge is back
-    /// where it started.
+    /// still runs before the server returns: its subscription is gone from
+    /// this server's fanout.
+    ///
+    /// The check reads this test's own server, not the process-wide
+    /// connection gauge, which other tests move while this one runs (#513).
     #[tokio::test]
     async fn a_cut_session_still_cleans_up() {
         let state = Arc::new(AppState::for_test().unwrap());
+        seed_channel(&state, "#cut");
         let app = Router::new()
             .route("/api/v1/ws", get(ws_handler))
-            .with_state(state);
+            .with_state(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}/api/v1/ws", listener.local_addr().unwrap());
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -2385,10 +2413,27 @@ mod tests {
             std::future::pending,
         ));
 
-        let before = metrics::snapshot().connections_active;
-        // Never read: the session waits for a Close reply until it is cut.
-        let silent = established(&url).await;
-        assert_eq!(metrics::snapshot().connections_active, before + 1);
+        // Read no further: the session waits for a Close reply until it is cut.
+        let mut silent = established(&url).await;
+        let sub = signed_subscribe_frame(
+            &test_identity(),
+            &audience(&state),
+            Scope::Channel {
+                slug: "#cut".into(),
+            },
+        );
+        silent
+            .send(TMessage::Text(serde_json::to_string(&sub).unwrap().into()))
+            .await
+            .unwrap();
+        let fanout = &state.ingest_ctx.fanout;
+        for _ in 0..300 {
+            if fanout.local_subscription_count().await == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(fanout.local_subscription_count().await, 1, "subscribed");
         stop_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(5), served)
             .await
@@ -2396,8 +2441,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            metrics::snapshot().connections_active,
-            before,
+            fanout.local_subscription_count().await,
+            0,
             "the cut session ran its cleanup"
         );
         drop(silent);
@@ -3313,5 +3358,35 @@ mod tests {
             other => panic!("expected UNSUPPORTED_VERSION, got {other:?}"),
         }
         assert_eq!(close_code(&mut ws).await, Some(close::PROTOCOL_VIOLATION));
+    }
+
+    /// A `head` frame on a connection whose welcome did not grant `heads` is
+    /// an ordinary error, and the connection goes on: what a server that
+    /// predates heads does with a frame it cannot parse.
+    #[tokio::test]
+    async fn a_head_without_the_heads_grant_is_an_ordinary_error() {
+        let (_state, url) = start_test_server().await;
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+        handshake(&mut ws).await;
+        let head = Envelope::new(Frame::Head {
+            channel_id: jig_pipeline::ingest_record::label_cid("Create"),
+            record_b64: String::new(),
+        });
+        ws.send(TMessage::Text(serde_json::to_string(&head).unwrap().into()))
+            .await
+            .unwrap();
+        match next_frame(&mut ws).await.frame {
+            Frame::Error { code, status, .. } => {
+                assert_eq!(code, HEADS_NOT_NEGOTIATED);
+                assert_eq!(status, Some(400));
+            }
+            other => panic!("expected {HEADS_NOT_NEGOTIATED}, got {other:?}"),
+        }
+        // Still up: a malformed frame is answered on it.
+        ws.send(TMessage::Text("{not json".into())).await.unwrap();
+        match next_frame(&mut ws).await.frame {
+            Frame::Error { code, .. } => assert_eq!(code, "BAD_JSON"),
+            other => panic!("expected BAD_JSON, got {other:?}"),
+        }
     }
 }

@@ -541,6 +541,11 @@ impl Contracts {
                         }),
                     )
                     .await?;
+                    // The follower carries nothing of the channel yet, so a
+                    // block pushed from here on is not one it can land: send
+                    // it the chain from its start. The pull on its timer
+                    // stays the fallback.
+                    self.stream.push_from(to, &channel.id, 0)?;
                 } else if matches!(
                     kept.state,
                     OfferState::Withdrawn | OfferState::Ending | OfferState::Ended
@@ -2870,11 +2875,33 @@ mod tests {
     async fn only_the_connections_peer_sequences_what_it_streams() {
         let p = pair(OfferPolicy::Accept).await;
         let channel = p.shared(1).await;
+        // The owner sends an accepted follower the channel at once; wait for
+        // it, then cut the link so nothing more is pushed.
+        let head = p.caught_up(&channel).await;
+        p.dial.abort();
+        eventually("the link down", || {
+            p.follower
+                .peers
+                .sender_for(&p.owner.server_did)
+                .is_none()
+                .then_some(())
+        })
+        .await;
+        // One more block on the owner: records the follower doesn't have.
+        p.text(&channel, "after the link").await;
         let records = Contracts::new(&p.owner)
             .stream
-            .records_from(&channel, 0)
+            .records_from(&channel, head + 1)
             .unwrap()
             .unwrap();
+        let follower = &p.follower.ingest_ctx.store;
+        let count = |store: &jig_pipeline::persist::SqliteStore| {
+            store
+                .list_ingest_records_by_id(&channel, 0, usize::MAX)
+                .unwrap()
+                .len()
+        };
+        let before = count(follower);
         // The owner's own blocks and records, landed as if another server
         // sent them: the sequencer is the connection's peer, and this one
         // holds no share and sequences nothing.
@@ -2884,17 +2911,15 @@ mod tests {
                 .as_bytes(),
         );
         p.follows.stream.land(&stranger, records.clone()).await;
-        let follower = &p.follower.ingest_ctx.store;
-        assert!(
-            follower
-                .get_channel_by_id_including_archived(&channel)
-                .unwrap()
-                .is_none(),
-            "no row for a stream from a server that does not own the channel"
+        assert_eq!(Pair::head(&p.follower, &channel), Some(head));
+        assert_eq!(
+            count(follower),
+            before,
+            "a stream from a server that does not own the channel lands nothing"
         );
         // From the owner, the same frame lands.
         p.follows.stream.land(&p.owner.server_did, records).await;
-        assert!(follower.get_channel_by_id(&channel).unwrap().is_some());
+        assert!(Pair::head(&p.follower, &channel) > Some(head));
     }
 
     #[tokio::test]
@@ -3137,6 +3162,29 @@ mod tests {
         assert_eq!(pushed.len(), 1, "{pushed:?}");
         assert_eq!(pushed[0].0, crate::v0_0_2_stream::RECORDS_FRAME);
         assert!(sent(&mut delisted_rx).is_empty(), "nothing pushed");
+    }
+
+    /// Once the owner records a follower's accept, it sends the follower the
+    /// channel from its start, so the follower carries it at once: the pair
+    /// runs no pull timer, and nothing here pulls.
+    #[tokio::test]
+    async fn an_accepted_share_is_carried_without_waiting_for_a_pull() {
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.shared(3).await;
+        let want = p.caught_up(&channel).await;
+        assert_eq!(
+            want,
+            4 + 1,
+            "the create, three posts, the share and the accept"
+        );
+        let row = p
+            .follower
+            .ingest_ctx
+            .store
+            .get_channel_by_id(&channel)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.sequencer_did, p.owner.server_did.to_did_jig_string());
     }
 
     #[tokio::test(start_paused = true)]
