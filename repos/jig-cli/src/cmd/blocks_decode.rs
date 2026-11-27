@@ -171,6 +171,11 @@ pub fn present(opened: &OpenedBlock, receipts: &[ReceiptRef], seen: &Seen) -> Op
         Seen::Added { member } => system(format!("{} was added", shorten_did(member))),
         Seen::Removed { member } => system(format!("{} was removed", shorten_did(member))),
         Seen::Left { member, .. } => system(format!("{} left", shorten_did(member))),
+        Seen::Linked { old, new, .. } => system(format!(
+            "{} moved to a new key, {}",
+            shorten_did(old),
+            shorten_did(new)
+        )),
         Seen::Gone => system("you are no longer in this channel".into()),
         Seen::Broken { reason } => {
             system(format!("could not follow a membership change: {reason}"))

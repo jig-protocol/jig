@@ -211,13 +211,6 @@ pub fn classify_with_wait(
         IngestError::KeyLinkRefused { .. } => {
             (StatusCode::CONFLICT, "KEY_LINK_REFUSED", e.to_string())
         }
-        // 409: an encrypted channel takes no key link until the MLS leaf
-        // swap exists (JEP-0005 rule 7b).
-        IngestError::MlsKeyLinkUnsupported { .. } => (
-            StatusCode::CONFLICT,
-            "MLS_KEY_LINK_UNSUPPORTED",
-            e.to_string(),
-        ),
         // 409: the owner moved the channel to another server (JEP-0005 rule
         // 11a); the message names it.
         IngestError::SequencerMoved { .. } => {

@@ -331,7 +331,6 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         | IngestError::CarriedChannel { .. }
         | IngestError::MoveRefused { .. }
         | IngestError::KeyLinkRefused { .. }
-        | IngestError::MlsKeyLinkUnsupported { .. }
         | IngestError::SequencerMoved { .. }
         | IngestError::RelayedOutsideShare { .. }
         | IngestError::GrantRefused { .. }

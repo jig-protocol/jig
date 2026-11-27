@@ -231,7 +231,12 @@ impl Reader {
         };
         let seen = secure.observe(&self.slug, &opened);
         let tidy = match &seen {
-            jig_client::secure::Seen::Left { member, tidy: true } => Some(member.clone()),
+            jig_client::secure::Seen::Left { member, tidy: true }
+            | jig_client::secure::Seen::Linked {
+                old: member,
+                tidy: true,
+                ..
+            } => Some(member.clone()),
             _ => None,
         };
         Ok(Read {

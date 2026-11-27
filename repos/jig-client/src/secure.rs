@@ -56,6 +56,14 @@ use crate::open::{Authenticity, OpenedBlock};
 pub enum SecureError {
     #[error(transparent)]
     Mls(#[from] jig_mls::MlsError),
+    /// A key link moved `did` to a new key (JEP-0005 rule 7b), and `did`'s
+    /// old leaf is still in this member's copy of the group: anything sent
+    /// now would be readable with the old key. It is committed out first.
+    #[error(
+        "{did} moved to a new key, and its old leaf is still in this member's copy of the \
+         group; it must be committed out before anything is sent"
+    )]
+    LinkedLeafInGroup { did: String },
     #[error("MLS state at {path:?}: {source}")]
     Io {
         path: PathBuf,
@@ -117,6 +125,16 @@ pub enum Seen {
     /// Someone left. When `tidy` is set, their leaf is still in this member's
     /// copy of the tree and this member should commit its removal.
     Left { member: String, tidy: bool },
+    /// `old` moved to the key `new` by a key link (JEP-0005 rule 7b): `new`
+    /// holds `old`'s place in the channel, and `old` none. When `tidy` is
+    /// set, this member should commit `old`'s leaf out: a member whose copy
+    /// of the tree still holds it, or `new` itself, which first rejoins by
+    /// its own external commit ([`Session::linked_from`]).
+    Linked {
+        old: String,
+        new: String,
+        tidy: bool,
+    },
     /// This member was removed, or left; its copy of the group is gone.
     Gone,
     /// A membership change this member could not follow.
@@ -185,6 +203,21 @@ struct Groups {
     /// by its slug have been filed under its channel id as well (#432).
     #[serde(default)]
     keyed_by_id: bool,
+    /// `server|slug` → the DID this device's key was linked from in that
+    /// channel (JEP-0005 rule 7b), until this device has rejoined the group
+    /// and the old DID's leaf is out.
+    #[serde(default)]
+    linked: HashMap<String, String>,
+    /// `server|slug` → DIDs a key link moved away from in that channel
+    /// (JEP-0005 rule 7b). While one's leaf is still in this member's copy
+    /// of the group, nothing is encrypted for it ([`Session::encrypt`]).
+    #[serde(default)]
+    linked_away: HashMap<String, Vec<String>>,
+    /// `server|slug` → CID of the join by external commit this device sent
+    /// and has not seen land ([`Session::join_sent`]). While one is here,
+    /// the group it prepared is not proof of being in.
+    #[serde(default)]
+    joining: HashMap<String, String>,
 }
 
 /// Epochs `from..until` of one group this device was in; `until` is unset
@@ -526,6 +559,24 @@ impl Session {
         self.with_member(|m, g| Ok(group_of(g, &key).is_some_and(|gid| m.has_group(&gid))))
     }
 
+    /// The DID this device's key was linked from in `server`/`slug`, while
+    /// it still has to rejoin the group and commit that DID's leaf out
+    /// (JEP-0005 rule 7b).
+    pub fn linked_from(&self, server: &str, slug: &str) -> Result<Option<String>> {
+        let key = group_key(server, slug);
+        self.with_member(|_, g| Ok(g.linked.get(&key).cloned()))
+    }
+
+    /// The old leaf is out, or another member took it out: nothing is left
+    /// to do for the link in `server`/`slug`.
+    pub fn link_settled(&self, server: &str, slug: &str) -> Result<()> {
+        let key = group_key(server, slug);
+        self.with_member(|_, g| {
+            g.linked.remove(&key);
+            Ok(())
+        })
+    }
+
     /// The id of the MLS group this device holds for `server`/`slug`, if it
     /// holds one: what [`created_group_id`] is compared against.
     pub fn group_id(&self, server: &str, slug: &str) -> Result<Option<Vec<u8>>> {
@@ -599,7 +650,22 @@ impl Session {
         key_package: &[u8],
         did: &str,
     ) -> Result<Commit> {
-        self.with_group(server, slug, |m, gid| Ok(m.add(gid, key_package, did)?))
+        // The welcome and the new epoch would reach the old key too, and
+        // the member added never saw the link to hold back its own sends
+        // (JEP-0005 rule 7b). Removing a linked DID stays open: that is the
+        // tidy-up.
+        let key = group_key(server, slug);
+        self.with_member(|m, g| {
+            // Judged under the lock the add runs under: a link recorded
+            // between the two would otherwise go unseen.
+            if let Some(did) = linked_leaves_in(m, g, &key)?.into_iter().next() {
+                return Err(SecureError::LinkedLeafInGroup { did });
+            }
+            let gid = group_of(g, &key)
+                .filter(|gid| m.has_group(gid))
+                .ok_or_else(|| SecureError::NoGroup(slug.to_string()))?;
+            Ok(m.add(&gid, key_package, did)?)
+        })
     }
 
     pub fn prepare_remove(&self, server: &str, slug: &str, did: &str) -> Result<Commit> {
@@ -617,6 +683,35 @@ impl Session {
                 m.forget(&gid)?;
             }
             g.drop_group(&key);
+            g.joining.remove(&key);
+            Ok(())
+        })
+    }
+
+    /// The join by external commit prepared for `server`/`slug` was sent as
+    /// the block `cid`; until [`Self::join_landed`] or [`Self::discard_join`],
+    /// whether it landed is unknown.
+    pub fn join_sent(&self, server: &str, slug: &str, cid: &str) -> Result<()> {
+        let key = group_key(server, slug);
+        self.with_member(|_, g| {
+            g.joining.insert(key, cid.to_string());
+            Ok(())
+        })
+    }
+
+    /// The CID of a join to `server`/`slug` sent and not yet seen to land:
+    /// reading its echo in the channel's history clears it, whatever read
+    /// does the reading.
+    pub fn join_unconfirmed(&self, server: &str, slug: &str) -> Result<Option<String>> {
+        let key = group_key(server, slug);
+        self.with_member(|_, g| Ok(g.joining.get(&key).cloned()))
+    }
+
+    /// The join sent to `server`/`slug` landed: its group is this device's.
+    pub fn join_landed(&self, server: &str, slug: &str) -> Result<()> {
+        let key = group_key(server, slug);
+        self.with_member(|_, g| {
+            g.joining.remove(&key);
             Ok(())
         })
     }
@@ -644,8 +739,30 @@ impl Session {
     }
 
     /// Encrypt `text` for the channel. Returns the MLS message and its epoch.
+    ///
+    /// Refused while a DID a key link moved away from still has a leaf in
+    /// this member's copy of the group ([`SecureError::LinkedLeafInGroup`]):
+    /// the old key would read it. [`Self::linked_leaves`] names them.
     pub fn encrypt(&self, server: &str, slug: &str, text: &str) -> Result<(Vec<u8>, u64)> {
-        self.with_group(server, slug, |m, gid| Ok(m.encrypt(gid, text.as_bytes())?))
+        let key = group_key(server, slug);
+        self.with_member(|m, g| {
+            // One lock for the check and the encryption, as in `prepare_add`.
+            if let Some(did) = linked_leaves_in(m, g, &key)?.into_iter().next() {
+                return Err(SecureError::LinkedLeafInGroup { did });
+            }
+            let gid = group_of(g, &key)
+                .filter(|gid| m.has_group(gid))
+                .ok_or_else(|| SecureError::NoGroup(slug.to_string()))?;
+            Ok(m.encrypt(&gid, text.as_bytes())?)
+        })
+    }
+
+    /// The DIDs a key link moved away from in `server`/`slug` whose leaves
+    /// are still in this member's copy of the group (JEP-0005 rule 7b): what
+    /// must be committed out before this member sends.
+    pub fn linked_leaves(&self, server: &str, slug: &str) -> Result<Vec<String>> {
+        let key = group_key(server, slug);
+        self.with_member(|m, g| linked_leaves_in(m, g, &key))
     }
 
     /// File the plaintext of a block this member sent or read.
@@ -957,7 +1074,10 @@ impl Session {
         // member commit someone's removal with its own key.
         if block.authenticity != Authenticity::Verified {
             let reason = "unsigned block; ignored".to_string();
-            if matches!(kind, BlockKind::MemberAdd | BlockKind::MemberRemove) {
+            if matches!(
+                kind,
+                BlockKind::MemberAdd | BlockKind::MemberRemove | BlockKind::KeyLink
+            ) {
                 return Ok(Seen::Broken { reason });
             }
             if block.manifest.content_suite().is_encrypted() {
@@ -997,6 +1117,47 @@ impl Session {
             | BlockKind::ChannelArchive
             | BlockKind::RoleAssign
             | BlockKind::RoleUnassign => Ok(Seen::Control),
+            BlockKind::KeyLink => {
+                let channel_id = channel
+                    .map(|c| c.id)
+                    .filter(|id| !id.is_empty())
+                    .or_else(|| block.meta_str(jig_pipeline::ingest::CHANNEL_ID_KEY))
+                    .unwrap_or_default()
+                    .to_string();
+                let Some((old, new)) = jig_core::sequencer_move::key_link_dids(
+                    &block.manifest.metadata,
+                    &block.sender,
+                    &channel_id,
+                ) else {
+                    return Ok(Seen::Control);
+                };
+                let canonical = jig_pipeline::effect::canonical_did_string;
+                let (old, new) = (canonical(&old), canonical(&new));
+                self.once(block, &key, |m, g| {
+                    let gid = group_of(g, &key).filter(|gid| m.has_group(gid));
+                    let away = g.linked_away.entry(key.clone()).or_default();
+                    if !away.contains(&old) {
+                        away.push(old.clone());
+                    }
+                    if new == me {
+                        // This device's new key: it rejoins, then commits the
+                        // old leaf out, unless it holds the group already.
+                        if gid.is_none() {
+                            g.linked.insert(key.clone(), old.clone());
+                        }
+                        return Ok(Seen::Linked {
+                            old,
+                            new,
+                            tidy: true,
+                        });
+                    }
+                    let tidy = match gid {
+                        Some(gid) => m.members(&gid)?.contains(&old),
+                        None => false,
+                    };
+                    Ok(Seen::Linked { old, new, tidy })
+                })
+            }
             BlockKind::MemberAdd => {
                 let Some(commit) = commit else {
                     return Ok(Seen::Control);
@@ -1127,10 +1288,21 @@ impl Session {
         f: impl FnOnce(&Member, &mut Groups) -> Result<Seen>,
     ) -> Result<Seen> {
         self.with_member(|m, g| {
+            // The echo of a join this device sent with no answer: proof it
+            // landed, kept before any head moves past it, however this read
+            // ends ([`Session::join_sent`]).
+            if g.joining.get(key) == Some(&block.cid) {
+                g.joining.remove(key);
+            }
             if let Some(seen) = g.seen.get(&block.cid) {
                 return Ok(match seen.clone() {
                     Seen::Left { member, .. } => Seen::Left {
                         member,
+                        tidy: false,
+                    },
+                    Seen::Linked { old, new, .. } => Seen::Linked {
+                        old,
+                        new,
                         tidy: false,
                     },
                     other => other,
@@ -1418,6 +1590,24 @@ fn follow(
 
 fn group_of(g: &Groups, key: &str) -> Option<Vec<u8>> {
     g.groups.get(key).and_then(|h| hex::decode(h).ok())
+}
+
+/// The DIDs a key link moved away from in the channel `key` names whose
+/// leaves are still in `m`'s copy of its group ([`Session::linked_leaves`]),
+/// read under the caller's lock.
+fn linked_leaves_in(m: &Member, g: &Groups, key: &str) -> Result<Vec<String>> {
+    let Some(away) = g.linked_away.get(key) else {
+        return Ok(Vec::new());
+    };
+    let Some(gid) = group_of(g, key).filter(|gid| m.has_group(gid)) else {
+        return Ok(Vec::new());
+    };
+    let members = m.members(&gid)?;
+    Ok(away
+        .iter()
+        .filter(|d| members.contains(d))
+        .cloned()
+        .collect())
 }
 
 /// The id of the MLS group a channel's creation block starts, from the
@@ -2351,6 +2541,253 @@ mod tests {
             }
         );
         assert_eq!(bob.observe(SERVER, &deliver(&leave)), Seen::Gone);
+    }
+
+    /// `new`'s `key-link` from `old` for the channel `channel_id` (JEP-0005
+    /// rule 7b).
+    fn key_link_block(
+        old: &ed25519_dalek::SigningKey,
+        new: &ed25519_dalek::SigningKey,
+        channel_id: &str,
+    ) -> BuiltBlock {
+        let id: cid::Cid = channel_id.parse().unwrap();
+        let link = jig_core::key_link::SignedKeyLink::sign(
+            old,
+            new,
+            jig_core::key_link::Audience::Channel {
+                channel_id: id.to_bytes(),
+            },
+            1_700_000_000,
+        )
+        .unwrap();
+        let meta = jig_core::sequencer_move::KeyLinkBlock {
+            channel_id: channel_id.to_string(),
+            link,
+        }
+        .to_metadata();
+        build_with_metadata(
+            &Identity::from_signing_key(new.clone()),
+            BlockKind::KeyLink,
+            HlcTimestamp::now_wall(jig_core::Did::from_ed25519_pubkey(&[1; 32])),
+            serde_json::Value::Object(meta.into_iter().collect()),
+        )
+    }
+
+    /// A member that read a key link sends nothing while the old leaf is in
+    /// its copy of the group (JEP-0005 rule 7b): Carol's tidy-up did not land,
+    /// so her send is refused rather than encrypted for the old key; once the
+    /// leaf is out, she sends.
+    #[test]
+    fn a_member_sends_nothing_while_a_linked_leaf_is_in_its_group() {
+        let root = tempfile::tempdir().unwrap();
+        let (bob_key, bob2_key) = (
+            jig_core::crypto::ed25519::generate_signing_key(),
+            jig_core::crypto::ed25519::generate_signing_key(),
+        );
+        let alice = session(root.path());
+        let carol = session(root.path());
+        let bob = Session::open(root.path(), Identity::from_signing_key(bob_key.clone())).unwrap();
+        alice.create_group(SERVER, "#sealed").unwrap();
+        let add_bob = add_block(&alice, "#sealed", &bob);
+        bob.observe(SERVER, &deliver(&add_bob));
+        let add_carol = add_block(&alice, "#sealed", &carol);
+        carol.observe(SERVER, &deliver(&add_carol));
+
+        let chan = jig_pipeline::ingest_record::label_cid("#sealed-channel");
+        let read = ReadIn {
+            key: "#sealed",
+            id: &chan,
+            slug: "#sealed",
+        };
+        let link = deliver(&key_link_block(&bob_key, &bob2_key, &chan));
+        assert!(matches!(
+            carol.observe_in(SERVER, Some(&read), &link),
+            Seen::Linked { tidy: true, .. }
+        ));
+        assert_eq!(
+            carol.linked_leaves(SERVER, "#sealed").unwrap(),
+            vec![bob.did().to_string()]
+        );
+        // Her tidy-up did not land: nothing is encrypted for the old key.
+        assert!(matches!(
+            carol.encrypt(SERVER, "#sealed", "hi"),
+            Err(SecureError::LinkedLeafInGroup { did }) if did == bob.did()
+        ));
+
+        // Alice's lands, and Carol follows it.
+        let removed = alice.prepare_remove(SERVER, "#sealed", bob.did()).unwrap();
+        alice.confirm(SERVER, "#sealed").unwrap();
+        let remove = build_with_metadata(
+            identity_of(&alice),
+            BlockKind::MemberRemove,
+            hlc(&alice),
+            json!({"channel": "#sealed", "member_did": bob.did(),
+                "mls_commit": STANDARD.encode(&removed.commit)}),
+        );
+        assert!(matches!(
+            carol.observe(SERVER, &deliver(&remove)),
+            Seen::Removed { .. }
+        ));
+        assert!(carol.linked_leaves(SERVER, "#sealed").unwrap().is_empty());
+        carol.encrypt(SERVER, "#sealed", "hi").unwrap();
+    }
+
+    /// Nor does she add anyone while the old leaf is there (JEP-0005 rule
+    /// 7b): the new epoch and the welcome would reach the old key, and the
+    /// member added never saw the link. Her removal of the linked DID, the
+    /// tidy-up itself, stays open; once the leaf is out, the add goes through.
+    #[test]
+    fn a_member_adds_no_one_while_a_linked_leaf_is_in_its_group() {
+        let root = tempfile::tempdir().unwrap();
+        let (bob_key, bob2_key) = (
+            jig_core::crypto::ed25519::generate_signing_key(),
+            jig_core::crypto::ed25519::generate_signing_key(),
+        );
+        let carol = session(root.path());
+        let erin = session(root.path());
+        let bob = Session::open(root.path(), Identity::from_signing_key(bob_key.clone())).unwrap();
+        carol.create_group(SERVER, "#sealed").unwrap();
+        bob.observe(SERVER, &deliver(&add_block(&carol, "#sealed", &bob)));
+
+        let chan = jig_pipeline::ingest_record::label_cid("#sealed-channel");
+        let read = ReadIn {
+            key: "#sealed",
+            id: &chan,
+            slug: "#sealed",
+        };
+        carol.observe_in(
+            SERVER,
+            Some(&read),
+            &deliver(&key_link_block(&bob_key, &bob2_key, &chan)),
+        );
+        let kp = erin.key_packages(1, false).unwrap().remove(0);
+        assert!(matches!(
+            carol.prepare_add(SERVER, "#sealed", &kp, erin.did()),
+            Err(SecureError::LinkedLeafInGroup { did }) if did == bob.did()
+        ));
+
+        // The tidy-up is allowed, and lands; then the add goes through.
+        carol.prepare_remove(SERVER, "#sealed", bob.did()).unwrap();
+        carol.confirm(SERVER, "#sealed").unwrap();
+        assert!(carol.linked_leaves(SERVER, "#sealed").unwrap().is_empty());
+        carol
+            .prepare_add(SERVER, "#sealed", &kp, erin.did())
+            .unwrap();
+    }
+
+    /// JEP-0005 rule 7b on an encrypted channel, as members see it. A
+    /// member whose tree still holds the old leaf is asked to commit it out;
+    /// so is the new key, which first rejoins ([`Session::linked_from`]);
+    /// a replay asks nothing again. Once a member commits the old leaf out,
+    /// the old key reads nothing more: if the new device goes silent after
+    /// joining, any other member takes the leaf out.
+    #[test]
+    fn a_key_link_asks_for_the_old_leaf_to_be_taken_out() {
+        let root = tempfile::tempdir().unwrap();
+        let (bob_key, bob2_key) = (
+            jig_core::crypto::ed25519::generate_signing_key(),
+            jig_core::crypto::ed25519::generate_signing_key(),
+        );
+        let alice = session(root.path());
+        let bob = Session::open(root.path(), Identity::from_signing_key(bob_key.clone())).unwrap();
+        let bob2 =
+            Session::open(root.path(), Identity::from_signing_key(bob2_key.clone())).unwrap();
+        alice.create_group(SERVER, "#sealed").unwrap();
+        bob.observe(SERVER, &deliver(&add_block(&alice, "#sealed", &bob)));
+
+        let chan = jig_pipeline::ingest_record::label_cid("#sealed-channel");
+        let read = ReadIn {
+            key: "#sealed",
+            id: &chan,
+            slug: "#sealed",
+        };
+        let link = deliver(&key_link_block(&bob_key, &bob2_key, &chan));
+        let linked = |tidy| Seen::Linked {
+            old: bob.did().to_string(),
+            new: bob2.did().to_string(),
+            tidy,
+        };
+        assert_eq!(alice.observe_in(SERVER, Some(&read), &link), linked(true));
+        assert_eq!(alice.observe_in(SERVER, Some(&read), &link), linked(false));
+        assert_eq!(bob2.observe_in(SERVER, Some(&read), &link), linked(true));
+        assert_eq!(
+            bob2.linked_from(SERVER, "#sealed").unwrap().as_deref(),
+            Some(bob.did())
+        );
+
+        // Alice, not the new device, takes the old leaf out.
+        let removed = alice.prepare_remove(SERVER, "#sealed", bob.did()).unwrap();
+        alice.confirm(SERVER, "#sealed").unwrap();
+        let remove = build_with_metadata(
+            identity_of(&alice),
+            BlockKind::MemberRemove,
+            hlc(&alice),
+            json!({"channel": "#sealed", "member_did": bob.did(),
+                "mls_commit": STANDARD.encode(&removed.commit)}),
+        );
+        assert_eq!(bob.observe(SERVER, &deliver(&remove)), Seen::Gone);
+        let after = say(&alice, "#sealed", "after the link");
+        assert!(matches!(
+            bob.observe(SERVER, &deliver(&after)),
+            Seen::Sealed { .. } | Seen::BeforeJoin
+        ));
+        bob2.link_settled(SERVER, "#sealed").unwrap();
+        assert_eq!(bob2.linked_from(SERVER, "#sealed").unwrap(), None);
+    }
+
+    /// A join sent with no answer stays unconfirmed, the group it prepared
+    /// with it, until it is seen to land or is dropped; dropping it forgets
+    /// both, so the next settle-up joins again.
+    #[test]
+    fn a_join_without_an_answer_is_unconfirmed_until_settled() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let bob = session(root.path());
+        let created = alice.create_group(SERVER, "#open").unwrap();
+        bob.prepare_join(SERVER, "#open", &created.group_info)
+            .unwrap();
+        bob.join_sent(SERVER, "#open", "the join").unwrap();
+        assert_eq!(
+            bob.join_unconfirmed(SERVER, "#open").unwrap().as_deref(),
+            Some("the join")
+        );
+        assert!(bob.has_group(SERVER, "#open").unwrap());
+        bob.discard_join(SERVER, "#open").unwrap();
+        assert_eq!(bob.join_unconfirmed(SERVER, "#open").unwrap(), None);
+        assert!(!bob.has_group(SERVER, "#open").unwrap());
+
+        bob.prepare_join(SERVER, "#open", &created.group_info)
+            .unwrap();
+        bob.join_sent(SERVER, "#open", "the second join").unwrap();
+        bob.join_landed(SERVER, "#open").unwrap();
+        assert_eq!(bob.join_unconfirmed(SERVER, "#open").unwrap(), None);
+        assert!(bob.has_group(SERVER, "#open").unwrap());
+    }
+
+    /// A join that landed with its answer lost is settled by any read that
+    /// meets its echo, before that read's head moves past it: a later check
+    /// that reads only after the head does not see the echo, and must not
+    /// take its absence for a join that failed.
+    #[test]
+    fn reading_a_joins_echo_settles_it() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let bob = session(root.path());
+        let created = alice.create_group(SERVER, "#open").unwrap();
+        let c = bob
+            .prepare_join(SERVER, "#open", &created.group_info)
+            .unwrap();
+        let join = build_with_metadata(
+            identity_of(&bob),
+            BlockKind::MemberAdd,
+            hlc(&bob),
+            json!({"channel": "#open", "member_did": bob.did(),
+                "mls_commit": STANDARD.encode(&c.commit)}),
+        );
+        bob.join_sent(SERVER, "#open", &join.cid()).unwrap();
+        bob.observe(SERVER, &deliver(&join));
+        assert_eq!(bob.join_unconfirmed(SERVER, "#open").unwrap(), None);
+        assert!(bob.has_group(SERVER, "#open").unwrap());
     }
 
     fn unsigned(b: &BuiltBlock) -> OpenedBlock {
