@@ -1,6 +1,7 @@
 //! Jig CLI - block-first command line interface
 
 mod channel_arg;
+mod channel_ref;
 mod cmd;
 mod config;
 
@@ -38,7 +39,7 @@ struct Cli {
     display_name: Option<String>,
 
     /// Override default channel
-    #[arg(long)]
+    #[arg(long, value_parser = channel_ref::parse)]
     channel: Option<String>,
 
     /// Output JSON when listing blocks
@@ -85,7 +86,7 @@ enum Commands {
         /// Flag-only, unlike the other channel-scoped commands: the
         /// positional slot here is the message body, so a positional channel
         /// would be ambiguous. See `channel_arg::ChannelArg`.
-        #[arg(long)]
+        #[arg(long, value_parser = channel_ref::parse)]
         channel: Option<String>,
     },
 
@@ -202,12 +203,12 @@ enum ChannelAction {
 
         /// Grow a group from a 1:1: link the new channel to that DM (a slug or
         /// channel id). The group is `private`; the 1:1 goes on unchanged.
-        #[arg(long)]
+        #[arg(long, value_parser = channel_ref::parse)]
         from_dm: Option<String>,
 
         /// Continue a frozen channel you own (a slug or channel id) in this
         /// new, encrypted one. No history moves.
-        #[arg(long)]
+        #[arg(long, value_parser = channel_ref::parse)]
         successor_of: Option<String>,
 
         /// Succeed (exit 0) if the channel already exists instead of failing.
@@ -227,7 +228,7 @@ enum ChannelAction {
     /// Add someone to a channel you own. On an encrypted channel this also
     /// adds them to its MLS group.
     Add {
-        #[arg()]
+        #[arg(value_parser = channel_ref::parse)]
         slug: String,
         /// A did:jig, a name from `[contacts]`, or a verified `alias@suffix`.
         #[arg()]
@@ -243,7 +244,7 @@ enum ChannelAction {
     /// can read nothing sent after this.
     #[command(alias = "remove")]
     Kick {
-        #[arg()]
+        #[arg(value_parser = channel_ref::parse)]
         slug: String,
         /// A did:jig, a name from `[contacts]`, or a verified `alias@suffix`.
         #[arg()]
@@ -252,14 +253,14 @@ enum ChannelAction {
 
     /// Leave a channel. The owner cannot leave; it deletes the channel instead.
     Leave {
-        #[arg()]
+        #[arg(value_parser = channel_ref::parse)]
         slug: String,
     },
 
     /// Open a restricted channel (or DM) you own to anyone: `restricted` →
     /// `open`. An encrypted channel stays encrypted.
     Promote {
-        #[arg()]
+        #[arg(value_parser = channel_ref::parse)]
         slug: String,
     },
 
@@ -282,7 +283,7 @@ enum ChannelAction {
     /// it on one server is refused (JEP-0014). Under a `write` or `member`
     /// grant, the other server relays its users' writes back here.
     Share {
-        #[arg()]
+        #[arg(value_parser = channel_ref::parse)]
         slug: String,
         /// The other server's DID, as its `/.well-known/jig` gives it.
         #[arg()]
@@ -305,7 +306,7 @@ enum ChannelAction {
     /// nothing after; the end is recorded in the channel as a
     /// `contract-end`. Same rights as `share`.
     Unshare {
-        #[arg()]
+        #[arg(value_parser = channel_ref::parse)]
         slug: String,
         /// The other server's DID.
         #[arg()]
@@ -314,13 +315,28 @@ enum ChannelAction {
 
     /// List a channel's members.
     Members {
-        #[arg()]
+        #[arg(value_parser = channel_ref::parse)]
         slug: String,
         /// Only the members whose latest write the server with this DID
-        /// relayed: after its contract ended, those a member may want to
-        /// remove with `jig channel kick`.
+        /// relayed: after its contract ended, those `jig channel prune`
+        /// judges.
         #[arg(long, value_name = "SERVER_DID")]
         via: Option<String>,
+    },
+    /// After a server stopped carrying a channel, remove the members who
+    /// reached it only through that server (JEP-0005 rule 11): those whose
+    /// latest write it relayed, and whose reachability record lists no other
+    /// server. Lists them, and removes them only with `--yes`. Run against
+    /// the channel's own server, with the right to remove members.
+    Prune {
+        #[arg()]
+        slug: String,
+        /// The DID of the server whose share ended.
+        #[arg(long, value_name = "SERVER_DID")]
+        via: String,
+        /// Remove the members listed, rather than only listing them.
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Join an existing channel by adding the caller's DID as a member.
@@ -331,7 +347,7 @@ enum ChannelAction {
     /// invite-only: its owner adds members, and a self-join is refused.
     Join {
         /// Channel slug to join (e.g. `#hello`).
-        #[arg()]
+        #[arg(value_parser = channel_ref::parse)]
         slug: String,
     },
 
@@ -343,7 +359,7 @@ enum ChannelAction {
     #[command(alias = "archive")]
     Delete {
         /// Channel slug to delete (e.g. `#hello`).
-        #[arg()]
+        #[arg(value_parser = channel_ref::parse)]
         slug: String,
 
         /// Skip the interactive confirmation. Required when stdin is not a
@@ -1047,6 +1063,9 @@ async fn run() -> Result<()> {
                 cmd::channel::unshare(&ctx, slug, server_did).await?
             }
             ChannelAction::Members { slug, via } => cmd::channel::members(&ctx, slug, via).await?,
+            ChannelAction::Prune { slug, via, yes } => {
+                cmd::channel::prune(&ctx, slug, via, yes).await?
+            }
             ChannelAction::Join { slug } => {
                 cmd::channel::join(&ctx, slug).await?;
             }

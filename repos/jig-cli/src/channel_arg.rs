@@ -39,7 +39,8 @@ pub struct ChannelArg {
     channel_flag: Option<String>,
 }
 
-/// Rejects a blank channel at parse time.
+/// Rejects a blank channel at parse time, and anything else that is not a
+/// channel ([`crate::channel_ref::parse`]); a `jig:` link gives its id.
 ///
 /// `jig tail "$CHANNEL"` with `CHANNEL` unset expands to `jig tail ""`. Without
 /// this the empty string satisfies the argument and surfaces much later as an
@@ -47,10 +48,7 @@ pub struct ChannelArg {
 /// silent-wrong-thing shape as sending to the wrong channel. Fail at the
 /// boundary, where the message can name the actual problem.
 fn parse_channel(raw: &str) -> Result<String, String> {
-    if raw.trim().is_empty() {
-        return Err("channel must not be blank (try `#hello`)".to_string());
-    }
-    Ok(raw.to_string())
+    crate::channel_ref::parse(raw)
 }
 
 impl ChannelArg {
@@ -141,6 +139,21 @@ mod tests {
     #[test]
     fn a_blank_default_is_passed_through_unchanged() {
         assert_eq!(resolve_from(&["t"], ""), "");
+    }
+
+    /// A `jig:` link names its channel by id (F2 Task 0c), and an argument
+    /// that is neither a slug, an id nor a link is refused here, not by the
+    /// server.
+    #[test]
+    fn a_link_resolves_to_its_channel_id_and_a_bare_word_is_refused() {
+        let id = jig_core::canonical_cid::of(b"channel-create").to_string();
+        assert_eq!(resolve_from(&["t", &format!("jig:{id}")], "#default"), id);
+        assert_eq!(
+            resolve_from(&["t", "--channel", &format!("jig:{id}?slug=%23ops")], "#d"),
+            id
+        );
+        let err = Harness::try_parse_from(["t", "hello"]).expect_err("a bare word");
+        assert!(err.to_string().contains("not a channel"), "{err}");
     }
 }
 
