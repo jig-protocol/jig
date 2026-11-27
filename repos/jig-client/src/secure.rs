@@ -785,11 +785,40 @@ impl Session {
         cid: &str,
         record: Option<&crate::chain::IngestRecord>,
     ) -> Result<()> {
+        self.set_head_with_moves(server, slug, cid, record, &[])
+    }
+
+    /// [`Self::set_head`], adding `moves`, the sequencer moves the chain
+    /// verified on the way to `record`, to those the head kept: a chain
+    /// rebuilt from this head holds a record past a move to the new
+    /// sequencer (JEP-0005 rule 11a).
+    pub fn set_head_with_moves(
+        &self,
+        server: &str,
+        slug: &str,
+        cid: &str,
+        record: Option<&crate::chain::IngestRecord>,
+        moves: &[crate::chain::HeadMove],
+    ) -> Result<()> {
         let key = group_key(server, slug);
         self.with_member(|_, g| {
             g.heads.insert(key.clone(), cid.to_string());
             match record {
-                Some(r) => g.head_records.insert(key, crate::chain::ChainHead::of(r)),
+                Some(r) => {
+                    let mut head = crate::chain::ChainHead::of(r);
+                    head.moves = g
+                        .head_records
+                        .get(&key)
+                        .map(|h| h.moves.clone())
+                        .unwrap_or_default();
+                    for m in moves {
+                        if m.seq <= r.seq && !head.moves.iter().any(|h| h.seq == m.seq) {
+                            head.moves.push(m.clone());
+                        }
+                    }
+                    head.moves.sort_by_key(|m| m.seq);
+                    g.head_records.insert(key, head)
+                }
                 None => g.head_records.remove(&key),
             };
             Ok(())
@@ -2147,6 +2176,47 @@ mod tests {
 
     fn channel_id(name: &[u8]) -> String {
         jig_core::canonical_cid::of(name).to_string()
+    }
+
+    /// A head moved on keeps the sequencer moves it held, and takes those
+    /// the chain verified on the way (JEP-0005 rule 11a): a later sync's
+    /// chain, rebuilt from it, holds records past a move to the new
+    /// sequencer.
+    #[test]
+    fn a_moved_head_keeps_the_sequencer_moves() {
+        use crate::chain::{HeadMove, RecordSigner, label_cid};
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        alice.create_group(SERVER, "#team").unwrap();
+        let key = jig_core::crypto::ed25519::generate_signing_key();
+        let signer = RecordSigner {
+            channel_id: label_cid("bafyCreate"),
+            key: &key,
+            ingest_wall_ms: 1,
+            ingest_logical: 0,
+        };
+        let at = |seq: u64| {
+            signer
+                .sign(seq, &label_cid(&format!("b{seq}")), [0; 32])
+                .unwrap()
+        };
+        let moved = HeadMove {
+            seq: 3,
+            sequencer: "did:jig:new".into(),
+        };
+        alice
+            .set_head_with_moves(
+                SERVER,
+                "#team",
+                "b4",
+                Some(&at(4)),
+                std::slice::from_ref(&moved),
+            )
+            .unwrap();
+        alice.set_head(SERVER, "#team", "b5", Some(&at(5))).unwrap();
+        let head = alice.head_record(SERVER, "#team").unwrap().unwrap();
+        assert_eq!(head.seq, 5);
+        assert_eq!(head.moves, [moved]);
     }
 
     /// #432: state an older build filed under a server's own channel's slug
