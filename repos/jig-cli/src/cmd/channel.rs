@@ -732,7 +732,6 @@ pub async fn kick(ctx: &CliContext, slug: String, who: String) -> Result<()> {
     let secure = Secure::open(ctx)?;
     let info = visible_channel(&secure, &slug).await?;
     let id = secure.identity();
-    let seen_record = crate::cmd::secure::seen_for(secure.server(), &slug);
     let cid = if info.encrypted() {
         let server = secure.server().to_string();
         secure
@@ -741,6 +740,9 @@ pub async fn kick(ctx: &CliContext, slug: String, who: String) -> Result<()> {
                 |s, key| Ok(s.prepare_remove(&server, key, &did)?),
                 |c| {
                     let mut extra = mls_fields(c);
+                    // Read for each attempt: a retry after a stale epoch
+                    // carries the head this device holds by then.
+                    let seen_record = crate::cmd::secure::seen_for(&server, &slug);
                     merge(&mut extra, seen(seen_record.as_ref()));
                     build_member_remove(id, &slug, &did, extra, now(id))
                 },
@@ -752,7 +754,7 @@ pub async fn kick(ctx: &CliContext, slug: String, who: String) -> Result<()> {
                 id,
                 &slug,
                 &did,
-                seen(seen_record.as_ref()),
+                seen(crate::cmd::secure::seen_for(secure.server(), &slug).as_ref()),
                 now(id),
             ))
             .await?

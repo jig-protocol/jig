@@ -634,10 +634,10 @@ async fn check_seen_in(
                 reference,
             ))
         };
-        let Some((chain, reference)) = pinned_chain(&Pins::load(pins_path)?) else {
+        let Some((mut chain, reference)) = pinned_chain(&Pins::load(pins_path)?) else {
             return Ok(());
         };
-        let mut check = chain.check_seen(&seen, block.ingest.as_ref());
+        let mut check = chain.check_block_seen(&seen, &block.bundle_b64, block.ingest.as_ref());
         // Proven once, and only when a record must be fetched.
         if matches!(check, SeenCheck::Ahead { .. } | SeenCheck::Differs { .. }) && proven.is_none()
         {
@@ -663,10 +663,12 @@ async fn check_seen_in(
             if !fetched.is_empty() {
                 check_chain_in(pins_path, who, Some(&audience), server, slug, &fetched).await?;
             }
-            let Some((chain, _)) = pinned_chain(&Pins::load(pins_path)?) else {
+            // The proofs below are drawn from the chain the check is.
+            let Some((reloaded, _)) = pinned_chain(&Pins::load(pins_path)?) else {
                 return Ok(());
             };
-            check = chain.check_seen(&seen, block.ingest.as_ref());
+            chain = reloaded;
+            check = chain.check_block_seen(&seen, &block.bundle_b64, block.ingest.as_ref());
             if let SeenCheck::Ahead { .. } = check {
                 eprintln!(
                     "warning: block {} in {slug} carries record {} of the channel as seen; \
@@ -1104,6 +1106,10 @@ async fn fetch_records(
         .await
         .with_context(|| format!("reading {url}"))?;
         let Some(last) = page.last() else { break };
+        // A page that ends before `next` would be asked for again forever.
+        if last.seq < next {
+            anyhow::bail!("GET {url} did not advance past record {next}");
+        }
         next = last.seq + 1;
         out.extend(page.into_iter().filter(|r| r.seq < to));
     }

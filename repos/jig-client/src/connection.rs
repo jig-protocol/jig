@@ -689,6 +689,10 @@ impl Client {
                                             None,
                                         )
                                     });
+                                // The head as it was: a `seen` at its `seq`
+                                // is judged against its record even after
+                                // this block moves the head past it.
+                                let before = chain.head().and_then(|h| h.record.clone());
                                 let step = chain.accept_live(record, cid.as_deref());
                                 for defect in chain.take_clock_defects() {
                                     tracing::warn!("{defect}");
@@ -701,7 +705,22 @@ impl Client {
                                 // The rest is the history check's to fetch.
                                 let seen_break = step.as_ref().ok().and_then(|_| {
                                     let seen = crate::chain::seen_of_block(&bundle_b64)?.ok()?;
-                                    match chain.check_seen(&seen, Some(record)) {
+                                    let check = match chain.check_block_seen(
+                                        &seen,
+                                        &bundle_b64,
+                                        Some(record),
+                                    ) {
+                                        crate::chain::SeenCheck::Differs { seq } => before
+                                            .as_ref()
+                                            .filter(|b| b.seq == seq)
+                                            .and_then(|b| chain.seen_fork(b, &seen))
+                                            .map_or(
+                                                crate::chain::SeenCheck::Differs { seq },
+                                                |p| crate::chain::SeenCheck::Forked(Box::new(p)),
+                                            ),
+                                        other => other,
+                                    };
+                                    match check {
                                         crate::chain::SeenCheck::Forked(proof) => Some((
                                             "chain-seen-forked",
                                             format!(
