@@ -4,14 +4,16 @@ The gate between "jig runs on private deployments" and "we tell strangers to
 run `curl -fsSL https://jig.onl/install.sh | bash`".
 
 jig is MIT OR Apache-2.0 source in a public repository, and it publishes signed
-alpha prereleases, but it has never been announced, never been deployed to a
+releases (alpha prereleases, and from `v0.2.0` final releases), but it has never been announced, never been deployed to a
 public address, and has never had a user outside the team. This document is the
 checklist for changing that. Every "current state" row below was checked against
 the code at merge commit `1fa5681`; §1.3, §1.5, §1.8 and §4 were re-checked
 against `d16f26a` on 2026-10-18; §1.1, §1.6, §1.7, the binary install row, §3,
 §6 and the verdict were re-checked against `a740fa8` on 2026-10-25; the gaps in
 §1.2 and §1.3, §1.6's wasmtime version, §1.7, §4's `jig-spec` book row, §6's release cadence and the verdict
-were brought up to date against `f9cdc2da` on 2026-11-23. Where a claim could not
+were brought up to date against `f9cdc2da` on 2026-11-23; §3's verdict, §6's release
+cadence and the verdict were re-checked for the first final release, `v0.2.0`, against
+`e6193516` on 2026-11-25. Where a claim could not
 be verified from the tree it says so.
 
 **Verdict vocabulary**
@@ -179,8 +181,14 @@ disagree are surfaced to the reader as a warning, not refused
 encryption suite, the manifest schema and the receipt domain are gates. The
 README (*"v0.x makes no compatibility guarantee"*) and every release's notes
 say that pre-1.0 releases make no wire, receipt or storage compatibility
-guarantee, and `release.yml` publishes every pre-release tag (`-alpha.N`, `-rc.N`) as a prerelease. A
-compatibility promise is still a BLOCKER for the day one is made.
+guarantee. `release.yml` publishes a pre-release tag (`-alpha.N`, `-rc.N`) as a
+prerelease and a bare `vX.Y.Z` as a final release (#479), and appends the same
+pre-1.0 line to both. A final release is not a compatibility promise: `v0.2.0`
+is final because it meets gate G2 (D35), not because its formats are frozen.
+The federation contract (F2) that ships in v0.2.x will add blocks, records and
+routes, and the receipt and storage formats can still change before 1.0, so a
+v0.2.x user must still upgrade servers and clients together when a release says
+so. A compatibility promise is still a BLOCKER for the day one is made.
 
 ---
 
@@ -257,7 +265,7 @@ registry, or copied code may appear anywhere under `repos/`. This belongs in
 | `CODEOWNERS` | DJ owns everything, repeated on sensitive paths | READY |
 | Discussion / support channel | dev@jig.onl and issues; security reports go to security@jig.onl or GitHub private reporting. No public chat. | GAP |
 | Triage owner | DJ, named in `SECURITY.md` for vulnerability reports. No rotation or SLA for ordinary issues. | GAP |
-| Release cadence | Five signed prereleases published so far, `v0.2.0-alpha.1` (2026-10-19), `alpha.2` (2026-10-25), `alpha.4` (2026-11-11), `alpha.5` (2026-11-14) and `alpha.6` (2026-11-15); the `alpha.3` tag has no published release. Each has notes in [`.github/release/notes/`](../.github/release/notes/). `release.yml` is tag-triggered, waits for a maintainer's approval in the `release` environment, refuses notes that do not list the threat-register entries mitigated, and publishes a tag with a pre-release part (`-alpha.N`) as a prerelease and a bare `vX.Y.Z` as the latest release. No cadence is promised. | GAP |
+| Release cadence | Seven signed prereleases published so far, `v0.2.0-alpha.1` (2026-10-19), `alpha.2` (2026-10-25), `alpha.4` (2026-11-11), `alpha.5` (2026-11-14), `alpha.6` (2026-11-15), `alpha.7` (2026-11-23) and `alpha.8` (2026-11-25); the `alpha.3` tag has no published release. `v0.2.0` is the first final release (D35). Each has notes in [`.github/release/notes/`](../.github/release/notes/). `release.yml` is tag-triggered, waits for a maintainer's approval in the `release` environment, refuses notes that do not list the threat-register entries mitigated, and publishes a tag with a pre-release part (`-alpha.N`) as a prerelease and a bare `vX.Y.Z` as the latest release. No cadence is promised. | GAP |
 | CI coverage | `changes`, `workspace` (fmt, clippy and nextest on every workspace crate), `wasm-build` and `dependency-policy` (also daily at 07:17 UTC against `main`). A `nightly` job on the same schedule runs doc tests, skips nights when nothing under `repos/` (Markdown aside) and not `rust-toolchain.toml` changed, and does not gate merges. Drafts and docs-only PRs skip the build jobs; the merge queue runs everything. Linux only for the workspace job; macOS runs in the install smoke test inside `release.yml` and after each release, and in `block-abi-vectors.yml` on manual dispatch only. | GAP |
 
 **Test counts, measured at `1fa5681`** (`cargo nextest list`, stable 1.97.1): 1,054 tests in
@@ -277,8 +285,8 @@ no authorization*, is no longer true: reads require proof of possession,
 restricted channels are membership-gated on every surface, membership changes
 are owner-signed, and rate limits are on by default. Nor are the next four: DMs,
 every channel but a `public` one is end-to-end encrypted with
-MLS; `SECURITY.md` gives a disclosure path; and five signed prereleases are published
-and install through the verified `curl | bash` path. What decides it now:
+MLS; `SECURITY.md` gives a disclosure path; and seven signed prereleases are published
+and install through the verified `curl | bash` path, with `v0.2.0` the first final release. What decides it now:
 
 - The email bridge refuses inbound mail until it can join MLS groups.
 - The federation contract is partly built and ships as v0.2.x (D35): a server follows a
