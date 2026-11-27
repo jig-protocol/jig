@@ -206,6 +206,11 @@ pub fn classify_with_wait(
         // as it stands (JEP-0005 rule 11a), such as one citing a head it
         // does not hold yet.
         IngestError::MoveRefused { .. } => (StatusCode::CONFLICT, "MOVE_REFUSED", e.to_string()),
+        // 409: the owner moved the channel to another server (JEP-0005 rule
+        // 11a); the message names it.
+        IngestError::SequencerMoved { .. } => {
+            (StatusCode::CONFLICT, "SEQUENCER_MOVED", e.to_string())
+        }
         // 403: a follower relayed past its share, or past its grant
         // (JEP-0005 rules 7a, 15).
         IngestError::RelayedOutsideShare { .. } => {

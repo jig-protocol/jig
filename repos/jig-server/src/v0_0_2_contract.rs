@@ -133,6 +133,8 @@ pub struct Contracts {
     /// each with its `sequencer-set`: `None` until the decider's first tick
     /// fills it from the channels' moves, so a restart resumes them.
     reoffers: Arc<std::sync::Mutex<Option<DueReoffers>>>,
+    /// The first peer registration [`Self::replay_moves`] has not seen.
+    seen_registrations: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Run the contract on `state`'s server:
@@ -302,6 +304,7 @@ impl Contracts {
             ),
             pending_key_links: Arc::default(),
             reoffers: Arc::default(),
+            seen_registrations: Arc::default(),
         }
     }
 
@@ -385,6 +388,7 @@ impl Contracts {
             Ok(offers) => {
                 for offer in offers {
                     if self.may_offer(&offer.channel_id, &offer.peer_did) {
+                        self.push_move_for(&offer);
                         let links = ContractOffer::from_envelope(&offer.offer)
                             .ok()
                             .and_then(|o| self.key_links_for(&o));
@@ -393,6 +397,34 @@ impl Contracts {
                 }
             }
             Err(e) => tracing::warn!("listing unanswered offers: {e}"),
+        }
+    }
+
+    /// A re-offer after a move (JEP-0005 rule 11a) goes with its
+    /// `sequencer-set` each time it is sent: a follower that was not
+    /// connected when the set was first pushed judges the re-offer by it,
+    /// and has no share yet to pull it by.
+    fn push_move_for(&self, offer: &StoredOffer) {
+        let Some(share_cid) = offer.share_cid.as_deref() else {
+            return;
+        };
+        match self.store().get_block(share_cid) {
+            Ok(Some(block)) if block.block_kind == BlockKind::SequencerSet.as_str() => {
+                match self
+                    .stream
+                    .push_to(&block, std::slice::from_ref(&offer.peer_did))
+                {
+                    Ok(unreached) if !unreached.is_empty() => {
+                        tracing::debug!(peer = %offer.peer_did, "the move not queued with its re-offer");
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::info!(peer = %offer.peer_did, "the move not sent with its re-offer: {e:#}");
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(peer = %offer.peer_did, "reading a re-offer's share: {e}"),
         }
     }
 
@@ -450,6 +482,34 @@ impl Contracts {
             }
         };
         let mut all = true;
+        // The move first, to the followers and to the sequencer it moves
+        // from: a follower judges the re-offer by the move in its chain.
+        let pushed = (|| -> anyhow::Result<Vec<String>> {
+            if let Some(block) = self.store().get_block(set_cid)? {
+                let mut to: Vec<String> = followers
+                    .iter()
+                    .map(|(f, _)| f.clone())
+                    .filter(|f| !jig_pipeline::handshake::same_did(f, &me))
+                    .collect();
+                if let Some(moved) = self.store().channel_moves(&channel.id)?.last() {
+                    to.push(moved.previous.clone());
+                }
+                return self.stream.push_to(&block, &to);
+            }
+            Ok(Vec::new())
+        })();
+        match pushed {
+            // A peer the move did not reach gets it when it next connects
+            // ([`Self::replay_moves`]), or with its re-offer's resend.
+            Ok(unreached) if !unreached.is_empty() => {
+                tracing::debug!(channel = %channel.id, ?unreached, "the move waits for peers to connect");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(channel = %channel.id, "the move not pushed to the followers: {e:#}");
+                all = false;
+            }
+        }
         for (to, grant) in followers {
             if jig_pipeline::handshake::same_did(&to, &me) {
                 continue;
@@ -546,65 +606,10 @@ impl Contracts {
     }
 
     /// The servers holding a live share of `channel_id`, each with its
-    /// grant, as the channel's chain records them (rule 10): a
-    /// `contract-accept` with no later `contract-end` for the same server.
+    /// grant, as the channel's chain records them (rule 10)
+    /// ([`live_followers_before`]).
     fn live_followers(&self, channel_id: &str) -> anyhow::Result<Vec<(String, Grant)>> {
-        let store = self.store();
-        let mut live: std::collections::BTreeMap<String, ([u8; 32], Grant)> = Default::default();
-        let mut from = 0;
-        loop {
-            let page = store.list_ingest_records_by_id(channel_id, from, 200)?;
-            let Some(last) = page.last() else { break };
-            from = last.seq + 1;
-            for record in &page {
-                let Some(block) = store.get_block(&record.block_cid)? else {
-                    continue;
-                };
-                let kind = block.block_kind.parse::<BlockKind>().ok();
-                if !matches!(
-                    kind,
-                    Some(BlockKind::ContractAccept | BlockKind::ContractEnd)
-                ) {
-                    continue;
-                }
-                let manifest = manifest_of(&block.bundle_bytes)?;
-                let Some(to) = manifest
-                    .metadata
-                    .get(contracts::TO_KEY)
-                    .and_then(|v| v.as_str())
-                    .map(jig_pipeline::effect::canonical_did_string)
-                else {
-                    continue;
-                };
-                if kind == Some(BlockKind::ContractEnd) {
-                    // An end closes the share it names, and only that one: an
-                    // end of an older offer leaves a later accept live.
-                    let ended = contracts::envelope(&manifest, contracts::END_KEY)
-                        .ok()
-                        .and_then(|e| ContractEnd::from_envelope(&e).ok())
-                        .map(|e| e.offer_id);
-                    if let Some(ended) = ended
-                        && live.get(&to).is_some_and(|(id, _)| *id == ended)
-                    {
-                        live.remove(&to);
-                    }
-                    continue;
-                }
-                let offer = manifest
-                    .metadata
-                    .get(contracts::OFFER_KEY)
-                    .and_then(|v| v.as_str())
-                    .and_then(|o| base64::engine::general_purpose::STANDARD.decode(o).ok())
-                    .and_then(|o| ContractOffer::from_envelope(&o).ok());
-                if let Some(offer) = offer {
-                    live.insert(to, (offer.offer_id, offer.grant));
-                }
-            }
-        }
-        Ok(live
-            .into_iter()
-            .map(|(to, (_, grant))| (to, grant))
-            .collect())
+        live_followers_before(self.store(), channel_id, u64::MAX)
     }
 
     async fn offer(
@@ -955,6 +960,18 @@ impl Contracts {
             share_cid: None,
         })?;
         let answer = match self.judge(&offer) {
+            // A channel this server carries, offered by another server: a
+            // re-offer after a move whose `sequencer-set` has not landed here
+            // yet (JEP-0005 rule 11a). Held, and judged again once it has
+            // ([`Self::rejudge_reoffers`]), rather than refused now.
+            Err(RefuseCode::PolicyRefused) if self.carries(&offer) => {
+                tracing::info!(
+                    owner = %offer.owner,
+                    channel = %offer.channel_id,
+                    "holding an offer of a carried channel until its move lands"
+                );
+                return Ok(());
+            }
             Err(code) => self.refuse(&offer, code, OfferState::Held)?,
             Ok(OfferPolicy::Accept) => self.accept(&offer, OfferState::Held)?,
             Ok(OfferPolicy::Hold) => {
@@ -1066,6 +1083,47 @@ impl Contracts {
         Ok(policy)
     }
 
+    /// Whether this server carries `offer`'s channel for another server.
+    fn carries(&self, offer: &ContractOffer) -> bool {
+        let me = self.me();
+        self.store()
+            .get_channel_by_id_including_archived(&offer.channel_id.to_string())
+            .ok()
+            .flatten()
+            .is_some_and(|c| {
+                !c.sequencer_did.is_empty()
+                    && !jig_pipeline::handshake::same_did(&c.sequencer_did, &me)
+            })
+    }
+
+    /// Accept each held offer that is now a re-offer of the same grant or
+    /// less: its channel's move has landed here since it came (JEP-0005 rule
+    /// 11a). Others stay held for the operator.
+    fn rejudge_reoffers(&self) {
+        let held = match self
+            .store()
+            .contract_offers_in(Side::Follower, OfferState::Held)
+        {
+            Ok(held) => held,
+            Err(e) => {
+                tracing::warn!("listing held offers: {e}");
+                return;
+            }
+        };
+        for kept in held {
+            let Ok(offer) = ContractOffer::from_envelope(&kept.offer) else {
+                continue;
+            };
+            if self.reoffer_of(&offer).is_none() || self.judge(&offer) != Ok(OfferPolicy::Accept) {
+                continue;
+            }
+            match self.accept(&offer, OfferState::Held) {
+                Ok(answer) => self.send(&kept.peer_did, ANSWER_FRAME, answer),
+                Err(e) => tracing::warn!("re-offer not accepted: {e:#}"),
+            }
+        }
+    }
+
     /// What `offer` re-offers, if it is a re-offer after a sequencer move
     /// (JEP-0005 rule 11a): this server carries the channel, the owner moved
     /// it to the offering server in the chain this server holds, and this
@@ -1154,6 +1212,7 @@ impl Contracts {
     /// An answer goes to the owner now if it is connected, and otherwise when
     /// the owner sends the offer again.
     pub async fn act_on_decisions(&self) {
+        self.rejudge_reoffers();
         let store = self.store();
         let decided = |state| {
             store
@@ -1180,6 +1239,46 @@ impl Contracts {
         }
         self.deliver_ends().await;
         self.resume_reoffers().await;
+        self.replay_moves();
+    }
+
+    /// Send each server that connected since the last call the moves that
+    /// took a channel away from it to this server (JEP-0005 rule 11a). A
+    /// sequencer that missed its move, or lost it with a connection that
+    /// dropped, learns of it on its next connection; the receiver keeps a
+    /// record it holds once.
+    fn replay_moves(&self) {
+        use std::sync::atomic::Ordering;
+        let mark = self.seen_registrations.load(Ordering::Relaxed);
+        let (peers, next) = self.peers.registered_since(mark);
+        self.seen_registrations.store(next, Ordering::Relaxed);
+        let me = self.me();
+        for peer in peers {
+            let peer = peer.to_did_jig_string();
+            let moves = match self.store().moves_away_from(&peer) {
+                Ok(moves) => moves,
+                Err(e) => {
+                    tracing::warn!(peer, "listing the moves to replay: {e}");
+                    continue;
+                }
+            };
+            for (channel_id, moved) in moves {
+                if !jig_pipeline::handshake::same_did(&moved.sequencer, &me) {
+                    continue;
+                }
+                match self.store().get_block(&moved.block_cid) {
+                    Ok(Some(block)) => {
+                        if let Err(e) = self.stream.push_to(&block, std::slice::from_ref(&peer)) {
+                            tracing::info!(peer, channel = %channel_id, "the move not replayed: {e:#}");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(channel = %channel_id, "reading a move to replay: {e}")
+                    }
+                }
+            }
+        }
     }
 
     /// Send each end this server decided on to the other side, and once it
@@ -1687,6 +1786,74 @@ fn b64(bytes: &[u8]) -> String {
 fn manifest_of(bundle_bytes: &[u8]) -> anyhow::Result<BlockManifest> {
     let (manifest_bytes, _code): (Vec<u8>, Vec<u8>) = serde_json::from_slice(bundle_bytes)?;
     Ok(serde_json::from_slice(&manifest_bytes)?)
+}
+
+/// The servers holding a live share of `channel_id` before record `seq` of
+/// its chain, each with its grant, as the chain records them (rule 10): a
+/// `contract-accept` with no later `contract-end` for the same server.
+pub(crate) fn live_followers_before(
+    store: &SqliteStore,
+    channel_id: &str,
+    seq: u64,
+) -> anyhow::Result<Vec<(String, Grant)>> {
+    let mut live: std::collections::BTreeMap<String, ([u8; 32], Grant)> = Default::default();
+    let mut from = 0;
+    'chain: loop {
+        let page = store.list_ingest_records_by_id(channel_id, from, 200)?;
+        let Some(last) = page.last() else { break };
+        from = last.seq + 1;
+        for record in &page {
+            if record.seq >= seq {
+                break 'chain;
+            }
+            let Some(block) = store.get_block(&record.block_cid)? else {
+                continue;
+            };
+            let kind = block.block_kind.parse::<BlockKind>().ok();
+            if !matches!(
+                kind,
+                Some(BlockKind::ContractAccept | BlockKind::ContractEnd)
+            ) {
+                continue;
+            }
+            let manifest = manifest_of(&block.bundle_bytes)?;
+            let Some(to) = manifest
+                .metadata
+                .get(contracts::TO_KEY)
+                .and_then(|v| v.as_str())
+                .map(jig_pipeline::effect::canonical_did_string)
+            else {
+                continue;
+            };
+            if kind == Some(BlockKind::ContractEnd) {
+                // An end closes the share it names, and only that one: an
+                // end of an older offer leaves a later accept live.
+                let ended = contracts::envelope(&manifest, contracts::END_KEY)
+                    .ok()
+                    .and_then(|e| ContractEnd::from_envelope(&e).ok())
+                    .map(|e| e.offer_id);
+                if let Some(ended) = ended
+                    && live.get(&to).is_some_and(|(id, _)| *id == ended)
+                {
+                    live.remove(&to);
+                }
+                continue;
+            }
+            let offer = manifest
+                .metadata
+                .get(contracts::OFFER_KEY)
+                .and_then(|v| v.as_str())
+                .and_then(|o| base64::engine::general_purpose::STANDARD.decode(o).ok())
+                .and_then(|o| ContractOffer::from_envelope(&o).ok());
+            if let Some(offer) = offer {
+                live.insert(to, (offer.offer_id, offer.grant));
+            }
+        }
+    }
+    Ok(live
+        .into_iter()
+        .map(|(to, (_, grant))| (to, grant))
+        .collect())
 }
 
 /// The DID a creation block names as its channel's sequencer, canonical.
@@ -2510,6 +2677,234 @@ mod tests {
         );
     }
 
+    /// Only a configured peer is a source of a channel's records: an entry
+    /// from any other DID lands nothing, even for a channel this server
+    /// follows, so the owner's signature on a move never makes an unlisted
+    /// server a source (JEP-0005 rule 11a).
+    #[tokio::test]
+    async fn records_from_a_peer_that_is_not_configured_land_nothing() {
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.shared(1).await;
+        let owners = Contracts::new(&p.owner);
+        let records = owners.stream.records_from(&channel, 0).unwrap().unwrap();
+        let stranger =
+            Did::from_ed25519_pubkey(SigningKey::from_bytes(&[91; 32]).verifying_key().as_bytes());
+        p.follows.stream.land(&stranger, records.clone()).await;
+        assert_eq!(Pair::head(&p.follower, &channel), None);
+        p.follows.stream.land(&p.owner.server_did, records).await;
+        assert!(Pair::head(&p.follower, &channel).is_some());
+    }
+
+    /// A whole move between two servers (JEP-0005 rule 11a): the owner asks
+    /// the server that carries its channel for a move accept, signs the
+    /// `sequencer-set` citing the head it names, and submits it there. That
+    /// server takes the channel over and sends the move to the server it
+    /// moved from, which from then on refuses writes to the channel with
+    /// `SEQUENCER_MOVED`, naming the new sequencer.
+    #[tokio::test]
+    async fn an_owner_moves_a_channel_to_the_server_that_carries_it() {
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.shared(1).await;
+        p.follows.stream.pull_all();
+        p.caught_up(&channel).await;
+        let new = p.follower.server_did.to_did_jig_string();
+
+        let (status, body) = ask_move_accept(&p.follower, &channel, &p.user, &new).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        let moved: MoveAcceptBody = serde_json::from_value(body).unwrap();
+        let set = jig_core::sequencer_move::SequencerSet {
+            channel_id: channel.clone(),
+            sequencer: moved.sequencer.clone(),
+            head: jig_core::sequencer_move::CitedHead {
+                seq: moved.head_seq,
+                hash: hex::decode(&moved.head_hash).unwrap().try_into().unwrap(),
+            },
+            accept: ContractAccept::from_envelope(
+                &base64::engine::general_purpose::STANDARD
+                    .decode(&moved.accept)
+                    .unwrap(),
+            )
+            .unwrap(),
+            reinstalls: vec![],
+        };
+        let meta = serde_json::Value::Object(set.to_metadata().into_iter().collect());
+        let cid = post(&p.follower, &p.user, BlockKind::SequencerSet, meta)
+            .await
+            .unwrap();
+        let record = p
+            .follower
+            .ingest_ctx
+            .store
+            .get_ingest_record(&cid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.seq, moved.head_seq + 1);
+        assert_eq!(record.sequencer, new);
+
+        // The server it moved from learns of it, and refuses writes.
+        let old = &p.owner.ingest_ctx.store;
+        eventually("the move at the old sequencer", || {
+            (!old.channel_moves(&channel).unwrap().is_empty()).then_some(())
+        })
+        .await;
+        let refused = post(
+            &p.owner,
+            &p.user,
+            BlockKind::TextRender,
+            serde_json::json!({"channel_id": channel, "body": "too late"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&refused, IngestError::SequencerMoved { sequencer, .. } if *sequencer == new),
+            "{refused:?}"
+        );
+        // And the new one sequences it.
+        let after = p.text_on(&p.follower, &channel, "after the move").await;
+        let next = p
+            .follower
+            .ingest_ctx
+            .store
+            .get_ingest_record(&after)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.seq, record.seq + 1);
+    }
+
+    /// A move reaches the servers that were away when it landed (JEP-0005
+    /// rule 11a), without the decider sending it again while they are away:
+    /// the sequencer it moved from on each new connection, and a follower
+    /// with each resend of its re-offer, before the re-offer it judges by
+    /// the move.
+    #[tokio::test]
+    async fn a_move_reaches_the_servers_that_were_away() {
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.shared(1).await;
+        p.follows.stream.pull_all();
+        p.caught_up(&channel).await;
+        let new = p.follower.server_did.to_did_jig_string();
+        let (status, body) = ask_move_accept(&p.follower, &channel, &p.user, &new).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        let moved: MoveAcceptBody = serde_json::from_value(body).unwrap();
+        let set = jig_core::sequencer_move::SequencerSet {
+            channel_id: channel.clone(),
+            sequencer: moved.sequencer.clone(),
+            head: jig_core::sequencer_move::CitedHead {
+                seq: moved.head_seq,
+                hash: hex::decode(&moved.head_hash).unwrap().try_into().unwrap(),
+            },
+            accept: ContractAccept::from_envelope(
+                &base64::engine::general_purpose::STANDARD
+                    .decode(&moved.accept)
+                    .unwrap(),
+            )
+            .unwrap(),
+            reinstalls: vec![],
+        };
+        let meta = serde_json::Value::Object(set.to_metadata().into_iter().collect());
+        let cid = post(&p.follower, &p.user, BlockKind::SequencerSet, meta)
+            .await
+            .unwrap();
+
+        // The sequencer it moved from, away: the move stays due for it until
+        // a connection to it takes the move.
+        let gone = Did::from_did_jig_string(&did_of(&SigningKey::from_bytes(&[45; 32]))).unwrap();
+        p.follower
+            .ingest_ctx
+            .store
+            .record_move_for_tests(
+                &channel,
+                &jig_pipeline::follow::ChannelMove {
+                    seq: u64::MAX >> 1,
+                    sequencer: new.clone(),
+                    previous: gone.to_did_jig_string(),
+                    block_cid: cid.clone(),
+                },
+            )
+            .unwrap();
+        let contracts = Contracts::new(&p.follower);
+        let row = p
+            .follower
+            .ingest_ctx
+            .store
+            .get_channel_by_id(&channel)
+            .unwrap()
+            .unwrap();
+        // Away: the move is not queued to it, and nothing keeps the channel
+        // due, so tick after tick sends nothing to the followers again.
+        contracts.replay_moves();
+        assert!(contracts.reoffer_each(&row, &cid).await);
+        for _ in 0..3 {
+            contracts.resume_reoffers().await;
+        }
+        assert!(
+            contracts
+                .reoffers_due()
+                .as_ref()
+                .is_none_or(|due| due.iter().all(|(c, _)| *c != channel)),
+            "the channel is not due again"
+        );
+        // It connects: the move goes on its new connection.
+        let (sender, mut gone_rx) = crate::v0_0_2_peer::PeerSender::new(gone);
+        p.follower.peers.register(sender);
+        contracts.replay_moves();
+        assert!(matches!(
+            gone_rx.try_recv().map(|e| e.frame),
+            Ok(jig_pipeline::envelope::Frame::Peer { kind, .. }) if kind == crate::v0_0_2_stream::RECORDS_FRAME
+        ));
+
+        // It drops and connects again: the move is sent on the new
+        // connection too, as a queued frame may have been lost with the old.
+        contracts.replay_moves();
+        let (again, mut again_rx) = crate::v0_0_2_peer::PeerSender::new(
+            Did::from_did_jig_string(&did_of(&SigningKey::from_bytes(&[45; 32]))).unwrap(),
+        );
+        p.follower.peers.register(again);
+        contracts.replay_moves();
+        assert!(matches!(
+            again_rx.try_recv().map(|e| e.frame),
+            Ok(jig_pipeline::envelope::Frame::Peer { kind, .. }) if kind == crate::v0_0_2_stream::RECORDS_FRAME
+        ));
+        contracts.replay_moves();
+        assert!(again_rx.try_recv().is_err(), "once per connection");
+
+        // A follower that was away: its re-offer is kept, unanswered.
+        let away = Did::from_did_jig_string(&did_of(&SigningKey::from_bytes(&[44; 32]))).unwrap();
+        let away_did = away.to_did_jig_string();
+        p.follower
+            .ingest_ctx
+            .store
+            .put_contract_offer(&StoredOffer {
+                offer_id: [44; 32],
+                channel_id: channel.clone(),
+                side: Side::Owner,
+                peer_did: away_did.clone(),
+                grant: Grant::Read,
+                state: OfferState::Offered,
+                offer: b"the re-offer".to_vec(),
+                answer: None,
+                share_cid: Some(cid.clone()),
+            })
+            .unwrap();
+        // It connects, and the resend reaches it.
+        let (sender, mut rx) = crate::v0_0_2_peer::PeerSender::with_tiers(away, true);
+        p.follower.peers.register(sender);
+        Contracts::new(&p.follower).resend_offers();
+        let mut kinds = Vec::new();
+        while let Ok(envelope) = rx.try_recv() {
+            if let jig_pipeline::envelope::Frame::Peer { kind, .. } = envelope.frame {
+                kinds.push(kind);
+            }
+        }
+        assert_eq!(
+            kinds,
+            vec![
+                crate::v0_0_2_stream::RECORDS_FRAME.to_string(),
+                OFFER_FRAME.to_string()
+            ]
+        );
+    }
+
     /// After a move (JEP-0005 rule 11a), the new sequencer re-offers the
     /// channel to its followers: a follower that carries it, holding a share
     /// with the sequencer it moved from, accepts a re-offer of that grant or
@@ -2673,6 +3068,14 @@ mod tests {
         assert_eq!(
             owner.live_followers(&channel).unwrap(),
             vec![(follower, Grant::Read)]
+        );
+        // Counted only from the accept on: at the start of the chain, no
+        // server held a share. This is what limits who a new sequencer
+        // serves records to before its re-offer is accepted.
+        assert!(
+            live_followers_before(&p.owner.ingest_ctx.store, &channel, 1)
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -3285,6 +3688,18 @@ mod tests {
     // ---- The owner's stream (JEP-0005 rules 12-14, 22a) --------------------
 
     impl Pair {
+        /// A post to `channel` on `state`, by this pair's user.
+        async fn text_on(&self, state: &AppState, channel: &str, body: &str) -> String {
+            post(
+                state,
+                &self.user,
+                BlockKind::TextRender,
+                serde_json::json!({"channel_id": channel, "body": body}),
+            )
+            .await
+            .unwrap()
+        }
+
         async fn text(&self, channel: &str, body: &str) -> String {
             post(
                 &self.owner,

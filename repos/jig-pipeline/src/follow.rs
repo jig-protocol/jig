@@ -555,6 +555,38 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    /// The channels whose newest move moved them away from `previous`, each
+    /// with that move (JEP-0005 rule 11a): what a server that missed its moves
+    /// is sent when it connects.
+    pub fn moves_away_from(
+        &self,
+        previous: &str,
+    ) -> crate::persist::Result<Vec<(String, ChannelMove)>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT m.channel_id, m.seq, m.sequencer, m.previous, m.block_cid
+               FROM channel_moves m
+              WHERE m.seq = (SELECT MAX(seq) FROM channel_moves WHERE channel_id = m.channel_id)",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    ChannelMove {
+                        seq: r.get::<_, i64>(1)? as u64,
+                        sequencer: r.get(2)?,
+                        previous: r.get(3)?,
+                        block_cid: r.get(4)?,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|(_, m)| crate::handshake::same_did(&m.previous, previous))
+            .collect())
+    }
+
     /// The `sequencer-set` kept for `channel_id` until this server holds the
     /// head it cites, if any.
     pub fn pending_move(&self, channel_id: &str) -> crate::persist::Result<Option<PendingMove>> {
@@ -576,6 +608,31 @@ impl SqliteStore {
                 },
             )
             .optional()?)
+    }
+
+    /// Every kept move, by channel: the channels to ask its new sequencer
+    /// for the records up to the head it cites.
+    pub fn pending_moves(&self) -> crate::persist::Result<Vec<(String, PendingMove)>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT channel_id, seq, sequencer, manifest, code, sig, record FROM pending_moves",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    PendingMove {
+                        seq: r.get::<_, i64>(1)? as u64,
+                        sequencer: r.get(2)?,
+                        manifest: r.get(3)?,
+                        code: r.get(4)?,
+                        sig: r.get(5)?,
+                        record: r.get(6)?,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     fn keep_pending_move(
@@ -991,6 +1048,84 @@ impl SqliteStore {
         tx.commit()?;
         Ok(Landing::Landed)
     }
+}
+
+/// This server, `me`, sequenced `channel_id` and its owner moved it away
+/// (JEP-0005 rule 11a): `bundle` is the owner's `sequencer-set`, and
+/// `record_bytes` its record, as the new sequencer `link` sent them. Checked
+/// as every reader checks a move, against the head this server signed; then
+/// kept as the channel's move, so this server refuses writes to it
+/// (`IngestError::SequencerMoved`) and never sequences it again. The block
+/// itself is not stored: its `seq` may hold a record of this server's own.
+///
+/// Returns how many records this server signed past the cited head: the
+/// writes the move left behind, for the operator.
+pub fn record_moved_away(
+    store: &SqliteStore,
+    bundle: BlockBundle<'_>,
+    sig: &[u8],
+    record_bytes: &[u8],
+    link: &str,
+    me: &str,
+) -> Result<u64, FollowError> {
+    let (manifest, kind) = carried_manifest(bundle.manifest_bytes)?;
+    if kind.known() != Some(BlockKind::SequencerSet) {
+        return Err(FollowError::Mismatch("not a sequencer move"));
+    }
+    let sender =
+        crate::ingest::verify_sig(bundle.manifest_bytes, bundle.code_bytes, &manifest, sig)?;
+    let record = IngestRecord::decode(record_bytes)?;
+    let set = jig_core::sequencer_move::SequencerSet::from_metadata(&manifest.metadata)?;
+    let chan = store
+        .get_channel_by_id_including_archived(&record.channel_id)?
+        .filter(|c| crate::handshake::same_did(&c.sequencer_did, me))
+        .ok_or(FollowError::Mismatch(
+            "a move of a channel this server does not sequence",
+        ))?;
+    if set.channel_id != chan.id || !crate::handshake::same_did(&set.sequencer, link) {
+        return Err(FollowError::Mismatch(
+            "the move names another channel or server",
+        ));
+    }
+    let block_cid = bundle
+        .block_cid()
+        .map_err(|e| IngestError::BundleMalformed(e.to_string()))?
+        .to_string();
+    if record.block_cid != block_cid {
+        return Err(FollowError::Mismatch("the record is for another block"));
+    }
+    if !chan.is_root_owner(&crate::effect::canonical_did_string(
+        &sender.to_did_jig_string(),
+    )) {
+        return Err(FollowError::Mismatch(
+            "a sequencer move signed by a DID that is not the channel's owner",
+        ));
+    }
+    record.verify(&set.sequencer)?;
+    set.check_record(record.seq, &record.prev, &record.sequencer)?;
+    let cited = store
+        .ingest_record_bytes(&chan.id, set.head.seq)?
+        .and_then(|b| IngestRecord::decode(&b).ok())
+        .filter(|h| h.hash() == set.head.hash && crate::handshake::same_did(&h.sequencer, me))
+        .ok_or(FollowError::Mismatch(
+            "the move cites a head this server did not sign",
+        ))?;
+    let past = store.chain_head_seq(&chan.id)?.unwrap_or(cited.seq) - cited.seq;
+    {
+        let conn = store.conn.lock().expect("poisoned");
+        conn.execute(
+            "INSERT OR IGNORE INTO channel_moves (channel_id, seq, sequencer, previous, block_cid)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![chan.id, record.seq as i64, set.sequencer, me, block_cid],
+        )
+        .map_err(crate::persist::PersistError::from)?;
+        conn.execute(
+            "UPDATE channels SET sequencer_did = ?1 WHERE id = ?2",
+            params![set.sequencer, chan.id],
+        )
+        .map_err(crate::persist::PersistError::from)?;
+    }
+    Ok(past)
 }
 
 /// Check that this server, `me`, can take `chan` over by the `sequencer-set`
@@ -2704,6 +2839,104 @@ mod tests {
         assert_eq!(next.seq, record.seq + 1);
         assert!(next.follows(&record));
         assert_eq!(next.sequencer, new_did);
+    }
+
+    /// A move away from this server that lands while a write is on its way
+    /// (JEP-0005 rule 11a) refuses the write at its landing, as one that came
+    /// after the move: no record of this server's past the move.
+    #[tokio::test]
+    async fn a_write_racing_a_move_away_is_refused_at_its_landing() {
+        let mut owner = Owner::new().await;
+        owner.text("before the move").await;
+        let me = owner.ctx.server_did.to_did_jig_string();
+        let elsewhere =
+            Did::from_ed25519_pubkey(SigningKey::from_bytes(&[52; 32]).verifying_key().as_bytes())
+                .to_did_jig_string();
+        let head = owner.ctx.store.chain_head_seq(&owner.channel).unwrap();
+        let store = owner.ctx.store.clone();
+        let channel = owner.channel.clone();
+        let to = elsewhere.clone();
+        crate::ingest::BEFORE_LANDING.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                store
+                    .record_move_for_tests(
+                        &channel,
+                        &ChannelMove {
+                            seq: head.unwrap() + 1,
+                            sequencer: to,
+                            previous: me,
+                            block_cid: "bafkmove".to_string(),
+                        },
+                    )
+                    .unwrap();
+            }));
+        });
+        let meta = serde_json::json!({"channel_id": owner.channel, "body": "racing"});
+        let parts = signed(&owner.user, BlockKind::TextRender, meta);
+        let got = ingest(
+            &owner.ctx,
+            bundle(&parts),
+            parts.2.clone(),
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&got, Err(IngestError::SequencerMoved { sequencer, .. }) if *sequencer == elsewhere),
+            "{got:?}"
+        );
+        assert_eq!(
+            owner.ctx.store.chain_head_seq(&owner.channel).unwrap(),
+            head
+        );
+    }
+
+    /// A channel moved away from this server and back again is this
+    /// server's: its writes land (JEP-0005 rule 11a).
+    #[tokio::test]
+    async fn a_channel_moved_away_and_back_takes_writes_again() {
+        let mut owner = Owner::new().await;
+        owner.text("before the moves").await;
+        let me = owner.ctx.server_did.to_did_jig_string();
+        let elsewhere =
+            Did::from_ed25519_pubkey(SigningKey::from_bytes(&[53; 32]).verifying_key().as_bytes())
+                .to_did_jig_string();
+        let head = owner
+            .ctx
+            .store
+            .chain_head_seq(&owner.channel)
+            .unwrap()
+            .unwrap();
+        for (seq, to, from) in [(head + 1, &elsewhere, &me), (head + 2, &me, &elsewhere)] {
+            owner
+                .ctx
+                .store
+                .record_move_for_tests(
+                    &owner.channel,
+                    &ChannelMove {
+                        seq,
+                        sequencer: to.clone(),
+                        previous: from.clone(),
+                        block_cid: format!("bafkmove{seq}"),
+                    },
+                )
+                .unwrap();
+        }
+        let meta = serde_json::json!({"channel_id": owner.channel, "body": "back again"});
+        let parts = signed(&owner.user, BlockKind::TextRender, meta);
+        let got = ingest(
+            &owner.ctx,
+            bundle(&parts),
+            parts.2.clone(),
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await;
+        assert!(got.is_ok(), "{got:?}");
     }
 
     /// The move's write checks again what `check_takeover` checked: a record
