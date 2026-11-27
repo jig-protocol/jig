@@ -476,8 +476,11 @@ mod tests {
                 .any(|w| w == b"policy_approvals")
         );
 
+        // Approvals set on an ordinary accept were never signed.
+        assert_eq!(ordinary.verify(), Ok(()));
         let mut forged = ordinary.clone();
         forged.policy_approvals = vec![b"approval".to_vec()];
+        assert!(forged.verify().is_err());
         let mut fields = crate::dcbor::decode(&forged.payload()).unwrap();
         if let crate::dcbor::Value::Map(entries) = &mut fields {
             entries.push((
