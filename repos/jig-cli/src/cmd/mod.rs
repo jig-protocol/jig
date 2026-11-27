@@ -22,6 +22,7 @@ pub mod keys;
 pub mod ns;
 pub mod ns_pow;
 pub mod passphrase;
+pub mod prune;
 pub mod reader;
 pub mod receipt;
 pub mod request_proof;
