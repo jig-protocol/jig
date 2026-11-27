@@ -101,6 +101,7 @@ impl Device {
                     slug: String::new(),
                     suite: "none".into(),
                     owner_did: String::new(),
+                    co_owners: Vec::new(),
                     chain_head: None,
                     sequencer: None,
                 },
