@@ -194,6 +194,10 @@ pub struct SqliteStore {
 type ChannelGates =
     Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::RwLock<()>>>>;
 
+/// How many channel gates the map keeps before it drops the idle ones
+/// ([`SqliteStore::gate_channel`]).
+const IDLE_GATES: usize = 256;
+
 /// A channel's gate, held ([`SqliteStore::gate_channel`]).
 #[derive(Debug)]
 pub enum ChannelGate {
@@ -1318,13 +1322,33 @@ impl SqliteStore {
     /// writing its own SQLite store, which is every deployment today. Several
     /// writers against one store would need a lock in the database instead.
     ///
-    /// The map keeps one entry per channel this process has gated and never
-    /// shrinks: a few bytes a channel, which is fine at today's scale.
+    /// An entry no holder or waiter shares (the map owns its last strong
+    /// reference) is dropped, under the map's lock, once the map holds more
+    /// than [`IDLE_GATES`]: a refused `channel-create` or carried block
+    /// leaves no gate behind for good, and a gate in use is never replaced.
     ///
     /// Taken by [`crate::ingest::ingest`] and by
     /// [`crate::follow::ingest_sequenced`], so a carried record and a
     /// takeover of its channel are judged one after the other.
     pub async fn gate_channel(&self, channel_id: &str, exclusive: bool) -> ChannelGate {
+        let gate = {
+            let mut gates = self.channel_gates.lock().expect("poisoned");
+            if gates.len() > IDLE_GATES {
+                gates.retain(|_, gate| std::sync::Arc::strong_count(gate) > 1);
+            }
+            gates.entry(channel_id.to_string()).or_default().clone()
+        };
+        if exclusive {
+            ChannelGate::Exclusive(gate.write_owned().await)
+        } else {
+            ChannelGate::Shared(gate.read_owned().await)
+        }
+    }
+
+    /// Whether a shared hold of `channel_id`'s gate could be taken now,
+    /// without waiting: for tests that look inside a held gate.
+    #[cfg(test)]
+    pub(crate) fn gate_free_for_content(&self, channel_id: &str) -> bool {
         let gate = self
             .channel_gates
             .lock()
@@ -1332,11 +1356,7 @@ impl SqliteStore {
             .entry(channel_id.to_string())
             .or_default()
             .clone();
-        if exclusive {
-            ChannelGate::Exclusive(gate.write_owned().await)
-        } else {
-            ChannelGate::Shared(gate.read_owned().await)
-        }
+        gate.try_read_owned().is_ok()
     }
 
     /// Open (or create) a SQLite file at `path` and run migrations.

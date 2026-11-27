@@ -675,7 +675,7 @@ pub async fn ingest(
     // given. Without it an old key's block, checked just before its key link
     // lands, could still be sequenced after the link. Held to the landing,
     // and let go before delivery.
-    let channel_gate = match channel_id {
+    let mut channel_gate = match channel_id {
         Some(id) => Some(
             ctx.store
                 .gate_channel(id, crate::authorize_write::changes_the_channel(kind))
@@ -1367,6 +1367,9 @@ pub async fn ingest(
                 _ => return Err(refused_at_landing(guard_refusal, kind_str)),
             };
             witness_record(ctx, record.as_ref());
+            // Landed with its record: its place in the chain is fixed, so
+            // the receipt is rendered with the channel's gate let go.
+            drop(channel_gate.take());
             if let Some(input) = render_input.take() {
                 stored_receipt = receipt_after_landing(ctx, input, &block_cid, record).await;
             }
@@ -1431,8 +1434,10 @@ pub async fn ingest(
                 }
             };
             witness_record(ctx, record.as_ref());
-            // The receipt is written before fanout below, so no subscriber or peer sees the
-            // block without it.
+            // Landed with its record: the receipt is rendered with the
+            // channel's gate let go. It is written before fanout below, so
+            // no subscriber or peer sees the block without it.
+            drop(channel_gate.take());
             if let Some(input) = render_input.take() {
                 stored_receipt = receipt_after_landing(ctx, input, &block_cid, record).await;
             }
@@ -6294,63 +6299,34 @@ mod tests {
         .unwrap();
         let hi = serde_json::json!({"channel_id": chan, "body": "hi"});
 
-        // The member's key link is in flight: it holds the gate.
-        let gate = ctx.store.gate_channel(&chan, true).await;
-        let racing = plain(&ctx, &member, BlockKind::TextRender, hi.clone());
-        tokio::pin!(racing);
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), &mut racing)
-                .await
-                .is_err(),
-            "the old key's post waits at the gate, unjudged"
-        );
-        // Content does not wait for content.
-        let gate2 = ctx.store.gate_channel(&chan, false);
-        tokio::pin!(gate2);
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(10), &mut gate2)
-                .await
-                .is_err(),
-            "a shared gate waits for the exclusive one"
-        );
-        let link = crate::ingest_record::label_cid("the member's link in the window");
-        let (mb, cb, sig) = signed_parts(
-            &member2.key,
+        // The member's key link, through ingest: at its landing, no post can
+        // take the channel's gate, so none is judged until the link lands.
+        let store = ctx.store.clone();
+        let channel = chan.clone();
+        let content_could_pass = std::rc::Rc::new(std::cell::Cell::new(true));
+        let seen = content_could_pass.clone();
+        super::BEFORE_LANDING.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                seen.set(store.gate_free_for_content(&channel));
+            }));
+        });
+        let link = plain(
+            &ctx,
+            &member2,
             BlockKind::KeyLink,
-            jig_core::EncryptionSuite::Unencrypted,
             key_link(&member, &member2, &chan, None),
+        )
+        .await
+        .expect("the member links its key");
+        assert!(
+            !content_could_pass.get(),
+            "a post cannot take the gate while the key link lands"
         );
-        let linked = ctx
-            .store
-            .insert_block_sequenced(
-                &StoredBlock {
-                    cid: link.clone(),
-                    channel_id: Some(chan.clone()),
-                    block_kind: "key-link".to_string(),
-                    sender_did: member2.did.clone(),
-                    sender_sig: sig,
-                    bundle_bytes: serde_json::to_vec(&(&mb, &cb)).unwrap(),
-                    is_synthetic: true,
-                    hlc_wall_ms: 0,
-                    hlc_logical: 0,
-                    hlc_origin: String::new(),
-                    posted_at: 0,
-                    origin_server: String::new(),
-                    federated_from: None,
-                },
-                &crate::ingest_record::RecordSigner {
-                    channel_id: chan.clone(),
-                    key: &ctx.server_key,
-                    ingest_wall_ms: 0,
-                    ingest_logical: 0,
-                },
-            )
-            .unwrap();
-        drop(gate);
-        let _shared = gate2.await;
-        drop(_shared);
+        let linked = ctx.store.get_ingest_record(&link).unwrap().unwrap();
 
-        let posted = racing.await.expect("an open channel takes the post");
+        let posted = plain(&ctx, &member, BlockKind::TextRender, hi)
+            .await
+            .expect("an open channel takes the post");
         let posted = ctx.store.get_ingest_record(&posted).unwrap().unwrap();
         assert!(
             posted.seq > linked.seq,
@@ -6358,12 +6334,16 @@ mod tests {
             linked.seq,
             posted.seq
         );
-        // Two posts hold the shared gate at once.
-        let (a, b) = (
-            ctx.store.gate_channel(&chan, false).await,
-            ctx.store.gate_channel(&chan, false).await,
-        );
-        drop((a, b));
+        // Content does not wait for content: two posts hold the shared gate
+        // at once, and the second takes it while the first is held.
+        let first = ctx.store.gate_channel(&chan, false).await;
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            ctx.store.gate_channel(&chan, false),
+        )
+        .await
+        .expect("a second shared gate is taken while the first is held");
+        drop((first, second));
     }
 
     /// The rejoin rule admits a member on the roster only: a member removed
