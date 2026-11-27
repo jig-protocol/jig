@@ -486,9 +486,26 @@ pub enum IngestError {
     #[error(transparent)]
     Identity(#[from] crate::identity::IdentityError),
     #[error(transparent)]
-    Persist(#[from] crate::persist::PersistError),
+    Persist(crate::persist::PersistError),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+impl From<crate::persist::PersistError> for IngestError {
+    /// A move that landed while a write awaited its landing refuses it as a
+    /// write after the move is refused.
+    fn from(e: crate::persist::PersistError) -> Self {
+        match e {
+            crate::persist::PersistError::SequencerMoved {
+                channel_id,
+                sequencer,
+            } => IngestError::SequencerMoved {
+                channel_id,
+                sequencer,
+            },
+            e => IngestError::Persist(e),
+        }
+    }
 }
 
 /// Block ingest entry point. Returns the CID of the persisted block on success.

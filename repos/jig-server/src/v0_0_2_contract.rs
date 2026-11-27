@@ -407,11 +407,17 @@ impl Contracts {
         };
         match self.store().get_block(share_cid) {
             Ok(Some(block)) if block.block_kind == BlockKind::SequencerSet.as_str() => {
-                if let Err(e) = self
+                match self
                     .stream
                     .push_to(&block, std::slice::from_ref(&offer.peer_did))
                 {
-                    tracing::info!(peer = %offer.peer_did, "the move not sent with its re-offer: {e:#}");
+                    Ok(unreached) if !unreached.is_empty() => {
+                        tracing::debug!(peer = %offer.peer_did, "the move not queued with its re-offer");
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::info!(peer = %offer.peer_did, "the move not sent with its re-offer: {e:#}");
+                    }
                 }
             }
             Ok(_) => {}
@@ -475,7 +481,7 @@ impl Contracts {
         let mut all = true;
         // The move first, to the followers and to the sequencer it moves
         // from: a follower judges the re-offer by the move in its chain.
-        let pushed = (|| -> anyhow::Result<()> {
+        let pushed = (|| -> anyhow::Result<Vec<String>> {
             if let Some(block) = self.store().get_block(set_cid)? {
                 let mut to: Vec<String> = followers
                     .iter()
@@ -485,13 +491,22 @@ impl Contracts {
                 if let Some(moved) = self.store().channel_moves(&channel.id)?.last() {
                     to.push(moved.previous.clone());
                 }
-                self.stream.push_to(&block, &to)?;
+                return self.stream.push_to(&block, &to);
             }
-            Ok(())
+            Ok(Vec::new())
         })();
-        if let Err(e) = pushed {
-            tracing::warn!(channel = %channel.id, "the move not pushed to the followers: {e:#}");
-            all = false;
+        match pushed {
+            // A peer the move did not reach, the sequencer it moved from
+            // included, keeps the channel due: the next tick sends it again.
+            Ok(unreached) if !unreached.is_empty() => {
+                tracing::debug!(channel = %channel.id, ?unreached, "the move waits for peers to connect");
+                all = false;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(channel = %channel.id, "the move not pushed to the followers: {e:#}");
+                all = false;
+            }
         }
         for (to, grant) in followers {
             if jig_pipeline::handshake::same_did(&to, &me) {
@@ -2714,11 +2729,12 @@ mod tests {
         assert_eq!(next.seq, record.seq + 1);
     }
 
-    /// A re-offer after a move goes with its `sequencer-set` each time it is
-    /// sent (JEP-0005 rule 11a): a follower that was not connected when the
-    /// set was first pushed gets it before the re-offer it judges by it.
+    /// A move reaches the servers that were away when it landed (JEP-0005
+    /// rule 11a): the sequencer it moved from once a connection to it takes
+    /// the move, and a follower with each resend of its re-offer, before the
+    /// re-offer it judges by the move.
     #[tokio::test]
-    async fn a_resent_reoffer_goes_after_its_move() {
+    async fn a_move_reaches_the_servers_that_were_away() {
         let p = pair(OfferPolicy::Accept).await;
         let channel = p.shared(1).await;
         p.follows.stream.pull_all();
@@ -2746,6 +2762,39 @@ mod tests {
         let cid = post(&p.follower, &p.user, BlockKind::SequencerSet, meta)
             .await
             .unwrap();
+
+        // The sequencer it moved from, away: the move stays due for it until
+        // a connection to it takes the move.
+        let gone = Did::from_did_jig_string(&did_of(&SigningKey::from_bytes(&[45; 32]))).unwrap();
+        p.follower
+            .ingest_ctx
+            .store
+            .record_move_for_tests(
+                &channel,
+                &jig_pipeline::follow::ChannelMove {
+                    seq: u64::MAX >> 1,
+                    sequencer: new.clone(),
+                    previous: gone.to_did_jig_string(),
+                    block_cid: cid.clone(),
+                },
+            )
+            .unwrap();
+        let contracts = Contracts::new(&p.follower);
+        let row = p
+            .follower
+            .ingest_ctx
+            .store
+            .get_channel_by_id(&channel)
+            .unwrap()
+            .unwrap();
+        assert!(!contracts.reoffer_each(&row, &cid).await, "not reached yet");
+        let (sender, mut gone_rx) = crate::v0_0_2_peer::PeerSender::new(gone);
+        p.follower.peers.register(sender);
+        assert!(contracts.reoffer_each(&row, &cid).await, "reached");
+        assert!(matches!(
+            gone_rx.try_recv().map(|e| e.frame),
+            Ok(jig_pipeline::envelope::Frame::Peer { kind, .. }) if kind == crate::v0_0_2_stream::RECORDS_FRAME
+        ));
 
         // A follower that was away: its re-offer is kept, unanswered.
         let away = Did::from_did_jig_string(&did_of(&SigningKey::from_bytes(&[44; 32]))).unwrap();
