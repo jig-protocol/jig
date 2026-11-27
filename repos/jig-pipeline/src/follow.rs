@@ -553,14 +553,6 @@ impl SqliteStore {
         Ok(())
     }
 
-    fn drop_pending_move(&self, channel_id: &str) -> crate::persist::Result<()> {
-        self.conn.lock().expect("poisoned").execute(
-            "DELETE FROM pending_moves WHERE channel_id = ?1",
-            [channel_id],
-        )?;
-        Ok(())
-    }
-
     /// The highest `seq` of `channel_id`'s chain this server holds.
     pub fn chain_head_seq(&self, channel_id: &str) -> crate::persist::Result<Option<u64>> {
         let conn = self.conn.lock().expect("poisoned");
@@ -1344,6 +1336,12 @@ pub async fn ingest_sequenced(
                 "UPDATE channels SET sequencer_did = ?1 WHERE id = ?2",
                 params![set.sequencer, channel_id],
             )?;
+            // The move kept for its head, if this is it, lands with it: in
+            // this transaction, and only that move's row.
+            conn.execute(
+                "DELETE FROM pending_moves WHERE channel_id = ?1 AND seq = ?2",
+                params![channel_id, seq as i64],
+            )?;
         }
         advance_mirror(conn, &channel_id, mls)
     };
@@ -1405,9 +1403,9 @@ pub async fn ingest_sequenced(
         .flatten()
         .map(crate::effect::canonical_did_string);
     deliver(ctx, &stored, &channel_id, removed).await;
-    if moving.is_some() {
-        ctx.store.drop_pending_move(&channel_id)?;
-    } else if let Some(p) = pending.filter(|p| p.seq == seq + 1) {
+    if moving.is_none()
+        && let Some(p) = pending.filter(|p| p.seq == seq + 1)
+    {
         // The head the kept move cites has landed: land the move now.
         let parts = BlockBundle {
             manifest_bytes: &p.manifest,

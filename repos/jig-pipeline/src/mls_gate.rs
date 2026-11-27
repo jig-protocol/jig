@@ -189,14 +189,17 @@ pub fn plan(
         // no commit: a role changes who may sign, not who is in the group.
         // Who may sign one is the write gate's call, from the chain.
         // Share blocks and contract records are control plane too: the
-        // servers read them, and members check their signed envelopes.
+        // servers read them, and members check their signed envelopes. So is
+        // a `sequencer-set` (rule 11a): it moves who orders the channel, not
+        // who is in the group.
         BlockKind::RoleAssign
         | BlockKind::RoleUnassign
         | BlockKind::ChannelShare
         | BlockKind::ChannelUnshare
         | BlockKind::ContractAccept
         | BlockKind::ContractRefuse
-        | BlockKind::ContractEnd => {
+        | BlockKind::ContractEnd
+        | BlockKind::SequencerSet => {
             require_plaintext_block(manifest, block_suite)?;
             Ok(MlsPlan::Nothing)
         }
@@ -957,6 +960,32 @@ mod tests {
             Err(SuiteRefusal::Missing {
                 field: keys::COMMIT
             })
+        );
+    }
+
+    /// A `sequencer-set` is plaintext control plane on an MLS channel, as a
+    /// contract record is (JEP-0005 rule 11a): it moves who orders the
+    /// channel, not who is in the group, so it carries no commit.
+    #[test]
+    fn a_sequencer_move_is_plain_control_on_an_mls_channel() {
+        let a = who(1);
+        let g = genesis(&a);
+        let sealed = chan("mls", &a.did);
+        let set = manifest(
+            BlockKind::SequencerSet,
+            &a.did,
+            EncryptionSuite::Unencrypted,
+            json!({"channel": "#sealed"}),
+        );
+        assert_eq!(
+            plan(
+                BlockKind::SequencerSet,
+                &a.did,
+                &set,
+                Some(&sealed),
+                Some(&g)
+            ),
+            Ok(MlsPlan::Nothing)
         );
     }
 
