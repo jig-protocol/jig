@@ -886,16 +886,19 @@ pub async fn get_channel_history(
             ),
         ));
     }
-    let gate = match channel.as_ref() {
-        Some(channel) => reader_gate(store, &headers, &channel.id)?,
-        None => None,
-    };
     // A carried channel stopped at a block kind this server does not
     // implement (JEP-0005 rule 14c): its history here ends short of the
     // owner's, and a reader must be told why rather than read it as whole.
+    // A client that cannot read an earlier block is told of that one first:
+    // it is the stop this client meets first.
     if let Some(channel) = channel.as_ref()
         && let Some(stop) = store.carried_upgrade(&channel.id).map_err(persist_err)?
     {
+        if let Some(gate) = reader_gate(store, &headers, &channel.id)?
+            && gate.seq < stop.seq
+        {
+            return Err(gated(&gate));
+        }
         let notice = stop.notice();
         return Err(err(
             StatusCode::from_u16(notice.status).unwrap_or(StatusCode::CONFLICT),
@@ -1020,7 +1023,12 @@ pub async fn get_channel_history(
     }
     // A client that cannot read a block past the gate is served the history
     // before it, and told at the gate (JEP-0005 rule 11a): a page that
-    // reaches it is cut there, and one that starts past it is refused.
+    // reaches it is cut there, and one that starts past it is refused. The
+    // gate is read after the page, so a move the page holds is one it sees.
+    let gate = match channel.as_ref() {
+        Some(channel) => reader_gate(store, &headers, &channel.id)?,
+        None => None,
+    };
     if let Some(gate) = &gate {
         let reached = timeline
             .iter()
@@ -1070,6 +1078,9 @@ pub async fn get_channel_records(
             query.limit.unwrap_or(MAX_HISTORY_LIMIT),
         )
         .map_err(persist_err)?;
+    // Read again after the page: a move that landed while it was read is in
+    // it, and must cut it as well.
+    let gate = reader_gate(store, &headers, &channel.id)?.or(gate);
     let records = match &gate {
         Some(gate) => records.into_iter().filter(|r| r.seq < gate.seq).collect(),
         None => records,
