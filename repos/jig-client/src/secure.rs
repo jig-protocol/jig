@@ -699,7 +699,9 @@ impl Session {
         })
     }
 
-    /// The CID of a join to `server`/`slug` sent and not yet seen to land.
+    /// The CID of a join to `server`/`slug` sent and not yet seen to land:
+    /// reading its echo in the channel's history clears it, whatever read
+    /// does the reading.
     pub fn join_unconfirmed(&self, server: &str, slug: &str) -> Result<Option<String>> {
         let key = group_key(server, slug);
         self.with_member(|_, g| Ok(g.joining.get(&key).cloned()))
@@ -1286,6 +1288,12 @@ impl Session {
         f: impl FnOnce(&Member, &mut Groups) -> Result<Seen>,
     ) -> Result<Seen> {
         self.with_member(|m, g| {
+            // The echo of a join this device sent with no answer: proof it
+            // landed, kept before any head moves past it, however this read
+            // ends ([`Session::join_sent`]).
+            if g.joining.get(key) == Some(&block.cid) {
+                g.joining.remove(key);
+            }
             if let Some(seen) = g.seen.get(&block.cid) {
                 return Ok(match seen.clone() {
                     Seen::Left { member, .. } => Seen::Left {
@@ -2752,6 +2760,32 @@ mod tests {
             .unwrap();
         bob.join_sent(SERVER, "#open", "the second join").unwrap();
         bob.join_landed(SERVER, "#open").unwrap();
+        assert_eq!(bob.join_unconfirmed(SERVER, "#open").unwrap(), None);
+        assert!(bob.has_group(SERVER, "#open").unwrap());
+    }
+
+    /// A join that landed with its answer lost is settled by any read that
+    /// meets its echo, before that read's head moves past it: a later check
+    /// that reads only after the head does not see the echo, and must not
+    /// take its absence for a join that failed.
+    #[test]
+    fn reading_a_joins_echo_settles_it() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let bob = session(root.path());
+        let created = alice.create_group(SERVER, "#open").unwrap();
+        let c = bob
+            .prepare_join(SERVER, "#open", &created.group_info)
+            .unwrap();
+        let join = build_with_metadata(
+            identity_of(&bob),
+            BlockKind::MemberAdd,
+            hlc(&bob),
+            json!({"channel": "#open", "member_did": bob.did(),
+                "mls_commit": STANDARD.encode(&c.commit)}),
+        );
+        bob.join_sent(SERVER, "#open", &join.cid()).unwrap();
+        bob.observe(SERVER, &deliver(&join));
         assert_eq!(bob.join_unconfirmed(SERVER, "#open").unwrap(), None);
         assert!(bob.has_group(SERVER, "#open").unwrap());
     }
