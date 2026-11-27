@@ -35,8 +35,10 @@ pub enum NeedsUpgrade {
         seq: Option<u64>,
     },
     /// The server this reader reads through stopped the channel there
-    /// (`CHANNEL_NEEDS_UPGRADE`).
-    #[error("{channel}: this channel needs your server to upgrade. The server says: {message}")]
+    /// (`CHANNEL_NEEDS_UPGRADE`). Its message names what must upgrade: this
+    /// server, or the client, at a kind the client does not declare (JEP-0005
+    /// rule 11a).
+    #[error("{channel}: this channel needs an upgrade. The server says: {message}")]
     Server { channel: String, message: String },
 }
 
@@ -183,7 +185,7 @@ mod tests {
         let body = r#"{"code":"CHANNEL_NEEDS_UPGRADE","message":"block kind `k` at seq 3"}"#;
         let e = from_error_body("#x", body).unwrap();
         assert!(is_needs_upgrade(&e));
-        assert!(format!("{e}").contains("needs your server to upgrade"));
+        assert!(format!("{e}").contains("needs an upgrade. The server says"));
         assert!(from_error_body("#x", r#"{"code":"NOT_FOUND","message":""}"#).is_none());
         assert!(from_error_body("#x", "not json").is_none());
     }

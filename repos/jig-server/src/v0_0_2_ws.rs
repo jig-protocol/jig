@@ -447,6 +447,7 @@ async fn handle_socket(
                                 &text,
                                 &state,
                                 &sub_tx,
+                                &mut sub_rx,
                                 &mut session,
                                 conn_id,
                                 &mut socket,
@@ -739,6 +740,10 @@ async fn handle_client_frame(
     text: &str,
     state: &Arc<AppState>,
     sub_tx: &mpsc::UnboundedSender<(
+        jig_pipeline::persist::StoredBlock,
+        jig_pipeline::persist::StoredReceipt,
+    )>,
+    sub_rx: &mut mpsc::UnboundedReceiver<(
         jig_pipeline::persist::StoredBlock,
         jig_pipeline::persist::StoredReceipt,
     )>,
@@ -1112,6 +1117,10 @@ async fn handle_client_frame(
             // the life of the process, long after this socket forgot it.
             if let Some(old) = session.sub_id.take() {
                 state.ingest_ctx.fanout.unsubscribe_local(old).await;
+                // Blocks the old subscription had queued are not the new
+                // one's: delivered after it, they would be read under its
+                // scope, and could gate it at another channel's block.
+                while sub_rx.try_recv().is_ok() {}
             } else {
                 // The gauge counts connections holding a subscription; a
                 // replacement is not a second unit.
@@ -1124,6 +1133,24 @@ async fn handle_client_frame(
                 .await;
             session.sub_id = Some(id);
             session.gated = false;
+            // A move landed between the check above and this registration
+            // would reach this subscription unnoticed: check again now that
+            // it is registered, and refuse it as above if it is gated.
+            if let Some(gate) = reader_gate(state, &session.block_kinds, &sub_key) {
+                state.ingest_ctx.fanout.unsubscribe_local(id).await;
+                session.sub_id = None;
+                metrics::subscriber_removed();
+                let notice = gate.notice();
+                let _ = send_error(
+                    socket,
+                    Some(notice.status),
+                    notice.code,
+                    Some(notice.channel_id),
+                    &notice.message,
+                )
+                .await;
+                return Ok(());
+            }
             if let Some(tx) = &session.notice_tx {
                 state.ingest_ctx.fanout.watch_notices(id, tx.clone());
                 // A stop kept between the check above and this registration
