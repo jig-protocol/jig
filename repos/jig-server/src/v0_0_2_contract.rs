@@ -2843,36 +2843,50 @@ mod tests {
         let p = pair(OfferPolicy::Accept).await;
         let channel = p.shared(1).await;
         // The owner sends an accepted follower the channel at once; wait for
-        // it, so what follows does not race that push.
+        // it, then cut the link so nothing more is pushed.
         let head = p.caught_up(&channel).await;
-        let follower = &p.follower.ingest_ctx.store;
-        let before = follower
-            .list_ingest_records_by_id(&channel, 0, usize::MAX)
+        p.dial.abort();
+        eventually("the link down", || {
+            p.follower
+                .peers
+                .sender_for(&p.owner.server_did)
+                .is_none()
+                .then_some(())
+        })
+        .await;
+        // One more block on the owner: records the follower doesn't have.
+        p.text(&channel, "after the link").await;
+        let records = Contracts::new(&p.owner)
+            .stream
+            .records_from(&channel, head + 1)
             .unwrap()
-            .len();
+            .unwrap();
+        let follower = &p.follower.ingest_ctx.store;
+        let count = |store: &jig_pipeline::persist::SqliteStore| {
+            store
+                .list_ingest_records_by_id(&channel, 0, usize::MAX)
+                .unwrap()
+                .len()
+        };
+        let before = count(follower);
         // The owner's own blocks and records, landed as if another server
         // sent them: the sequencer is the connection's peer, and this one
         // holds no share and sequences nothing.
-        let records = Contracts::new(&p.owner)
-            .stream
-            .records_from(&channel, 0)
-            .unwrap()
-            .unwrap();
         let stranger = Did::from_ed25519_pubkey(
             SigningKey::from_bytes(&rand::random())
                 .verifying_key()
                 .as_bytes(),
         );
-        p.follows.stream.land(&stranger, records).await;
+        p.follows.stream.land(&stranger, records.clone()).await;
         assert_eq!(Pair::head(&p.follower, &channel), Some(head));
         assert_eq!(
-            follower
-                .list_ingest_records_by_id(&channel, 0, usize::MAX)
-                .unwrap()
-                .len(),
+            count(follower),
             before,
-            "a stream from a server that does not own the channel changes nothing"
+            "a stream from a server that does not own the channel lands nothing"
         );
+        // From the owner, the same frame lands.
+        p.follows.stream.land(&p.owner.server_did, records).await;
+        assert!(Pair::head(&p.follower, &channel) > Some(head));
     }
 
     #[tokio::test]
