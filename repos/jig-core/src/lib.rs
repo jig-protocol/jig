@@ -39,6 +39,8 @@ pub mod program;
 pub mod proptest_generators;
 pub mod request_auth;
 pub mod ruleset;
+#[cfg(feature = "ed25519")]
+pub mod sequencer_move;
 mod serde_helpers;
 pub mod signing;
 pub mod slug;
