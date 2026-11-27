@@ -491,7 +491,7 @@ impl AppState {
             server_url: server_url.clone(),
             naively_allow_unknown_handles_fallback,
             executor: Some(BlockExecutor::shared()),
-            require_remove_ends: false,
+            require_remove_ends: config.server.require_remove_ends,
         });
 
         let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));
@@ -551,7 +551,7 @@ impl AppState {
             server_url: server_url.clone(),
             naively_allow_unknown_handles_fallback,
             executor: Some(BlockExecutor::shared()),
-            require_remove_ends: false,
+            require_remove_ends: config.server.require_remove_ends,
         });
 
         let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));
@@ -920,6 +920,19 @@ mod tests {
                 .expect("a bound outside the range must not boot");
             assert!(err.to_string().contains("max_future_skew_ms"), "{err}");
         }
+    }
+
+    /// `[server] require_remove_ends` reaches the ingest context through the
+    /// test constructors too, so a fixture configured with it behaves as the
+    /// server it stands for.
+    #[test]
+    fn require_remove_ends_reaches_ingest() {
+        let state = super::AppState::for_test().unwrap();
+        assert!(!state.ingest_ctx.require_remove_ends);
+        let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
+        config.server.require_remove_ends = true;
+        let state = super::AppState::for_test_with_config(config).unwrap();
+        assert!(state.ingest_ctx.require_remove_ends);
     }
 
     /// Every operator-facing execution limit must reach the runtime config.

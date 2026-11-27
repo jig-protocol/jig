@@ -52,9 +52,14 @@ async fn a_leave_replayed_on_another_server_ends_nothing_there() {
 
     a.create_channel(&owner_a, "#team", "open").await.unwrap();
     b.create_channel(&owner_b, "#team", "open").await.unwrap();
-    // The member joins both, each by its own `member-add`.
-    let joined_a = a.add_member(&member, "#team", &did).await.unwrap();
-    let joined_b = b.add_member(&member, "#team", &did).await.unwrap();
+    // The member joins both, each by its own `member-add`. The two are
+    // stamped a millisecond apart, so their CIDs differ however fast they go.
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let joined_a = a.add_member_at(&member, "#team", &did, now).await.unwrap();
+    let joined_b = b
+        .add_member_at(&member, "#team", &did, now + 1)
+        .await
+        .unwrap();
     assert_ne!(joined_a, joined_b);
     assert_eq!(
         since_of(&a, &member, "#team", &did).await,

@@ -413,7 +413,7 @@ mod tests {
             server_url: server_url.clone(),
             naively_allow_unknown_handles_fallback: false,
             executor: Some(BlockExecutor::shared()),
-            require_remove_ends: false,
+            require_remove_ends: config.server.require_remove_ends,
         });
 
         let bridges = Arc::new(crate::v0_0_2_bridges::BridgeRegistry::new(&config));

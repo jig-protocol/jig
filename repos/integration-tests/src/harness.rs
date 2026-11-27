@@ -437,8 +437,21 @@ impl TestJigServer {
         slug: &str,
         member_did: &str,
     ) -> Result<String> {
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        self.add_member_at(owner, slug, member_did, now).await
+    }
+
+    /// [`Self::add_member`] stamped at `wall_ms`, for tests that need two
+    /// adds whose blocks differ however fast they are sent.
+    pub async fn add_member_at(
+        &self,
+        owner: &Identity,
+        slug: &str,
+        member_did: &str,
+        wall_ms: u64,
+    ) -> Result<String> {
         let hlc = jig_core::HlcTimestamp {
-            wall_ms: chrono::Utc::now().timestamp_millis() as u64,
+            wall_ms,
             logical: 0,
             server_did: owner.did().clone(),
         };
