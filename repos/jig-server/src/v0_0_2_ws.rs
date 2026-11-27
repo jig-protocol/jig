@@ -2378,14 +2378,18 @@ mod tests {
 
     /// A drain that runs out cuts a session that is still open (here, one
     /// waiting for a Close reply that never comes), and the session's cleanup
-    /// still runs before the server returns: the connection gauge is back
-    /// where it started.
+    /// still runs before the server returns: its subscription is gone from
+    /// this server's fanout.
+    ///
+    /// The check reads this test's own server, not the process-wide
+    /// connection gauge, which other tests move while this one runs (#513).
     #[tokio::test]
     async fn a_cut_session_still_cleans_up() {
         let state = Arc::new(AppState::for_test().unwrap());
+        seed_channel(&state, "#cut");
         let app = Router::new()
             .route("/api/v1/ws", get(ws_handler))
-            .with_state(state);
+            .with_state(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}/api/v1/ws", listener.local_addr().unwrap());
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -2401,10 +2405,27 @@ mod tests {
             std::future::pending,
         ));
 
-        let before = metrics::snapshot().connections_active;
-        // Never read: the session waits for a Close reply until it is cut.
-        let silent = established(&url).await;
-        assert_eq!(metrics::snapshot().connections_active, before + 1);
+        // Read no further: the session waits for a Close reply until it is cut.
+        let mut silent = established(&url).await;
+        let sub = signed_subscribe_frame(
+            &test_identity(),
+            &audience(&state),
+            Scope::Channel {
+                slug: "#cut".into(),
+            },
+        );
+        silent
+            .send(TMessage::Text(serde_json::to_string(&sub).unwrap().into()))
+            .await
+            .unwrap();
+        let fanout = &state.ingest_ctx.fanout;
+        for _ in 0..300 {
+            if fanout.local_subscription_count().await == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(fanout.local_subscription_count().await, 1, "subscribed");
         stop_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(5), served)
             .await
@@ -2412,8 +2433,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            metrics::snapshot().connections_active,
-            before,
+            fanout.local_subscription_count().await,
+            0,
             "the cut session ran its cleanup"
         );
         drop(silent);
