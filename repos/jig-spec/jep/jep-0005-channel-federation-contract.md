@@ -59,11 +59,11 @@ Non-goals for v0.2:
 ## Encoding
 
 0. Every message this JEP defines and signs (`contract-offer`, `contract-accept`,
-   `contract-refuse`, `contract-end`, a custodian release policy and a key-package
-   request) is a `COSE_Sign1` over deterministic CBOR, exactly as JEP-0004 rule 0 states,
-   with `domain` `jig-contract-offer-v1`, `jig-contract-accept-v1`,
-   `jig-contract-refuse-v1`, `jig-contract-end-v1`, `jig-kp-release-policy-v1` and
-   `jig-kp-request-v1` respectively. Blocks (`channel-share`, `role-assign`,
+   `contract-refuse`, `contract-end`, a custodian release policy, a key-package request
+   and a decision on a held request) is a `COSE_Sign1` over deterministic CBOR, exactly
+   as JEP-0004 rule 0 states, with `domain` `jig-contract-offer-v1`,
+   `jig-contract-accept-v1`, `jig-contract-refuse-v1`, `jig-contract-end-v1`,
+   `jig-kp-release-policy-v1`, `jig-kp-request-v1` and `jig-kp-decision-v1` respectively. Blocks (`channel-share`, `role-assign`,
    `sequencer-set` and the rest) and the `ingest` record are signed as JEP-0002 defines.
 
 ## Roles and addressing
@@ -384,10 +384,46 @@ Non-goals for v0.2:
        defined (#449).
      - The requester MUST check that a released package verifies and is the DID's before
        it commits.
-21b. *v0.2 interim, until DIDs sign release policies:* a server's own configured policy
-     (`open`, within the limits of 21a, or `closed`) stands in for every DID's. Held
-     requests, approvals, the Welcome mailbox and one package per device are not yet
-     defined.
+21b. A **release policy** is a `COSE_Sign1` by `did` (rule 0, domain
+     `jig-kp-release-policy-v1`) over
+     `{domain, did, custodian, seq, issued_at, release_to, release_any}`:
+     - `custodian` is the server DID it is for;
+     - `seq` is an unsigned integer: a custodian keeps only the policy with the highest
+       `seq` it has seen for `(did, custodian)`;
+     - `release_to` is an array of the requester DIDs it releases to, each a canonical
+       did:jig key, at most 256, sorted by their deterministic encoding and without
+       repeats;
+     - `release_any` is a boolean: release to any requester. `release_to` MUST then be
+       empty.
+
+     A verifier MUST refuse any other form, so that each policy has one encoding. A
+     custodian MUST refuse a policy that names another custodian. A request from a
+     requester the policy releases to is released as 21a says. Any other request is held
+     (21c). A DID that has stored no policy with a custodian falls back to that server's
+     own configured policy: `open`, within the limits of 21a, or `closed`
+     (DJ 2026-11-26), so that DIDs whose clients predate policies keep the release they
+     had. Vectors are in `vectors/0005/kp-custody.json`.
+21c. **Held requests.** A custodian answers a request it holds with `409 HELD` and the
+     request's `request_id`: BLAKE3-256 over the request's deterministic payload. It is a
+     refusal, not a release, so a requester that does not know holds reports it as one.
+     - The DID reads its held requests with a read proof of its own (JEP-0002), addressed
+       to the custodian. Nobody else may read them: they say who is trying to add the
+       DID, and to which channel.
+     - The DID answers a held request with a **decision**: a `COSE_Sign1` by `did`
+       (rule 0, domain `jig-kp-decision-v1`) over
+       `{domain, did, custodian, request_id, approve, issued_at}`, where `approve` is a
+       boolean. A custodian MUST refuse a decision that names another custodian, or a
+       `request_id` that is not a request it holds for that same DID. A request is decided
+       once.
+     - An approval lets the requester's next request for the same DID and channel be
+       released as the policy would have released it, once, within 24 hours. The limits
+       of 21a still apply. No package is set aside, and nothing new is sent: the
+       requester asks again with a fresh signed request.
+     - A refusal is final for that request. The requester may still ask again; a new
+       request is held again.
+     - Every hold, decision and release is logged, as in 21a.
+
+     The Welcome mailbox and one package per device are not yet defined.
 
 ## Unchanged
 
@@ -437,13 +473,16 @@ Non-goals for v0.2:
   content, which stays MLS ciphertext. A share sent encrypted is refused, not carried
   unread (PV-05).
 
-- **Key-package custody** (21–21b). A custodian can withhold a DID's packages, and can
+- **Key-package custody** (21–21c). A custodian can withhold a DID's packages, and can
   log who asked for them; it cannot substitute one, since each is signed by the DID and
-  checked by the adder. Anyone it admits can ask, within its limits, so many identities
-  that each pass admission can draw a DID's ordinary stock down to its last-resort
-  package. The DID stays reachable, but adds that reuse the last-resort package share
-  its init key until the DID updates its leaf. Signed release policies (21b) are what
-  close this.
+  checked by the adder. Under a server's own `open` policy, anyone it admits can ask,
+  within its limits, so many identities that each pass admission can draw a DID's
+  ordinary stock down to its last-resort package. The DID stays reachable, but adds that
+  reuse the last-resort package share its init key until the DID updates its leaf. A
+  release policy the DID signed (21b) closes this: a requester it does not name is held
+  until the DID approves (21c), so only those the DID names, or approves, draw its stock.
+  A DID that stores no policy keeps the server's. The held list shows who is trying to
+  add the DID, so only the DID reads it.
 
 - **Unknown block kinds** (14c). A hostile owner can sequence a critical block of an
   invented kind to stop a channel at readers that do not implement it. That is no more
@@ -478,6 +517,12 @@ deterministic payload and its `COSE_Sign1`, in hex, under fixed test keys. The o
 
 `vectors/0005/kp-request.json`: a `jig-kp-request-v1` (21a) under fixed test keys, as its
 deterministic payload and its `COSE_Sign1`, in hex.
+
+`vectors/0005/kp-custody.json`: a `jig-kp-release-policy-v1` (21b) releasing to two
+requesters, the `request_id` of the request in `kp-request.json`, and a
+`jig-kp-decision-v1` (21c) approving that request, each as its deterministic payload and
+its `COSE_Sign1`, in hex, under fixed test keys. Under `refused`, the same policy and
+decision signed for another custodian: valid objects that the custodian above MUST refuse.
 
 `vectors/0005/unknown-kinds.json` (14c): manifests of kinds that no v0.2 build implements,
 each signed under a fixed test key. For each it gives whether the block is critical and
