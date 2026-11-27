@@ -871,6 +871,58 @@ impl Pins {
             .unwrap_or_default()
     }
 
+    /// The sequencer moves this device verified for each channel it pinned
+    /// on `server`, by channel id, oldest first (JEP-0005 rule 11a): what a
+    /// new connection's chains start from.
+    pub fn moves(
+        &self,
+        server: &str,
+    ) -> std::collections::HashMap<String, Vec<crate::chain::HeadMove>> {
+        self.server(server)
+            .map(|p| {
+                p.channels
+                    .values()
+                    .filter_map(|c| {
+                        let head = c.chain_head.as_ref()?;
+                        (!head.moves.is_empty()).then(|| (c.create_cid.clone(), head.moves.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The sequencer the channel `create_cid` on `server` moved to last, as
+    /// this device verified in its chain (JEP-0005 rule 11a): `None` when it
+    /// never moved. The pin keeps the sequencer it was pinned to; the chain
+    /// head's moves hold the channel to each one after.
+    pub fn moved_to(&self, server: &str, create_cid: &str) -> Option<&str> {
+        self.file
+            .servers
+            .get(&server_key(server))?
+            .channels
+            .get(create_cid)?
+            .chain_head
+            .as_ref()?
+            .moves
+            .last()
+            .map(|m| m.sequencer.as_str())
+    }
+
+    /// The owners of the channels pinned on `server`, by channel id: the DID
+    /// each creation block was signed by, as pinned. Who may move a channel's
+    /// sequencer ([`crate::chain::ChannelChain::with_owners`]).
+    pub fn owners(&self, server: &str) -> std::collections::HashMap<String, Vec<String>> {
+        self.server(server)
+            .map(|p| {
+                p.channels
+                    .values()
+                    .filter(|c| !c.owner_did.is_empty())
+                    .map(|c| (c.create_cid.clone(), vec![c.owner_did.clone()]))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// [`Self::anchor_channel`] for an owner [`prove_carried`] proved, keeping
     /// the key links that proof followed, if any, beside the pin: the
     /// channel's records from before the owner's key change are held to the
@@ -1273,6 +1325,77 @@ pub fn prove_carried(
     offer_b64: Option<&str>,
     owner_key_links: &[String],
 ) -> Result<CarriedOwner, PinError> {
+    prove_carried_by(
+        server,
+        slug,
+        channel_id,
+        sequencer,
+        server_dids,
+        offer_b64,
+        owner_key_links,
+        None,
+    )
+}
+
+/// [`prove_carried`] for a channel whose sequencer moved (JEP-0005 rule
+/// 11a): the creation block names the sequencer it moved from, and the
+/// offer is the new one's. `moved_to` is the sequencer this device verified
+/// the channel's chain moved to last ([`Pins::moved_to`]); it must be
+/// `sequencer`. The offer is checked as [`prove_carried`] checks it.
+pub fn prove_carried_after_move(
+    server: &str,
+    slug: &str,
+    channel_id: &str,
+    sequencer: &str,
+    server_dids: &[String],
+    offer_b64: Option<&str>,
+    moved_to: &str,
+) -> Result<CarriedOwner, PinError> {
+    // The move landed here before this server accepted the new sequencer's
+    // re-offer: said so, since it usually closes by itself (a same or
+    // narrower grant is accepted on the server's next tick; a wider one
+    // waits for its operator).
+    let not_yet = || PinError::CarriedUnproven {
+        server: server.to_string(),
+        slug: slug.to_string(),
+        sequencer: sequencer.to_string(),
+        reason: format!(
+            "the channel moved to {sequencer}, and this server has not accepted its re-offer yet"
+        ),
+    };
+    match prove_carried_by(
+        server,
+        slug,
+        channel_id,
+        sequencer,
+        server_dids,
+        offer_b64,
+        &[],
+        Some(moved_to),
+    ) {
+        Err(PinError::CarriedUnproven { reason, .. })
+            if reason == NO_OFFER || reason == OFFER_FROM_ANOTHER =>
+        {
+            Err(not_yet())
+        }
+        proven => proven,
+    }
+}
+
+const NO_OFFER: &str = "it shows no offer from that server";
+const OFFER_FROM_ANOTHER: &str = "the offer is signed by another server";
+
+#[allow(clippy::too_many_arguments)]
+fn prove_carried_by(
+    server: &str,
+    slug: &str,
+    channel_id: &str,
+    sequencer: &str,
+    server_dids: &[String],
+    offer_b64: Option<&str>,
+    owner_key_links: &[String],
+    moved_to: Option<&str>,
+) -> Result<CarriedOwner, PinError> {
     let unproven = |reason: &str| PinError::CarriedUnproven {
         server: server.to_string(),
         slug: slug.to_string(),
@@ -1280,14 +1403,14 @@ pub fn prove_carried(
         reason: reason.to_string(),
     };
     let canonical = jig_pipeline::effect::canonical_did_string;
-    let offer_b64 = offer_b64.ok_or_else(|| unproven("it shows no offer from that server"))?;
+    let offer_b64 = offer_b64.ok_or_else(|| unproven(NO_OFFER))?;
     let envelope = base64::engine::general_purpose::STANDARD
         .decode(offer_b64)
         .map_err(|_| unproven("its offer is not base64"))?;
     let offer = jig_core::contract::ContractOffer::from_envelope(&envelope)
         .map_err(|e| unproven(&format!("its offer does not verify: {e}")))?;
     if canonical(&offer.owner) != canonical(sequencer) {
-        return Err(unproven("the offer is signed by another server"));
+        return Err(unproven(OFFER_FROM_ANOTHER));
     }
     if offer.channel_id.to_string() != channel_id {
         return Err(unproven("the offer is for another channel"));
@@ -1321,6 +1444,12 @@ pub fn prove_carried(
         .and_then(|v| v.as_str())
     {
         Some(named) if canonical(named) == canonical(sequencer) => Vec::new(),
+        // The channel's own chain, as this device verified it, moved it to
+        // the offer's signer: the move is the proof the creation block cannot
+        // give.
+        Some(_) if moved_to.is_some_and(|m| jig_pipeline::handshake::same_did(m, sequencer)) => {
+            Vec::new()
+        }
         Some(named) if !owner_key_links.is_empty() => {
             jig_pipeline::handshake::chain_moves(owner_key_links, named, &offer.owner).map_err(
                 |reason| {
@@ -1749,6 +1878,7 @@ mod tests {
             ingest_logical: 0,
             record: None,
             high: None,
+            moves: Vec::new(),
         };
         assert!(
             !pins.advance_chain(server, "#ops", &head(1)).unwrap(),
@@ -2315,6 +2445,95 @@ mod tests {
         }
     }
 
+    /// JEP-0005 rule 11a: after a move, the creation block names the old
+    /// sequencer and the offer is the new one's. The offer proves the new
+    /// one only when this device's verified chain moved the channel to it;
+    /// the offer is still checked as before.
+    #[test]
+    fn a_moved_channel_is_proven_by_the_new_sequencers_offer_and_the_chain() {
+        let old = did_of_key(&jig_core::crypto::ed25519::generate_signing_key());
+        let new = jig_core::crypto::ed25519::generate_signing_key();
+        let c = carried_naming(new.clone(), Some(&old));
+        let prove = |moved_to: &str, offer: Option<&str>| {
+            prove_carried_after_move(
+                "wss://follower",
+                "#team",
+                &c.channel_id,
+                &did_of_key(&new),
+                std::slice::from_ref(&c.follower),
+                offer,
+                moved_to,
+            )
+        };
+        let proven = prove(&did_of_key(&new), Some(&c.offer_b64)).unwrap();
+        assert_eq!(proven.did, did_of_key(&new));
+        assert!(proven.links.is_empty());
+
+        // The chain moved it elsewhere: the creation block still names `old`.
+        let third = did_of_key(&jig_core::crypto::ed25519::generate_signing_key());
+        let error = prove(&third, Some(&c.offer_b64)).unwrap_err();
+        assert!(
+            error.to_string().contains("named another server"),
+            "{error}"
+        );
+        // The move is no proof without the new sequencer's offer; the
+        // message says the re-offer is not accepted yet.
+        let error = prove(&did_of_key(&new), None).unwrap_err();
+        assert!(
+            error.to_string().contains(&format!(
+                "moved to {}, and this server has not accepted its re-offer yet",
+                did_of_key(&new)
+            )),
+            "{error}"
+        );
+        // The old sequencer's offer still listed: the same.
+        let from_old = carried_naming(
+            jig_core::crypto::ed25519::generate_signing_key(),
+            Some(&old),
+        );
+        let error = prove(&did_of_key(&new), Some(&from_old.offer_b64)).unwrap_err();
+        assert!(error.to_string().contains("re-offer yet"), "{error}");
+    }
+
+    /// The pin answers where its verified chain moved the channel, and never
+    /// for a chain that did not move.
+    #[test]
+    fn a_pin_says_where_its_chain_moved_the_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pins = Pins::load(&dir.path().join("pins.json")).unwrap();
+        pins.check_channel(
+            "wss://a",
+            "#team",
+            ChannelPin {
+                create_cid: "bafyteam".to_string(),
+                slug: String::new(),
+                suite: "none".to_string(),
+                owner_did: "did:jig:zowner".to_string(),
+                chain_head: None,
+                sequencer: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(pins.moved_to("wss://a", "bafyteam"), None);
+        let head = crate::chain::ChainHead {
+            format: crate::chain::RECORD_FORMAT.to_string(),
+            seq: 5,
+            hash: "aa".to_string(),
+            ingest_wall_ms: 1,
+            ingest_logical: 0,
+            record: None,
+            high: None,
+            moves: vec![crate::chain::HeadMove {
+                seq: 4,
+                sequencer: "did:jig:znew".into(),
+            }],
+        };
+        pins.advance_chain("wss://a", "bafyteam", &head).unwrap();
+        assert_eq!(pins.moved_to("wss://a", "bafyteam"), Some("did:jig:znew"));
+        assert_eq!(pins.moved_to("wss://a", "bafyother"), None);
+        assert_eq!(pins.moved_to("wss://b", "bafyteam"), None);
+    }
+
     /// The links a carried pin was proven along are kept beside it, and give
     /// a session the DIDs its records are held to, oldest first. Pinning the
     /// same owner without links forgets them.
@@ -2503,6 +2722,7 @@ mod tests {
             ingest_logical: 0,
             record: None,
             high: None,
+            moves: Vec::new(),
         };
         pins.check_channel(
             server,
@@ -2773,6 +2993,7 @@ mod tests {
             ingest_logical: 0,
             record: None,
             high: None,
+            moves: Vec::new(),
         };
         assert!(pins.advance_chain(server, "bafyCarried", &head).unwrap());
         assert_eq!(

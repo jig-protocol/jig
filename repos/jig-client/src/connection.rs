@@ -190,6 +190,15 @@ pub struct ConnectOptions {
     /// their records are held to the owner, not to the server. Every other
     /// channel is held to the server.
     pub carried: HashMap<String, Vec<String>>,
+    /// The owners of the channels this device pinned on the server, by
+    /// channel id: who may move a channel's sequencer (JEP-0005 rule 11a;
+    /// [`crate::pins::Pins::owners`]). A channel with none takes no move.
+    pub owners: HashMap<String, Vec<String>>,
+    /// The sequencer moves this device verified, by channel id
+    /// ([`crate::pins::Pins::moves`]): a channel's chain on this connection
+    /// starts from them, so a record past a move is held to the new
+    /// sequencer even when the move is not delivered again.
+    pub moves: HashMap<String, Vec<crate::chain::HeadMove>>,
 }
 
 /// Per-channel delivery senders, keyed by channel slug.
@@ -473,6 +482,8 @@ impl Client {
             on_contradiction,
             key_links,
             carried,
+            owners,
+            moves,
         } = options;
         let url = Url::parse(server_url).map_err(|e| ClientError::BadUrl(e.to_string()))?;
         // Map http(s) → ws(s) if user gave HTTP scheme; otherwise leave alone.
@@ -670,8 +681,25 @@ impl Client {
                                             signers,
                                             None,
                                         )
+                                        .with_owners(
+                                            owners
+                                                .get(&record.channel_id)
+                                                .cloned()
+                                                .unwrap_or_default(),
+                                        )
+                                        .with_moves(
+                                            moves
+                                                .get(&record.channel_id)
+                                                .cloned()
+                                                .unwrap_or_default(),
+                                        )
                                     });
-                                let step = chain.accept_live(record, cid.as_deref());
+                                let step = chain.accept_block_live(
+                                    record,
+                                    cid.as_deref(),
+                                    &bundle_b64,
+                                    sig_b64.as_deref(),
+                                );
                                 for defect in chain.take_clock_defects() {
                                     tracing::warn!("{defect}");
                                     lock_defects(&defects_for_reader).push(defect);
