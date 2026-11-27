@@ -522,6 +522,38 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    /// The channels whose newest move moved them away from `previous`, each
+    /// with that move (JEP-0005 rule 11a): what a server that missed its moves
+    /// is sent when it connects.
+    pub fn moves_away_from(
+        &self,
+        previous: &str,
+    ) -> crate::persist::Result<Vec<(String, ChannelMove)>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT m.channel_id, m.seq, m.sequencer, m.previous, m.block_cid
+               FROM channel_moves m
+              WHERE m.seq = (SELECT MAX(seq) FROM channel_moves WHERE channel_id = m.channel_id)",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    ChannelMove {
+                        seq: r.get::<_, i64>(1)? as u64,
+                        sequencer: r.get(2)?,
+                        previous: r.get(3)?,
+                        block_cid: r.get(4)?,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|(_, m)| crate::handshake::same_did(&m.previous, previous))
+            .collect())
+    }
+
     /// The `sequencer-set` kept for `channel_id` until this server holds the
     /// head it cites, if any.
     pub fn pending_move(&self, channel_id: &str) -> crate::persist::Result<Option<PendingMove>> {
@@ -703,6 +735,14 @@ impl SqliteStore {
                 upgrade_stop,
             )
             .optional()?)
+    }
+
+    /// Run `sql` on the store, for other crates' tests of what a store that
+    /// fails to read does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn execute_for_tests(&self, sql: &str) -> crate::persist::Result<()> {
+        self.conn.lock().expect("poisoned").execute_batch(sql)?;
+        Ok(())
     }
 
     /// Keep `moved` as though a `sequencer-set` had landed in `channel_id`,
@@ -2819,6 +2859,104 @@ mod tests {
             .unwrap();
         assert_eq!(at.sequencer, owner.did(), "no record of ours at its seq");
         assert!(new.store.channel_moves(&owner.channel).unwrap().is_empty());
+    }
+
+    /// A move away from this server that lands while a write is on its way
+    /// (JEP-0005 rule 11a) refuses the write at its landing, as one that came
+    /// after the move: no record of this server's past the move.
+    #[tokio::test]
+    async fn a_write_racing_a_move_away_is_refused_at_its_landing() {
+        let mut owner = Owner::new().await;
+        owner.text("before the move").await;
+        let me = owner.ctx.server_did.to_did_jig_string();
+        let elsewhere =
+            Did::from_ed25519_pubkey(SigningKey::from_bytes(&[52; 32]).verifying_key().as_bytes())
+                .to_did_jig_string();
+        let head = owner.ctx.store.chain_head_seq(&owner.channel).unwrap();
+        let store = owner.ctx.store.clone();
+        let channel = owner.channel.clone();
+        let to = elsewhere.clone();
+        crate::ingest::BEFORE_LANDING.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                store
+                    .record_move_for_tests(
+                        &channel,
+                        &ChannelMove {
+                            seq: head.unwrap() + 1,
+                            sequencer: to,
+                            previous: me,
+                            block_cid: "bafkmove".to_string(),
+                        },
+                    )
+                    .unwrap();
+            }));
+        });
+        let meta = serde_json::json!({"channel_id": owner.channel, "body": "racing"});
+        let parts = signed(&owner.user, BlockKind::TextRender, meta);
+        let got = ingest(
+            &owner.ctx,
+            bundle(&parts),
+            parts.2.clone(),
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&got, Err(IngestError::SequencerMoved { sequencer, .. }) if *sequencer == elsewhere),
+            "{got:?}"
+        );
+        assert_eq!(
+            owner.ctx.store.chain_head_seq(&owner.channel).unwrap(),
+            head
+        );
+    }
+
+    /// A channel moved away from this server and back again is this
+    /// server's: its writes land (JEP-0005 rule 11a).
+    #[tokio::test]
+    async fn a_channel_moved_away_and_back_takes_writes_again() {
+        let mut owner = Owner::new().await;
+        owner.text("before the moves").await;
+        let me = owner.ctx.server_did.to_did_jig_string();
+        let elsewhere =
+            Did::from_ed25519_pubkey(SigningKey::from_bytes(&[53; 32]).verifying_key().as_bytes())
+                .to_did_jig_string();
+        let head = owner
+            .ctx
+            .store
+            .chain_head_seq(&owner.channel)
+            .unwrap()
+            .unwrap();
+        for (seq, to, from) in [(head + 1, &elsewhere, &me), (head + 2, &me, &elsewhere)] {
+            owner
+                .ctx
+                .store
+                .record_move_for_tests(
+                    &owner.channel,
+                    &ChannelMove {
+                        seq,
+                        sequencer: to.clone(),
+                        previous: from.clone(),
+                        block_cid: format!("bafkmove{seq}"),
+                    },
+                )
+                .unwrap();
+        }
+        let meta = serde_json::json!({"channel_id": owner.channel, "body": "back again"});
+        let parts = signed(&owner.user, BlockKind::TextRender, meta);
+        let got = ingest(
+            &owner.ctx,
+            bundle(&parts),
+            parts.2.clone(),
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await;
+        assert!(got.is_ok(), "{got:?}");
     }
 
     /// The move's write checks again what `check_takeover` checked: a record

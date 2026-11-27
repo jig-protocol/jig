@@ -33,6 +33,14 @@ pub enum PersistError {
          resolve the conflicting alias_attestations rows by hand"
     )]
     AliasCaseClash(String),
+    /// The owner moved the channel from this server to `sequencer` while a
+    /// write was on its way to landing (JEP-0005 rule 11a): nothing was
+    /// written, as for a write that came after the move.
+    #[error("channel {channel_id} moved to {sequencer}")]
+    SequencerMoved {
+        channel_id: String,
+        sequencer: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, PersistError>;
@@ -993,6 +1001,35 @@ pub enum MembershipChange {
 /// Give `block_cid` the next entry of its channel's chain, signed by
 /// `signer`, inside the caller's transaction. `seq` and `prev` are read from
 /// the chain as stored under the same lock, so two blocks can never share one.
+/// Refuse to sequence onto `signer`'s channel if its newest move that names
+/// the signer moved the channel away from it (JEP-0005 rule 11a): read in
+/// the landing transaction, so a move that lands while a write awaits its
+/// effect still refuses that write.
+fn refuse_if_moved_away_on(conn: &Connection, signer: &RecordSigner<'_>) -> Result<()> {
+    let me = jig_core::Did::from_ed25519_pubkey(signer.key.verifying_key().as_bytes())
+        .to_did_jig_string();
+    let mut stmt = conn.prepare(
+        "SELECT sequencer, previous FROM channel_moves WHERE channel_id = ?1 ORDER BY seq DESC",
+    )?;
+    let moves = stmt
+        .query_map([signer.channel_id.as_str()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let newest = moves.into_iter().find(|(to, from)| {
+        crate::handshake::same_did(to, &me) || crate::handshake::same_did(from, &me)
+    });
+    match newest {
+        Some((to, from)) if crate::handshake::same_did(&from, &me) => {
+            Err(PersistError::SequencerMoved {
+                channel_id: signer.channel_id.clone(),
+                sequencer: to,
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
 fn sequence_on(
     conn: &Connection,
     block_cid: &str,
@@ -1671,6 +1708,7 @@ impl SqliteStore {
         }
         let mut conn = self.conn.lock().expect("poisoned");
         let tx = conn.transaction()?;
+        refuse_if_moved_away_on(&tx, signer)?;
         insert_block_on(&tx, b)?;
         let record = sequence_on(&tx, &b.cid, signer)?;
         tx.commit()?;
@@ -1975,6 +2013,7 @@ impl SqliteStore {
         if declined_on(&tx, b, membership)? {
             return Ok(Landing::Declined);
         }
+        refuse_if_moved_away_on(&tx, signer)?;
         insert_block_on(&tx, b)?;
         let record = sequence_on(&tx, &b.cid, signer)?;
         if let Some(guard) = guard
@@ -2908,6 +2947,9 @@ impl SqliteStore {
         let tx = conn.transaction()?;
         if declined_on(&tx, block, membership)? {
             return Ok(Landing::Declined);
+        }
+        if let Some(signer) = signer {
+            refuse_if_moved_away_on(&tx, signer)?;
         }
         // `group_info` replaces the stored one even when `None`: a group info
         // describes one epoch, and serving the previous epoch's under the new

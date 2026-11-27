@@ -140,6 +140,20 @@ impl PeerRegistry {
         Registration(id)
     }
 
+    /// The peers whose connections registered at or after `mark`, and the
+    /// mark to pass next time: a caller that keeps the mark sees each new
+    /// connection once.
+    pub fn registered_since(&self, mark: u64) -> (Vec<Did>, u64) {
+        let next = self.next.load(Ordering::Relaxed);
+        let peers = self
+            .lock()
+            .iter()
+            .filter(|(id, s)| **id >= mark && !s.is_closed())
+            .map(|(_, s)| s.peer.clone())
+            .collect();
+        (peers, next)
+    }
+
     pub fn unregister(&self, registration: Registration) {
         self.lock().remove(&registration.0);
     }
