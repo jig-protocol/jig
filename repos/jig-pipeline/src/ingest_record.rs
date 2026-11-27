@@ -206,6 +206,115 @@ impl IngestRecord {
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
         serde_json::from_slice(bytes).map_err(|_| RecordError::Malformed("not a stored record"))
     }
+
+    /// The signed envelope alone: the compact form a record travels in as a
+    /// block's `seen` and in a `head` frame (JEP-0002 rule 10). Every field
+    /// is in its payload, so [`Self::from_cose`] rebuilds the record.
+    pub fn cose_bytes(&self) -> Result<Vec<u8>, RecordError> {
+        STANDARD
+            .decode(&self.cose)
+            .map_err(|_| RecordError::Malformed("cose is not base64"))
+    }
+
+    /// The record a COSE_Sign1 envelope signs, read from its payload.
+    ///
+    /// Parsing only: nothing here checks the signature or who made it. A
+    /// caller relies on the result only after [`Self::verify`], which also
+    /// requires the payload to be exactly the one these fields encode, so a
+    /// payload with a field more or less than a record's does not verify.
+    pub fn from_cose(envelope: &[u8]) -> Result<Self, RecordError> {
+        if envelope.len() > MAX_COSE_BYTES {
+            return Err(RecordError::Malformed("the record is too large"));
+        }
+        let signed = jig_core::cose::open_sign1(envelope)
+            .map_err(|_| RecordError::Malformed("cose is not a COSE_Sign1"))?;
+        let payload = dcbor::decode(&signed.payload)
+            .map_err(|_| RecordError::Malformed("the payload is not deterministic CBOR"))?;
+        let text = |key| payload.get(key).and_then(Value::as_text);
+        let uint = |key| payload.get(key).and_then(Value::as_u64);
+        let cid = |key| {
+            payload
+                .get(key)
+                .and_then(Value::as_bytes)
+                .and_then(|b| cid::Cid::try_from(b).ok())
+                .filter(|c| jig_core::canonical_cid::check(c).is_ok())
+                .map(|c| c.to_string())
+                .ok_or(RecordError::Malformed(
+                    "a CID in the record is not canonical",
+                ))
+        };
+        match text("domain") {
+            Some(RECORD_FORMAT) => {}
+            Some(other) => {
+                return Err(RecordError::UnknownFormat {
+                    format: other.to_string(),
+                });
+            }
+            None => return Err(RecordError::Malformed("the payload names no domain")),
+        }
+        let prev: [u8; 32] = payload
+            .get("prev")
+            .and_then(Value::as_bytes)
+            .and_then(|b| b.try_into().ok())
+            .ok_or(RecordError::Malformed("prev is not 32 bytes"))?;
+        let missing = RecordError::Malformed("the payload lacks a record field");
+        Ok(Self {
+            format: RECORD_FORMAT.to_string(),
+            channel_id: cid("channel_id")?,
+            seq: uint("seq").ok_or(missing.clone())?,
+            ingest_wall_ms: uint("ingest_wall_ms").ok_or(missing.clone())?,
+            ingest_logical: uint("ingest_logical")
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or(missing.clone())?,
+            block_cid: cid("block_cid")?,
+            prev: hex::encode(prev),
+            sequencer: text("sequencer").ok_or(missing)?.to_string(),
+            cose: STANDARD.encode(envelope),
+        })
+    }
+}
+
+/// The most a record's envelope may hold, as a block's `seen` or in a `head`
+/// frame. A real one is under 400 bytes: two CIDs, a DID, a hash, two
+/// numbers and a signature.
+pub const MAX_COSE_BYTES: usize = 1024;
+
+/// The manifest metadata key under which an authored block carries `seen`
+/// (JEP-0002 rule 10): the latest record its author verified for the
+/// block's channel, as base64 of the record's envelope
+/// ([`IngestRecord::cose_bytes`]). A `channel-create` carries none, nor does
+/// a block whose author has verified no record of the channel yet.
+pub const SEEN_KEY: &str = "seen";
+
+/// The value an author puts under [`SEEN_KEY`] for `record`.
+pub fn seen_value(record: &IngestRecord) -> Result<serde_json::Value, RecordError> {
+    Ok(serde_json::Value::String(
+        STANDARD.encode(record.cose_bytes()?),
+    ))
+}
+
+/// The record `manifest` carries as `seen`: `None` when it carries none,
+/// `Some(Err)` when the value is not a record's envelope. Parsing only, as
+/// with [`IngestRecord::from_cose`]: the caller verifies it against the
+/// channel's sequencer before relying on it. A `seen` that does not verify
+/// is its author's word, never evidence against a server.
+pub fn read_seen(manifest: &jig_core::BlockManifest) -> Option<Result<IngestRecord, RecordError>> {
+    let value = manifest.metadata.get(SEEN_KEY)?;
+    Some(seen_from_value(value))
+}
+
+fn seen_from_value(value: &serde_json::Value) -> Result<IngestRecord, RecordError> {
+    let text = value
+        .as_str()
+        .ok_or(RecordError::Malformed("seen is not a string"))?;
+    // Refused before decoding: base64 of an envelope past the cap.
+    if text.len() > MAX_COSE_BYTES.div_ceil(3) * 4 {
+        return Err(RecordError::Malformed("the record is too large"));
+    }
+    let envelope = STANDARD
+        .decode(text)
+        .map_err(|_| RecordError::Malformed("seen is not base64"))?;
+    IngestRecord::from_cose(&envelope)
 }
 
 #[cfg(test)]
@@ -246,6 +355,91 @@ mod tests {
             .unwrap();
         assert!(!skipped.follows(&first), "a gap is not a link");
         assert_eq!(IngestRecord::decode(&second.encode()).unwrap(), second);
+    }
+
+    #[test]
+    fn the_envelope_alone_rebuilds_the_record() {
+        let key = generate_signing_key();
+        let first = signer(&key)
+            .sign(0, &label_cid("Create"), GENESIS_PREV)
+            .unwrap();
+        let second = signer(&key)
+            .sign(1, &label_cid("Post"), first.hash())
+            .unwrap();
+        for record in [&first, &second] {
+            let envelope = record.cose_bytes().unwrap();
+            assert!(envelope.len() <= MAX_COSE_BYTES, "{}", envelope.len());
+            let rebuilt = IngestRecord::from_cose(&envelope).unwrap();
+            assert_eq!(&rebuilt, record);
+            assert_eq!(rebuilt.hash(), record.hash());
+            rebuilt.verify(&did_of(&key)).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_envelope_that_is_not_a_record_is_refused() {
+        let key = generate_signing_key();
+        let not_cose = IngestRecord::from_cose(b"not cbor");
+        assert!(
+            matches!(not_cose, Err(RecordError::Malformed(_))),
+            "{not_cose:?}"
+        );
+        let too_big = IngestRecord::from_cose(&vec![0; MAX_COSE_BYTES + 1]);
+        assert!(
+            matches!(too_big, Err(RecordError::Malformed(_))),
+            "{too_big:?}"
+        );
+        // A well-formed envelope over something else.
+        let other = jig_core::cose::sign1(
+            &key,
+            &dcbor::encode(&Value::text_map([("domain", Value::text("jig-other-v1"))])).unwrap(),
+        );
+        assert_eq!(
+            IngestRecord::from_cose(&other),
+            Err(RecordError::UnknownFormat {
+                format: "jig-other-v1".into()
+            })
+        );
+        // A record's fields with one more: it parses, and does not verify.
+        let record = signer(&key)
+            .sign(0, &label_cid("Create"), GENESIS_PREV)
+            .unwrap();
+        let mut payload = dcbor::decode(&record.payload().unwrap()).unwrap();
+        if let Value::Map(entries) = &mut payload {
+            entries.push((Value::text("extra"), Value::Unsigned(1)));
+        }
+        let padded = jig_core::cose::sign1(&key, &dcbor::encode(&payload).unwrap());
+        let parsed = IngestRecord::from_cose(&padded).unwrap();
+        assert_eq!(parsed.verify(&did_of(&key)), Err(RecordError::BadSignature));
+    }
+
+    #[test]
+    fn seen_round_trips_through_a_manifest() {
+        let key = generate_signing_key();
+        let record = signer(&key)
+            .sign(4, &label_cid("Post"), GENESIS_PREV)
+            .unwrap();
+        let mut manifest: jig_core::BlockManifest =
+            serde_json::from_value(serde_json::json!({"version": "0.1.0"})).unwrap();
+        assert_eq!(read_seen(&manifest), None, "a block without seen");
+        manifest
+            .metadata
+            .insert(SEEN_KEY.to_string(), seen_value(&record).unwrap());
+        let read = read_seen(&manifest).unwrap().unwrap();
+        assert_eq!(read, record);
+        read.verify(&did_of(&key)).unwrap();
+        for bad in [
+            serde_json::json!(7),
+            serde_json::json!("not base64!"),
+            serde_json::json!(STANDARD.encode(b"not a record")),
+            serde_json::json!("A".repeat(MAX_COSE_BYTES * 2)),
+        ] {
+            manifest.metadata.insert(SEEN_KEY.to_string(), bad.clone());
+            assert!(
+                matches!(read_seen(&manifest), Some(Err(RecordError::Malformed(_)))),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
