@@ -3049,6 +3049,48 @@ mod tests {
         assert!(got.is_ok(), "{got:?}");
     }
 
+    /// The other order of the race above (JEP-0005 rule 11a): the takeover
+    /// commits first, and the old sequencer's next record, past the head the
+    /// move cited, is then refused as superseded. Nothing of the old
+    /// sequencer's lands at that seq, and the move's record holds it.
+    #[tokio::test]
+    async fn a_carried_record_after_a_takeover_is_superseded() {
+        let mut owner = Owner::new().await;
+        owner.text("before the move").await;
+        let new = owner.follower();
+        for sent in &owner.sent {
+            take(&new, &owner, sent).await.unwrap();
+        }
+        let moved = move_to(&owner, &new.server_key, &owner.user);
+        let set = ingest(
+            &new,
+            bundle(&moved.parts),
+            moved.parts.2.clone(),
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .expect("the takeover lands");
+        let set_seq = new.store.get_ingest_record(&set).unwrap().unwrap().seq;
+        owner.text("past the cited head").await;
+        let late = owner.sent.last().unwrap();
+        assert_eq!(IngestRecord::decode(&late.record).unwrap().seq, set_seq);
+        assert!(matches!(
+            take(&new, &owner, late).await,
+            Err(FollowError::Superseded { .. })
+        ));
+        let at = new
+            .store
+            .ingest_record_bytes(&owner.channel, set_seq)
+            .unwrap()
+            .map(|b| IngestRecord::decode(&b).unwrap())
+            .unwrap();
+        assert_eq!(at.block_cid, set, "the move's record holds the seq");
+        assert_eq!(at.sequencer, new.server_did.to_did_jig_string());
+    }
+
     /// The move's write checks again what `check_takeover` checked: a record
     /// that lands on the channel between the check and the write leaves the
     /// move refused, with nothing of it written.
