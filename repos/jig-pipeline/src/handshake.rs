@@ -910,6 +910,9 @@ pub fn verify_offline(text: &str, server_did: &str) -> HandshakeResult {
     if let Frame::Welcome { suites, .. } = &env.frame {
         offer.suites.extend(suites.iter().cloned());
     }
+    // The hello it answered is not kept, so whether it asked for `heads` is
+    // unknown: a signed grant is the server's word, not outside an offer.
+    offer.capabilities.heads = true;
     // The session it was bound to is long gone: only the signature counts.
     interpret_envelope(&env, text, &nonce, &offer, Binding::OfflineEvidence)
 }
@@ -2431,6 +2434,30 @@ mod tests {
         assert!(matches!(
             pending.interpret_on(&bound, &[8; TLS_EXPORTER_LEN]),
             HandshakeResult::FailClosed { reason, .. } if reason.contains("another TLS session")
+        ));
+    }
+
+    /// A kept welcome that grants `heads` verifies offline: the hello it
+    /// answered is gone, so the grant is not checked against it. A live
+    /// client that did not ask still refuses the same frame.
+    #[test]
+    fn a_kept_heads_grant_verifies_offline() {
+        let key = generate_signing_key();
+        let did = Did::from_ed25519_pubkey(key.verifying_key().as_bytes()).to_did_jig_string();
+        let (hello, pending) = begin(&ClientOffer::default());
+        let Frame::Hello { nonce, .. } = hello.frame else {
+            panic!("hello");
+        };
+        let mut statement = negotiate(&hello_view(&nonce), &offer_server()).unwrap();
+        statement.capabilities.heads = true;
+        let welcome = serde_json::to_string(&seal(&key, statement)).unwrap();
+        assert!(matches!(
+            verify_offline(&welcome, &did),
+            HandshakeResult::Established(w) if w.evidence == welcome
+        ));
+        assert!(matches!(
+            pending.interpret(&welcome),
+            HandshakeResult::FailClosed { reason, .. } if reason.contains("heads")
         ));
     }
 
