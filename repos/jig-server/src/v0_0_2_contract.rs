@@ -486,8 +486,16 @@ impl Contracts {
                         {
                             continue;
                         }
-                        if let Ok(moves) = store.channel_moves(&channel.id)
-                            && let Some(last) = moves.into_iter().last()
+                        // A channel whose moves do not read leaves the set
+                        // unfilled, so the next tick reads them all again.
+                        let moves = match store.channel_moves(&channel.id) {
+                            Ok(moves) => moves,
+                            Err(e) => {
+                                tracing::warn!(channel = %channel.id, "reading moves to resume re-offers: {e}");
+                                return due;
+                            }
+                        };
+                        if let Some(last) = moves.into_iter().last()
                             && jig_pipeline::handshake::same_did(&last.sequencer, &me)
                         {
                             seeded.insert((channel.id, last.block_cid));
@@ -504,10 +512,12 @@ impl Contracts {
         due
     }
 
+    /// Keep a re-offer to make again. If the set is not filled yet, the
+    /// fill finds the channel from its move.
     fn keep_reoffer(&self, channel_id: String, set_cid: String) {
-        self.reoffers_due()
-            .get_or_insert_default()
-            .insert((channel_id, set_cid));
+        if let Some(due) = self.reoffers_due().as_mut() {
+            due.insert((channel_id, set_cid));
+        }
     }
 
     /// Make the re-offers a failure or a restart left unmade.
@@ -2604,6 +2614,46 @@ mod tests {
         assert_eq!(
             contracts.judge(&offer_with(&new, Grant::Read)),
             Ok(OfferPolicy::Hold)
+        );
+    }
+
+    /// The re-offers still to make after a restart come from the moves to
+    /// this server. If the moves do not read, the set stays unfilled and the
+    /// next tick reads them again, rather than dropping the channel.
+    #[tokio::test]
+    async fn the_reoffers_due_after_a_restart_come_from_the_moves() {
+        let p = pair(OfferPolicy::Accept).await;
+        let channel = p.shared(1).await;
+        let me = p.owner.server_did.to_did_jig_string();
+        let store = &p.owner.ingest_ctx.store;
+        store
+            .record_move_for_tests(
+                &channel,
+                &jig_pipeline::follow::ChannelMove {
+                    seq: 9,
+                    sequencer: me.clone(),
+                    previous: did_of(&SigningKey::from_bytes(&[8; 32])),
+                    block_cid: "bafkmove".to_string(),
+                },
+            )
+            .unwrap();
+        let contracts = Contracts::new(&p.owner);
+        store
+            .execute_for_tests("ALTER TABLE channel_moves RENAME TO channel_moves_away")
+            .unwrap();
+        assert!(
+            contracts.reoffers_due().is_none(),
+            "a failed read fills nothing"
+        );
+        contracts.keep_reoffer(channel.clone(), "bafkother".to_string());
+        assert!(contracts.reoffers_due().is_none());
+        store
+            .execute_for_tests("ALTER TABLE channel_moves_away RENAME TO channel_moves")
+            .unwrap();
+        let due = contracts.reoffers_due().clone().unwrap();
+        assert_eq!(
+            due.into_iter().collect::<Vec<_>>(),
+            vec![(channel, "bafkmove".to_string())]
         );
     }
 
