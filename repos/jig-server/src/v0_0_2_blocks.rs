@@ -2089,9 +2089,35 @@ mod tests {
                 found_at: 0,
             })
             .unwrap();
-        let (status, body) = get_path(router, &path).await;
+        let (status, body) = get_path(router.clone(), &path).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["code"], "CHANNEL_NEEDS_UPGRADE");
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains("`future-kind` at seq 7"), "{message}");
+
+        // A client that cannot read a block before the server's stop is told
+        // of that one: the first stop it meets. One that reads it is told of
+        // the server's.
+        store.gate_for_tests(&id, 3, "sequencer-set").unwrap();
+        let (status, body) = get_path(router.clone(), &path).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains("`sequencer-set` at seq 3"), "{message}");
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri(&path)
+                    .header(CAPABILITIES_HEADER, "sequencer-set")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let message = body["message"].as_str().unwrap();
         assert!(message.contains("`future-kind` at seq 7"), "{message}");
     }
