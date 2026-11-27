@@ -213,6 +213,11 @@ struct Groups {
     /// of the group, nothing is encrypted for it ([`Session::encrypt`]).
     #[serde(default)]
     linked_away: HashMap<String, Vec<String>>,
+    /// `server|slug` → CID of the join by external commit this device sent
+    /// and has not seen land ([`Session::join_sent`]). While one is here,
+    /// the group it prepared is not proof of being in.
+    #[serde(default)]
+    joining: HashMap<String, String>,
 }
 
 /// Epochs `from..until` of one group this device was in; `until` is unset
@@ -649,10 +654,18 @@ impl Session {
         // the member added never saw the link to hold back its own sends
         // (JEP-0005 rule 7b). Removing a linked DID stays open: that is the
         // tidy-up.
-        if let Some(did) = self.linked_leaves(server, slug)?.into_iter().next() {
-            return Err(SecureError::LinkedLeafInGroup { did });
-        }
-        self.with_group(server, slug, |m, gid| Ok(m.add(gid, key_package, did)?))
+        let key = group_key(server, slug);
+        self.with_member(|m, g| {
+            // Judged under the lock the add runs under: a link recorded
+            // between the two would otherwise go unseen.
+            if let Some(did) = linked_leaves_in(m, g, &key)?.into_iter().next() {
+                return Err(SecureError::LinkedLeafInGroup { did });
+            }
+            let gid = group_of(g, &key)
+                .filter(|gid| m.has_group(gid))
+                .ok_or_else(|| SecureError::NoGroup(slug.to_string()))?;
+            Ok(m.add(&gid, key_package, did)?)
+        })
     }
 
     pub fn prepare_remove(&self, server: &str, slug: &str, did: &str) -> Result<Commit> {
@@ -670,6 +683,33 @@ impl Session {
                 m.forget(&gid)?;
             }
             g.drop_group(&key);
+            g.joining.remove(&key);
+            Ok(())
+        })
+    }
+
+    /// The join by external commit prepared for `server`/`slug` was sent as
+    /// the block `cid`; until [`Self::join_landed`] or [`Self::discard_join`],
+    /// whether it landed is unknown.
+    pub fn join_sent(&self, server: &str, slug: &str, cid: &str) -> Result<()> {
+        let key = group_key(server, slug);
+        self.with_member(|_, g| {
+            g.joining.insert(key, cid.to_string());
+            Ok(())
+        })
+    }
+
+    /// The CID of a join to `server`/`slug` sent and not yet seen to land.
+    pub fn join_unconfirmed(&self, server: &str, slug: &str) -> Result<Option<String>> {
+        let key = group_key(server, slug);
+        self.with_member(|_, g| Ok(g.joining.get(&key).cloned()))
+    }
+
+    /// The join sent to `server`/`slug` landed: its group is this device's.
+    pub fn join_landed(&self, server: &str, slug: &str) -> Result<()> {
+        let key = group_key(server, slug);
+        self.with_member(|_, g| {
+            g.joining.remove(&key);
             Ok(())
         })
     }
@@ -702,10 +742,17 @@ impl Session {
     /// this member's copy of the group ([`SecureError::LinkedLeafInGroup`]):
     /// the old key would read it. [`Self::linked_leaves`] names them.
     pub fn encrypt(&self, server: &str, slug: &str, text: &str) -> Result<(Vec<u8>, u64)> {
-        if let Some(did) = self.linked_leaves(server, slug)?.into_iter().next() {
-            return Err(SecureError::LinkedLeafInGroup { did });
-        }
-        self.with_group(server, slug, |m, gid| Ok(m.encrypt(gid, text.as_bytes())?))
+        let key = group_key(server, slug);
+        self.with_member(|m, g| {
+            // One lock for the check and the encryption, as in `prepare_add`.
+            if let Some(did) = linked_leaves_in(m, g, &key)?.into_iter().next() {
+                return Err(SecureError::LinkedLeafInGroup { did });
+            }
+            let gid = group_of(g, &key)
+                .filter(|gid| m.has_group(gid))
+                .ok_or_else(|| SecureError::NoGroup(slug.to_string()))?;
+            Ok(m.encrypt(&gid, text.as_bytes())?)
+        })
     }
 
     /// The DIDs a key link moved away from in `server`/`slug` whose leaves
@@ -713,20 +760,7 @@ impl Session {
     /// must be committed out before this member sends.
     pub fn linked_leaves(&self, server: &str, slug: &str) -> Result<Vec<String>> {
         let key = group_key(server, slug);
-        self.with_member(|m, g| {
-            let Some(away) = g.linked_away.get(&key) else {
-                return Ok(Vec::new());
-            };
-            let Some(gid) = group_of(g, &key).filter(|gid| m.has_group(gid)) else {
-                return Ok(Vec::new());
-            };
-            let members = m.members(&gid)?;
-            Ok(away
-                .iter()
-                .filter(|d| members.contains(d))
-                .cloned()
-                .collect())
-        })
+        self.with_member(|m, g| linked_leaves_in(m, g, &key))
     }
 
     /// File the plaintext of a block this member sent or read.
@@ -1548,6 +1582,24 @@ fn follow(
 
 fn group_of(g: &Groups, key: &str) -> Option<Vec<u8>> {
     g.groups.get(key).and_then(|h| hex::decode(h).ok())
+}
+
+/// The DIDs a key link moved away from in the channel `key` names whose
+/// leaves are still in `m`'s copy of its group ([`Session::linked_leaves`]),
+/// read under the caller's lock.
+fn linked_leaves_in(m: &Member, g: &Groups, key: &str) -> Result<Vec<String>> {
+    let Some(away) = g.linked_away.get(key) else {
+        return Ok(Vec::new());
+    };
+    let Some(gid) = group_of(g, key).filter(|gid| m.has_group(gid)) else {
+        return Ok(Vec::new());
+    };
+    let members = m.members(&gid)?;
+    Ok(away
+        .iter()
+        .filter(|d| members.contains(d))
+        .cloned()
+        .collect())
 }
 
 /// The id of the MLS group a channel's creation block starts, from the
@@ -2673,6 +2725,35 @@ mod tests {
         ));
         bob2.link_settled(SERVER, "#sealed").unwrap();
         assert_eq!(bob2.linked_from(SERVER, "#sealed").unwrap(), None);
+    }
+
+    /// A join sent with no answer stays unconfirmed, the group it prepared
+    /// with it, until it is seen to land or is dropped; dropping it forgets
+    /// both, so the next settle-up joins again.
+    #[test]
+    fn a_join_without_an_answer_is_unconfirmed_until_settled() {
+        let root = tempfile::tempdir().unwrap();
+        let alice = session(root.path());
+        let bob = session(root.path());
+        let created = alice.create_group(SERVER, "#open").unwrap();
+        bob.prepare_join(SERVER, "#open", &created.group_info)
+            .unwrap();
+        bob.join_sent(SERVER, "#open", "the join").unwrap();
+        assert_eq!(
+            bob.join_unconfirmed(SERVER, "#open").unwrap().as_deref(),
+            Some("the join")
+        );
+        assert!(bob.has_group(SERVER, "#open").unwrap());
+        bob.discard_join(SERVER, "#open").unwrap();
+        assert_eq!(bob.join_unconfirmed(SERVER, "#open").unwrap(), None);
+        assert!(!bob.has_group(SERVER, "#open").unwrap());
+
+        bob.prepare_join(SERVER, "#open", &created.group_info)
+            .unwrap();
+        bob.join_sent(SERVER, "#open", "the second join").unwrap();
+        bob.join_landed(SERVER, "#open").unwrap();
+        assert_eq!(bob.join_unconfirmed(SERVER, "#open").unwrap(), None);
+        assert!(bob.has_group(SERVER, "#open").unwrap());
     }
 
     fn unsigned(b: &BuiltBlock) -> OpenedBlock {

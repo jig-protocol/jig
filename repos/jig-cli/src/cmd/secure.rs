@@ -2600,8 +2600,15 @@ impl Secure {
     pub async fn tidy(&self, slug: &str, did: &str) -> Result<()> {
         let key = self.key(slug);
         let linked = self.session.linked_from(&self.server, &key)?;
-        if linked.as_deref() == Some(did) && !self.session.has_group(&self.server, &key)? {
-            self.rejoin(slug).await?;
+        if linked.as_deref() == Some(did) {
+            // A group from a join whose answer never came is not proof of
+            // being in: settled first, it is kept or dropped.
+            if self.session.join_unconfirmed(&self.server, &key)?.is_some() {
+                self.reconcile_join(slug).await?;
+            }
+            if !self.session.has_group(&self.server, &key)? {
+                self.rejoin(slug).await?;
+            }
         }
         let tidied = self.tidy_out(slug, did).await;
         if tidied.is_ok() && linked.as_deref() == Some(did) {
@@ -2632,22 +2639,62 @@ impl Secure {
                 jig_core::HlcTimestamp::now_wall(self.identity.did().clone()),
                 meta,
             );
+            self.session.join_sent(&self.server, &key, &block.cid())?;
             match self.submit(&block).await {
-                Ok(_) => return Ok(()),
-                Err(e) => {
+                Ok(_) => {
+                    self.session.join_landed(&self.server, &key)?;
+                    return Ok(());
+                }
+                // Turned down: the group it prepared was never the channel's.
+                Err(e) if refused(&e) => {
                     let stale = e
                         .downcast_ref::<Refused>()
                         .is_some_and(|r| r.code == "STALE_EPOCH");
-                    if e.downcast_ref::<Refused>().is_some() {
-                        self.session.discard_join(&self.server, &key)?;
-                    }
+                    self.session.discard_join(&self.server, &key)?;
                     if !(stale && attempt == 0) {
                         return Err(e.context(format!("rejoining {slug} under the new key")));
                     }
                 }
+                // No answer, or one that says nothing of whether the server
+                // acted on it: history says whether the join landed.
+                Err(e) => {
+                    return match self.reconcile_join(slug).await {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Err(e.context(format!("rejoining {slug} under the new key"))),
+                        Err(unsettled) => Err(
+                            e.context(format!("rejoining {slug} under the new key: {unsettled:#}"))
+                        ),
+                    };
+                }
             }
         }
         unreachable!("the loop returns on its second attempt")
+    }
+
+    /// Whether the join this device sent to `slug` and saw no answer to
+    /// landed: its echo in history means it did, and its group is kept; a
+    /// sync that reads to the head without it means it did not, and the
+    /// group is dropped. Without such a sync, the join stays unconfirmed.
+    async fn reconcile_join(&self, slug: &str) -> Result<bool> {
+        let key = self.key(slug);
+        let Some(cid) = self.session.join_unconfirmed(&self.server, &key)? else {
+            return Ok(true);
+        };
+        let synced = self
+            .sync(slug)
+            .await
+            .context("no answer to the join; it is kept until a sync shows whether it landed")?;
+        if synced.cids.contains(&cid) {
+            self.session.join_landed(&self.server, &key)?;
+            return Ok(true);
+        }
+        if let Some(stop) = &synced.stopped {
+            return Err(self
+                .stopped_at(slug, stop)
+                .context("the join is kept until a sync past the stop shows whether it landed"));
+        }
+        self.session.discard_join(&self.server, &key)?;
+        Ok(false)
     }
 
     async fn tidy_out(&self, slug: &str, did: &str) -> Result<()> {
@@ -2686,6 +2733,16 @@ impl Secure {
                 .with_context(|| format!("taking {old}'s old leaf out of {slug}"))?;
         }
         Ok(())
+    }
+
+    /// [`Self::settle_links`] after a sync, so a key link that landed since
+    /// this device last read `slug` is settled before an add rather than
+    /// refusing it.
+    pub async fn sync_and_settle_links(&self, slug: &str) -> Result<()> {
+        if let Some(stop) = self.sync(slug).await?.stopped {
+            return Err(self.stopped_at(slug, &stop));
+        }
+        self.settle_links(slug).await
     }
 
     /// Encrypt and send `text`. Returns the block CID.

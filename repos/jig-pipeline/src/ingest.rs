@@ -841,7 +841,18 @@ pub async fn ingest(
             // A legacy `#dm/` channel that already holds three or more takes
             // no further adds, not even of the pair.
             let oversized = ctx.store.list_members(&chan.id)?.len() > 2;
-            if oversized || (member != owner && jig_core::dm::dm_slug(&owner, &member) != chan.slug)
+            // Either of the pair may have linked its key on (rule 7b): the
+            // DID added is judged as the one of the pair its links lead
+            // from, so the new key rejoins and a third party stays out.
+            let links: Vec<(String, String)> = ctx
+                .store
+                .list_role_blocks_before(&chan.id, crate::roles::NEXT)?
+                .into_iter()
+                .filter(|(kind, _)| *kind == BlockKind::KeyLink)
+                .filter_map(|(_, m)| crate::roles::key_link_of(&m, &chan.id))
+                .collect();
+            let origin = origin_through_links(&links, &member);
+            if oversized || (origin != owner && jig_core::dm::dm_slug(&owner, &origin) != chan.slug)
             {
                 return Err(IngestError::DmIsAPair {
                     slug: chan.slug.clone(),
@@ -889,6 +900,7 @@ pub async fn ingest(
                     _ => false,
                 },
                 self_join: false,
+                target_linked_away: false,
             },
             None => Default::default(),
         }
@@ -957,6 +969,32 @@ pub async fn ingest(
             });
         }
     }
+    // A root owner by the channel's terms who linked away holds its root no
+    // longer (rule 7b): its old leaf may then be taken out like any departed
+    // member's. The write gate reads the terms only, so the chain says.
+    let membership = match resolved_channel.as_ref() {
+        Some(chan) if kind == BlockKind::MemberRemove => {
+            let target = manifest
+                .metadata
+                .get("member_did")
+                .and_then(|v| v.as_str())
+                .map(crate::effect::canonical_did_string)
+                .filter(|t| chan.is_root_owner(t));
+            let target_linked_away = match target {
+                Some(target) => {
+                    let standing =
+                        crate::roles::standing_at(&ctx.store, chan, &target, crate::roles::NEXT)?;
+                    standing.linked_away && !standing.root
+                }
+                None => false,
+            };
+            crate::authorize_write::Membership {
+                target_linked_away,
+                ..membership
+            }
+        }
+        _ => membership,
+    };
     if let Err(refusal) = crate::authorize_write::authorize_block_with(
         kind,
         sender.as_str(),
@@ -1593,6 +1631,21 @@ pub struct BlockChannel {
     /// The name as the block carried it — the slug, or the `channel_id` text
     /// — for errors and logs.
     pub named: String,
+}
+
+/// The DID `did` is linked from along `links` (each `(old, new)`, in chain
+/// order): followed back from the newest link that ends at it, until none
+/// does. Each DID is linked away at most once (rule 7b), so the walk ends;
+/// it stops after `links.len()` steps all the same.
+fn origin_through_links(links: &[(String, String)], did: &str) -> String {
+    let mut at = did.to_string();
+    for _ in 0..links.len() {
+        match links.iter().rev().find(|(_, new)| *new == at) {
+            Some((old, _)) => at = old.clone(),
+            None => break,
+        }
+    }
+    at
 }
 
 /// Whether a `member-add` that adds its own signer to a `server` or `shared`
@@ -6528,6 +6581,80 @@ mod tests {
         );
     }
 
+    /// JEP-0005 rule 7b, the creator's own link on an encrypted channel: the
+    /// creator's old leaf is taken out once the new DID holds its place,
+    /// though the channel's terms still name the old DID. The new DID, the
+    /// root owner now, is still not removed by anyone.
+    #[tokio::test]
+    async fn a_root_owners_old_leaf_is_taken_out_after_its_key_link() {
+        let ctx = test_ctx_allowing(&["channel-create", "member-add", "member-remove", "key-link"]);
+        let (alice, alice2, bob) = (person(), person(), person());
+        let gid = create_sealed(&ctx, &alice).await;
+        add_to_sealed(&ctx, &alice, &bob, &gid).await;
+        let chan = ctx
+            .store
+            .get_channel_by_slug("#sealed")
+            .unwrap()
+            .unwrap()
+            .id;
+        submit(
+            &ctx,
+            &alice2,
+            BlockKind::KeyLink,
+            jig_core::EncryptionSuite::Unencrypted,
+            key_link(&alice, &alice2, &chan, None),
+        )
+        .await
+        .expect("the creator links its key");
+        let group = ctx.store.get_mls_group("#sealed").unwrap().unwrap();
+        let (_, joined) = alice2
+            .mls
+            .join_external(group.group_info.as_ref().unwrap())
+            .unwrap();
+        submit(
+            &ctx,
+            &alice2,
+            BlockKind::MemberAdd,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"channel": "#sealed", "member_did": alice2.did,
+                "mls_commit": b64(&joined.commit),
+                "mls_group_info": b64(joined.group_info.as_ref().unwrap())}),
+        )
+        .await
+        .expect("the new DID rejoins");
+        bob.mls.apply_commit(&gid, &joined.commit).unwrap();
+
+        // Another member tidies the old leaf out under the tidy-up rule.
+        let removed = bob.mls.remove(&gid, &alice.did).unwrap();
+        submit(
+            &ctx,
+            &bob,
+            BlockKind::MemberRemove,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"channel": "#sealed", "member_did": alice.did,
+                "mls_commit": b64(&removed.commit)}),
+        )
+        .await
+        .expect("the linked-away creator's old leaf is taken out");
+        bob.mls.confirm(&gid).unwrap();
+
+        // The root it carried stays fixed on the new DID.
+        let again = bob.mls.remove(&gid, &alice2.did).unwrap();
+        let root = submit(
+            &ctx,
+            &bob,
+            BlockKind::MemberRemove,
+            jig_core::EncryptionSuite::Unencrypted,
+            serde_json::json!({"channel": "#sealed", "member_did": alice2.did,
+                "mls_commit": b64(&again.commit)}),
+        )
+        .await;
+        assert!(
+            matches!(root, Err(IngestError::NotChannelOwner { .. })),
+            "the new root owner is not removed: {root:?}"
+        );
+    }
+
     /// Sequence the owner's `role-unassign` of `admin` between the next
     /// block's write gate and its landing. Says whether it ran.
     fn unassign_before_landing(
@@ -7256,6 +7383,50 @@ mod tests {
         member_of(&ctx, &dm, &c.did);
         assert!(matches!(
             add(&b.did).await,
+            Err(IngestError::DmIsAPair { .. })
+        ));
+    }
+
+    /// Rule 18 across key links (rule 7b): a 1:1 takes the DID either of its
+    /// pair linked to, each rejoining under its new key, and still nobody
+    /// else.
+    #[tokio::test]
+    async fn a_dm_takes_the_new_key_of_either_of_its_pair() {
+        let ctx = test_ctx_allowing(&["channel-create", "member-add", "key-link"]);
+        let (a, b, a2, b2, c) = (person(), person(), person(), person(), person());
+        let dm = crate::ingest_record::label_cid("a dm");
+        let slug = jig_core::dm::dm_slug(&a.did, &b.did);
+        ctx.store
+            .upsert_channel(&tiered_row(
+                &dm,
+                &slug,
+                &a.did,
+                crate::persist::ChannelTiering::of(jig_core::tier::Tier::Private),
+            ))
+            .unwrap();
+        member_of(&ctx, &dm, &a.did);
+        member_of(&ctx, &dm, &b.did);
+        for (old, new, what) in [(&b, &b2, "the member"), (&a, &a2, "the creator")] {
+            plain(&ctx, new, BlockKind::KeyLink, key_link(old, new, &dm, None))
+                .await
+                .unwrap_or_else(|e| panic!("{what} links its key: {e:?}"));
+            plain(
+                &ctx,
+                new,
+                BlockKind::MemberAdd,
+                serde_json::json!({"channel_id": dm, "member_did": new.did}),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{what}'s new key rejoins: {e:?}"));
+        }
+        assert!(matches!(
+            plain(
+                &ctx,
+                &a2,
+                BlockKind::MemberAdd,
+                serde_json::json!({"channel_id": dm, "member_did": c.did}),
+            )
+            .await,
             Err(IngestError::DmIsAPair { .. })
         ));
     }

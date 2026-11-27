@@ -657,8 +657,9 @@ pub async fn add(ctx: &CliContext, slug: String, who: String, via: Option<String
     let added = async {
         if info.encrypted() {
             let kp = member_key_package(&secure, &info, &did, reach, via.as_deref()).await?;
-            // No add into a group that still holds a linked-away leaf.
-            secure.settle_links(&slug).await?;
+            // No add into a group that still holds a linked-away leaf, one
+            // linked since this device last read the channel included.
+            secure.sync_and_settle_links(&slug).await?;
             let server = secure.server().to_string();
             secure
                 .commit(

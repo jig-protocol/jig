@@ -71,6 +71,10 @@ pub struct Membership {
     /// channel's join rule admits, as the caller judged the joiner's server
     /// role (JEP-0014 rules 12 and 13).
     pub self_join: bool,
+    /// `member_did`, a root owner by the channel's terms, was linked away to
+    /// another DID (JEP-0005 rule 7b), as the caller read the chain: its root
+    /// is carried to that DID, and its old leaf may be taken out.
+    pub target_linked_away: bool,
 }
 
 impl From<bool> for Membership {
@@ -79,6 +83,7 @@ impl From<bool> for Membership {
             sender,
             target: false,
             self_join: false,
+            target_linked_away: false,
         }
     }
 }
@@ -253,7 +258,9 @@ pub fn authorize_block_with(
                     })
                 };
             }
-            if channel.is_root_owner(&target) {
+            // A root owner linked away holds its root no longer: the DID it
+            // linked to does, and is refused here by ingest's chain check.
+            if channel.is_root_owner(&target) && !membership.target_linked_away {
                 return refuse(sender);
             }
             if rights.membership {
@@ -587,6 +594,7 @@ mod tests {
                 sender: sender_is_member,
                 target: target_is_member,
                 self_join: false,
+                target_linked_away: false,
             },
         )
     }
@@ -790,6 +798,7 @@ mod tests {
                     sender: true,
                     target: true,
                     self_join: false,
+                    target_linked_away: false,
                 },
                 Rights::ADMIN
             ),
@@ -832,6 +841,7 @@ mod tests {
                         sender: true,
                         target: true,
                         self_join: false,
+                        target_linked_away: false,
                     },
                     Rights::ADMIN
                 ),
