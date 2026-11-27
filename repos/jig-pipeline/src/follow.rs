@@ -705,6 +705,14 @@ impl SqliteStore {
             .optional()?)
     }
 
+    /// Run `sql` on the store, for other crates' tests of what a store that
+    /// fails to read does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn execute_for_tests(&self, sql: &str) -> crate::persist::Result<()> {
+        self.conn.lock().expect("poisoned").execute_batch(sql)?;
+        Ok(())
+    }
+
     /// Keep `moved` as though a `sequencer-set` had landed in `channel_id`,
     /// for other crates' tests of what follows a move.
     #[cfg(any(test, feature = "test-support"))]
