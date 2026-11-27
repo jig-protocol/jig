@@ -9,7 +9,7 @@
 //! message is encrypted by the MLS session (`cmd::secure`) and sent over REST.
 
 use anyhow::{Context, Result};
-use jig_client::blocks::build_text_render;
+use jig_client::blocks::build_text_render_seen;
 use jig_core::HlcTimestamp;
 
 use crate::cmd::common::CliContext;
@@ -61,7 +61,8 @@ pub async fn run(ctx: &CliContext, channel: String, body: String) -> Result<()> 
     // identity load is a 32-byte file read + ed25519 pubkey derivation.
     let id_for_hlc = ctx.identity()?;
     let hlc = HlcTimestamp::now_wall(id_for_hlc.did().clone());
-    let block = build_text_render(&id_for_hlc, &channel, &body, hlc);
+    let seen = crate::cmd::secure::seen_for(&server_url, &channel);
+    let block = build_text_render_seen(&id_for_hlc, &channel, &body, hlc, seen.as_ref());
 
     let cid = client
         .submit(block)

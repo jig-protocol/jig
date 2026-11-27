@@ -29,7 +29,7 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 use jig_client::blocks::{
     BuiltBlock, build_channel_archive, build_channel_promote, build_member_add,
-    build_member_remove, build_with_metadata, merge,
+    build_member_remove, build_with_metadata, merge, seen,
 };
 use jig_core::tier::{JoinRole, Tier};
 use jig_core::{BlockKind, HlcTimestamp};
@@ -738,12 +738,25 @@ pub async fn kick(ctx: &CliContext, slug: String, who: String) -> Result<()> {
             .commit(
                 &slug,
                 |s, key| Ok(s.prepare_remove(&server, key, &did)?),
-                |c| build_member_remove(id, &slug, &did, mls_fields(c), now(id)),
+                |c| {
+                    let mut extra = mls_fields(c);
+                    // Read for each attempt: a retry after a stale epoch
+                    // carries the head this device holds by then.
+                    let seen_record = crate::cmd::secure::seen_for(&server, &slug);
+                    merge(&mut extra, seen(seen_record.as_ref()));
+                    build_member_remove(id, &slug, &did, extra, now(id))
+                },
             )
             .await?
     } else {
         secure
-            .submit(&build_member_remove(id, &slug, &did, json!({}), now(id)))
+            .submit(&build_member_remove(
+                id,
+                &slug,
+                &did,
+                seen(crate::cmd::secure::seen_for(secure.server(), &slug).as_ref()),
+                now(id),
+            ))
             .await?
     };
     println!("removed {did} from {slug}");
@@ -762,7 +775,13 @@ pub async fn leave(ctx: &CliContext, slug: String) -> Result<()> {
     let id = secure.identity();
     let me = id.did_string();
     let cid = secure
-        .submit(&build_member_remove(id, &slug, &me, json!({}), now(id)))
+        .submit(&build_member_remove(
+            id,
+            &slug,
+            &me,
+            seen(crate::cmd::secure::seen_for(secure.server(), &slug).as_ref()),
+            now(id),
+        ))
         .await?;
     secure.session.discard_group(secure.server(), &key)?;
     println!("left {slug}");

@@ -378,6 +378,7 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         // will a restricted one (D25), and the same bytes will be refused the
         // same way again.
         ref e @ (IngestError::OwnerCannotLeave { .. }
+        | IngestError::BadSeen { .. }
         | IngestError::UnknownSuite { .. }
         | IngestError::SuiteMismatch { .. }
         | IngestError::RestrictedRequiresMls { .. }

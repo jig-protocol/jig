@@ -228,6 +228,7 @@ pub fn classify_with_wait(
         IngestError::BadContractBlock { .. } => {
             (StatusCode::BAD_REQUEST, "BAD_CONTRACT_BLOCK", e.to_string())
         }
+        IngestError::BadSeen { .. } => (StatusCode::BAD_REQUEST, "BAD_SEEN", e.to_string()),
         // 400: the slug is outside the canonical grammar or in a reserved
         // namespace (`#dm/`, `#jig/`, `#email/`) the author may not use.
         IngestError::InvalidSlug { .. } => (StatusCode::BAD_REQUEST, "INVALID_SLUG", e.to_string()),
@@ -477,6 +478,9 @@ mod tests {
             IngestError::BadContractBlock {
                 kind: "channel-share".to_string(),
                 detail: "`to` is missing".to_string(),
+            },
+            IngestError::BadSeen {
+                detail: "seen is not base64".to_string(),
             },
             IngestError::InvalidSlug {
                 slug: "#General".to_string(),

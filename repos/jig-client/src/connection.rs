@@ -669,10 +669,80 @@ impl Client {
                                             None,
                                         )
                                     });
+                                // The head as it was: a `seen` at its `seq`
+                                // is judged against its record even after
+                                // this block moves the head past it.
+                                let before = chain.head().and_then(|h| h.record.clone());
                                 let step = chain.accept_live(record, cid.as_deref());
                                 for defect in chain.take_clock_defects() {
                                     tracing::warn!("{defect}");
                                     lock_defects(&defects_for_reader).push(defect);
+                                }
+                                // The block's `seen` (JEP-0002 rule 10), where
+                                // this session can judge it without fetching:
+                                // a record at the head's `seq` with other
+                                // contents, or the block placed before it.
+                                // The rest is the history check's to fetch.
+                                let seen_break = step.as_ref().ok().and_then(|_| {
+                                    let seen = crate::chain::seen_of_block(&bundle_b64)?.ok()?;
+                                    let check = match chain.check_block_seen(
+                                        &seen,
+                                        &bundle_b64,
+                                        Some(record),
+                                    ) {
+                                        crate::chain::SeenCheck::Differs { seq } => before
+                                            .as_ref()
+                                            .filter(|b| b.seq == seq)
+                                            .and_then(|b| chain.seen_fork(b, &seen))
+                                            .map_or(
+                                                crate::chain::SeenCheck::Differs { seq },
+                                                |p| crate::chain::SeenCheck::Forked(Box::new(p)),
+                                            ),
+                                        other => other,
+                                    };
+                                    match check {
+                                        crate::chain::SeenCheck::Forked(proof) => Some((
+                                            "chain-seen-forked",
+                                            format!(
+                                                "a block carries record {} of its channel as seen, \
+                                                 and it is not the one this session verified",
+                                                seen.seq
+                                            ),
+                                            crate::evidence::Proof::Chain(proof),
+                                        )),
+                                        crate::chain::SeenCheck::Reordered {
+                                            record: at,
+                                            seen: s,
+                                        } => crate::chain::ReorderProof::of(&bundle_b64, record)
+                                            .map(|p| {
+                                                (
+                                                    "chain-reordered",
+                                                    format!(
+                                                        "a block placed at record {at} carries \
+                                                             record {s} as seen"
+                                                    ),
+                                                    crate::evidence::Proof::Reordered(Box::new(p)),
+                                                )
+                                            }),
+                                        crate::chain::SeenCheck::Differs { seq } => {
+                                            // Proven only with this device's
+                                            // record there: the next history
+                                            // read fetches it.
+                                            tracing::warn!(
+                                                channel = %record.channel_id,
+                                                seq,
+                                                "a block's seen is not the record this \
+                                                 session verified at that seq"
+                                            );
+                                            None
+                                        }
+                                        _ => None,
+                                    }
+                                });
+                                if let Some((code, reason, proof)) = seen_break {
+                                    drop(chains);
+                                    contradict_with(code, reason, &text, Some(Box::new(proof)));
+                                    break;
                                 }
                                 match step {
                                     Ok(crate::chain::Step::Gap { from, to }) => {

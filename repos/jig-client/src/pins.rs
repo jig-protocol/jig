@@ -733,6 +733,20 @@ impl Pins {
             .map(|pin| (pin.slug.as_str(), pin))
     }
 
+    /// The record a block this device authors into `reference` (an id, or a
+    /// slug as [`Self::channel_by_ref`] reads it) on `server` carries as
+    /// `seen` (JEP-0002 rule 10): the last record of the channel's chain this
+    /// device verified, when it kept it whole and in the current format.
+    pub fn seen(
+        &self,
+        server: &str,
+        reference: &str,
+    ) -> Option<jig_pipeline::ingest_record::IngestRecord> {
+        let (_, pin) = self.channel_by_ref(server, reference)?;
+        let head = pin.chain_head.as_ref().filter(|h| h.is_current())?;
+        head.record.clone()
+    }
+
     /// Check a channel's proven creation against the pin, and pin it on first
     /// sight, under its id with `slug` as its name. A different creation
     /// block under a slug pinned for the same orderer is refused: the server
@@ -1644,6 +1658,7 @@ mod tests {
             ingest_logical: 0,
             record: None,
             high: None,
+            recent: Default::default(),
         };
         assert!(
             !pins.advance_chain(server, "#ops", &head(1)).unwrap(),
@@ -2265,6 +2280,7 @@ mod tests {
             ingest_logical: 0,
             record: None,
             high: None,
+            recent: Default::default(),
         };
         pins.check_channel(
             server,
@@ -2533,6 +2549,7 @@ mod tests {
             ingest_logical: 0,
             record: None,
             high: None,
+            recent: Default::default(),
         };
         assert!(pins.advance_chain(server, "bafyCarried", &head).unwrap());
         assert_eq!(

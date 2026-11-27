@@ -54,6 +54,33 @@ pub fn build_text_render(
     build_text_render_with_nickname(sender, channel_slug, body, None, hlc)
 }
 
+/// What a block's metadata carries as `seen` (JEP-0002 rule 10) for
+/// `record`, the last record of the channel this device verified
+/// ([`crate::pins::Pins::seen`]): `{seen: ...}`, or nothing when it has
+/// verified none. Merge it into a block's metadata with [`merge`].
+pub fn seen(record: Option<&jig_pipeline::ingest_record::IngestRecord>) -> Value {
+    match record.and_then(|r| jig_pipeline::ingest_record::seen_value(r).ok()) {
+        Some(value) => json!({ jig_pipeline::ingest_record::SEEN_KEY: value }),
+        None => json!({}),
+    }
+}
+
+/// [`build_text_render`], carrying `seen` ([`seen`]).
+pub fn build_text_render_seen(
+    sender: &Identity,
+    channel_slug: &str,
+    body: &str,
+    hlc: HlcTimestamp,
+    seen_record: Option<&jig_pipeline::ingest_record::IngestRecord>,
+) -> BuiltBlock {
+    let mut meta = json!({
+        "channel": channel_slug,
+        "body": body,
+    });
+    merge(&mut meta, seen(seen_record));
+    build_with_metadata(sender, BlockKind::TextRender, hlc, meta)
+}
+
 /// Same as [`build_text_render`], plus an optional `nickname` metadata entry.
 ///
 /// ⚠️ DANGER — passing `Some(..)` ACTIVATES SERVER-SIDE TOFU ENFORCEMENT.
@@ -221,16 +248,32 @@ pub fn build_sealed_text(
     epoch: u64,
     hlc: HlcTimestamp,
 ) -> BuiltBlock {
+    build_sealed_text_seen(sender, channel_slug, mls_message, epoch, hlc, None)
+}
+
+/// [`build_sealed_text`], carrying `seen` ([`seen`]). `seen` is in the
+/// manifest, so it is plaintext on an encrypted channel; it says only what
+/// the server delivered to the author.
+pub fn build_sealed_text_seen(
+    sender: &Identity,
+    channel_slug: &str,
+    mls_message: &[u8],
+    epoch: u64,
+    hlc: HlcTimestamp,
+    seen_record: Option<&jig_pipeline::ingest_record::IngestRecord>,
+) -> BuiltBlock {
     use base64::Engine as _;
+    let mut meta = json!({
+        "channel": channel_slug,
+        "mls_message": base64::engine::general_purpose::STANDARD.encode(mls_message),
+        "mls_epoch": epoch,
+    });
+    merge(&mut meta, seen(seen_record));
     build_with_suite(
         sender,
         BlockKind::TextRender,
         hlc,
-        json!({
-            "channel": channel_slug,
-            "mls_message": base64::engine::general_purpose::STANDARD.encode(mls_message),
-            "mls_epoch": epoch,
-        }),
+        meta,
         jig_core::EncryptionSuite::Mls,
     )
 }

@@ -571,7 +571,225 @@ pub async fn check_history(
              history after them is not checked against this device's pin."
         );
     }
+    check_seen_in(&Pins::default_path(), who, None, server, slug, blocks).await
+}
+
+/// Hold the `seen` each of `blocks` carries (JEP-0002 rule 10) to the chain
+/// this device pinned for `slug` on `server`, which [`check_chain_in`] has
+/// just moved over them. Its author verified that record, so the server
+/// showed it a history this device can compare with its own:
+///
+/// - a record at a `seq` this device holds, with other contents, is a fork:
+///   the two records are the proof;
+/// - a block placed at or before the `seen` it carries was reordered: the
+///   block and the two records are the proof;
+/// - a `seen` past this device's head is fetched up to, and checked then;
+/// - one older than the hashes this device keeps is not checked, and said so.
+///
+/// A `seen` that is not the sequencer's is its author's word: a warning,
+/// never a refusal of the server.
+async fn check_seen_in(
+    pins_path: &std::path::Path,
+    who: &jig_client::Identity,
+    audience: Option<&str>,
+    server: &str,
+    slug: &str,
+    blocks: &[jig_client::DeliveredBlock],
+) -> Result<()> {
+    use jig_client::chain::{ChannelChain, SeenCheck};
+    let mut out_of_reach = 0usize;
+    let mut proven: Option<String> = None;
+    for block in blocks {
+        let Some(seen) = jig_client::chain::seen_of_block(&block.bundle_b64) else {
+            continue;
+        };
+        let seen = match seen {
+            Ok(seen) => seen,
+            Err(e) => {
+                eprintln!(
+                    "warning: block {} in {slug} carries a `seen` that does not parse ({e}); \
+                     not checked",
+                    block.delivery_cid
+                );
+                continue;
+            }
+        };
+        // The chain as pinned now, with the channel's sequencers.
+        let pinned_chain = |pins: &Pins| -> Option<(ChannelChain, String)> {
+            let (pinned_as, channel) = pins.channel_by_ref(server, slug)?;
+            let sequencers = match &channel.sequencer {
+                Some(owner) => vec![owner.clone()],
+                None => pins
+                    .server(server)
+                    .filter(|p| !p.server_did.is_empty())?
+                    .sequencers(),
+            };
+            let reference = match channel.sequencer {
+                Some(_) => channel.create_cid.clone(),
+                None => pinned_as.to_string(),
+            };
+            let head = channel.chain_head.clone().filter(|h| h.is_current());
+            Some((
+                ChannelChain::across(&channel.create_cid, sequencers, head),
+                reference,
+            ))
+        };
+        let Some((mut chain, reference)) = pinned_chain(&Pins::load(pins_path)?) else {
+            return Ok(());
+        };
+        let mut check = chain.check_block_seen(&seen, &block.bundle_b64, block.ingest.as_ref());
+        // Proven once, and only when a record must be fetched.
+        if matches!(check, SeenCheck::Ahead { .. } | SeenCheck::Differs { .. }) && proven.is_none()
+        {
+            proven = Some(match audience {
+                Some(a) => a.to_string(),
+                None => {
+                    crate::cmd::request_proof::audience(
+                        server,
+                        who,
+                        crate::cmd::request_proof::Trust::Pinned,
+                    )
+                    .await?
+                }
+            });
+        }
+        let audience = proven.clone().unwrap_or_default();
+        if let SeenCheck::Ahead { to } = check {
+            // Catch up to it, held to the pin like any other records.
+            let from = chain.head().map_or(0, |h| h.seq + 1);
+            let fetched = fetch_records(who, &audience, server, &reference, from, to + 1)
+                .await
+                .unwrap_or_default();
+            if !fetched.is_empty() {
+                check_chain_in(pins_path, who, Some(&audience), server, slug, &fetched).await?;
+            }
+            // The proofs below are drawn from the chain the check is.
+            let Some((reloaded, _)) = pinned_chain(&Pins::load(pins_path)?) else {
+                return Ok(());
+            };
+            chain = reloaded;
+            check = chain.check_block_seen(&seen, &block.bundle_b64, block.ingest.as_ref());
+            if let SeenCheck::Ahead { .. } = check {
+                eprintln!(
+                    "warning: block {} in {slug} carries record {} of the channel as seen; \
+                     {server} did not serve up to it, so it is not checked.",
+                    block.delivery_cid, seen.seq
+                );
+                continue;
+            }
+        }
+        let proof = match check {
+            SeenCheck::Agrees | SeenCheck::Ahead { .. } => None,
+            SeenCheck::OutOfReach => {
+                out_of_reach += 1;
+                None
+            }
+            SeenCheck::NotEvidence(why) => {
+                eprintln!(
+                    "warning: block {} in {slug} carries a `seen` that proves nothing ({why}); \
+                     it is its author's word, not checked.",
+                    block.delivery_cid
+                );
+                None
+            }
+            SeenCheck::Forked(proof) => Some((
+                "chain-seen-forked",
+                jig_client::evidence::Proof::Chain(proof),
+            )),
+            SeenCheck::Differs { seq } => {
+                let ours = fetch_records(who, &audience, server, &reference, seq, seq + 1)
+                    .await
+                    .ok()
+                    .and_then(|mut r| r.pop());
+                match ours.and_then(|ours| chain.seen_fork(&ours, &seen)) {
+                    Some(proof) => Some((
+                        "chain-seen-forked",
+                        jig_client::evidence::Proof::Chain(Box::new(proof)),
+                    )),
+                    None => {
+                        eprintln!(
+                            "warning: block {} in {slug} carries a record {seq} of the channel \
+                             that is not the one this device verified, and {server} did not \
+                             serve the one it did: a fork is likely, but not proven.",
+                            block.delivery_cid
+                        );
+                        None
+                    }
+                }
+            }
+            SeenCheck::Reordered { .. } => block.ingest.as_ref().and_then(|record| {
+                jig_client::chain::ReorderProof::of(&block.bundle_b64, record).map(|p| {
+                    (
+                        "chain-reordered",
+                        jig_client::evidence::Proof::Reordered(Box::new(p)),
+                    )
+                })
+            }),
+        };
+        if let Some((code, proof)) = proof {
+            return Err(seen_contradiction(
+                pins_path, server, slug, block, &seen, code, proof,
+            ));
+        }
+    }
+    if out_of_reach > 0 {
+        eprintln!(
+            "note: {out_of_reach} block(s) in {slug} carry a `seen` older than the records this \
+             device keeps; those are not checked."
+        );
+    }
     Ok(())
+}
+
+/// The contradiction a block's `seen` showed ([`check_seen_in`]), kept as
+/// evidence like a broken chain.
+fn seen_contradiction(
+    pins_path: &std::path::Path,
+    server: &str,
+    slug: &str,
+    block: &jig_client::DeliveredBlock,
+    seen: &jig_client::chain::IngestRecord,
+    code: &'static str,
+    proof: jig_client::evidence::Proof,
+) -> anyhow::Error {
+    let what = match code {
+        "chain-reordered" => format!(
+            "block {} is placed before record {} of the channel, which its author had already \
+             verified",
+            block.delivery_cid, seen.seq
+        ),
+        _ => format!(
+            "block {} carries a record {} of the channel that is not the one this device \
+             verified: the server showed its author another history",
+            block.delivery_cid, seen.seq
+        ),
+    };
+    let c = jig_client::connection::Contradiction {
+        code,
+        reason: format!("the history of {slug}: {what}"),
+        welcome: None,
+        evidence: vec![
+            block.bundle_b64.clone(),
+            serde_json::to_string(seen).unwrap_or_default(),
+        ],
+        proof: Some(Box::new(proof)),
+    };
+    let kept = match keep_evidence_in(pins_path, server, &c) {
+        Ok(kept) => format!(
+            " Kept as `jig trust evidence show {}`{}.",
+            kept.id,
+            if kept.sticky {
+                format!("; {server} is refused until `jig trust accept {server}`")
+            } else {
+                String::new()
+            }
+        ),
+        Err(e) => format!(" The evidence could not be kept: {e:#}."),
+    };
+    anyhow::anyhow!(
+        "{server} contradicted the history of {slug} this device verified: {what}. \
+         Refusing to go on.{kept}"
+    )
 }
 
 /// Why a live connection to `server` ended, when the server contradicted
@@ -888,6 +1106,10 @@ async fn fetch_records(
         .await
         .with_context(|| format!("reading {url}"))?;
         let Some(last) = page.last() else { break };
+        // A page that ends before `next` would be asked for again forever.
+        if last.seq < next {
+            anyhow::bail!("GET {url} did not advance past record {next}");
+        }
         next = last.seq + 1;
         out.extend(page.into_iter().filter(|r| r.seq < to));
     }
@@ -1024,6 +1246,102 @@ mod tests {
             .channel(SERVER, "#ops")
             .and_then(|c| c.chain_head.as_ref())
             .map(|h| h.seq)
+    }
+
+    /// A block `author` writes into `#ops` carrying `seen`, delivered with
+    /// the record `record_at(cid)` places it with.
+    fn delivered_with_seen(
+        author: &jig_client::Identity,
+        seen: &IngestRecord,
+        record_at: impl FnOnce(&str) -> IngestRecord,
+    ) -> jig_client::DeliveredBlock {
+        use base64::Engine as _;
+        let block = jig_client::blocks::build_text_render_seen(
+            author,
+            "#ops",
+            "hi",
+            jig_core::HlcTimestamp::now_wall(author.did().clone()),
+            Some(seen),
+        );
+        let cid = block.cid();
+        jig_client::DeliveredBlock {
+            bundle_b64: base64::engine::general_purpose::STANDARD.encode(block.canonical_bytes()),
+            sig_b64: None,
+            receipts: vec![],
+            delivery_cid: cid.clone(),
+            ingest: Some(record_at(&cid)),
+        }
+    }
+
+    /// JEP-0002 rule 10: a block whose author was shown another history
+    /// than this device was is a fork, kept with both records as the proof;
+    /// one placed before the record its author had verified is a reorder.
+    /// One that agrees is no contradiction.
+    #[tokio::test]
+    async fn a_seen_from_another_history_or_out_of_order_is_refused() {
+        let key = jig_core::crypto::ed25519::generate_signing_key();
+        let r0 = sign(&key, 0, "bafyCreate", GENESIS_PREV);
+        let r1 = sign(&key, 1, "b1", r0.hash());
+        let r2 = sign(&key, 2, "b2", r1.hash());
+        let other2 = sign(&key, 2, "bOther", r1.hash());
+        let keys = tempfile::tempdir().unwrap();
+        let author = jig_client::Identity::generate_for_tests(keys.path());
+        let who = jig_client::Identity::generate_for_tests(keys.path());
+        let place = |seq: u64, prev: [u8; 32]| {
+            let key = key.clone();
+            move |cid: &str| {
+                RecordSigner {
+                    channel_id: label_cid("bafyCreate"),
+                    key: &key,
+                    ingest_wall_ms: 2_000,
+                    ingest_logical: 0,
+                }
+                .sign(seq, cid, prev)
+                .unwrap()
+            }
+        };
+        let check = |path: std::path::PathBuf, blocks: Vec<jig_client::DeliveredBlock>| {
+            let who = &who;
+            async move {
+                check_seen_in(
+                    &path,
+                    who,
+                    Some("did:jig:zaudience"),
+                    SERVER,
+                    "#ops",
+                    &blocks,
+                )
+                .await
+            }
+        };
+
+        // Agrees with the pin, placed after it: nothing to refuse.
+        let dir = tempfile::tempdir().unwrap();
+        let path = pinned(dir.path(), &key, Some(&r0));
+        check_chain_in(&path, &who, None, SERVER, "#ops", &[r1.clone(), r2.clone()])
+            .await
+            .unwrap();
+        let fine = delivered_with_seen(&author, &r2, place(3, r2.hash()));
+        check(path.clone(), vec![fine]).await.unwrap();
+        assert!(Pins::load(&path).unwrap().refusal(SERVER).is_none());
+
+        // Another record 2: a fork, refused, with a proof that holds.
+        let forked = delivered_with_seen(&author, &other2, place(3, r2.hash()));
+        let e = check(path.clone(), vec![forked]).await.unwrap_err();
+        assert!(e.to_string().contains("another history"), "{e:#}");
+        let refused = Pins::load(&path).unwrap().refusal(SERVER).cloned();
+        assert!(refused.is_some(), "a fork proven by two records is sticky");
+
+        // Placed at record 1, before the record 2 its author had verified.
+        let dir = tempfile::tempdir().unwrap();
+        let path = pinned(dir.path(), &key, Some(&r0));
+        check_chain_in(&path, &who, None, SERVER, "#ops", &[r1.clone(), r2.clone()])
+            .await
+            .unwrap();
+        let early = delivered_with_seen(&author, &r2, place(1, r0.hash()));
+        let e = check(path.clone(), vec![early]).await.unwrap_err();
+        assert!(e.to_string().contains("placed before"), "{e:#}");
+        assert!(Pins::load(&path).unwrap().refusal(SERVER).is_some());
     }
 
     #[test]
@@ -1308,6 +1626,7 @@ mod tests {
                 ingest_logical: 0,
                 record: None,
                 high: None,
+                recent: Default::default(),
             },
         )
         .unwrap();
