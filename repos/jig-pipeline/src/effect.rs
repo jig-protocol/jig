@@ -65,6 +65,10 @@ pub async fn apply_effect(
         // The takeover needs the block's record, so ingest records it once
         // the block has landed (`SqliteStore::take_over`).
         BlockKind::SequencerSet => Ok(()),
+        // Roles follow the link in the chain (`roles::standing`); the
+        // membership row moves in the transaction the link lands in
+        // (`MembershipChange::Move`), so a link refused there moves nothing.
+        BlockKind::KeyLink => Ok(()),
         BlockKind::FedHello => apply_fed_hello(store, &manifest, block_cid),
 
         BlockKind::NsRegister | BlockKind::NsAttestation => apply_ns_attestation(store, &manifest),
@@ -288,6 +292,22 @@ fn member_remove_on(
     Ok(())
 }
 
+/// A `key-link`'s effect (JEP-0005 rule 7b): the old DID's membership is
+/// the new DID's. Its roles are read from the chain, so nothing else moves.
+fn key_link_on(
+    conn: &rusqlite::Connection,
+    m: &BlockManifest,
+    channel: Option<&StoredChannel>,
+) -> anyhow::Result<()> {
+    let Some(channel) = channel else {
+        return Ok(());
+    };
+    let (old, new) = crate::roles::key_link_of(m, &channel.id)
+        .ok_or_else(|| anyhow::anyhow!("key-link does not read as a link for its author"))?;
+    crate::persist::move_membership_on(conn, &channel.id, &old, &new)?;
+    Ok(())
+}
+
 fn apply_channel_promote(
     store: &Arc<SqliteStore>,
     m: &BlockManifest,
@@ -349,7 +369,7 @@ fn apply_channel_archive(
     let sender = sender_did_string(m);
     // An empty owner_did would make an author-less manifest match; refuse
     // rather than treat "we don't know who owns this" as permission.
-    if !channel.is_root_owner(&sender) {
+    if !crate::roles::rights_at_channel(store, &channel, &sender, crate::roles::NEXT)?.owner {
         anyhow::bail!("channel-archive rejected: `{sender}` is not the owner of `{channel_slug}`");
     }
 
@@ -413,6 +433,7 @@ pub fn apply_carried_effect(
         // The move itself lands with its record (`follow::ingest_sequenced`):
         // the schedule entry needs the record's `seq`.
         BlockKind::SequencerSet => Ok(()),
+        BlockKind::KeyLink => key_link_on(conn, m, Some(carried()?)),
         BlockKind::FedHello
         | BlockKind::NsRegister
         | BlockKind::NsRotate

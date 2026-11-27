@@ -41,6 +41,10 @@ pub enum PersistError {
         channel_id: String,
         sequencer: String,
     },
+    /// A `key-link` whose author's membership could not move to the new DID
+    /// at landing (JEP-0005 rule 7b): nothing was written.
+    #[error("the key link is refused: {detail}")]
+    KeyLinkNotMoved { detail: String },
 }
 
 pub type Result<T> = std::result::Result<T, PersistError>;
@@ -981,6 +985,15 @@ pub enum MembershipChange {
         channel_id: String,
         member_did: String,
     },
+    /// A `key-link`'s (JEP-0005 rule 7b): `old`'s membership, if it has
+    /// one, is `new`'s. A member whose membership cannot move (`new` is a
+    /// member already) refuses the link; a DID with standing and no
+    /// membership moves nothing.
+    Move {
+        channel_id: String,
+        old: String,
+        new: String,
+    },
 }
 
 /// Give `block_cid` the next entry of its channel's chain, signed by
@@ -1143,7 +1156,7 @@ fn role_blocks_before_on(
             "SELECT b.block_kind, b.bundle_bytes
                FROM chain_records r JOIN blocks b ON b.cid = r.block_cid
               WHERE r.channel_id = ?1 AND r.seq < ?2
-                AND b.block_kind IN ('role-assign', 'role-unassign')
+                AND b.block_kind IN ('role-assign', 'role-unassign', 'key-link')
               ORDER BY r.seq ASC",
         )?;
         let before = i64::try_from(before_seq).unwrap_or(i64::MAX);
@@ -1182,6 +1195,22 @@ fn apply_membership_on(conn: &Connection, membership: &MembershipChange) -> Resu
                 "DELETE FROM memberships WHERE channel_id = ? AND member_did = ?",
                 [channel_id.as_str(), member_did.as_str()],
             )?;
+        }
+        MembershipChange::Move {
+            channel_id,
+            old,
+            new,
+        } => {
+            let member: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM memberships WHERE channel_id = ?1 AND member_did = ?2)",
+                [channel_id.as_str(), old.as_str()],
+                |r| r.get(0),
+            )?;
+            if member && !move_membership_on(conn, channel_id, old, new)? {
+                return Err(PersistError::KeyLinkNotMoved {
+                    detail: format!("{new} is a member of the channel already"),
+                });
+            }
         }
     }
     Ok(())
@@ -1921,9 +1950,10 @@ impl SqliteStore {
         Ok(written)
     }
 
-    /// The `role-assign` and `role-unassign` blocks of `channel_id` whose
-    /// ingest record `seq` is strictly below `before_seq`, in chain order,
-    /// with their manifests. What [`crate::roles::rights_at`] folds.
+    /// The `role-assign`, `role-unassign` and `key-link` blocks of
+    /// `channel_id` whose ingest record `seq` is strictly below `before_seq`,
+    /// in chain order, with their manifests. What [`crate::roles::rights_at`]
+    /// folds.
     pub fn list_role_blocks_before(
         &self,
         channel_id: &str,
@@ -3858,6 +3888,25 @@ pub(crate) fn upsert_channel_on(conn: &Connection, c: &StoredChannel) -> Result<
 }
 
 /// [`SqliteStore::remove_membership_by_id`] on `conn`.
+/// Move `old`'s membership of `channel_id` to `new` (JEP-0005 rule 7b): the
+/// row keeps its role, join time and the block that made it. A DID that is
+/// not a member moves nothing. Returns whether a row moved.
+pub(crate) fn move_membership_on(
+    conn: &Connection,
+    channel_id: &str,
+    old: &str,
+    new: &str,
+) -> Result<bool> {
+    let moved = conn.execute(
+        "UPDATE memberships SET member_did = ?3
+          WHERE channel_id = ?1 AND member_did = ?2
+            AND NOT EXISTS (SELECT 1 FROM memberships
+                             WHERE channel_id = ?1 AND member_did = ?3)",
+        [channel_id, old, new],
+    )?;
+    Ok(moved > 0)
+}
+
 pub(crate) fn remove_membership_by_id_on(
     conn: &Connection,
     channel_id: &str,

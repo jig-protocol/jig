@@ -60,6 +60,55 @@ pub struct ChainHead {
     /// moved, and in a pin written before moves.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub moves: Vec<HeadMove>,
+    /// The channel-scoped key links this client verified in the chain up to
+    /// here (JEP-0005 rule 7b), oldest first: what carries a root owner to
+    /// its new key ([`jig_core::sequencer_move::root_owners`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_links: Vec<HeadKeyLink>,
+    /// The runs of records a live stream went past ([`ChannelChain::
+    /// accept_live`]), each with the hashes either side of it: a record
+    /// filled in later is held to the chain from the record before the run,
+    /// in order, so the key link it carries is kept only once it connects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gaps: Vec<HeadGap>,
+}
+
+/// The most runs a head keeps open ([`ChainHead::gaps`]): past it the
+/// oldest is dropped with its provisional links, which then count for
+/// nothing. A server that skips a live stream ahead again and again cannot
+/// grow the pin without bound.
+pub const MAX_HEAD_GAPS: usize = 64;
+
+/// The most provisional key links one run keeps ([`HeadGap::links`]): past
+/// it the run is dropped whole.
+pub const MAX_GAP_LINKS: usize = 64;
+
+/// A run of records, `from` up to `to` (exclusive), that a chain went past
+/// and has not yet filled in order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeadGap {
+    /// The next record to connect.
+    pub from: u64,
+    /// The record after the run, which the chain holds.
+    pub to: u64,
+    /// Hex hash the record at `from` must name as its `prev`.
+    pub prev: String,
+    /// Hex hash the last record of the run must have: the `prev` of the
+    /// record at `to`.
+    pub end: String,
+    /// The key links of the records connected so far, kept once the whole
+    /// run meets the record at `to`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<HeadKeyLink>,
+}
+
+/// A `key-link` in a channel's chain, as a client keeps it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeadKeyLink {
+    /// The `seq` of its record: it is in force for the records after it.
+    pub seq: u64,
+    pub old: String,
+    pub new: String,
 }
 
 /// The features a request outside a connection declares in its
@@ -96,6 +145,8 @@ impl ChainHead {
             record: Some(record.clone()),
             high: None,
             moves: Vec::new(),
+            key_links: Vec::new(),
+            gaps: Vec::new(),
         }
     }
 
@@ -127,6 +178,8 @@ impl ChainHead {
             next.high = self.high_record().cloned();
         }
         next.moves = self.moves.clone();
+        next.key_links = self.key_links.clone();
+        next.gaps = self.gaps.clone();
         next
     }
 }
@@ -339,6 +392,20 @@ pub struct ChannelChain {
     /// ([`Self::with_moves`]), or taken from the first record it is given.
     /// A head made from none takes them.
     prior_moves: Vec<HeadMove>,
+    /// The record below the head [`Self::fill_gap`] just connected, for its
+    /// key link to be kept.
+    connected: Option<Connected>,
+}
+
+/// A record [`ChannelChain::fill_gap`] connected: inside the run ending at
+/// `run`, still open, or (`None`) the one that closed its run whole.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Connected {
+    seq: u64,
+    /// The connected record's hash, hex: only that record keeps a link by
+    /// it, not another at the same `seq`.
+    hash: String,
+    run: Option<u64>,
 }
 
 impl ChannelChain {
@@ -366,6 +433,7 @@ impl ChannelChain {
             clock_defects: Vec::new(),
             owners: Vec::new(),
             prior_moves: Vec::new(),
+            connected: None,
         }
     }
 
@@ -473,6 +541,7 @@ impl ChannelChain {
         record: &IngestRecord,
         block_cid: Option<&str>,
     ) -> Result<Step, ChainBreak> {
+        self.connected = None;
         // Which of the sequencer's DIDs signed it; one outside the chain is
         // held to the current DID, and fails as before. Past a move
         // (JEP-0005 rule 11a), the record is the new sequencer's alone, and
@@ -559,6 +628,7 @@ impl ChannelChain {
             });
         }
         if record.seq < head.seq {
+            self.fill_gap(record);
             return Ok(Step::Behind);
         }
         if record.seq > head.seq + 1 {
@@ -656,8 +726,11 @@ impl ChannelChain {
         sig_b64: Option<&str>,
         step: impl FnOnce(&mut Self) -> Result<Step, ChainBreak>,
     ) -> Result<Step, ChainBreak> {
+        let link = self.key_link_in(record, bundle_b64, sig_b64);
         let Some(moved) = self.move_in(record, bundle_b64, sig_b64)? else {
-            return step(self);
+            let result = step(self);
+            self.keep_key_link(record, link);
+            return result;
         };
         let saved = self.head.clone();
         let saved_prior = self.prior_moves.clone();
@@ -687,6 +760,138 @@ impl ChannelChain {
             self.prior_moves = saved_prior;
         }
         result
+    }
+
+    /// The `(old, new)` DIDs of `bundle_b64`, if it is the verified block of
+    /// `record` and a key link for this channel (JEP-0005 rule 7b).
+    fn key_link_in(
+        &self,
+        record: &IngestRecord,
+        bundle_b64: &str,
+        sig_b64: Option<&str>,
+    ) -> Option<(String, String)> {
+        let opened = crate::open::open(&crate::DeliveredBlock {
+            bundle_b64: bundle_b64.to_string(),
+            sig_b64: sig_b64.map(str::to_string),
+            receipts: Vec::new(),
+            delivery_cid: String::new(),
+            ingest: None,
+        })
+        .ok()?;
+        if opened.manifest.kind != Some(jig_core::BlockKind::KeyLink)
+            || opened.authenticity != crate::open::Authenticity::Verified
+            || opened.cid != record.block_cid
+        {
+            return None;
+        }
+        jig_core::sequencer_move::key_link_dids(
+            &opened.manifest.metadata,
+            &opened.sender,
+            &self.channel_id,
+        )
+    }
+
+    /// Keep `link`, `record`'s key link, once `record` is in the chain the
+    /// head holds: the head itself, or a record [`Self::fill_gap`] connected
+    /// below it. A record that does not connect keeps nothing.
+    fn keep_key_link(&mut self, record: &IngestRecord, link: Option<(String, String)>) {
+        // Taken whatever the record carries: what one record connected is
+        // never another's.
+        let connected = self
+            .connected
+            .take()
+            .filter(|c| c.seq == record.seq && c.hash == hex::encode(record.hash()));
+        let Some((old, new)) = link else {
+            return;
+        };
+        let Some(head) = self.head.as_mut() else {
+            return;
+        };
+        let link = HeadKeyLink {
+            seq: record.seq,
+            old,
+            new,
+        };
+        let kept = match connected {
+            // Inside a run still open: provisional until the run connects.
+            Some(Connected { run: Some(to), .. }) => {
+                if let Some(at) = head.gaps.iter().position(|g| g.to == to) {
+                    if head.gaps[at].links.len() < MAX_GAP_LINKS {
+                        head.gaps[at].links.push(link);
+                    } else {
+                        // More links than a run keeps: the run, and every
+                        // link in it, counts for nothing.
+                        head.gaps.remove(at);
+                    }
+                }
+                return;
+            }
+            Some(Connected { run: None, .. }) => true,
+            None => head.seq == record.seq && head.hash == hex::encode(record.hash()),
+        };
+        if kept && !head.key_links.iter().any(|l| l.seq == record.seq) {
+            head.key_links.push(link);
+            head.key_links.sort_by_key(|l| l.seq);
+        }
+    }
+
+    /// A record below the head: if it is the next one of a run the chain
+    /// went past, and names the one before it, it connects, and the run
+    /// moves on past it. A run filled to its end that meets the record after
+    /// it is whole: the key links found in it are kept. One that does not
+    /// meet it is dropped with them, and so is a record that does not
+    /// connect: behind, holding nothing.
+    fn fill_gap(&mut self, record: &IngestRecord) {
+        let Some(head) = self.head.as_mut() else {
+            return;
+        };
+        let Some(at) = head
+            .gaps
+            .iter()
+            .position(|g| g.from == record.seq && g.prev == record.prev)
+        else {
+            return;
+        };
+        let gap = &mut head.gaps[at];
+        gap.from += 1;
+        gap.prev = hex::encode(record.hash());
+        if gap.from < gap.to {
+            self.connected = Some(Connected {
+                seq: record.seq,
+                hash: gap.prev.clone(),
+                run: Some(gap.to),
+            });
+            return;
+        }
+        let gap = head.gaps.remove(at);
+        if gap.prev != gap.end {
+            return;
+        }
+        for link in gap.links {
+            if !head.key_links.iter().any(|l| l.seq == link.seq) {
+                head.key_links.push(link);
+            }
+        }
+        head.key_links.sort_by_key(|l| l.seq);
+        self.connected = Some(Connected {
+            seq: record.seq,
+            hash: hex::encode(record.hash()),
+            run: None,
+        });
+    }
+
+    /// The channel's root owners as of `seq`: the owners this client was
+    /// given, carried along the key links it verified before `seq`.
+    pub fn owners_at(&self, seq: u64) -> Vec<String> {
+        let links = self
+            .head
+            .as_ref()
+            .map(|h| h.key_links.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter(|l| l.seq < seq)
+            .map(|l| (l.old.clone(), l.new.clone()));
+        jig_core::sequencer_move::root_owners(self.owners.clone(), links)
     }
 
     /// The move `bundle_b64` makes, if it is an owner's `sequencer-set`.
@@ -724,13 +929,13 @@ impl ChannelChain {
         set.check_record(record.seq, &record.prev, &record.sequencer)
             .map_err(|e| bad(e.to_string()))?;
         if !self
-            .owners
+            .owners_at(record.seq)
             .iter()
             .any(|o| jig_pipeline::handshake::same_did(o, &opened.sender))
         {
             return Err(bad(format!(
-                "it is signed by {}, a key that is not the channel's creation-block owner; \
-                 owner key links are not yet followed",
+                "it is signed by {}, which is not an owner of the channel as of its place in \
+                 the chain",
                 opened.sender
             )));
         }
@@ -750,10 +955,36 @@ impl ChannelChain {
         block_cid: Option<&str>,
     ) -> Result<Step, ChainBreak> {
         let step = self.accept(record, block_cid)?;
-        if matches!(step, Step::Gap { .. }) {
+        if let Step::Gap { from, to } = step {
             self.head = Some(match &self.head {
-                Some(head) => head.after(record),
-                None => self.first_head(record),
+                // The run gone past, with the hashes it must connect.
+                Some(head) => {
+                    let mut next = head.after(record);
+                    if next.gaps.len() >= MAX_HEAD_GAPS {
+                        next.gaps.remove(0);
+                    }
+                    next.gaps.push(HeadGap {
+                        from,
+                        to,
+                        prev: head.hash.clone(),
+                        end: record.prev.clone(),
+                        links: Vec::new(),
+                    });
+                    next
+                }
+                // No head yet: the run from the channel's start, which
+                // connects from the genesis record's fixed `prev`.
+                None => {
+                    let mut first = self.first_head(record);
+                    first.gaps.push(HeadGap {
+                        from,
+                        to,
+                        prev: hex::encode(GENESIS_PREV),
+                        end: record.prev.clone(),
+                        links: Vec::new(),
+                    });
+                    first
+                }
             });
         }
         Ok(step)
@@ -806,6 +1037,22 @@ mod tests {
     impl Seq {
         /// The same chain, signed from here on by a new key. Returns the
         /// key it signed with before.
+        /// [`Self::push`], for a block named by its real CID.
+        fn push_cid(&mut self, block_cid: &str, wall: u64) -> IngestRecord {
+            let seq = self.records.len() as u64;
+            let prev = self.records.last().map_or(GENESIS_PREV, IngestRecord::hash);
+            let record = RecordSigner {
+                channel_id: label_cid("bafyCreate"),
+                key: &self.key,
+                ingest_wall_ms: wall,
+                ingest_logical: 0,
+            }
+            .sign(seq, block_cid, prev)
+            .unwrap();
+            self.records.push(record.clone());
+            record
+        }
+
         fn rotate(&mut self) -> ed25519_dalek::SigningKey {
             std::mem::replace(&mut self.key, generate_signing_key())
         }
@@ -878,6 +1125,310 @@ mod tests {
             b64.encode(block.canonical_bytes()),
             b64.encode(&block.sender_sig),
         )
+    }
+
+    /// `new`'s `key-link` from `old` for the test channel (JEP-0005 rule 7b),
+    /// as a server delivers it: bundle and signature, base64, with its CID
+    /// and manifest.
+    fn key_link_block(
+        old: &ed25519_dalek::SigningKey,
+        new: &ed25519_dalek::SigningKey,
+    ) -> (String, String, String, jig_core::BlockManifest) {
+        use base64::Engine as _;
+        let channel: cid::Cid = label_cid("bafyCreate").parse().unwrap();
+        let link = jig_core::key_link::SignedKeyLink::sign(
+            old,
+            new,
+            jig_core::key_link::Audience::Channel {
+                channel_id: channel.to_bytes(),
+            },
+            1_700_000_000,
+        )
+        .unwrap();
+        let meta = jig_core::sequencer_move::KeyLinkBlock {
+            channel_id: label_cid("bafyCreate"),
+            link,
+        }
+        .to_metadata();
+        let block = crate::blocks::build_with_metadata(
+            &crate::Identity::from_signing_key(new.clone()),
+            jig_core::BlockKind::KeyLink,
+            jig_core::HlcTimestamp::now_wall(jig_core::Did::from_ed25519_pubkey(&[1; 32])),
+            serde_json::Value::Object(meta.into_iter().collect()),
+        );
+        let manifest = serde_json::from_slice(&block.manifest_bytes).unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD;
+        (
+            b64.encode(block.canonical_bytes()),
+            b64.encode(&block.sender_sig),
+            block.cid(),
+            manifest,
+        )
+    }
+
+    /// One reading of "owner" (JEP-0005 rule 7b): the same chain, a creator
+    /// that linked its key and then moved the sequencer with the new key,
+    /// gives the same verdict through the client's chain and the server's
+    /// rights. With the link, the new key's move holds and the old key is no
+    /// owner; without it, the new key is no owner on either side.
+    #[test]
+    fn the_client_and_the_server_read_one_owner_across_a_key_link() {
+        let did = |k: &ed25519_dalek::SigningKey| {
+            jig_core::Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        };
+        let (owner, rotated, new) = (
+            generate_signing_key(),
+            generate_signing_key(),
+            generate_signing_key(),
+        );
+        let mut server = Seq::new();
+        let old = server.did();
+        let create = server.push("bafyCreate", 10);
+        let (link_bundle, link_sig, link_cid, link_manifest) = key_link_block(&owner, &rotated);
+        let linked = server.push_cid(&link_cid, 20);
+        let (set_bundle, set_sig) = move_block(&server, &new, &rotated);
+        server.key = new.clone();
+        let set = server.push("set", 30);
+
+        // The server: the creator's rights folded from the same blocks.
+        let channel = jig_pipeline::persist::StoredChannel {
+            id: label_cid("bafyCreate"),
+            slug: "#team".into(),
+            visibility: "open".into(),
+            created_at: 0,
+            owner_did: did(&owner),
+            suite: "none".into(),
+            sequencer_did: old.clone(),
+            co_owners: Vec::new(),
+            tiering: jig_pipeline::persist::ChannelTiering::legacy("#team", "open", "none"),
+        };
+        let server_owner = |key: &ed25519_dalek::SigningKey, links: bool| {
+            let blocks = links
+                .then(|| (jig_core::BlockKind::KeyLink, link_manifest.clone()))
+                .into_iter();
+            jig_pipeline::roles::standing(&channel, &did(key), blocks).root
+        };
+        // The client: the same chain, told only of the creation block's owner.
+        let client = |links: bool| {
+            let mut chain = ChannelChain::new(&label_cid("bafyCreate"), &old, None)
+                .with_owners(vec![did(&owner)]);
+            assert_eq!(chain.accept(&create, None), Ok(Step::Next));
+            let step = if links {
+                chain.accept_block(&linked, None, &link_bundle, Some(&link_sig))
+            } else {
+                chain.accept(&linked, None)
+            };
+            assert_eq!(step, Ok(Step::Next));
+            chain
+        };
+
+        let mut with_link = client(true);
+        assert_eq!(with_link.owners_at(set.seq), [did(&rotated)]);
+        assert!(server_owner(&rotated, true) && !server_owner(&owner, true));
+        assert_eq!(
+            with_link.accept_block(&set, None, &set_bundle, Some(&set_sig)),
+            Ok(Step::Next),
+            "the rotated owner's move holds"
+        );
+        assert_eq!(with_link.moves().len(), 1);
+        // Kept with the head: a chain picked up from it reads the same owner.
+        let resumed = ChannelChain::new(&label_cid("bafyCreate"), &old, with_link.head().cloned())
+            .with_owners(vec![did(&owner)]);
+        assert_eq!(resumed.owners_at(set.seq + 1), [did(&rotated)]);
+
+        let mut without = client(false);
+        assert!(!server_owner(&rotated, false) && server_owner(&owner, false));
+        assert!(matches!(
+            without.accept_block(&set, None, &set_bundle, Some(&set_sig)),
+            Err(ChainBreak::BadMove { .. })
+        ));
+    }
+
+    /// A key link the live stream went past (JEP-0005 rule 7b): filled in
+    /// later, it is kept once the run it sits in connects, in order, from
+    /// the record held before the run to the record after it, and then the
+    /// linked key's move holds. Filled in out of order, or from a run that
+    /// does not meet the record after it, it is kept nowhere.
+    #[test]
+    fn a_key_link_filled_in_below_the_head_counts_once_its_run_connects() {
+        let did = |k: &ed25519_dalek::SigningKey| {
+            jig_core::Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        };
+        let (owner, rotated, new) = (
+            generate_signing_key(),
+            generate_signing_key(),
+            generate_signing_key(),
+        );
+        let mut server = Seq::new();
+        let old = server.did();
+        let create = server.push("bafyCreate", 10);
+        let b1 = server.push("b1", 20);
+        let (link_bundle, link_sig, link_cid, _) = key_link_block(&owner, &rotated);
+        let linked = server.push_cid(&link_cid, 30);
+        let b3 = server.push("b3", 40);
+        let (set_bundle, set_sig) = move_block(&server, &new, &rotated);
+        let old_key = std::mem::replace(&mut server.key, new.clone());
+        let set = server.push("set", 50);
+        let live = || {
+            let mut chain = ChannelChain::new(&label_cid("bafyCreate"), &old, None)
+                .with_owners(vec![did(&owner)]);
+            assert_eq!(chain.accept(&create, None), Ok(Step::Next));
+            assert_eq!(
+                chain.accept_live(&b3, None),
+                Ok(Step::Gap { from: 1, to: 3 })
+            );
+            chain
+        };
+
+        // In order: the run connects, and the link counts from its seq.
+        let mut chain = live();
+        assert_eq!(chain.accept(&b1, None), Ok(Step::Behind));
+        assert_eq!(
+            chain.accept_block(&linked, None, &link_bundle, Some(&link_sig)),
+            Ok(Step::Behind)
+        );
+        assert_eq!(chain.owners_at(set.seq), [did(&rotated)]);
+        assert_eq!(
+            chain.accept_block_live(&set, None, &set_bundle, Some(&set_sig)),
+            Ok(Step::Next),
+            "the linked key's move holds"
+        );
+        // Kept with the head.
+        let resumed = ChannelChain::new(&label_cid("bafyCreate"), &old, chain.head().cloned())
+            .with_owners(vec![did(&owner)]);
+        assert_eq!(resumed.owners_at(set.seq + 1), [did(&rotated)]);
+
+        // Out of order: the link does not connect, and counts for nothing.
+        let mut early = live();
+        assert_eq!(
+            early.accept_block(&linked, None, &link_bundle, Some(&link_sig)),
+            Ok(Step::Behind)
+        );
+        assert_eq!(early.owners_at(set.seq), [did(&owner)]);
+        assert!(matches!(
+            early.accept_block_live(&set, None, &set_bundle, Some(&set_sig)),
+            Err(ChainBreak::BadMove { .. })
+        ));
+
+        // A run that does not meet the record after it: the sequencer's own
+        // other record 2, with the link, on top of record 1. It connects from
+        // below, but not to record 3, so the run and its link are dropped.
+        let mut forked = live();
+        assert_eq!(forked.accept(&b1, None), Ok(Step::Behind));
+        let other = Seq {
+            key: old_key,
+            records: vec![create.clone(), b1.clone()],
+        }
+        .push_cid(&link_cid, 31);
+        assert_ne!(other.hash(), linked.hash());
+        assert_eq!(
+            forked.accept_block(&other, None, &link_bundle, Some(&link_sig)),
+            Ok(Step::Behind)
+        );
+        assert_eq!(forked.owners_at(set.seq), [did(&owner)]);
+        assert!(forked.head().unwrap().gaps.is_empty());
+    }
+
+    /// The run filled in below the head holds across the edges: a live
+    /// stream's first record past the start, anchored at the genesis
+    /// `prev`; a head saved and resumed with a run half filled; and a record
+    /// at a seq already connected, which keeps nothing by it.
+    #[test]
+    fn a_filled_in_run_holds_from_the_start_across_a_resume_and_once_per_record() {
+        let did = |k: &ed25519_dalek::SigningKey| {
+            jig_core::Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        };
+        let (owner, rotated) = (generate_signing_key(), generate_signing_key());
+        let mut server = Seq::new();
+        let old = server.did();
+        let create = server.push("bafyCreate", 10);
+        let b1 = server.push("b1", 20);
+        let (link_bundle, link_sig, link_cid, _) = key_link_block(&owner, &rotated);
+        let linked = server.push_cid(&link_cid, 30);
+        let b3 = server.push("b3", 40);
+        let fresh = |head: Option<ChainHead>| {
+            ChannelChain::new(&label_cid("bafyCreate"), &old, head).with_owners(vec![did(&owner)])
+        };
+
+        // A live stream's first record is b3: the run 0..3 connects from
+        // the genesis record, and the link in it counts.
+        let mut chain = fresh(None);
+        assert_eq!(
+            chain.accept_live(&b3, None),
+            Ok(Step::Gap { from: 0, to: 3 })
+        );
+        assert_eq!(chain.accept(&create, None), Ok(Step::Behind));
+        // Saved and resumed with the run half filled.
+        let mut chain = fresh(chain.head().cloned());
+        assert_eq!(chain.accept(&b1, None), Ok(Step::Behind));
+        assert_eq!(
+            chain.accept_block(&linked, None, &link_bundle, Some(&link_sig)),
+            Ok(Step::Behind)
+        );
+        assert_eq!(chain.owners_at(b3.seq + 1), [did(&rotated)]);
+
+        // Another record 1, carrying the link, after the real record 1
+        // connected: it is not the record that connected, and keeps nothing.
+        let mut once = fresh(None);
+        once.accept_live(&b3, None).unwrap();
+        once.accept(&create, None).unwrap();
+        once.accept(&b1, None).unwrap();
+        let stranger = generate_signing_key();
+        let (other_bundle, other_sig, other_cid, _) = key_link_block(&owner, &stranger);
+        let other_b1 = Seq {
+            key: server.key.clone(),
+            records: vec![create.clone()],
+        }
+        .push_cid(&other_cid, 21);
+        assert_eq!(
+            once.accept_block(&other_b1, None, &other_bundle, Some(&other_sig)),
+            Ok(Step::Behind)
+        );
+        // The run completes with the real record 2, read without its block:
+        // nothing the other record 1 carried is in it.
+        assert_eq!(once.accept(&linked, None), Ok(Step::Behind));
+        assert!(once.head().unwrap().gaps.is_empty());
+        assert_eq!(once.owners_at(b3.seq + 1), [did(&owner)]);
+    }
+
+    /// The runs a head keeps open are capped ([`MAX_HEAD_GAPS`]): past it the
+    /// oldest goes, and a run filled into it afterwards connects nothing and
+    /// is no fork; its key link counts for nothing.
+    #[test]
+    fn a_head_keeps_at_most_max_head_gaps_runs() {
+        let did = |k: &ed25519_dalek::SigningKey| {
+            jig_core::Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        };
+        let (owner, rotated) = (generate_signing_key(), generate_signing_key());
+        let mut server = Seq::new();
+        let old = server.did();
+        let create = server.push("bafyCreate", 10);
+        let (link_bundle, link_sig, link_cid, _) = key_link_block(&owner, &rotated);
+        let linked = server.push_cid(&link_cid, 20);
+        let mut chain =
+            ChannelChain::new(&label_cid("bafyCreate"), &old, None).with_owners(vec![did(&owner)]);
+        assert_eq!(chain.accept(&create, None), Ok(Step::Next));
+        // One gap past the link, then MAX_HEAD_GAPS more, each skipping one.
+        for i in 0..=MAX_HEAD_GAPS {
+            server.push(&format!("skipped {i}"), 30 + 2 * i as u64);
+            let ahead = server.push(&format!("ahead {i}"), 31 + 2 * i as u64);
+            assert!(matches!(
+                chain.accept_live(&ahead, None),
+                Ok(Step::Gap { .. })
+            ));
+        }
+        let head = chain.head().unwrap();
+        assert_eq!(head.gaps.len(), MAX_HEAD_GAPS);
+        assert!(
+            head.gaps.iter().all(|g| g.from > linked.seq),
+            "the oldest went"
+        );
+        // Filled into the dropped run: behind, no fork, and no owner moved.
+        assert_eq!(
+            chain.accept_block(&linked, None, &link_bundle, Some(&link_sig)),
+            Ok(Step::Behind)
+        );
+        assert_eq!(chain.owners_at(u64::MAX), [did(&owner)]);
     }
 
     /// A chain that starts with no head (a new connection) takes a move as
@@ -1019,9 +1570,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(refused, ChainBreak::BadMove { .. }));
         assert!(
-            refused
-                .to_string()
-                .contains("not the channel's creation-block owner"),
+            refused.to_string().contains("not an owner of the channel"),
             "{refused}"
         );
         assert!(matches!(

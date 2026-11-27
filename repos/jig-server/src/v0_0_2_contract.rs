@@ -1550,8 +1550,20 @@ pub async fn issue_move_accept(
     let channel = store
         .get_channel_by_id(&channel_id)
         .map_err(persist_err)?
-        .filter(|c| c.is_root_owner(&jig_pipeline::effect::canonical_did_string(caller.as_str())))
         .ok_or_else(not_owner)?;
+    // An owner now, the creator rule carried across its key links (rule 7b).
+    let caller_did = jig_pipeline::effect::canonical_did_string(caller.as_str());
+    if !jig_pipeline::roles::rights_at_channel(
+        store,
+        &channel,
+        &caller_did,
+        jig_pipeline::roles::NEXT,
+    )
+    .map_err(persist_err)?
+    .owner
+    {
+        return Err(not_owner());
+    }
     let me = state.server_did.to_did_jig_string();
     let current = jig_pipeline::effect::canonical_did_string(&channel.sequencer_did);
     if channel.sequencer_did.is_empty() || jig_pipeline::handshake::same_did(&current, &me) {

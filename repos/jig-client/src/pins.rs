@@ -137,6 +137,11 @@ pub struct ChannelPin {
     pub slug: String,
     pub suite: String,
     pub owner_did: String,
+    /// The co-owners the creation block lists, canonical (JEP-0005 rule
+    /// 7b): with [`Self::owner_did`], the channel's root owners. Empty in a
+    /// pin written before they were kept.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub co_owners: Vec<String>,
     /// The last record of the channel's `ingest` chain this device verified
     /// ([`crate::chain`]); the server is held to it on every later read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -908,16 +913,22 @@ impl Pins {
             .map(|m| m.sequencer.as_str())
     }
 
-    /// The owners of the channels pinned on `server`, by channel id: the DID
-    /// each creation block was signed by, as pinned. Who may move a channel's
-    /// sequencer ([`crate::chain::ChannelChain::with_owners`]).
+    /// The root owners of the channels pinned on `server`, by channel id:
+    /// the DID each creation block was signed by and the co-owners it lists,
+    /// as pinned. Who may move a channel's sequencer, carried along the key
+    /// links in its chain ([`crate::chain::ChannelChain::owners_at`]).
     pub fn owners(&self, server: &str) -> std::collections::HashMap<String, Vec<String>> {
         self.server(server)
             .map(|p| {
                 p.channels
                     .values()
                     .filter(|c| !c.owner_did.is_empty())
-                    .map(|c| (c.create_cid.clone(), vec![c.owner_did.clone()]))
+                    .map(|c| {
+                        let roots = std::iter::once(c.owner_did.clone())
+                            .chain(c.co_owners.iter().cloned())
+                            .collect();
+                        (c.create_cid.clone(), roots)
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -1246,6 +1257,17 @@ pub fn prove_channel(
         slug: String::new(),
         suite: suite.as_str().to_string(),
         owner_did: Did::from_ed25519_pubkey(&key_bytes).to_did_jig_string(),
+        co_owners: manifest
+            .metadata
+            .get(jig_pipeline::ingest::CO_OWNERS_KEY)
+            .and_then(|v| v.as_array())
+            .map(|dids| {
+                dids.iter()
+                    .filter_map(|d| d.as_str())
+                    .map(jig_pipeline::effect::canonical_did_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
         chain_head: None,
         sequencer: None,
     })
@@ -1569,6 +1591,7 @@ mod tests {
             slug: String::new(),
             suite: suite.into(),
             owner_did: "did:jig:zA".into(),
+            co_owners: Vec::new(),
             chain_head: None,
             sequencer: None,
         };
@@ -1759,6 +1782,7 @@ mod tests {
             slug: "#ops".into(),
             suite: "mls".into(),
             owner_did: "did:jig:zOwner".into(),
+            co_owners: Vec::new(),
             chain_head: None,
             sequencer: None,
         };
@@ -1845,6 +1869,7 @@ mod tests {
             slug: String::new(),
             suite: "mls".into(),
             owner_did: "did:jig:zOwner".into(),
+            co_owners: Vec::new(),
             chain_head: None,
             sequencer: None,
         };
@@ -1879,6 +1904,8 @@ mod tests {
             record: None,
             high: None,
             moves: Vec::new(),
+            key_links: Vec::new(),
+            gaps: Vec::new(),
         };
         assert!(
             !pins.advance_chain(server, "#ops", &head(1)).unwrap(),
@@ -1892,6 +1919,7 @@ mod tests {
                 slug: String::new(),
                 suite: "mls".into(),
                 owner_did: "did:jig:zOwner".into(),
+                co_owners: Vec::new(),
                 chain_head: None,
                 sequencer: None,
             },
@@ -2509,6 +2537,7 @@ mod tests {
                 slug: String::new(),
                 suite: "none".to_string(),
                 owner_did: "did:jig:zowner".to_string(),
+                co_owners: Vec::new(),
                 chain_head: None,
                 sequencer: None,
             },
@@ -2527,6 +2556,8 @@ mod tests {
                 seq: 4,
                 sequencer: "did:jig:znew".into(),
             }],
+            key_links: Vec::new(),
+            gaps: Vec::new(),
         };
         pins.advance_chain("wss://a", "bafyteam", &head).unwrap();
         assert_eq!(pins.moved_to("wss://a", "bafyteam"), Some("did:jig:znew"));
@@ -2551,6 +2582,7 @@ mod tests {
                 slug: String::new(),
                 suite: "none".to_string(),
                 owner_did: "did:jig:zuser".to_string(),
+                co_owners: Vec::new(),
                 chain_head: None,
                 sequencer: None,
             },
@@ -2723,6 +2755,8 @@ mod tests {
             record: None,
             high: None,
             moves: Vec::new(),
+            key_links: Vec::new(),
+            gaps: Vec::new(),
         };
         pins.check_channel(
             server,
@@ -2732,6 +2766,7 @@ mod tests {
                 slug: String::new(),
                 suite: "none".to_string(),
                 owner_did: "did:jig:zuser".to_string(),
+                co_owners: Vec::new(),
                 chain_head: None,
                 sequencer: None,
             },
@@ -2793,6 +2828,7 @@ mod tests {
             slug: String::new(),
             suite: "none".to_string(),
             owner_did: "did:jig:zuser".to_string(),
+            co_owners: Vec::new(),
             chain_head: None,
             sequencer: None,
         };
@@ -2863,6 +2899,7 @@ mod tests {
             slug: String::new(),
             suite: "mls".into(),
             owner_did: "did:jig:zUser".into(),
+            co_owners: Vec::new(),
             chain_head: None,
             sequencer: None,
         };
@@ -2969,6 +3006,7 @@ mod tests {
             slug: String::new(),
             suite: "mls".into(),
             owner_did: "did:jig:zUser".into(),
+            co_owners: Vec::new(),
             chain_head: None,
             sequencer: sequencer.map(str::to_string),
         };
@@ -2994,6 +3032,8 @@ mod tests {
             record: None,
             high: None,
             moves: Vec::new(),
+            key_links: Vec::new(),
+            gaps: Vec::new(),
         };
         assert!(pins.advance_chain(server, "bafyCarried", &head).unwrap());
         assert_eq!(
@@ -3020,6 +3060,7 @@ mod tests {
             slug: String::new(),
             suite: "mls".into(),
             owner_did: "did:jig:zUser".into(),
+            co_owners: Vec::new(),
             chain_head: None,
             sequencer: None,
         };

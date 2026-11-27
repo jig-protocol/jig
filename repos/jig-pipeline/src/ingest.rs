@@ -332,6 +332,17 @@ pub enum IngestError {
     /// (JEP-0005 rule 11a).
     #[error("the sequencer move is refused: {detail}")]
     MoveRefused { detail: String },
+    /// A `key-link` that cannot move anything here (JEP-0005 rule 7b).
+    #[error("the key link is refused: {detail}")]
+    KeyLinkRefused { detail: String },
+    /// A `key-link` on an encrypted channel: the new DID needs the old one's
+    /// leaf in the MLS group, and this server has no commit that swaps a
+    /// leaf yet (JEP-0005 rule 7b).
+    #[error(
+        "{slug} is encrypted: moving a member to a new key needs an MLS commit that swaps its \
+         leaf, which this server does not implement yet"
+    )]
+    MlsKeyLinkUnsupported { slug: String },
     /// A relayed block for a channel the relaying server's share does not
     /// cover (JEP-0005 rule 15).
     #[error("`{kind}` refused: `{via}` relayed it outside its share of channel {channel_id}")]
@@ -503,6 +514,9 @@ impl From<crate::persist::PersistError> for IngestError {
                 channel_id,
                 sequencer,
             },
+            crate::persist::PersistError::KeyLinkNotMoved { detail } => {
+                IngestError::KeyLinkRefused { detail }
+            }
             e => IngestError::Persist(e),
         }
     }
@@ -744,6 +758,24 @@ pub async fn ingest(
         }
         _ => None,
     };
+    // JEP-0005 rule 7b: a key link moves the old DID's standing to its
+    // author. What it may move is judged here, against the chain as it
+    // stands; the write gate then takes it from anyone.
+    if kind == BlockKind::KeyLink
+        && let Some(chan) = resolved_channel.as_ref()
+        && chan.suite == jig_core::EncryptionSuite::Mls.as_str()
+    {
+        return Err(IngestError::MlsKeyLinkUnsupported {
+            slug: chan.slug.clone(),
+        });
+    }
+    if kind == BlockKind::KeyLink
+        && let Some(chan) = resolved_channel.as_ref()
+        && let Err(detail) =
+            crate::roles::check_key_link(&ctx.store, chan, &manifest, sender.as_str())?
+    {
+        return Err(IngestError::KeyLinkRefused { detail });
+    }
     // A channel another server sequences takes its blocks only from that
     // server, with that server's records (`crate::follow`): this server never
     // signs a record for it (JEP-0005 rule 12), so nothing lands here.
@@ -890,6 +922,43 @@ pub async fn ingest(
         }
         _ => crate::roles::Rights::default(),
     };
+    // A root owner's place is fixed for the channel's life, and a key link
+    // carries it to the owner's new DID (rule 7b): that DID is removed or
+    // given a role no more than the creator is. The write gate knows the
+    // channel's terms only, so the carried root is checked here.
+    if let Some(chan) = resolved_channel.as_ref()
+        && matches!(
+            kind,
+            BlockKind::MemberRemove | BlockKind::RoleAssign | BlockKind::RoleUnassign
+        )
+    {
+        let key = match kind {
+            BlockKind::MemberRemove => "member_did",
+            _ => crate::roles::MEMBER_KEY,
+        };
+        if let Some(target) = manifest
+            .metadata
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(crate::effect::canonical_did_string)
+            // Leaving is the sender's own, judged by the write gate.
+            && (kind != BlockKind::MemberRemove || target != sender.as_str())
+            && !chan.is_root_owner(&target)
+            && crate::roles::standing_at(&ctx.store, chan, &target, crate::roles::NEXT)?.root
+        {
+            return Err(match kind {
+                BlockKind::MemberRemove => IngestError::NotChannelOwner {
+                    kind: kind_str.to_string(),
+                    slug: chan.slug.clone(),
+                    sender: sender.as_str().to_string(),
+                },
+                _ => IngestError::RootOwnerRole {
+                    slug: chan.slug.clone(),
+                    member: target,
+                },
+            });
+        }
+    }
     if let Err(refusal) = crate::authorize_write::authorize_block_with(
         kind,
         sender.as_str(),
@@ -947,9 +1016,21 @@ pub async fn ingest(
     let guarded_right = match kind {
         BlockKind::MemberAdd | BlockKind::MemberRemove => Some(crate::roles::Right::Membership),
         BlockKind::ChannelShare | BlockKind::ChannelUnshare => Some(crate::roles::Right::Share),
+        // The role blocks have no effect beyond their place in the chain, so
+        // they land on the guarded path. Promote and archive change the row,
+        // which that path does not apply, and are judged before landing only.
+        BlockKind::RoleAssign | BlockKind::RoleUnassign => Some(crate::roles::Right::Owner),
         _ => None,
     };
     let guard_refusal = match (resolved_channel.as_ref(), guarded_right) {
+        // A key link retires a root owner's old DID (rule 7b), so even the
+        // owner right is re-checked where the block lands: one that lands
+        // after its signer's key was linked away is refused.
+        (Some(chan), Some(crate::roles::Right::Owner)) => Some(IngestError::NotChannelOwner {
+            kind: kind_str.to_string(),
+            slug: chan.slug.clone(),
+            sender: sender.as_str().to_string(),
+        }),
         (Some(chan), Some(right))
             if crate::authorize_write::authorize_block_with(
                 kind,
@@ -1259,7 +1340,9 @@ pub async fn ingest(
         // A membership or share block whose authority rests on a role: its
         // effect, block and record land in one transaction, and only if the
         // role still holds at the seq it is given.
-        _ if guard.is_some() => {
+        // A `key-link`'s membership move lands with it, in the same
+        // transaction (JEP-0005 rule 7b).
+        _ if guard.is_some() || kind == BlockKind::KeyLink => {
             let Some(signer) = signer.as_ref() else {
                 return Err(refused_at_landing(guard_refusal, kind_str));
             };
@@ -1742,6 +1825,7 @@ fn requires_existing_channel(kind: BlockKind, _source: &IngestSource) -> bool {
     matches!(
         kind,
         BlockKind::SequencerSet
+            | BlockKind::KeyLink
             | BlockKind::TextRender
             | BlockKind::MemberAdd
             | BlockKind::MemberRemove
@@ -2005,7 +2089,7 @@ pub fn check_linked_channels(
                 ),
             ));
         }
-        if !old.is_root_owner(creator) {
+        if !crate::roles::rights_at_channel(store, &old, creator, crate::roles::NEXT)?.owner {
             return Err(invalid(
                 tier_keys::SUCCESSOR_OF,
                 format!("only an owner of `{}` creates its successor", old.slug),
@@ -2190,6 +2274,18 @@ fn membership_change(
     block_cid: &str,
 ) -> crate::persist::MembershipChange {
     use crate::persist::{MembershipChange, StoredMembership};
+    if kind == BlockKind::KeyLink {
+        return match channel
+            .and_then(|c| crate::roles::key_link_of(manifest, &c.id).map(|l| (c, l)))
+        {
+            Some((channel, (old, new))) => MembershipChange::Move {
+                channel_id: channel.id.clone(),
+                old,
+                new,
+            },
+            None => MembershipChange::None,
+        };
+    }
     let (Some(channel), Some(member)) = (
         channel,
         manifest.metadata.get("member_did").and_then(|v| v.as_str()),
@@ -5646,6 +5742,279 @@ mod tests {
         );
     }
 
+    /// A `key-link` block (JEP-0005 rule 7b), signed by `new`, linking `old`
+    /// to it for `channel`, or for `audience` when given.
+    fn key_link(
+        old: &Person,
+        new: &Person,
+        channel: &str,
+        audience: Option<jig_core::key_link::Audience>,
+    ) -> serde_json::Value {
+        let id: cid::Cid = channel.parse().unwrap();
+        let audience = audience.unwrap_or(jig_core::key_link::Audience::Channel {
+            channel_id: id.to_bytes(),
+        });
+        let link =
+            jig_core::key_link::SignedKeyLink::sign(&old.key, &new.key, audience, 1_700_000_000)
+                .unwrap();
+        serde_json::to_value(
+            jig_core::sequencer_move::KeyLinkBlock {
+                channel_id: channel.to_string(),
+                link,
+            }
+            .to_metadata(),
+        )
+        .unwrap()
+    }
+
+    /// A key link lands with its membership move, in one transaction
+    /// (JEP-0005 rule 7b): if the new DID became a member after the link was
+    /// checked, the member's link is refused at landing and nothing of it is
+    /// written; its author stays the member it was.
+    #[tokio::test]
+    async fn a_key_link_whose_membership_cannot_move_at_landing_is_refused_whole() {
+        let ctx = test_ctx_allowing(&["channel-create", "member-add", "key-link"]);
+        let (owner, member, member2) = (person(), person(), person());
+        let chan = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#team"}),
+        )
+        .await
+        .unwrap();
+        plain(
+            &ctx,
+            &owner,
+            BlockKind::MemberAdd,
+            serde_json::json!({"channel_id": chan, "member_did": member.did}),
+        )
+        .await
+        .unwrap();
+        let head = ctx.store.chain_head_seq(&chan).unwrap();
+        let store = ctx.store.clone();
+        let (channel_id, new_did) = (chan.clone(), member2.did.clone());
+        super::BEFORE_LANDING.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                store
+                    .upsert_membership(&crate::persist::StoredMembership {
+                        channel_id,
+                        member_did: new_did,
+                        role: "member".to_string(),
+                        joined_at: 0,
+                        source_block_cid: "elsewhere".to_string(),
+                    })
+                    .unwrap();
+            }));
+        });
+        let linked = plain(
+            &ctx,
+            &member2,
+            BlockKind::KeyLink,
+            key_link(&member, &member2, &chan, None),
+        )
+        .await;
+        assert!(
+            matches!(linked, Err(IngestError::KeyLinkRefused { .. })),
+            "{linked:?}"
+        );
+        assert!(ctx.store.is_member_by_id(&chan, &member.did).unwrap());
+        assert_eq!(ctx.store.chain_head_seq(&chan).unwrap(), head);
+    }
+
+    /// JEP-0005 rule 7b: from a key link's `seq`, the old DID's role,
+    /// membership and root are the new DID's, and the old DID holds nothing.
+    /// The creator rule carries across: the creator's new DID cannot be
+    /// removed. A link with nothing to move, one that would merge two
+    /// standings, a second link from a DID linked away, and a link scoped to
+    /// anything but this channel are refused.
+    #[tokio::test]
+    async fn a_key_link_moves_roles_membership_and_the_creator_rule() {
+        let ctx = test_ctx_allowing(&[
+            "channel-create",
+            "member-add",
+            "member-remove",
+            "channel-archive",
+            "role-assign",
+            "key-link",
+        ]);
+        let (owner, owner2) = (person(), person());
+        let (admin, admin2) = (person(), person());
+        let (member, member2) = (person(), person());
+        let chan = plain(
+            &ctx,
+            &owner,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#team"}),
+        )
+        .await
+        .unwrap();
+        plain(
+            &ctx,
+            &owner,
+            BlockKind::RoleAssign,
+            serde_json::json!({"channel_id": chan, "role": "admin", "member": admin.did}),
+        )
+        .await
+        .unwrap();
+        plain(
+            &ctx,
+            &owner,
+            BlockKind::MemberAdd,
+            serde_json::json!({"channel_id": chan, "member_did": member.did}),
+        )
+        .await
+        .unwrap();
+        let add = |who: &'static str| serde_json::json!({"channel_id": chan, "member_did": who});
+
+        // The admin's role moves.
+        plain(
+            &ctx,
+            &admin2,
+            BlockKind::KeyLink,
+            key_link(&admin, &admin2, &chan, None),
+        )
+        .await
+        .expect("an admin links its key");
+        plain(&ctx, &admin2, BlockKind::MemberAdd, add("did:jig:zOne"))
+            .await
+            .expect("the new key holds the role");
+        let old = plain(&ctx, &admin, BlockKind::MemberAdd, add("did:jig:zTwo")).await;
+        assert!(
+            matches!(old, Err(IngestError::NotChannelOwner { .. })),
+            "the old key holds nothing: {old:?}"
+        );
+
+        // A member's membership moves.
+        plain(
+            &ctx,
+            &member2,
+            BlockKind::KeyLink,
+            key_link(&member, &member2, &chan, None),
+        )
+        .await
+        .expect("a member links its key");
+        assert!(!ctx.store.is_member_by_id(&chan, &member.did).unwrap());
+        assert!(ctx.store.is_member_by_id(&chan, &member2.did).unwrap());
+
+        // The creator's root moves, and stays fixed.
+        plain(
+            &ctx,
+            &owner2,
+            BlockKind::KeyLink,
+            key_link(&owner, &owner2, &chan, None),
+        )
+        .await
+        .expect("the creator links its key");
+        plain(
+            &ctx,
+            &owner2,
+            BlockKind::RoleAssign,
+            serde_json::json!({"channel_id": chan, "role": "admin", "member": "did:jig:zOne"}),
+        )
+        .await
+        .expect("the creator's new key assigns roles");
+        let retired = plain(
+            &ctx,
+            &owner,
+            BlockKind::RoleAssign,
+            serde_json::json!({"channel_id": chan, "role": "admin", "member": "did:jig:zTwo"}),
+        )
+        .await;
+        assert!(retired.is_err(), "the creator's old key: {retired:?}");
+        let remove = plain(
+            &ctx,
+            &admin2,
+            BlockKind::MemberRemove,
+            serde_json::json!({"channel_id": chan, "member_did": owner2.did}),
+        )
+        .await;
+        assert!(
+            matches!(remove, Err(IngestError::NotChannelOwner { .. })),
+            "the creator's new key is a root owner: {remove:?}"
+        );
+        let role = plain(
+            &ctx,
+            &owner2,
+            BlockKind::RoleAssign,
+            serde_json::json!({"channel_id": chan, "role": "admin", "member": owner2.did}),
+        )
+        .await;
+        assert!(role.is_err(), "a root takes no role: {role:?}");
+
+        // What a link may not do.
+        let refused = |r: Result<String, IngestError>| {
+            assert!(
+                matches!(r, Err(IngestError::KeyLinkRefused { .. })),
+                "{r:?}"
+            );
+        };
+        let (stranger, fresh) = (person(), person());
+        refused(
+            plain(
+                &ctx,
+                &fresh,
+                BlockKind::KeyLink,
+                key_link(&stranger, &fresh, &chan, None),
+            )
+            .await,
+        );
+        refused(
+            plain(
+                &ctx,
+                &member2,
+                BlockKind::KeyLink,
+                key_link(&admin2, &member2, &chan, None),
+            )
+            .await,
+        );
+        refused(
+            plain(
+                &ctx,
+                &fresh,
+                BlockKind::KeyLink,
+                key_link(&owner, &fresh, &chan, None),
+            )
+            .await,
+        );
+        let elsewhere = jig_pipeline_test_other_channel();
+        refused(
+            plain(
+                &ctx,
+                &fresh,
+                BlockKind::KeyLink,
+                key_link(
+                    &admin2,
+                    &fresh,
+                    &chan,
+                    Some(jig_core::key_link::Audience::Channel {
+                        channel_id: elsewhere.to_bytes(),
+                    }),
+                ),
+            )
+            .await,
+        );
+        // Signed by the old key: the author must be the link's new DID.
+        refused(
+            plain(
+                &ctx,
+                &admin2,
+                BlockKind::KeyLink,
+                key_link(&admin2, &fresh, &chan, None),
+            )
+            .await,
+        );
+    }
+
+    /// A CID that names no channel here.
+    fn jig_pipeline_test_other_channel() -> cid::Cid {
+        jig_pipeline_label_cid("#elsewhere")
+    }
+
+    fn jig_pipeline_label_cid(label: &str) -> cid::Cid {
+        crate::ingest_record::label_cid(label).parse().unwrap()
+    }
+
     /// Rights are read as of the block's position in the chain, by record
     /// `seq`: a block the admin signed while it was one stays valid after
     /// the role is taken away, and its next membership block is refused.
@@ -5805,6 +6174,33 @@ mod tests {
         )
         .await
         .expect("role-assign on an mls channel");
+    }
+
+    /// JEP-0005 rule 7b: an encrypted channel takes no key link until the
+    /// delivery service can swap a member's leaf; refused, not half-applied.
+    #[tokio::test]
+    async fn a_key_link_on_an_encrypted_channel_is_refused() {
+        let ctx = test_ctx_allowing(&["channel-create", "key-link"]);
+        let (owner, owner2) = (person(), person());
+        create_sealed(&ctx, &owner).await;
+        let chan = ctx
+            .store
+            .get_channel_by_slug("#sealed")
+            .unwrap()
+            .unwrap()
+            .id;
+        let linked = plain(
+            &ctx,
+            &owner2,
+            BlockKind::KeyLink,
+            key_link(&owner, &owner2, &chan, None),
+        )
+        .await;
+        assert!(
+            matches!(linked, Err(IngestError::MlsKeyLinkUnsupported { .. })),
+            "{linked:?}"
+        );
+        assert!(ctx.store.is_member_by_id(&chan, &owner.did).unwrap());
     }
 
     /// Sequence the owner's `role-unassign` of `admin` between the next
