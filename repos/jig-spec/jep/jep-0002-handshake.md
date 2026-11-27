@@ -39,6 +39,10 @@ Draft. Field names are provisional. The design behind this revision is
 1. After the transport opens, the client's first frame is `hello`:
    envelope versions it speaks, suites it implements, capabilities it wants, and a fresh
    random `nonce`. A server that dials another server adds `peer_did`, its own DID.
+   In a hello, `capabilities.block_kinds` lists every block kind the client implements
+   (JEP-0005 rule 11a). A server serves a client a channel only up to the first block
+   of a critical kind, added after `v0.2.0`, that the client does not list. Clients up
+   to `v0.2.0` list none.
 2. The server's first frame is `welcome`, signed by the server's DID key over its
    canonical bytes (domain `jig-handshake-welcome-v2`; v1 had no `server_nonce` or
    `tls_exporter`):
@@ -48,7 +52,7 @@ Draft. Field names are provisional. The design behind this revision is
    | `server_did` | The signing key, as a `did:jig` in its canonical lowercase spelling; a client MUST refuse any other spelling of it | OP-08 |
    | `v` | Chosen envelope version | OP-02 |
    | `suites` | Suites the server implements | OP-02, OP-03 |
-   | `capabilities` | Allowed block kinds, limits (including `max_future_skew_ms`), features (execution, federation) | OP-02, TM-01 |
+   | `capabilities` | Allowed block kinds (in a welcome, the server's allow-list), limits (including `max_future_skew_ms`), features (execution, federation) | OP-02, TM-01 |
    | `reputation` | Placeholder object; `null` until JEP-0003 | OP-10 |
    | `manifest` | CID and `seq` of the server's current `server-manifest` block | OP-02, OP-03 |
    | `key_link` | During a key change: the public key link (JEP-0012) from the server's old DID to `server_did`, signed by both keys; absent otherwise | OP-08 |

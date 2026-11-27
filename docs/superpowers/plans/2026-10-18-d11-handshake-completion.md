@@ -174,6 +174,11 @@ checks).
 - Lane I's `sequencer-rekey` (the sequencer moves to its own rotated DID) is checked
   here too; an owner's `sequencer-set` takes precedence over it.
 - Lands with or after F's contract build.
+- Built by lane F2-B with F2 Task 9 (see that plan's item list and decisions). The
+  expected-sequencer rule is a per-channel schedule of signer ranges. Its one public
+  lookup is `expected_sequencer(channel, seq)`. Server rotation on main is link-based, so
+  "a `sequencer-set` beats a `sequencer-rekey`" is implemented as: links the old sequencer
+  serves later never extend its range past the set.
 
 ## Done
 
