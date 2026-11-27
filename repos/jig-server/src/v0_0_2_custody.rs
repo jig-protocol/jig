@@ -383,10 +383,11 @@ pub async fn request_key_package(
     {
         // A lost answer is answered again (rule 21a), before anything is
         // held or a grant is used.
-        if let again @ Release::Again { .. } =
-            release(&state, &did, &request, &envelope, &listing, now, false)?
-        {
-            return answer(&state, &did, &request, &channel_id, again);
+        // Anything but "not a repeat" is the answer: a repeat, or a refusal
+        // no approval could change.
+        match release(&state, &did, &request, &envelope, &listing, now, false)? {
+            Release::NotARepeat => {}
+            settled => return answer(&state, &did, &request, &channel_id, settled),
         }
         grant = store
             .take_kp_grant(&did, &request.requester, &channel_id, now)
@@ -402,6 +403,7 @@ pub async fn request_key_package(
                 ttl: HOLD_SECS,
                 max_per_did: MAX_HELD_PER_DID,
                 max_per_requester: MAX_HELD_PER_REQUESTER,
+                forget_expired_before: forget_expired_before(now, window),
             };
             return match store.hold_kp_request(&hold).map_err(persist_err)? {
                 Held::New(id) | Held::Already(id) => {
@@ -417,6 +419,15 @@ pub async fn request_key_package(
                     format!("{MAX_HELD_PER_DID} requests already wait on {did}'s decision here"),
                     until - now,
                 )),
+                Held::Settled => Err(err(
+                    StatusCode::CONFLICT,
+                    "DECIDED",
+                    format!(
+                        "request {} was decided already, or expired undecided; sign a fresh \
+                         request to ask again",
+                        hex::encode(request.request_id())
+                    ),
+                )),
                 Held::RequesterFull { until } => Err(held_full(
                     format!(
                         "{MAX_HELD_PER_REQUESTER} of {}'s requests already wait on a decision \
@@ -429,19 +440,26 @@ pub async fn request_key_package(
         }
     }
     let released = release(&state, &did, &request, &envelope, &listing, now, true);
-    // An approval is used by a release; one the release did not happen for
-    // stays for the next request.
+    // An approval is used by a fresh release only; one the release did not
+    // happen for, or that a concurrent repeat answered, stays for the next
+    // request.
     if let Some(grant) = grant
-        && !matches!(
-            released,
-            Ok(Release::Released { .. } | Release::Again { .. })
-        )
+        && !matches!(released, Ok(Release::Released { .. }))
     {
         store
             .restore_kp_grant(&did, &request.requester, &channel_id, &grant)
             .map_err(persist_err)?;
     }
     answer(&state, &did, &request, &channel_id, released?)
+}
+
+/// Requests held at or before this, and expired undecided, are forgotten.
+/// A copy of one was signed at most `window` after it was held, so by now it
+/// is answered `STALE_REQUEST` before the store is asked: past `HOLD_SECS` and
+/// twice the window, no copy is fresh.
+fn forget_expired_before(now: i64, window: i64) -> i64 {
+    now.saturating_sub(HOLD_SECS)
+        .saturating_sub(window.saturating_mul(2))
 }
 
 /// The answer to a request, for what [`release`] did.
@@ -672,7 +690,9 @@ pub async fn held_requests(
 /// The body is `did`'s own `jig-kp-decision-v1`, naming this server and the
 /// request. A request held for another DID, or none, is `404 NO_SUCH_REQUEST`,
 /// whichever it is, so a decision tells nothing of another DID's holds; one
-/// decided already is `409 DECIDED`.
+/// decided already, or expired, is `409 DECIDED`. A request that expired
+/// longer ago than [`forget_expired_before`] is forgotten, and is
+/// `404 NO_SUCH_REQUEST`.
 pub async fn decide(
     State(state): State<Arc<AppState>>,
     Path((did, request_id)): Path<(String, String)>,
@@ -1883,5 +1903,74 @@ mod tests {
         // Another requester still is held, not refused.
         let refused = ask(&state, 9, 20, &custodian, now()).await.unwrap_err();
         held_id(&refused);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_no_approval_could_change_is_not_held() {
+        let state = custodian_with_policy().await;
+        let custodian = ours(&state);
+        let _ = mark(&state, 4, &custodian, false, 1).await.unwrap();
+        let sequenced = jig_pipeline::persist::StoredChannel {
+            id: channel().to_string(),
+            slug: "#here".into(),
+            visibility: "open".into(),
+            created_at: 0,
+            owner_did: did_of(3),
+            suite: "mls".into(),
+            sequencer_did: custodian.clone(),
+            co_owners: vec![],
+            tiering: jig_pipeline::persist::ChannelTiering::current("open", "mls"),
+        };
+        state.ingest_ctx.store.upsert_channel(&sequenced).unwrap();
+        // Seed 5 is not named: it is told local adds ended, not held.
+        let refused = ask(&state, 5, 4, &custodian, now()).await.unwrap_err();
+        assert_eq!(
+            code(&refused),
+            (StatusCode::FORBIDDEN, "LOCAL_ADDS_ENDED".into())
+        );
+        assert!(read_held(&state, 4, 4).await.unwrap().held.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_refused_request_sent_again_is_told_decided() {
+        let state = custodian_with_policy().await;
+        let custodian = ours(&state);
+        let req = KpRequest::sign(
+            &key(5),
+            &did_of(4),
+            channel(),
+            &custodian,
+            rand::random(),
+            now(),
+        );
+        let send = || {
+            request_key_package(
+                State(state.clone()),
+                Path(did_of(4)),
+                Json(RequestBody {
+                    request_b64: STANDARD.encode(&req.envelope),
+                }),
+            )
+        };
+        let id = held_id(&send().await.unwrap_err());
+        let _ = decide_as(&state, 4, &custodian, id, false).await.unwrap();
+        let again = send().await.unwrap_err();
+        assert_eq!(code(&again), (StatusCode::CONFLICT, "DECIDED".into()));
+        assert!(read_held(&state, 4, 4).await.unwrap().held.is_empty());
+        // A fresh request is held anew.
+        let fresh = ask(&state, 5, 4, &custodian, now()).await.unwrap_err();
+        assert_ne!(held_id(&fresh), id);
+    }
+
+    #[tokio::test]
+    async fn a_copy_of_a_forgotten_request_is_stale() {
+        let state = custodian_with_policy().await;
+        let window = i64::try_from(state.config.custody.request_window_secs).unwrap();
+        let now = now();
+        // The latest a request forgotten now could have been signed: held at
+        // the cutoff, signed one window after.
+        let signed = forget_expired_before(now, window) + window;
+        let copy = ask(&state, 5, 4, &ours(&state), signed).await.unwrap_err();
+        assert_eq!(code(&copy).1, "STALE_REQUEST");
     }
 }
