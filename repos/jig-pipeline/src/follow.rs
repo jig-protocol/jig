@@ -435,6 +435,39 @@ enum Landing {
 }
 
 impl SqliteStore {
+    /// Whether `record_bytes` is, byte for byte, the record held at its `seq`
+    /// of its channel, for the block held with signature `sig`, in a channel
+    /// neither stopped by a fork nor waiting on an upgrade. Those are the
+    /// conditions under which [`ingest_sequenced`] would end in `Duplicate`,
+    /// so it can answer that before checking any signature: both were
+    /// checked when the block and its record were kept, and the block's CID
+    /// covers its bytes. Anything else, a fork's record included, takes the
+    /// full path.
+    fn holds_exactly(
+        &self,
+        record: &IngestRecord,
+        record_bytes: &[u8],
+        sig: &[u8],
+    ) -> crate::persist::Result<bool> {
+        let conn = self.conn.lock().expect("poisoned");
+        Ok(conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM chain_records r JOIN blocks b ON b.cid = r.block_cid
+                 WHERE r.channel_id = ?1 AND r.seq = ?2 AND r.block_cid = ?3
+                   AND r.record = ?4 AND b.sender_sig = ?5)
+             AND NOT EXISTS(SELECT 1 FROM chain_evidence WHERE channel_id = ?1)
+             AND NOT EXISTS(SELECT 1 FROM carried_upgrades WHERE channel_id = ?1)",
+            params![
+                record.channel_id,
+                record.seq as i64,
+                record.block_cid,
+                record_bytes,
+                sig
+            ],
+            |r| r.get(0),
+        )?)
+    }
+
     /// The chain evidence kept for `channel_id`: none, or the one fork that
     /// stopped it.
     pub fn chain_evidence(&self, channel_id: &str) -> crate::persist::Result<Vec<ChainEvidence>> {
@@ -1161,6 +1194,19 @@ pub fn check_takeover(
     Ok(set)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Signature checks [`ingest_sequenced`] made on this thread, for the
+    /// tests of its check order.
+    static SIGNATURE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one signature check, in tests.
+fn note_signature_check() {
+    #[cfg(test)]
+    SIGNATURE_CHECKS.with(|n| n.set(n.get() + 1));
+}
+
 /// Take one block of a channel `sequencer` owns, with its record as the owner
 /// sent it (`record_bytes`, the stored form, kept byte for byte).
 ///
@@ -1196,9 +1242,10 @@ pub async fn ingest_sequenced(
     }
     let (manifest, kind) = carried_manifest(bundle.manifest_bytes)?;
     crate::ingest::check_manifest_dids(&manifest)?;
-    let sender =
-        crate::ingest::verify_sig(bundle.manifest_bytes, bundle.code_bytes, &manifest, &sig)?;
 
+    // Cheap checks first, signatures last (F2 Task 10): a block for a channel
+    // this server does not carry from `sequencer`, or one it holds already,
+    // costs no signature check.
     let record = IngestRecord::decode(record_bytes)?;
     // The stored form exactly, as the owner stores it: nothing rides along
     // outside the signed fields, and what a client is sent is what was signed.
@@ -1344,6 +1391,18 @@ pub async fn ingest_sequenced(
             sequencer: share_with,
         });
     }
+    // The same block under the same record again: what landing it would
+    // answer, without its signatures checked a second time.
+    if ctx.store.holds_exactly(&record, record_bytes, &sig)? {
+        return Ok(Followed::Duplicate {
+            block_cid,
+            seq: record.seq,
+        });
+    }
+    note_signature_check();
+    let sender =
+        crate::ingest::verify_sig(bundle.manifest_bytes, bundle.code_bytes, &manifest, &sig)?;
+    note_signature_check();
     // Rule 11a: only the owner moves the sequencer, and the set's record is
     // the new sequencer's, right after the head it cites.
     if let (Some(set), Some(chan)) = (&moving, &channel) {
@@ -3550,12 +3609,17 @@ mod tests {
             code_bytes: &sent.parts.1,
             resources: vec![],
         };
+        // Under a record the owner signed for the renamed block, so that
+        // only the author's signature is wrong.
+        let renamed = (manifest.clone(), sent.parts.1.clone(), sent.parts.2.clone());
+        let prev = IngestRecord::decode(&owner.sent[0].record).unwrap().hash();
+        let record = owner.sign_at(&renamed, 1, prev);
         assert!(matches!(
             ingest_sequenced(
                 &follower,
                 unknown,
                 sent.parts.2.clone(),
-                &sent.record,
+                &record,
                 &owner.did()
             )
             .await,
@@ -3628,6 +3692,123 @@ mod tests {
         assert!(matches!(
             take(&follower, &owner, &owner.sent[2]).await,
             Err(FollowError::NoShare { .. })
+        ));
+    }
+
+    fn signature_checks() -> usize {
+        SIGNATURE_CHECKS.with(|n| n.get())
+    }
+
+    /// F2 Task 10: what a flood of oversize, unshared and duplicate entries
+    /// costs is no signature check, and each is answered as it was before the
+    /// checks were reordered.
+    #[tokio::test]
+    async fn cheap_checks_come_before_any_signature() {
+        let mut owner = Owner::new().await;
+        owner.text("one").await;
+        let follower = owner.follower();
+        for sent in &owner.sent {
+            take(&follower, &owner, sent).await.unwrap();
+        }
+        let landed = signature_checks();
+        assert_eq!(landed, 2 * owner.sent.len(), "author and record, per block");
+
+        // Oversize: refused by its length alone.
+        let sent = &owner.sent[1];
+        let max = jig_core::bundle::MAX_BUNDLE_BYTES;
+        let code = code_for(&sent.parts.0, max + 1);
+        for _ in 0..10 {
+            let oversize = BlockBundle {
+                manifest_bytes: &sent.parts.0,
+                code_bytes: &code,
+                resources: vec![],
+            };
+            assert!(matches!(
+                ingest_sequenced(
+                    &follower,
+                    oversize,
+                    sent.parts.2.clone(),
+                    &sent.record,
+                    &owner.did()
+                )
+                .await,
+                Err(FollowError::Block(IngestError::BundleTooLarge { .. }))
+            ));
+        }
+
+        // Unshared: refused as before, whether or not its author's signature
+        // is good.
+        let stranger = ctx();
+        let mut bad_sig = owner.sent[0].parts.clone();
+        bad_sig.2 = vec![0; 64];
+        let forged = Sent {
+            parts: bad_sig,
+            record: owner.sent[0].record.clone(),
+        };
+        for _ in 0..10 {
+            for sent in [&owner.sent[0], &forged] {
+                assert!(matches!(
+                    take(&stranger, &owner, sent).await,
+                    Err(FollowError::NoShare { .. })
+                ));
+            }
+        }
+
+        // Duplicates: the answer landing them again would give.
+        for _ in 0..10 {
+            for (seq, sent) in owner.sent.iter().enumerate() {
+                let cid = bundle(&sent.parts).block_cid().unwrap().to_string();
+                assert_eq!(
+                    take(&follower, &owner, sent).await.unwrap(),
+                    Followed::Duplicate {
+                        block_cid: cid,
+                        seq: seq as u64
+                    }
+                );
+            }
+        }
+        assert_eq!(
+            signature_checks(),
+            landed,
+            "the flood cost no signature check"
+        );
+
+        // A copy of a held block with another signature is not a duplicate:
+        // it takes the full path and is refused for its signature.
+        let resigned = Sent {
+            parts: forged.parts.clone(),
+            record: owner.sent[0].record.clone(),
+        };
+        assert!(matches!(
+            take(&follower, &owner, &resigned).await,
+            Err(FollowError::Block(IngestError::InvalidSignature))
+        ));
+        assert_eq!(signature_checks(), landed + 1);
+    }
+
+    /// A duplicate in a channel a fork stopped is answered as landing it
+    /// would answer: `Stopped`, not `Duplicate`.
+    #[tokio::test]
+    async fn a_duplicate_in_a_stopped_channel_is_answered_stopped() {
+        let mut owner = Owner::new().await;
+        owner.text("one").await;
+        let follower = owner.follower();
+        for sent in &owner.sent {
+            take(&follower, &owner, sent).await.unwrap();
+        }
+        let other = owner.text_parts("forked");
+        let prev = IngestRecord::decode(&owner.sent[0].record).unwrap().hash();
+        let fork = Sent {
+            record: owner.sign_at(&other, 1, prev),
+            parts: other,
+        };
+        assert!(matches!(
+            take(&follower, &owner, &fork).await,
+            Err(FollowError::Fork { .. })
+        ));
+        assert!(matches!(
+            take(&follower, &owner, &owner.sent[1]).await,
+            Err(FollowError::Stopped { .. })
         ));
     }
 

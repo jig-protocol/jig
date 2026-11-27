@@ -736,6 +736,10 @@ fn authorize_subscribe(
 
 // ---- Per-frame dispatch ----------------------------------------------------
 
+/// The error code for a `head` frame on a connection whose welcome did not
+/// grant `heads`.
+pub(crate) const HEADS_NOT_NEGOTIATED: &str = "HEADS_NOT_NEGOTIATED";
+
 async fn handle_client_frame(
     text: &str,
     state: &Arc<AppState>,
@@ -1303,6 +1307,23 @@ async fn handle_client_frame(
             Ok(())
         }
 
+        // ------------------------------------------------------------------ Head
+        // Head gossip (JEP-0002 rule 10), on a connection whose welcome
+        // granted it. This server grants it to none yet, so every `head` is
+        // answered with an ordinary error and the connection stays up, as it
+        // does for a frame a server predating heads cannot parse.
+        Frame::Head { .. } => {
+            let _ = send_error(
+                socket,
+                Some(400),
+                HEADS_NOT_NEGOTIATED,
+                None,
+                "head frames need the heads capability, which this welcome did not grant",
+            )
+            .await;
+            Ok(())
+        }
+
         // ------------------------------------------------------------------ CatchUp
         Frame::CatchUp { since_hlc: _ } => {
             // v0.0.2 stub: cursor-based replay is deferred to Phase D6 / Phase F.
@@ -1341,6 +1362,9 @@ pub(crate) fn handshake_capabilities(state: &AppState) -> jig_pipeline::handshak
         // The request-proof versions this server accepts; `negotiate` signs
         // those the hello listed.
         request_auth: vec![jig_core::request_auth::VERSION.to_string()],
+        // Not yet: this server neither checks nor forwards `head` frames, so
+        // it grants none.
+        heads: false,
     }
 }
 
@@ -3481,5 +3505,35 @@ mod tests {
             other => panic!("expected UNSUPPORTED_VERSION, got {other:?}"),
         }
         assert_eq!(close_code(&mut ws).await, Some(close::PROTOCOL_VIOLATION));
+    }
+
+    /// A `head` frame on a connection whose welcome did not grant `heads` is
+    /// an ordinary error, and the connection goes on: what a server that
+    /// predates heads does with a frame it cannot parse.
+    #[tokio::test]
+    async fn a_head_without_the_heads_grant_is_an_ordinary_error() {
+        let (_state, url) = start_test_server().await;
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+        handshake(&mut ws).await;
+        let head = Envelope::new(Frame::Head {
+            channel_id: jig_pipeline::ingest_record::label_cid("Create"),
+            record_b64: String::new(),
+        });
+        ws.send(TMessage::Text(serde_json::to_string(&head).unwrap().into()))
+            .await
+            .unwrap();
+        match next_frame(&mut ws).await.frame {
+            Frame::Error { code, status, .. } => {
+                assert_eq!(code, HEADS_NOT_NEGOTIATED);
+                assert_eq!(status, Some(400));
+            }
+            other => panic!("expected {HEADS_NOT_NEGOTIATED}, got {other:?}"),
+        }
+        // Still up: a malformed frame is answered on it.
+        ws.send(TMessage::Text("{not json".into())).await.unwrap();
+        match next_frame(&mut ws).await.frame {
+            Frame::Error { code, .. } => assert_eq!(code, "BAD_JSON"),
+            other => panic!("expected BAD_JSON, got {other:?}"),
+        }
     }
 }
