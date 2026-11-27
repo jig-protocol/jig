@@ -871,6 +871,26 @@ impl Pins {
             .unwrap_or_default()
     }
 
+    /// The sequencer moves this device verified for each channel it pinned
+    /// on `server`, by channel id, oldest first (JEP-0005 rule 11a): what a
+    /// new connection's chains start from.
+    pub fn moves(
+        &self,
+        server: &str,
+    ) -> std::collections::HashMap<String, Vec<crate::chain::HeadMove>> {
+        self.server(server)
+            .map(|p| {
+                p.channels
+                    .values()
+                    .filter_map(|c| {
+                        let head = c.chain_head.as_ref()?;
+                        (!head.moves.is_empty()).then(|| (c.create_cid.clone(), head.moves.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The sequencer the channel `create_cid` on `server` moved to last, as
     /// this device verified in its chain (JEP-0005 rule 11a): `None` when it
     /// never moved. The pin keeps the sequencer it was pinned to; the chain

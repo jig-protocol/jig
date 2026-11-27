@@ -335,6 +335,10 @@ pub struct ChannelChain {
     /// its root owners, as this client pinned them. None, and no move is
     /// taken ([`Self::accept_block`]).
     owners: Vec<String>,
+    /// The moves this client verified before it holds a head here: pinned
+    /// ([`Self::with_moves`]), or taken from the first record it is given.
+    /// A head made from none takes them.
+    prior_moves: Vec<HeadMove>,
 }
 
 impl ChannelChain {
@@ -361,6 +365,7 @@ impl ChannelChain {
             head,
             clock_defects: Vec::new(),
             owners: Vec::new(),
+            prior_moves: Vec::new(),
         }
     }
 
@@ -371,9 +376,26 @@ impl ChannelChain {
         self
     }
 
+    /// This chain, knowing the sequencer `moves` this client verified
+    /// before (as a pin keeps them), for a chain that starts with no head: a
+    /// new connection's records past a move are held to the new sequencer.
+    pub fn with_moves(mut self, moves: Vec<HeadMove>) -> Self {
+        self.prior_moves = moves;
+        self
+    }
+
     /// The moves of the channel's sequencer this chain verified, oldest first.
     pub fn moves(&self) -> &[HeadMove] {
-        self.head.as_ref().map_or(&[], |h| h.moves.as_slice())
+        self.head
+            .as_ref()
+            .map_or(self.prior_moves.as_slice(), |h| h.moves.as_slice())
+    }
+
+    /// A head at `record`, the first this chain holds, with the moves it knew.
+    fn first_head(&self, record: &IngestRecord) -> ChainHead {
+        let mut head = ChainHead::of(record);
+        head.moves = self.prior_moves.clone();
+        head
     }
 
     /// The DID the sequencer signs as now.
@@ -506,7 +528,7 @@ impl ChannelChain {
             // First contact with this channel's chain. Trust on first use, as
             // with every pin; from here on the server is held to it.
             return if record.seq == 0 {
-                self.head = Some(ChainHead::of(record));
+                self.head = Some(self.first_head(record));
                 Ok(Step::Next)
             } else {
                 Ok(Step::Gap {
@@ -638,11 +660,20 @@ impl ChannelChain {
             return step(self);
         };
         let saved = self.head.clone();
-        if let Some(head) = self.head.as_mut()
-            && record.seq > head.seq
-            && !head.moves.iter().any(|m| m.seq == moved.seq)
-        {
-            head.moves.push(moved);
+        let saved_prior = self.prior_moves.clone();
+        match self.head.as_mut() {
+            Some(head) => {
+                if record.seq > head.seq && !head.moves.iter().any(|m| m.seq == moved.seq) {
+                    head.moves.push(moved);
+                }
+            }
+            // No head yet: the move is checked as the chain's first, and the
+            // record held to the sequencer it names.
+            None => {
+                if !self.prior_moves.iter().any(|m| m.seq == moved.seq) {
+                    self.prior_moves.push(moved);
+                }
+            }
         }
         let result = step(self);
         let advanced = self
@@ -651,6 +682,9 @@ impl ChannelChain {
             .is_some_and(|h| h.seq == record.seq && h.hash == hex::encode(record.hash()));
         if !advanced {
             self.head = saved;
+        }
+        if result.is_err() {
+            self.prior_moves = saved_prior;
         }
         result
     }
@@ -719,7 +753,7 @@ impl ChannelChain {
         if matches!(step, Step::Gap { .. }) {
             self.head = Some(match &self.head {
                 Some(head) => head.after(record),
-                None => ChainHead::of(record),
+                None => self.first_head(record),
             });
         }
         Ok(step)
@@ -844,6 +878,69 @@ mod tests {
             b64.encode(block.canonical_bytes()),
             b64.encode(&block.sender_sig),
         )
+    }
+
+    /// A chain that starts with no head (a new connection) takes a move as
+    /// its first delivery, holding the record to the sequencer the move
+    /// names, and keeps the move in the head it makes; and one told of the
+    /// moves its device verified holds a record past them to the new
+    /// sequencer, the move not delivered again. A first record by the
+    /// pinned sequencer is still a gap.
+    #[test]
+    fn a_chain_with_no_head_holds_a_record_past_a_move_to_the_new_sequencer() {
+        let mut server = Seq::new();
+        let old = server.did();
+        server.push("bafyCreate", 10);
+        server.push("b1", 20);
+        let owner = generate_signing_key();
+        let owner_did = jig_core::Did::from_ed25519_pubkey(owner.verifying_key().as_bytes())
+            .to_did_jig_string();
+        let new = generate_signing_key();
+        let (bundle, sig) = move_block(&server, &new, &owner);
+        server.key = new.clone();
+        let new_did = server.did();
+        let set = server.push("set", 30);
+        let after = server.push("b3", 40);
+        let fresh = || {
+            ChannelChain::new(&label_cid("bafyCreate"), &old, None)
+                .with_owners(vec![owner_did.clone()])
+        };
+        let moved = [HeadMove {
+            seq: 2,
+            sequencer: new_did.clone(),
+        }];
+
+        let mut chain = fresh();
+        assert_eq!(
+            chain.accept_block_live(&set, None, &bundle, Some(&sig)),
+            Ok(Step::Gap { from: 0, to: 2 })
+        );
+        assert_eq!(chain.moves(), moved);
+        assert_eq!(chain.accept_live(&after, None), Ok(Step::Next));
+
+        // A move that does not verify leaves nothing behind.
+        let mut refused = fresh();
+        assert!(
+            refused
+                .accept_block_live(&set, None, &bundle, None)
+                .is_err()
+        );
+        assert!(refused.moves().is_empty());
+
+        // Pinned moves: the new sequencer's record, with no move delivered.
+        let mut pinned = fresh().with_moves(moved.to_vec());
+        assert_eq!(
+            pinned.accept_live(&after, None),
+            Ok(Step::Gap { from: 0, to: 3 })
+        );
+        assert_eq!(pinned.moves(), moved);
+        // Without them, it is not the pinned sequencer's.
+        assert!(fresh().accept_live(&after, None).is_err());
+        // The pinned sequencer's own first record is a gap, as ever.
+        assert_eq!(
+            fresh().accept_live(&server.records[1], None),
+            Ok(Step::Gap { from: 0, to: 1 })
+        );
     }
 
     /// The owner moves the channel's sequencer (JEP-0005 rule 11a): its
