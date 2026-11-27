@@ -439,7 +439,8 @@ impl Stream {
     /// moved from, none of which holds a share with this server yet.
     ///
     /// Returns the peers it could not queue the block to, for lack of a live
-    /// connection or room on it: the caller sends it again later.
+    /// connection or room on it, for the caller to log: they get it on their
+    /// next connection.
     pub fn push_to(&self, block: &StoredBlock, peers: &[String]) -> anyhow::Result<Vec<String>> {
         let Some((channel_id, _, entry)) = self.entry(block)? else {
             return Ok(Vec::new());
