@@ -359,17 +359,23 @@ impl Stream {
 
     /// Send `body` to `peer`, if it is connected. A frame not sent is not
     /// lost: the follower's next pull asks for what it lacks.
-    fn send(&self, peer: &str, kind: &str, body: Vec<u8>) {
+    /// Queue a frame to `peer` on its live connection; whether it was queued.
+    fn send(&self, peer: &str, kind: &str, body: Vec<u8>) -> bool {
         let Ok(did) = Did::from_did_jig_string(peer) else {
-            return;
+            return false;
         };
         match self.peers.sender_for(&did) {
-            Some(sender) => {
-                if let Err(e) = sender.send(kind, body) {
+            Some(sender) => match sender.send(kind, body) {
+                Ok(()) => true,
+                Err(e) => {
                     tracing::info!(peer, kind, "stream frame not sent: {e}");
+                    false
                 }
+            },
+            None => {
+                tracing::debug!(peer, kind, "no live connection to the peer");
+                false
             }
-            None => tracing::debug!(peer, kind, "no live connection to the peer"),
         }
     }
 
@@ -431,9 +437,12 @@ impl Stream {
     /// shares: the `sequencer-set` by which this server took a channel over
     /// (JEP-0005 rule 11a), to the servers that carried it and to the one it
     /// moved from, none of which holds a share with this server yet.
-    pub fn push_to(&self, block: &StoredBlock, peers: &[String]) -> anyhow::Result<()> {
+    ///
+    /// Returns the peers it could not queue the block to, for lack of a live
+    /// connection or room on it: the caller sends it again later.
+    pub fn push_to(&self, block: &StoredBlock, peers: &[String]) -> anyhow::Result<Vec<String>> {
         let Some((channel_id, _, entry)) = self.entry(block)? else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let body = Records {
             channel_id,
@@ -441,10 +450,11 @@ impl Stream {
             more: false,
         }
         .encode();
-        for peer in peers {
-            self.send(peer, RECORDS_FRAME, body.clone());
-        }
-        Ok(())
+        Ok(peers
+            .iter()
+            .filter(|peer| !self.send(peer, RECORDS_FRAME, body.clone()))
+            .cloned()
+            .collect())
     }
 
     /// Send a block this server just sequenced to every server following its
