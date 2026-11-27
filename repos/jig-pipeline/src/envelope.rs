@@ -276,6 +276,19 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ingest: Option<crate::ingest_record::IngestRecord>,
     },
+    /// Head gossip (JEP-0002 rule 10): the latest `ingest` record the sender
+    /// verified for a channel, with no identity attached. A client sends one
+    /// to its server, and servers to each other; a receiver verifies the
+    /// record against the channel's sequencer and compares it with its own
+    /// chain. Sent only on a connection whose welcome granted
+    /// [`crate::handshake::Capabilities::heads`].
+    Head {
+        /// The CID of the channel's `channel-create` block.
+        channel_id: String,
+        /// base64 of the record's COSE_Sign1 envelope
+        /// ([`crate::ingest_record::IngestRecord::cose_bytes`]).
+        record_b64: String,
+    },
     /// Report an error in reply to a prior frame.
     ///
     /// `status` carries the HTTP-style status the REST surface would have
