@@ -990,6 +990,17 @@ pub fn check_takeover(
             "this server holds no accepted share of the channel",
         ));
     }
+    // Rule 11a: a slug names one channel per sequencer. A channel of this
+    // slug here, archived or not, taken since this server's move accept,
+    // refuses the move.
+    if store.slug_held_by(store.local_sequencer(), &chan.slug, &chan.id)?
+        || store.slug_held_by(me, &chan.slug, &chan.id)?
+    {
+        return Err(refused(&format!(
+            "this server already orders a channel `{}`",
+            chan.slug
+        )));
+    }
     let head = store
         .chain_head_seq(&chan.id)?
         .ok_or_else(|| refused("this server holds none of the channel's chain"))?;
