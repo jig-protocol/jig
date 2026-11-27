@@ -718,10 +718,7 @@ mod tests {
         );
         let (shown, ended, _) = shown(f).await;
         assert_eq!(shown, bodies(0..2));
-        assert!(
-            ended.contains("this channel needs your server to upgrade"),
-            "{ended}"
-        );
+        assert!(ended.contains("this channel needs an upgrade"), "{ended}");
         assert!(ended.contains("block kind `k` at seq 2"), "{ended}");
     }
 
