@@ -210,3 +210,55 @@ default_channel = "#general"
         "must not panic — stderr: {stderr}"
     );
 }
+
+/// `jig tail` as the binary parses it, against a closed port: whatever it
+/// says on stderr, and its exit code.
+fn tail_channel(channel: &str) -> (Option<i32>, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg_dir = tmp.path().join(".jig");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::write(
+        cfg_dir.join("cli.toml"),
+        r##"
+[server]
+base_url = "http://127.0.0.1:1"
+
+[user]
+did = "did:jig:zfake"
+display_name = "test"
+default_channel = "#general"
+"##,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_jig"))
+        // Never the developer's real keychain; seal test keys with a fixed secret.
+        .env("JIG_KEYCHAIN", "none")
+        .env("JIG_KEY_UNLOCK", "env:JIG_TEST_KEY_SECRET")
+        .env(
+            "JIG_TEST_KEY_SECRET",
+            "jig cli tests: a fixed, public secret",
+        )
+        .args(["tail", channel])
+        .env("HOME", tmp.path())
+        .output()
+        .unwrap();
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// A `jig:` link is taken as its channel's id (F2 Task 0c): it gets past the
+/// argument parser to the (closed) server. A bare word is refused by the
+/// parser, as a usage error, before anything is sent.
+#[test]
+fn tail_takes_a_jig_link_and_refuses_a_bare_word() {
+    let id = jig_core::canonical_cid::of(b"channel-create").to_string();
+    let (code, stderr) = tail_channel(&format!("jig:{id}?slug=%23ops"));
+    assert_ne!(code, Some(2), "a link is a channel: {stderr}");
+    assert!(!stderr.contains("not a channel"), "{stderr}");
+
+    let (code, stderr) = tail_channel("hello");
+    assert_eq!(code, Some(2), "a usage error: {stderr}");
+    assert!(stderr.contains("not a channel"), "{stderr}");
+}

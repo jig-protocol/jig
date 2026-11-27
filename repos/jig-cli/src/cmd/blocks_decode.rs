@@ -200,8 +200,9 @@ fn contract_end_notice(opened: &OpenedBlock) -> Option<String> {
         .get("to")?
         .as_str()?;
     Some(format!(
-        "{} no longer carries this channel; `jig channel members <channel> --via {to}` \
-         lists the members who last wrote through it",
+        "{} no longer carries this channel; `jig channel prune <channel> --via {to}` \
+         lists the members who reached it only through that server, and with `--yes` \
+         removes them",
         shorten_did(to)
     ))
 }
@@ -295,7 +296,9 @@ mod tests {
         assert_eq!(decoded.sender, SYSTEM);
         assert!(decoded.is_message());
         assert!(
-            decoded.body.contains("--via did:jig:zfollower"),
+            decoded
+                .body
+                .contains("jig channel prune <channel> --via did:jig:zfollower"),
             "{}",
             decoded.body
         );
