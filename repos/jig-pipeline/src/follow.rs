@@ -2750,6 +2750,58 @@ mod tests {
         assert_eq!(next.sequencer, new_did);
     }
 
+    /// A move away from this server that lands while a write is on its way
+    /// (JEP-0005 rule 11a) refuses the write at its landing, as one that came
+    /// after the move: no record of this server's past the move.
+    #[tokio::test]
+    async fn a_write_racing_a_move_away_is_refused_at_its_landing() {
+        let mut owner = Owner::new().await;
+        owner.text("before the move").await;
+        let me = owner.ctx.server_did.to_did_jig_string();
+        let elsewhere =
+            Did::from_ed25519_pubkey(SigningKey::from_bytes(&[52; 32]).verifying_key().as_bytes())
+                .to_did_jig_string();
+        let head = owner.ctx.store.chain_head_seq(&owner.channel).unwrap();
+        let store = owner.ctx.store.clone();
+        let channel = owner.channel.clone();
+        let to = elsewhere.clone();
+        crate::ingest::BEFORE_LANDING.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                store
+                    .record_move_for_tests(
+                        &channel,
+                        &ChannelMove {
+                            seq: head.unwrap() + 1,
+                            sequencer: to,
+                            previous: me,
+                            block_cid: "bafkmove".to_string(),
+                        },
+                    )
+                    .unwrap();
+            }));
+        });
+        let meta = serde_json::json!({"channel_id": owner.channel, "body": "racing"});
+        let parts = signed(&owner.user, BlockKind::TextRender, meta);
+        let got = ingest(
+            &owner.ctx,
+            bundle(&parts),
+            parts.2.clone(),
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&got, Err(IngestError::SequencerMoved { sequencer, .. }) if *sequencer == elsewhere),
+            "{got:?}"
+        );
+        assert_eq!(
+            owner.ctx.store.chain_head_seq(&owner.channel).unwrap(),
+            head
+        );
+    }
+
     /// The move's write checks again what `check_takeover` checked: a record
     /// that lands on the channel between the check and the write leaves the
     /// move refused, with nothing of it written.
