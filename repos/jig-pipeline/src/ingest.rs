@@ -6360,6 +6360,26 @@ mod tests {
         .await
         .expect("a second shared gate is taken while the first is held");
         drop((first, second));
+
+        // A post waits at the gate: while a channel change holds it, the
+        // post is not judged, and it lands once the change lets go.
+        let held = ctx.store.gate_channel(&chan, true).await;
+        let waiting = plain(
+            &ctx,
+            &member,
+            BlockKind::TextRender,
+            serde_json::json!({"channel_id": chan, "body": "after"}),
+        );
+        tokio::pin!(waiting);
+        tokio::select! {
+            landed = &mut waiting => panic!("a post went past a held gate: {landed:?}"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+        }
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("the post lands once the gate is let go")
+            .expect("an open channel takes the post");
     }
 
     /// JEP-0005 rule 7b: an encrypted channel takes no key link until the
