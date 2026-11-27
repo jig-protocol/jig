@@ -1137,6 +1137,9 @@ async fn handle_client_frame(
             // it is registered, and refuse it as above if it is gated.
             if let Some(gate) = reader_gate(state, &session.block_kinds, &sub_key) {
                 state.ingest_ctx.fanout.unsubscribe_local(id).await;
+                // As on a replacement: what it queued is no later
+                // subscription's.
+                while sub_rx.try_recv().is_ok() {}
                 session.sub_id = None;
                 metrics::subscriber_removed();
                 let notice = gate.notice();
