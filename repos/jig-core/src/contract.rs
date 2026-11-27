@@ -552,7 +552,13 @@ impl ContractAccept {
         Ok(accept)
     }
 
+    /// `server` signed this accept. An accept that is not a move signs no
+    /// `policy_approvals`, so one that carries some is refused: they would be
+    /// unsigned.
     pub fn verify(&self) -> Result<(), ContractError> {
+        if !self.is_move() && !self.policy_approvals.is_empty() {
+            return Err(ContractError::BadPayload(Self::WHAT));
+        }
         verify_envelope(&self.envelope, &self.payload(), &self.server)
     }
 

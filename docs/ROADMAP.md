@@ -1,14 +1,14 @@
 # jig roadmap
 
 Where jig is going, in phases from a public alpha (`v0.1`) to a distributed OS (`v1+`), and the
-decisions that shape the path. Last updated 2026-11-23.
+decisions that shape the path. Last updated 2026-11-25.
 
-**Status in one line:** five signed v0.2 prereleases are published and install through
-`install.sh` (`v0.2.0-alpha.1`, `alpha.2`, `alpha.4`, `alpha.5` and `alpha.6`; the `alpha.3`
-tag has no published release), and on `main` v0.2 has per-channel MLS
-encryption with restricted channels always encrypted, TLS by default bound to the server's DID, a
-signed handshake bound to the TLS session, clients that pin servers, names and each channel's
-suite, rate limits and proof-of-work at admission. `v0.2.0` is tagged at gate G2, and the
+**Status in one line:** seven signed v0.2 prereleases are published and install through
+`install.sh` (`v0.2.0-alpha.1`, `alpha.2` and `alpha.4` to `alpha.8`; the `alpha.3` tag has no
+published release), and `v0.2.0`, at gate G2, is the first final release (D35). v0.2 has
+per-channel MLS encryption with restricted channels always encrypted, TLS by default bound to
+the server's DID, a signed handshake bound to the TLS session, clients that pin servers, names
+and each channel's suite, keys sealed at rest, rate limits and proof-of-work at admission. The
 federation contract, which is partly built, ships as v0.2.x (D35). For what
 works today, gate by gate, see [`RELEASE_READINESS.md`](RELEASE_READINESS.md). This doc is the
 direction, not the status page.
@@ -112,7 +112,7 @@ reserve the hooks for encryption so that turning it on in v0.2 changes a value, 
 | # | Item | Status |
 | --- | --- | --- |
 | 1 | Green `main`: patch advisories, pinned toolchain (`rust-toolchain.toml`), daily advisory check | Done |
-| 2 | Release pipeline: static musl x86_64/aarch64 + Apple Silicon, checksums, signatures | Done: `v0.1.0-alpha.1` never shipped binaries; `v0.2.0-alpha.1` (2026-10-19) and `v0.2.0-alpha.2` (2026-10-25) were the first published, signed, and install-smoked against the published release on Linux and macOS, and `alpha.4` to `alpha.6` followed |
+| 2 | Release pipeline: static musl x86_64/aarch64 + Apple Silicon, checksums, signatures | Done: `v0.1.0-alpha.1` never shipped binaries; `v0.2.0-alpha.1` (2026-10-19) and `v0.2.0-alpha.2` (2026-10-25) were the first published, signed, and install-smoked against the published release on Linux and macOS, and `alpha.4` to `alpha.8` followed. `v0.2.0` is the first final release; `release.yml` publishes a bare `vX.Y.Z` tag as the latest release (#479) |
 | 3 | 60-second default path: working `install.sh`, channel ops out of `[debug]`, CI smoke test | Done (`install-smoke.yml`, Linux + macOS) |
 | 4 | Security communication: root `SECURITY.md`, private vulnerability reporting, "not implemented" banners on the spec | Done |
 | 5 | Scrub history, go public with full history, archive the pre-monorepo repos | Done |

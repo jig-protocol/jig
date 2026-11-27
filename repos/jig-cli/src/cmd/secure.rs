@@ -419,7 +419,8 @@ fn continues(chain: &mut ChannelChain, page: &[DeliveredBlock]) -> Result<(), St
 
 /// Who may sign `channel_id`'s records on `server`, for [`ChannelChain`]: a
 /// channel the server carries for its owner is held to the owner, the DID
-/// its pin proved (`Pins::anchor_channel`), as `jig read` holds it, never
+/// its pin proved (`Pins::anchor_channel`), and the DIDs the owner's key
+/// links lead from (`Pins::carried_signers`), as `jig read` holds it, never
 /// to the server. Any other channel is held to the server's DIDs along the
 /// key links pinned for it, or to the record's own signer when nothing is
 /// pinned.
@@ -429,8 +430,8 @@ fn sequencers_for(
     channel_id: &str,
     record_sequencer: &str,
 ) -> Vec<String> {
-    if let Some(owner) = pins.and_then(|p| p.carried(server).remove(channel_id)) {
-        return vec![owner];
+    if let Some(signers) = pins.and_then(|p| p.carried_signers(server).remove(channel_id)) {
+        return signers;
     }
     let pinned = pins
         .and_then(|p| p.server(server).map(|s| s.sequencers()))
