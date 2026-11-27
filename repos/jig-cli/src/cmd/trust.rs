@@ -441,6 +441,10 @@ pub async fn check_channel_chain(
     .await
 }
 
+/// How many of a gap's records a chain check reads with their blocks
+/// before it reads the rest as records alone ([`check_chain_in`]).
+const GAP_BLOCKS: usize = 32;
+
 /// A delivered block's bundle and signature, by block CID: what lets a
 /// chain check take the owner's `sequencer-set` in history (JEP-0005 rule
 /// 11a) rather than hold the new sequencer's record to the old one.
@@ -555,19 +559,36 @@ async fn check_chain_in(
                     .await
                 }
             };
-            let filled = match proven {
-                Ok(audience) => fetch_records(who, &audience, server, reference, from, to).await,
-                Err(e) => Err(e),
+            // The same audience reads the gap's blocks: proving it again could
+            // open another pinned connection, which checks this log again.
+            let filled = match &proven {
+                Ok(audience) => fetch_records(who, audience, server, reference, from, to).await,
+                Err(e) => Err(anyhow::anyhow!("{e:#}")),
             };
             match filled {
                 Ok(filler) if filler.len() as u64 == to - from => {
-                    for missing in &filler {
-                        // A gap's records come without their blocks: each is
-                        // checked with its own, which may carry a key link or
-                        // be the move the gap crosses. The block must be the
-                        // one the record names. One the server does not serve
-                        // is checked as a record alone.
-                        let block = fetch_block(who, server, &missing.block_cid).await.ok();
+                    for (i, missing) in filler.iter().enumerate() {
+                        // A gap's records come without their blocks. Up to
+                        // `GAP_BLOCKS` of them are checked with their own,
+                        // which may carry a key link or be the move the gap
+                        // crosses; past that, a record is read with its block
+                        // only if the chain does not take it alone, so a
+                        // long gap costs no request per record (a key link
+                        // there then counts for nothing). The block must be
+                        // the one the record names.
+                        if i >= GAP_BLOCKS {
+                            let mut plain = chain.clone();
+                            if plain.accept(missing, None).is_ok() {
+                                chain = plain;
+                                continue;
+                            }
+                        }
+                        let block = match &proven {
+                            Ok(audience) => fetch_block(who, audience, server, &missing.block_cid)
+                                .await
+                                .ok(),
+                            Err(_) => None,
+                        };
                         let cid = block.as_ref().and_then(|(bundle, sig)| {
                             jig_client::open::open(&jig_client::DeliveredBlock {
                                 bundle_b64: bundle.clone(),
@@ -932,9 +953,10 @@ pub async fn show(who: &jig_client::Identity, server: &str) -> Result<()> {
 }
 
 /// Block `cid` of `server`, its bundle and signature, read with a proof
-/// addressed to the server's pinned DID.
+/// addressed to `audience`, the server's DID as already proven.
 async fn fetch_block(
     who: &jig_client::Identity,
+    audience: &str,
     server: &str,
     cid: &str,
 ) -> Result<(String, Option<String>)> {
@@ -943,14 +965,11 @@ async fn fetch_block(
         bundle_b64: String,
         sig_b64: Option<String>,
     }
-    let audience =
-        crate::cmd::request_proof::audience(server, who, crate::cmd::request_proof::Trust::Pinned)
-            .await?;
     let base = crate::cmd::channel::base_http_url(server);
     let url = format!("{base}/api/v1/blocks/{cid}");
     let proof = jig_client::read_auth::ReadProof::sign(
         who,
-        &audience,
+        audience,
         "GET",
         jig_client::read_auth::signable_path(&url),
     );
