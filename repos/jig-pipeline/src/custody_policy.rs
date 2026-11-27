@@ -41,6 +41,8 @@ pub(crate) fn migrate(conn: &rusqlite::Connection) -> Result<()> {
             decision   BLOB
         );
         CREATE INDEX IF NOT EXISTS kp_holds_by_did ON kp_holds(did, state, held_at);
+        CREATE INDEX IF NOT EXISTS kp_holds_by_requester ON kp_holds(requester, state, held_at);
+        CREATE INDEX IF NOT EXISTS kp_holds_by_state ON kp_holds(state, held_at);
         CREATE TABLE IF NOT EXISTS kp_grants (
             did        TEXT NOT NULL,
             requester  TEXT NOT NULL,
@@ -87,6 +89,9 @@ pub enum Held {
     /// [`NewHold::max_per_requester`]. Not held; the oldest expires at
     /// `until`.
     RequesterFull { until: i64 },
+    /// This very request was held before and has been decided or has
+    /// expired. It is not held again; a fresh request is.
+    Settled,
 }
 
 /// A request held for its DID.
@@ -211,7 +216,7 @@ impl SqliteStore {
             tx.commit()?;
             return Ok(Held::RequesterFull { until });
         }
-        tx.execute(
+        let inserted = tx.execute(
             "INSERT OR IGNORE INTO kp_holds
                  (request_id, did, requester, channel_id, request, held_at, state)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'held')",
@@ -225,6 +230,11 @@ impl SqliteStore {
             ],
         )?;
         tx.commit()?;
+        // Its id is already kept, and not as waiting (that was answered
+        // above): it was decided, or expired.
+        if inserted == 0 {
+            return Ok(Held::Settled);
+        }
         Ok(Held::New(*hold.request_id))
     }
 
@@ -562,5 +572,28 @@ mod tests {
                 .unwrap(),
             Held::New([2; 32])
         );
+    }
+
+    #[test]
+    fn a_settled_request_is_not_held_again() {
+        let s = store();
+        s.hold_kp_request(&hold(&[1; 32], "did:jig:zR", "c1"))
+            .unwrap();
+        assert_eq!(decide(&s, D, [1; 32], false, 110), Decided::Refused);
+        // The same signed request, sent again, is not reported as held.
+        assert_eq!(
+            s.hold_kp_request(&hold(&[1; 32], "did:jig:zR", "c1"))
+                .unwrap(),
+            Held::Settled
+        );
+        assert!(s.held_kp_requests(D, 10, 0).unwrap().is_empty());
+        // Nor is one that expired.
+        s.hold_kp_request(&hold(&[3; 32], "did:jig:zS", "c1"))
+            .unwrap();
+        let late = NewHold {
+            now: 100 + TTL,
+            ..hold(&[3; 32], "did:jig:zS", "c1")
+        };
+        assert_eq!(s.hold_kp_request(&late).unwrap(), Held::Settled);
     }
 }

@@ -416,11 +416,18 @@ Non-goals for v0.2:
      - A refusal is final for that request. The requester may still ask again; a new
        request is held again.
      - A custodian MUST bound what it holds: per DID, and per requester across every DID
-       it holds for, so that requesters who cost nothing to mint cannot fill every DID's
-       queue. A request past a bound is answered `429 HELD_FULL` with when to try again.
-       It is neither held nor released. A request undecided for 7 days expires and is no
-       longer decided, so a queue nobody reads drains by itself. The reference custodian
-       holds at most 256 requests per DID and 8 per requester.
+       it holds for. The bound per DID caps what one DID's queue costs the custodian; the
+       bound per requester keeps one requester from filling every DID's queue. Neither
+       stops many requesters, which cost nothing to mint, from filling one DID's queue:
+       until the DID refuses them or they expire, further requesters for that DID are
+       answered `HELD_FULL`. Requesters the DID's policy releases to are released as
+       before, since they are never held. A request past a bound is answered
+       `429 HELD_FULL` with when to try again. It is neither held nor released. A request
+       undecided for 7 days expires and is no longer decided, so a queue nobody reads
+       drains by itself. The reference custodian holds at most 256 requests per DID and 8
+       per requester.
+     - A held request sent again after it was decided, or after it expired, is answered
+       `409 DECIDED` and is not held again; the requester signs a fresh request.
      - Every hold, decision and release is logged, as in 21a.
 
      The Welcome mailbox and one package per device are not yet defined.
