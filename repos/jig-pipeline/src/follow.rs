@@ -1267,6 +1267,13 @@ pub async fn ingest_sequenced(
         return Err(FollowError::Mismatch("the record is for another block"));
     }
     let channel_id = record.channel_id.clone();
+    // The channel's gate, exclusive, from the checks of this record to its
+    // landing (JEP-0005 rules 7b and 11a): a takeover this server sequences
+    // reads the head it cites under the same gate, so a carried record past
+    // that head lands either before the takeover is judged, which then
+    // refuses it as citing a stale head, or after it, as a superseded
+    // sequencer's. Never both at one seq.
+    let gate = ctx.store.gate_channel(&channel_id, true).await;
     let not_carried = || FollowError::NotCarried {
         channel_id: channel_id.clone(),
         sequencer: sequencer.to_string(),
@@ -1669,6 +1676,9 @@ pub async fn ingest_sequenced(
         Landing::EffectFailed(e) => return Err(FollowError::Other(e)),
         Landing::Landed => {}
     }
+    // Landed: let the gate go before delivery, and before a kept move lands
+    // below, which takes it again.
+    drop(gate);
     // A removed member still receives its own removal, as from the owner
     // (`ingest`): on an MLS channel it carries the commit that tells its
     // client the group is gone.
@@ -2943,6 +2953,63 @@ mod tests {
         assert_eq!(next.sequencer, new_did);
     }
 
+    /// JEP-0005 rule 11a: a carried record and a takeover of the same channel
+    /// are judged one after the other under the channel's gate. While the
+    /// owner's move to this server holds the gate, the old sequencer's next
+    /// record waits; landed first, it leaves the move citing a stale head,
+    /// which is refused, so this server never signs a record at that seq.
+    #[tokio::test]
+    async fn a_carried_record_racing_a_takeover_leaves_no_record_of_ours_at_its_seq() {
+        let mut owner = Owner::new().await;
+        owner.text("before the move").await;
+        let new = owner.follower();
+        for sent in &owner.sent {
+            take(&new, &owner, sent).await.unwrap();
+        }
+        // The owner's move, citing the head this server holds now.
+        let moved = move_to(&owner, &new.server_key, &owner.user);
+        // The old sequencer's next record, past that head.
+        owner.text("past the cited head").await;
+        let next = owner.sent.last().unwrap();
+        let next_seq = IngestRecord::decode(&next.record).unwrap().seq;
+
+        // The takeover is in flight: it holds the gate.
+        let gate = new.store.gate_channel(&owner.channel, true).await;
+        let carried = take(&new, &owner, next);
+        tokio::pin!(carried);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut carried)
+                .await
+                .is_err(),
+            "the carried record waits at the gate"
+        );
+        drop(gate);
+        carried.await.expect("the carried record lands first");
+
+        let refused = ingest(
+            &new,
+            bundle(&moved.parts),
+            moved.parts.2.clone(),
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(IngestError::MoveRefused { .. })),
+            "the move cites a stale head: {refused:?}"
+        );
+        let at = new
+            .store
+            .ingest_record_bytes(&owner.channel, next_seq)
+            .unwrap()
+            .map(|b| IngestRecord::decode(&b).unwrap())
+            .unwrap();
+        assert_eq!(at.sequencer, owner.did(), "no record of ours at its seq");
+        assert!(new.store.channel_moves(&owner.channel).unwrap().is_empty());
+    }
+
     /// A move away from this server that lands while a write is on its way
     /// (JEP-0005 rule 11a) refuses the write at its landing, as one that came
     /// after the move: no record of this server's past the move.
@@ -3039,6 +3106,48 @@ mod tests {
         )
         .await;
         assert!(got.is_ok(), "{got:?}");
+    }
+
+    /// The other order of the race above (JEP-0005 rule 11a): the takeover
+    /// commits first, and the old sequencer's next record, past the head the
+    /// move cited, is then refused as superseded. Nothing of the old
+    /// sequencer's lands at that seq, and the move's record holds it.
+    #[tokio::test]
+    async fn a_carried_record_after_a_takeover_is_superseded() {
+        let mut owner = Owner::new().await;
+        owner.text("before the move").await;
+        let new = owner.follower();
+        for sent in &owner.sent {
+            take(&new, &owner, sent).await.unwrap();
+        }
+        let moved = move_to(&owner, &new.server_key, &owner.user);
+        let set = ingest(
+            &new,
+            bundle(&moved.parts),
+            moved.parts.2.clone(),
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await
+        .expect("the takeover lands");
+        let set_seq = new.store.get_ingest_record(&set).unwrap().unwrap().seq;
+        owner.text("past the cited head").await;
+        let late = owner.sent.last().unwrap();
+        assert_eq!(IngestRecord::decode(&late.record).unwrap().seq, set_seq);
+        assert!(matches!(
+            take(&new, &owner, late).await,
+            Err(FollowError::Superseded { .. })
+        ));
+        let at = new
+            .store
+            .ingest_record_bytes(&owner.channel, set_seq)
+            .unwrap()
+            .map(|b| IngestRecord::decode(&b).unwrap())
+            .unwrap();
+        assert_eq!(at.block_cid, set, "the move's record holds the seq");
+        assert_eq!(at.sequencer, new.server_did.to_did_jig_string());
     }
 
     /// The move's write checks again what `check_takeover` checked: a record

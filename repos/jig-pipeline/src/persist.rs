@@ -186,6 +186,25 @@ pub struct SqliteStore {
     /// Until then only rows whose `sequencer_did` is still the empty
     /// placeholder count as local.
     local_sequencer: OnceLock<String>,
+    /// One gate per channel, held by ingest from a block's rights check to
+    /// its landing ([`Self::gate_channel`]).
+    channel_gates: ChannelGates,
+}
+
+type ChannelGates =
+    Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::RwLock<()>>>>;
+
+/// How many channel gates the map keeps before it drops the idle ones
+/// ([`SqliteStore::gate_channel`]).
+const IDLE_GATES: usize = 256;
+
+/// A channel's gate, held ([`SqliteStore::gate_channel`]).
+#[derive(Debug)]
+pub enum ChannelGate {
+    /// A content block: many at once, none while a control block holds it.
+    Shared(tokio::sync::OwnedRwLockReadGuard<()>),
+    /// A control block: alone.
+    Exclusive(tokio::sync::OwnedRwLockWriteGuard<()>),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1288,6 +1307,58 @@ fn row_to_stored_mls_group(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMlsG
 }
 
 impl SqliteStore {
+    /// Hold `channel_id`'s gate (JEP-0005 rule 7b) from a block's rights
+    /// check to its landing. A block that changes the channel holds it
+    /// `exclusive`: no other block of the channel is judged or sequenced
+    /// meanwhile. A content block holds it shared, alongside other content.
+    ///
+    /// So a block's rights, read under the gate, are its rights at the `seq`
+    /// it is given. A key link waits for content already in flight, and
+    /// content that comes after the link is judged by the moved standing: no
+    /// block signed by the old key can be checked before the link and land
+    /// after it.
+    ///
+    /// The gate is in this process's memory. It holds for one server process
+    /// writing its own SQLite store, which is every deployment today. Several
+    /// writers against one store would need a lock in the database instead.
+    ///
+    /// An entry no holder or waiter shares (the map owns its last strong
+    /// reference) is dropped, under the map's lock, once the map holds more
+    /// than [`IDLE_GATES`]: a refused `channel-create` or carried block
+    /// leaves no gate behind for good, and a gate in use is never replaced.
+    ///
+    /// Taken by [`crate::ingest::ingest`] and by
+    /// [`crate::follow::ingest_sequenced`], so a carried record and a
+    /// takeover of its channel are judged one after the other.
+    pub async fn gate_channel(&self, channel_id: &str, exclusive: bool) -> ChannelGate {
+        let gate = {
+            let mut gates = self.channel_gates.lock().expect("poisoned");
+            if gates.len() > IDLE_GATES {
+                gates.retain(|_, gate| std::sync::Arc::strong_count(gate) > 1);
+            }
+            gates.entry(channel_id.to_string()).or_default().clone()
+        };
+        if exclusive {
+            ChannelGate::Exclusive(gate.write_owned().await)
+        } else {
+            ChannelGate::Shared(gate.read_owned().await)
+        }
+    }
+
+    /// Whether a shared hold of `channel_id`'s gate could be taken now,
+    /// without waiting: for tests that look inside a held gate.
+    #[cfg(test)]
+    pub(crate) fn gate_free_for_content(&self, channel_id: &str) -> bool {
+        let gate = self
+            .channel_gates
+            .lock()
+            .expect("poisoned")
+            .entry(channel_id.to_string())
+            .or_default()
+            .clone();
+        gate.try_read_owned().is_ok()
+    }
+
     /// Open (or create) a SQLite file at `path` and run migrations.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -1306,6 +1377,7 @@ impl SqliteStore {
         Ok(Self {
             conn: Mutex::new(conn),
             local_sequencer: OnceLock::new(),
+            channel_gates: Default::default(),
         })
     }
 
@@ -1316,6 +1388,7 @@ impl SqliteStore {
         Ok(Self {
             conn: Mutex::new(conn),
             local_sequencer: OnceLock::new(),
+            channel_gates: Default::default(),
         })
     }
 
@@ -4364,6 +4437,7 @@ mod tests {
         let store = SqliteStore {
             conn: Mutex::new(conn),
             local_sequencer: Default::default(),
+            channel_gates: Default::default(),
         };
         assert_eq!(
             store.backfill_ingest_records(&key).unwrap(),
@@ -4556,6 +4630,7 @@ mod tests {
         let store = SqliteStore {
             conn: Mutex::new(conn),
             local_sequencer: Default::default(),
+            channel_gates: Default::default(),
         };
         assert_eq!(
             store.list_channels().unwrap().len(),
@@ -4790,6 +4865,7 @@ mod tests {
         let store = SqliteStore {
             conn: Mutex::new(conn),
             local_sequencer: Default::default(),
+            channel_gates: Default::default(),
         };
         assert_eq!(
             store.get_channel_by_slug("#a").unwrap().map(|c| c.id),
@@ -5116,6 +5192,7 @@ mod tests {
         let store = SqliteStore {
             conn: Mutex::new(conn),
             local_sequencer: Default::default(),
+            channel_gates: Default::default(),
         };
         let g = store
             .get_mls_group_by_id("bafy_create_sealed")
