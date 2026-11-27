@@ -213,9 +213,9 @@ impl Refusal {
 
     /// The refusal for an ingest error, as every surface classifies it.
     pub fn of(e: &IngestError) -> Self {
-        use crate::v0_0_2_ingest_error::{classify_with_wait, jitter, millis, retry_after};
+        use crate::v0_0_2_ingest_error::{classify_with_wait, millis, retry_after_spread};
         // One draw, said in the message and carried in the field.
-        let wait = retry_after(e).map(jitter);
+        let wait = retry_after_spread(e);
         let (status, code, message) = classify_with_wait(e, wait);
         Refusal {
             retry_after_ms: wait.map(millis),

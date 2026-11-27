@@ -192,9 +192,19 @@ Draft. Field names are provisional. The design behind this revision is
     the `seq` of the `seen` it carries: the record names the block, the block embeds `seen`,
     and `seen`'s chain commits to the record at the earlier `seq`, so the block's record is
     not on that chain.
-11. A `member-remove` block, including a self-leave, carries `ends`: the CID of the
-    `member-add` it ends. A server MUST refuse a remove whose `ends` is not the member's
-    current membership.
+11. A `member-remove` block, including a self-leave, SHOULD carry `ends`, under the manifest
+    metadata key `ends`: the CID of the block that began the membership it ends (the
+    `member-add`, or the `channel-create` for a root owner). A server lists it as `since`
+    beside each member. A server MUST refuse a remove whose `ends` is present and is not the
+    member's current membership, and MAY refuse one without `ends`
+    (`[server] require_remove_ends`; off by default in v0.2.x, so that removes from authors
+    that predate `ends` still land). A remove without `ends` that was written, by its
+    `hlc_ts`, more than `max_future_skew_ms` before the current membership began, by its
+    `ingest` record's clock, is refused as well, with `REMOVE_PREDATES_MEMBERSHIP`. A device
+    whose clock is slow by more than that is refused only while its clock reads before the
+    membership began: a remove it writes later lands, and the refusal says how much later
+    (`retry_after_ms`) when that is under an hour. A remove of someone who is not a member
+    changes nothing, whatever it names.
 
 ## Manifest log
 

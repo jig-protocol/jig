@@ -175,6 +175,7 @@ impl AppState {
             // pay to compile one. `None` means "does not execute Wasm kinds",
             // not "fall back" — a text-render block would be rejected outright.
             executor: None,
+            require_remove_ends: false,
         });
 
         let pending_challenges = Arc::new(RwLock::new(HashMap::new()));
@@ -272,6 +273,7 @@ impl AppState {
             // allow `text-render`, so there's no Wasm module for this server to
             // execute. `None` is a hard "won't execute", not a fallback.
             executor: None,
+            require_remove_ends: false,
         });
 
         let pending_challenges = Arc::new(RwLock::new(HashMap::new()));

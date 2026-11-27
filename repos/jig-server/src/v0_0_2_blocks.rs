@@ -421,6 +421,9 @@ pub struct MemberView {
     pub did: String,
     pub role: String,
     pub joined_at: i64,
+    /// The CID of the block that began this membership: what a
+    /// `member-remove` ending it names as `ends` (JEP-0002 rule 11).
+    pub since: String,
     /// The server that relayed this member's latest write here, if one did
     /// (JEP-0005 rule 15): a hint at where its client is, for pruning the
     /// members a follower took with it when its contract ended.
@@ -473,6 +476,7 @@ pub async fn list_members(
             did: m.member_did,
             role: m.role,
             joined_at: m.joined_at,
+            since: m.source_block_cid,
         })
         .collect();
     Ok(Json(MembersResponse {

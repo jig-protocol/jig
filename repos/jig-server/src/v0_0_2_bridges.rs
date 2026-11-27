@@ -378,6 +378,9 @@ fn map_ingest_err(e: jig_pipeline::ingest::IngestError) -> jig_bridge_core::Subm
         // will a restricted one (D25), and the same bytes will be refused the
         // same way again.
         ref e @ (IngestError::OwnerCannotLeave { .. }
+        | IngestError::RemoveEndsStale { .. }
+        | IngestError::RemoveEndsRequired { .. }
+        | IngestError::RemovePredatesMembership { .. }
         | IngestError::UnknownSuite { .. }
         | IngestError::SuiteMismatch { .. }
         | IngestError::RestrictedRequiresMls { .. }
@@ -559,6 +562,7 @@ mod tests {
             server_url: "ws://127.0.0.1:0".to_string(),
             naively_allow_unknown_handles_fallback: false,
             executor: Some(BlockExecutor::shared()),
+            require_remove_ends: false,
         });
         (store, ingest_ctx, fanout, RouterMount::new())
     }

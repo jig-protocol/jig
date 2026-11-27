@@ -193,6 +193,10 @@ pub struct IngestContext {
     /// `render_hash` is exactly the carve-out this replaced: it would look like
     /// success while the block never executed.
     pub executor: Option<Arc<crate::executor::BlockExecutor>>,
+    /// `[server] require_remove_ends`: refuse a `member-remove` without
+    /// `ends` (JEP-0002 rule 11) instead of taking it from an author that
+    /// predates it.
+    pub require_remove_ends: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -416,6 +420,35 @@ pub enum IngestError {
     /// needs, or whose signed messages do not check out.
     #[error("`{kind}` refused: {detail}")]
     BadContractBlock { kind: String, detail: String },
+    /// A `member-remove` that names a membership other than the target's
+    /// current one, or that predates it (JEP-0002 rule 11).
+    #[error("the remove of {member} from {slug} does not end their current membership: {detail}")]
+    RemoveEndsStale {
+        slug: String,
+        member: String,
+        detail: String,
+    },
+    /// A `member-remove` without `ends`, on a server that requires it.
+    #[error(
+        "the remove of {member} from {slug} names no membership it ends (`ends`), which this \
+         server requires"
+    )]
+    RemoveEndsRequired { slug: String, member: String },
+    /// A `member-remove` without `ends`, timestamped more than the skew
+    /// bound before the membership it would end began (JEP-0002 rule 11).
+    /// `wait_ms` is how far the author's clock is short.
+    #[error(
+        "this remove of {member} from {slug} is timestamped before the membership it would end \
+         ({written_ms} ms, the membership began at {began_ms} ms): check the device clock and \
+         write the remove again, or upgrade so the client sends `ends`"
+    )]
+    RemovePredatesMembership {
+        slug: String,
+        member: String,
+        written_ms: u64,
+        began_ms: u64,
+        wait_ms: u64,
+    },
     /// A `channel-create` whose slug is outside the slug grammar, or in a
     /// reserved namespace its author may not create in
     /// ([`jig_core::slug::check_create`]).
@@ -867,7 +900,93 @@ pub async fn ingest(
             WriteRefusal::BadContractBlock { detail } => {
                 IngestError::BadContractBlock { kind, detail }
             }
+            WriteRefusal::RemoveEndsStale {
+                slug,
+                member,
+                detail,
+            } => IngestError::RemoveEndsStale {
+                slug,
+                member,
+                detail,
+            },
+            WriteRefusal::RemoveEndsRequired { slug, member } => {
+                IngestError::RemoveEndsRequired { slug, member }
+            }
+            WriteRefusal::RemovePredatesMembership {
+                slug,
+                member,
+                written_ms,
+                began_ms,
+                wait_ms,
+            } => IngestError::RemovePredatesMembership {
+                slug,
+                member,
+                written_ms,
+                began_ms,
+                wait_ms,
+            },
         });
+    }
+
+    // A remove ends one membership, the one its `ends` names (JEP-0002 rule
+    // 11): a remove written for another, earlier here or on another server
+    // under the same slug, is refused.
+    if kind == BlockKind::MemberRemove
+        && let Some(chan) = resolved_channel.as_ref()
+        && let Some(target) = manifest.metadata.get("member_did").and_then(|v| v.as_str())
+    {
+        let target = crate::effect::canonical_did_string(target);
+        let current = ctx.store.get_membership_by_id(&chan.id, &target)?;
+        let since_wall_ms = match &current {
+            Some(m) => ctx
+                .store
+                .get_ingest_record(&m.source_block_cid)?
+                .map(|r| r.ingest_wall_ms),
+            None => None,
+        };
+        if let Err(refusal) = crate::authorize_write::check_remove_ends(
+            &manifest,
+            &chan.slug,
+            &target,
+            current
+                .as_ref()
+                .map(|m| crate::authorize_write::CurrentMembership {
+                    since: &m.source_block_cid,
+                    since_wall_ms,
+                }),
+            ctx.require_remove_ends,
+            ctx.hlc_clock.max_future_skew_ms(),
+        ) {
+            tracing::info!(kind = kind_str, refusal = ?refusal, "write refused");
+            return Err(match refusal {
+                crate::authorize_write::WriteRefusal::RemoveEndsRequired { slug, member } => {
+                    IngestError::RemoveEndsRequired { slug, member }
+                }
+                crate::authorize_write::WriteRefusal::RemovePredatesMembership {
+                    slug,
+                    member,
+                    written_ms,
+                    began_ms,
+                    wait_ms,
+                } => IngestError::RemovePredatesMembership {
+                    slug,
+                    member,
+                    written_ms,
+                    began_ms,
+                    wait_ms,
+                },
+                crate::authorize_write::WriteRefusal::RemoveEndsStale {
+                    slug,
+                    member,
+                    detail,
+                } => IngestError::RemoveEndsStale {
+                    slug,
+                    member,
+                    detail,
+                },
+                other => unreachable!("check_remove_ends refuses only on `ends`: {other:?}"),
+            });
+        }
     }
 
     // Whether that decision rested on a role rather than on the channel's
@@ -2742,6 +2861,7 @@ mod tests {
             // Shared, so the ~16ms module compile is paid once for the whole
             // test binary rather than per test.
             executor: Some(crate::executor::BlockExecutor::shared()),
+            require_remove_ends: false,
         }
     }
 
@@ -3455,8 +3575,17 @@ mod tests {
         meta: serde_json::Value,
     ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         // A fresh HLC per block, so two blocks with the same payload (a
-        // replayed commit) are different blocks rather than one duplicate.
-        signed_parts_at(key, kind, suite, meta, rand::random::<u32>() as u64)
+        // replayed commit) are different blocks rather than one duplicate:
+        // the author's clock now, as a client stamps it, plus a random
+        // offset well inside the future-skew bound.
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        signed_parts_at(
+            key,
+            kind,
+            suite,
+            meta,
+            now + u64::from(rand::random::<u16>()),
+        )
     }
 
     /// [`signed_parts`] with the author's clock at `wall_ms`.
@@ -4484,6 +4613,87 @@ mod tests {
             matches!(err, IngestError::ChannelExists { .. }),
             "got {err:?}"
         );
+    }
+
+    /// JEP-0002 rule 11: a remove names the membership it ends. One written
+    /// for an earlier membership is refused once the member is back; one for
+    /// the current membership lands. Without `ends` it lands as a block from
+    /// an author that predates it, unless the server requires `ends`.
+    #[tokio::test]
+    async fn a_remove_ends_only_the_membership_it_names() {
+        let mut ctx = test_ctx_allowing(&["member-add", "member-remove"]);
+        let owner = random_signing_key();
+        let member = random_signing_key();
+        let member_did = did_of(&member);
+        seed_channel_owned_by(&ctx, "#hello", &did_of(&owner));
+        let local = || IngestSource::LocalClient {
+            conn_id: 1,
+            tiers: true,
+        };
+        let join = |nonce: &'static str| {
+            build_bundle_parts_with_meta(
+                &member,
+                BlockKind::MemberAdd,
+                &[
+                    ("channel", "#hello"),
+                    ("member_did", &member_did),
+                    ("nonce", nonce),
+                ],
+            )
+        };
+        let leave = |ends: Option<&str>| {
+            let mut meta = vec![("channel", "#hello"), ("member_did", member_did.as_str())];
+            if let Some(ends) = ends {
+                meta.push((crate::authorize_write::ENDS_KEY, ends));
+            }
+            build_bundle_parts_with_meta(&member, BlockKind::MemberRemove, &meta)
+        };
+
+        let (m, c, sig) = join("first");
+        let first = do_ingest(&ctx, m, c, sig, local()).await.unwrap();
+        let (m, c, sig) = leave(Some(&first));
+        do_ingest(&ctx, m, c, sig, local()).await.unwrap();
+        assert!(!ctx.store.is_member("#hello", &member_did).unwrap());
+
+        let (m, c, sig) = join("second");
+        let second = do_ingest(&ctx, m, c, sig, local()).await.unwrap();
+        // A leave written for the first membership, never sent until now.
+        let (m, c, sig) = build_bundle_parts_with_meta(
+            &member,
+            BlockKind::MemberRemove,
+            &[
+                ("channel", "#hello"),
+                ("member_did", &member_did),
+                (crate::authorize_write::ENDS_KEY, &first),
+                ("nonce", "late"),
+            ],
+        );
+        let stale = do_ingest(&ctx, m, c, sig, local()).await;
+        assert!(
+            matches!(stale, Err(IngestError::RemoveEndsStale { .. })),
+            "{stale:?}"
+        );
+        assert!(ctx.store.is_member("#hello", &member_did).unwrap());
+
+        // Without `ends`, refused where the server requires it.
+        ctx.require_remove_ends = true;
+        let (m, c, sig) = leave(None);
+        let required = do_ingest(&ctx, m.clone(), c.clone(), sig.clone(), local()).await;
+        assert!(
+            matches!(required, Err(IngestError::RemoveEndsRequired { .. })),
+            "{required:?}"
+        );
+        ctx.require_remove_ends = false;
+        do_ingest(&ctx, m, c, sig, local()).await.unwrap();
+        assert!(!ctx.store.is_member("#hello", &member_did).unwrap());
+
+        // And naming the membership it ends.
+        let (m, c, sig) = join("third");
+        let third = do_ingest(&ctx, m, c, sig, local()).await.unwrap();
+        assert_ne!(third, second);
+        let (m, c, sig) = leave(Some(&third));
+        do_ingest(&ctx, m, c, sig, local()).await.unwrap();
+        assert!(!ctx.store.is_member("#hello", &member_did).unwrap());
     }
 
     /// Replaying an accepted member-add must not re-enrol a member who has

@@ -29,7 +29,7 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 use jig_client::blocks::{
     BuiltBlock, build_channel_archive, build_channel_promote, build_member_add,
-    build_member_remove, build_with_metadata, merge,
+    build_member_remove, build_with_metadata, ends, merge,
 };
 use jig_core::tier::{JoinRole, Tier};
 use jig_core::{BlockKind, HlcTimestamp};
@@ -738,7 +738,10 @@ pub async fn kick(ctx: &CliContext, slug: String, who: String) -> Result<()> {
 }
 
 /// Remove `did` from the channel: a `member-remove`, carrying the commit
-/// that takes its leaf out of the group on an encrypted channel.
+/// that takes its leaf out of the group on an encrypted channel. It names
+/// the membership it ends (`ends`, JEP-0002 rule 11), read from the members
+/// listing just before it is written; against a server that lists no
+/// `since`, it names none.
 async fn remove_member(
     secure: &Secure,
     slug: &str,
@@ -746,18 +749,29 @@ async fn remove_member(
     did: &str,
 ) -> Result<String> {
     let id = secure.identity();
+    let since = member_since(secure, slug, did).await?;
     if info.encrypted() {
         let server = secure.server().to_string();
         secure
             .commit(
                 slug,
                 |s, key| Ok(s.prepare_remove(&server, key, did)?),
-                |c| build_member_remove(id, slug, did, mls_fields(c), now(id)),
+                |c| {
+                    let mut extra = mls_fields(c);
+                    merge(&mut extra, ends(since.as_deref()));
+                    build_member_remove(id, slug, did, extra, now(id))
+                },
             )
             .await
     } else {
         secure
-            .submit(&build_member_remove(id, slug, did, json!({}), now(id)))
+            .submit(&build_member_remove(
+                id,
+                slug,
+                did,
+                ends(since.as_deref()),
+                now(id),
+            ))
             .await
     }
 }
@@ -954,8 +968,15 @@ pub async fn leave(ctx: &CliContext, slug: String) -> Result<()> {
     let key = secure.pin(&slug).await?;
     let id = secure.identity();
     let me = id.did_string();
+    let since = member_since(&secure, &slug, &me).await?;
     let cid = secure
-        .submit(&build_member_remove(id, &slug, &me, json!({}), now(id)))
+        .submit(&build_member_remove(
+            id,
+            &slug,
+            &me,
+            ends(since.as_deref()),
+            now(id),
+        ))
         .await?;
     secure.session.discard_group(secure.server(), &key)?;
     println!("left {slug}");
@@ -1041,6 +1062,10 @@ pub async fn unshare(ctx: &CliContext, slug: String, to: String) -> Result<()> {
 struct MemberView {
     did: String,
     role: String,
+    /// The block that began the membership, which a remove names as `ends`
+    /// (JEP-0002 rule 11). Absent from a server that predates it.
+    #[serde(default)]
+    since: Option<String>,
     /// The server that relayed the member's latest write, as the channel's
     /// own server saw it.
     #[serde(default)]
@@ -1080,6 +1105,32 @@ pub async fn members(ctx: &CliContext, slug: String, via: Option<String>) -> Res
         println!("{:<6}  {:<16}  {}", m.role, name, m.did);
     }
     Ok(())
+}
+
+/// The block that began `did`'s membership of the channel, as its server
+/// lists it, for the remove that ends it to name: `None` when it is not a
+/// member, or the server predates `since`, and the remove then names none.
+async fn member_since(secure: &Secure, slug: &str, did: &str) -> Result<Option<String>> {
+    match secure
+        .get_json::<MembersResponse>(&format!(
+            "/api/v1/channels/{}/members",
+            escape_slug_for_url(slug)
+        ))
+        .await
+    {
+        Ok(body) => Ok(body
+            .members
+            .into_iter()
+            .find(|m| m.did == did)
+            .and_then(|m| m.since)),
+        Err(e)
+            if e.downcast_ref::<Refused>()
+                .is_some_and(|r| matches!(r.status, 403 | 404)) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// `did`'s role in the channel, as the server has it: `None` when it is not
