@@ -749,6 +749,7 @@ pub async fn ingest(
     // signs a record for it (JEP-0005 rule 12), so nothing lands here.
     // A channel the owner moved away from this server is the new
     // sequencer's: said so, rather than relayed as a carried channel's write.
+    // A later move back to this server makes it this server's again.
     if takeover.is_none()
         && let Some(chan) = resolved_channel.as_ref()
         && let Some(moved) = ctx
@@ -756,7 +757,11 @@ pub async fn ingest(
             .channel_moves(&chan.id)?
             .into_iter()
             .rev()
-            .find(|m| crate::handshake::same_did(&m.previous, &server_did))
+            .find(|m| {
+                crate::handshake::same_did(&m.previous, &server_did)
+                    || crate::handshake::same_did(&m.sequencer, &server_did)
+            })
+            .filter(|m| crate::handshake::same_did(&m.previous, &server_did))
     {
         return Err(IngestError::SequencerMoved {
             channel_id: chan.id.clone(),

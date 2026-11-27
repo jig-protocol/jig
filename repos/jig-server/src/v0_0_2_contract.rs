@@ -133,6 +133,8 @@ pub struct Contracts {
     /// each with its `sequencer-set`: `None` until the decider's first tick
     /// fills it from the channels' moves, so a restart resumes them.
     reoffers: Arc<std::sync::Mutex<Option<DueReoffers>>>,
+    /// The first peer registration [`Self::replay_moves`] has not seen.
+    seen_registrations: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Run the contract on `state`'s server:
@@ -302,6 +304,7 @@ impl Contracts {
             ),
             pending_key_links: Arc::default(),
             reoffers: Arc::default(),
+            seen_registrations: Arc::default(),
         }
     }
 
@@ -1237,6 +1240,46 @@ impl Contracts {
         }
         self.deliver_ends().await;
         self.resume_reoffers().await;
+        self.replay_moves();
+    }
+
+    /// Send each server that connected since the last call the moves that
+    /// took a channel away from it to this server (JEP-0005 rule 11a). A
+    /// sequencer that missed its move, or lost it with a connection that
+    /// dropped, learns of it on its next connection; the receiver keeps a
+    /// record it holds once.
+    fn replay_moves(&self) {
+        use std::sync::atomic::Ordering;
+        let mark = self.seen_registrations.load(Ordering::Relaxed);
+        let (peers, next) = self.peers.registered_since(mark);
+        self.seen_registrations.store(next, Ordering::Relaxed);
+        let me = self.me();
+        for peer in peers {
+            let peer = peer.to_did_jig_string();
+            let moves = match self.store().moves_away_from(&peer) {
+                Ok(moves) => moves,
+                Err(e) => {
+                    tracing::warn!(peer, "listing the moves to replay: {e}");
+                    continue;
+                }
+            };
+            for (channel_id, moved) in moves {
+                if !jig_pipeline::handshake::same_did(&moved.sequencer, &me) {
+                    continue;
+                }
+                match self.store().get_block(&moved.block_cid) {
+                    Ok(Some(block)) => {
+                        if let Err(e) = self.stream.push_to(&block, std::slice::from_ref(&peer)) {
+                            tracing::info!(peer, channel = %channel_id, "the move not replayed: {e:#}");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(channel = %channel_id, "reading a move to replay: {e}")
+                    }
+                }
+            }
+        }
     }
 
     /// Send each end this server decided on to the other side, and once it
@@ -2795,6 +2838,21 @@ mod tests {
             gone_rx.try_recv().map(|e| e.frame),
             Ok(jig_pipeline::envelope::Frame::Peer { kind, .. }) if kind == crate::v0_0_2_stream::RECORDS_FRAME
         ));
+
+        // It drops and connects again: the move is sent on the new
+        // connection too, as a queued frame may have been lost with the old.
+        contracts.replay_moves();
+        let (again, mut again_rx) = crate::v0_0_2_peer::PeerSender::new(
+            Did::from_did_jig_string(&did_of(&SigningKey::from_bytes(&[45; 32]))).unwrap(),
+        );
+        p.follower.peers.register(again);
+        contracts.replay_moves();
+        assert!(matches!(
+            again_rx.try_recv().map(|e| e.frame),
+            Ok(jig_pipeline::envelope::Frame::Peer { kind, .. }) if kind == crate::v0_0_2_stream::RECORDS_FRAME
+        ));
+        contracts.replay_moves();
+        assert!(again_rx.try_recv().is_err(), "once per connection");
 
         // A follower that was away: its re-offer is kept, unanswered.
         let away = Did::from_did_jig_string(&did_of(&SigningKey::from_bytes(&[44; 32]))).unwrap();
