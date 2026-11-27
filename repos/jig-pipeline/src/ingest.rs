@@ -1753,6 +1753,19 @@ pub fn channel_terms(
     manifest: &jig_core::BlockManifest,
     server_did: &str,
 ) -> Result<ChannelTerms, IngestError> {
+    channel_terms_from(manifest, server_did, &[])
+}
+
+/// [`channel_terms`] for a server that has changed its key since the channel
+/// was created: the block may name `server_did` or any of `predecessors`,
+/// the DIDs a verified key-link chain leads from to `server_did` (JEP-0012:
+/// a link moves the sequencer role). The terms then name `server_did`, the
+/// DID that signs for the channel now.
+pub fn channel_terms_from(
+    manifest: &jig_core::BlockManifest,
+    server_did: &str,
+    predecessors: &[String],
+) -> Result<ChannelTerms, IngestError> {
     let invalid = |field: &str, detail: String| IngestError::InvalidTerms {
         field: field.to_string(),
         detail,
@@ -1767,10 +1780,16 @@ pub fn channel_terms(
             &parsed.to_did_jig_string(),
         ))
     };
-    let sequencer = match manifest.metadata.get(SEQUENCER_KEY) {
+    let mut sequencer = match manifest.metadata.get(SEQUENCER_KEY) {
         None => server_did.to_string(),
         Some(raw) => did(SEQUENCER_KEY, raw)?,
     };
+    if predecessors
+        .iter()
+        .any(|p| crate::effect::canonical_did_string(p) == sequencer)
+    {
+        sequencer = server_did.to_string();
+    }
     if sequencer != server_did {
         return Err(IngestError::NotSequencer {
             sequencer,
