@@ -275,7 +275,11 @@ impl Heads {
             }
             if self.send_to(&target, &body) {
                 forwarded.at.insert(key.clone(), now);
-                forwarded.forks.remove(&key);
+                // Only the fork's own frame settles a held fork: an ordinary
+                // head carries none of its evidence.
+                if fork {
+                    forwarded.forks.remove(&key);
+                }
             } else if fork {
                 forwarded.hold(key, body.clone());
             }
@@ -809,6 +813,11 @@ mod tests {
         heads.retry_pending();
         assert_eq!(heads.pending_forks(), 1, "still no room");
         assert_eq!(heads_in(&mut inbox), 0, "only the filler was queued");
+        // An ordinary head sent before the retry does not settle the fork.
+        tokio::time::advance(FORWARD_EVERY).await;
+        heads.forward(&channel, &record, None, false);
+        assert_eq!(heads_in(&mut inbox), 1);
+        assert_eq!(heads.pending_forks(), 1, "the fork still waits");
         heads.retry_pending();
         assert_eq!(heads.pending_forks(), 0);
         assert_eq!(heads_in(&mut inbox), 1);

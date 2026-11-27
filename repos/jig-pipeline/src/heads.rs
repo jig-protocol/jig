@@ -87,6 +87,17 @@ impl HeadCheck {
     }
 }
 
+/// What [`SqliteStore::keep_head`] did.
+#[derive(Debug, PartialEq, Eq)]
+enum Kept {
+    /// Kept, or not, against the head kept already: `advanced` if it is now
+    /// the highest.
+    Kept { advanced: bool },
+    /// The chain holds a record at the head's seq, in its stored form: not
+    /// kept, and compared instead.
+    Landed(Vec<u8>),
+}
+
 impl SqliteStore {
     /// Compare `envelope`, a head (a record's COSE_Sign1 envelope) handed in
     /// for `channel_id`, with this server's chain of it, and keep what it
@@ -120,7 +131,7 @@ impl SqliteStore {
         // held at its `seq`: once the chain lands one there, it is compared.
         let duplicate = match &held {
             Some(h) => h.cose == sent,
-            None => self.kept_head(channel_id)? == Some(sent),
+            None => self.kept_head(channel_id)?.as_deref() == Some(sent.as_str()),
         };
         if duplicate {
             return Ok(HeadCheck::Duplicate);
@@ -157,11 +168,24 @@ impl SqliteStore {
                 "a head signed by this server's key is past its own chain"
             );
         }
-        let advanced = self.keep_head(channel_id, &head, envelope)?;
-        Ok(HeadCheck::Ahead {
-            seq: head.seq,
-            advanced,
-        })
+        match self.keep_head(channel_id, &head, envelope)? {
+            Kept::Kept { advanced } => Ok(HeadCheck::Ahead {
+                seq: head.seq,
+                advanced,
+            }),
+            // The chain landed a record at that seq since it was read above.
+            Kept::Landed(held) => {
+                if IngestRecord::decode(&held).is_ok_and(|h| h.cose == sent) {
+                    return Ok(HeadCheck::Duplicate);
+                }
+                let first = self.keep_head_fork(&channel, head.seq, &held, &head.encode())?;
+                Ok(HeadCheck::Fork {
+                    seq: head.seq,
+                    held,
+                    first,
+                })
+            }
+        }
     }
 
     /// The highest head this server has been handed for `channel_id` past
@@ -194,15 +218,28 @@ impl SqliteStore {
         Ok(bytes.and_then(|b| IngestRecord::from_cose(&b).ok()))
     }
 
-    /// Keep `head` for `channel_id` if it is past the one kept. Whether it
-    /// was.
+    /// Keep `head` for `channel_id` if it is past the one kept, unless the
+    /// chain holds a record at its seq by now. That is read under the same
+    /// lock the chain lands under, which compares a landing record with the
+    /// kept head ([`SqliteStore::land_carried`]): whichever of the two comes
+    /// second sees the other.
     fn keep_head(
         &self,
         channel_id: &str,
         head: &IngestRecord,
         envelope: &[u8],
-    ) -> crate::persist::Result<bool> {
+    ) -> crate::persist::Result<Kept> {
         let conn = self.conn.lock().expect("poisoned");
+        let landed: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT record FROM chain_records WHERE channel_id = ?1 AND seq = ?2",
+                params![channel_id, head.seq as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(held) = landed {
+            return Ok(Kept::Landed(held));
+        }
         let changed = conn.execute(
             "INSERT INTO channel_heads (channel_id, seq, record, received_at)
              VALUES (?1, ?2, ?3, ?4)
@@ -216,7 +253,9 @@ impl SqliteStore {
                 chrono::Utc::now().timestamp()
             ],
         )?;
-        Ok(changed > 0)
+        Ok(Kept::Kept {
+            advanced: changed > 0,
+        })
     }
 
     /// Keep a fork a head showed. On a channel this server follows, it is the
@@ -431,6 +470,41 @@ mod tests {
             "{check:?}"
         );
         assert_eq!(store.chain_evidence(&channel).unwrap().len(), 1);
+    }
+
+    /// The chain can land a record at a head's seq between `check_head`
+    /// reading it and keeping the head: keeping it reads the chain again,
+    /// under the lock the chain lands under, and the two are compared.
+    #[test]
+    fn a_record_landed_while_a_head_is_checked_is_compared_not_overwritten() {
+        let owner = generate_signing_key();
+        let (store, held) = follower(&owner);
+        let channel = label_cid("Create");
+        let head = sign_at(&owner, 2, "b2", held[1].hash());
+        // Landed after the head was found past the chain, before it is kept.
+        let landed = sign_at(&owner, 2, "b2Other", held[1].hash());
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+            conn.execute(
+                "INSERT INTO carried_records (block_cid, channel_id, seq, record)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    landed.block_cid,
+                    landed.channel_id,
+                    landed.seq as i64,
+                    landed.encode()
+                ],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            store
+                .keep_head(&channel, &head, &head.cose_bytes().unwrap())
+                .unwrap(),
+            Kept::Landed(landed.encode())
+        );
+        assert_eq!(store.kept_head(&channel).unwrap(), None, "not kept");
     }
 
     #[test]

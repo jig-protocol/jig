@@ -425,7 +425,15 @@ async fn handle_socket(
                     match msg {
                         // Every frame costs its sender's address, signed or not:
                         // one upgraded connection is not a licence to flood.
-                        Message::Text(_) if ip.is_some_and(|ip| !state.auth.charge_ip(ip)) => {
+                        Message::Text(text) if ip.is_some_and(|ip| !state.auth.charge_ip(ip)) => {
+                            // A head is no request: a refusal of it would be
+                            // read as the answer to whatever the client asked
+                            // last. Charged, and dropped unanswered.
+                            if Envelope::parse(&text)
+                                .is_ok_and(|env| matches!(env.frame, Frame::Head { .. }))
+                            {
+                                continue;
+                            }
                             let outcome = crate::auth::GateOutcome::RateLimited;
                             let (status, code, message) = state.auth.disclosure.disclose(&outcome);
                             let wait = (code == "RATE_LIMITED")
@@ -2559,6 +2567,60 @@ mod tests {
         assert_eq!(until_refused(&mut ws).await, 1, "a second refills one");
         clock.advance(Duration::from_secs(10));
         assert_eq!(until_refused(&mut ws).await, 3, "and never past the burst");
+    }
+
+    /// A head past its address's rate is charged and dropped unanswered: a
+    /// refusal of it would be read as a pending submit's answer.
+    #[tokio::test]
+    async fn a_head_past_the_address_rate_is_dropped_unanswered() {
+        let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
+        config.auth.rate_limit.per_ip_burst = 2;
+        config.auth.rate_limit.per_ip_per_second = 1;
+        let state = Arc::new(AppState::for_test_with_config(config).unwrap());
+        let clock = crate::auth::rate::ManualClock::new();
+        state.auth.set_rate_clock(&clock);
+        let app = Router::new()
+            .route("/api/v1/ws", get(ws_handler))
+            .with_state(state)
+            .into_make_service_with_connect_info::<SocketAddr>();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/api/v1/ws", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut ws = established(&url).await;
+        // The hello took one token; this takes the other.
+        ws.send(TMessage::Text("not valid json".into()))
+            .await
+            .unwrap();
+        match next_frame(&mut ws).await.frame {
+            Frame::Error { code, .. } => assert_eq!(code, "BAD_JSON"),
+            other => panic!("expected BAD_JSON, got {other:?}"),
+        }
+        let head = Envelope::new(Frame::Head {
+            channel_id: jig_pipeline::ingest_record::label_cid("Create"),
+            record_b64: String::new(),
+        });
+        ws.send(TMessage::Text(serde_json::to_string(&head).unwrap().into()))
+            .await
+            .unwrap();
+        // Past the rate, a frame that is not a head is still refused...
+        ws.send(TMessage::Text("not valid json".into()))
+            .await
+            .unwrap();
+        match next_frame(&mut ws).await.frame {
+            Frame::Error { code, .. } => assert_eq!(code, "RATE_LIMITED"),
+            other => panic!("expected RATE_LIMITED, got {other:?}"),
+        }
+        // ...and after a refill, the next answer is to the next frame: the
+        // head was answered with nothing.
+        clock.advance(Duration::from_secs(1));
+        ws.send(TMessage::Text("not valid json".into()))
+            .await
+            .unwrap();
+        match next_frame(&mut ws).await.frame {
+            Frame::Error { code, .. } => assert_eq!(code, "BAD_JSON"),
+            other => panic!("expected BAD_JSON, got {other:?}"),
+        }
     }
 
     /// A well-formed frame at a version or suite this server does not speak,
