@@ -1905,6 +1905,7 @@ mod tests {
             high: None,
             moves: Vec::new(),
             key_links: Vec::new(),
+            gaps: Vec::new(),
         };
         assert!(
             !pins.advance_chain(server, "#ops", &head(1)).unwrap(),
@@ -2556,6 +2557,7 @@ mod tests {
                 sequencer: "did:jig:znew".into(),
             }],
             key_links: Vec::new(),
+            gaps: Vec::new(),
         };
         pins.advance_chain("wss://a", "bafyteam", &head).unwrap();
         assert_eq!(pins.moved_to("wss://a", "bafyteam"), Some("did:jig:znew"));
@@ -2754,6 +2756,7 @@ mod tests {
             high: None,
             moves: Vec::new(),
             key_links: Vec::new(),
+            gaps: Vec::new(),
         };
         pins.check_channel(
             server,
@@ -3030,6 +3033,7 @@ mod tests {
             high: None,
             moves: Vec::new(),
             key_links: Vec::new(),
+            gaps: Vec::new(),
         };
         assert!(pins.advance_chain(server, "bafyCarried", &head).unwrap());
         assert_eq!(

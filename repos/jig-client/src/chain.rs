@@ -65,6 +65,31 @@ pub struct ChainHead {
     /// its new key ([`jig_core::sequencer_move::root_owners`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub key_links: Vec<HeadKeyLink>,
+    /// The runs of records a live stream went past ([`ChannelChain::
+    /// accept_live`]), each with the hashes either side of it: a record
+    /// filled in later is held to the chain from the record before the run,
+    /// in order, so the key link it carries is kept only once it connects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gaps: Vec<HeadGap>,
+}
+
+/// A run of records, `from` up to `to` (exclusive), that a chain went past
+/// and has not yet filled in order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeadGap {
+    /// The next record to connect.
+    pub from: u64,
+    /// The record after the run, which the chain holds.
+    pub to: u64,
+    /// Hex hash the record at `from` must name as its `prev`.
+    pub prev: String,
+    /// Hex hash the last record of the run must have: the `prev` of the
+    /// record at `to`.
+    pub end: String,
+    /// The key links of the records connected so far, kept once the whole
+    /// run meets the record at `to`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<HeadKeyLink>,
 }
 
 /// A `key-link` in a channel's chain, as a client keeps it.
@@ -111,6 +136,7 @@ impl ChainHead {
             high: None,
             moves: Vec::new(),
             key_links: Vec::new(),
+            gaps: Vec::new(),
         }
     }
 
@@ -143,6 +169,7 @@ impl ChainHead {
         }
         next.moves = self.moves.clone();
         next.key_links = self.key_links.clone();
+        next.gaps = self.gaps.clone();
         next
     }
 }
@@ -355,6 +382,17 @@ pub struct ChannelChain {
     /// ([`Self::with_moves`]), or taken from the first record it is given.
     /// A head made from none takes them.
     prior_moves: Vec<HeadMove>,
+    /// The record below the head [`Self::fill_gap`] just connected, for its
+    /// key link to be kept.
+    connected: Option<Connected>,
+}
+
+/// A record [`ChannelChain::fill_gap`] connected: inside the run ending at
+/// `run`, still open, or (`None`) the one that closed its run whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Connected {
+    seq: u64,
+    run: Option<u64>,
 }
 
 impl ChannelChain {
@@ -382,6 +420,7 @@ impl ChannelChain {
             clock_defects: Vec::new(),
             owners: Vec::new(),
             prior_moves: Vec::new(),
+            connected: None,
         }
     }
 
@@ -575,6 +614,7 @@ impl ChannelChain {
             });
         }
         if record.seq < head.seq {
+            self.fill_gap(record);
             return Ok(Step::Behind);
         }
         if record.seq > head.seq + 1 {
@@ -737,22 +777,80 @@ impl ChannelChain {
         )
     }
 
-    /// Keep `link`, `record`'s key link, once the head is `record`.
+    /// Keep `link`, `record`'s key link, once `record` is in the chain the
+    /// head holds: the head itself, or a record [`Self::fill_gap`] connected
+    /// below it. A record that does not connect keeps nothing.
     fn keep_key_link(&mut self, record: &IngestRecord, link: Option<(String, String)>) {
         let Some((old, new)) = link else {
             return;
         };
-        if let Some(head) = self.head.as_mut()
-            && head.seq == record.seq
-            && head.hash == hex::encode(record.hash())
-            && !head.key_links.iter().any(|l| l.seq == record.seq)
-        {
-            head.key_links.push(HeadKeyLink {
-                seq: record.seq,
-                old,
-                new,
-            });
+        let connected = self.connected.take().filter(|c| c.seq == record.seq);
+        let Some(head) = self.head.as_mut() else {
+            return;
+        };
+        let link = HeadKeyLink {
+            seq: record.seq,
+            old,
+            new,
+        };
+        let kept = match connected {
+            // Inside a run still open: provisional until the run connects.
+            Some(Connected { run: Some(to), .. }) => {
+                if let Some(gap) = head.gaps.iter_mut().find(|g| g.to == to) {
+                    gap.links.push(link);
+                }
+                return;
+            }
+            Some(Connected { run: None, .. }) => true,
+            None => head.seq == record.seq && head.hash == hex::encode(record.hash()),
+        };
+        if kept && !head.key_links.iter().any(|l| l.seq == record.seq) {
+            head.key_links.push(link);
+            head.key_links.sort_by_key(|l| l.seq);
         }
+    }
+
+    /// A record below the head: if it is the next one of a run the chain
+    /// went past, and names the one before it, it connects, and the run
+    /// moves on past it. A run filled to its end that meets the record after
+    /// it is whole: the key links found in it are kept. One that does not
+    /// meet it is dropped with them, and so is a record that does not
+    /// connect: behind, holding nothing.
+    fn fill_gap(&mut self, record: &IngestRecord) {
+        let Some(head) = self.head.as_mut() else {
+            return;
+        };
+        let Some(at) = head
+            .gaps
+            .iter()
+            .position(|g| g.from == record.seq && g.prev == record.prev)
+        else {
+            return;
+        };
+        let gap = &mut head.gaps[at];
+        gap.from += 1;
+        gap.prev = hex::encode(record.hash());
+        if gap.from < gap.to {
+            self.connected = Some(Connected {
+                seq: record.seq,
+                run: Some(gap.to),
+            });
+            return;
+        }
+        let gap = head.gaps.remove(at);
+        if gap.prev != gap.end {
+            return;
+        }
+        for link in gap.links {
+            if !head.key_links.iter().any(|l| l.seq == link.seq) {
+                head.key_links.push(link);
+            }
+        }
+        head.key_links.sort_by_key(|l| l.seq);
+        self.connected = Some(Connected {
+            seq: record.seq,
+            run: None,
+        });
     }
 
     /// The channel's root owners as of `seq`: the owners this client was
@@ -830,9 +928,20 @@ impl ChannelChain {
         block_cid: Option<&str>,
     ) -> Result<Step, ChainBreak> {
         let step = self.accept(record, block_cid)?;
-        if matches!(step, Step::Gap { .. }) {
+        if let Step::Gap { from, to } = step {
             self.head = Some(match &self.head {
-                Some(head) => head.after(record),
+                // The run gone past, with the hashes it must connect.
+                Some(head) => {
+                    let mut next = head.after(record);
+                    next.gaps.push(HeadGap {
+                        from,
+                        to,
+                        prev: head.hash.clone(),
+                        end: record.prev.clone(),
+                        links: Vec::new(),
+                    });
+                    next
+                }
                 None => self.first_head(record),
             });
         }
@@ -1091,6 +1200,91 @@ mod tests {
             without.accept_block(&set, None, &set_bundle, Some(&set_sig)),
             Err(ChainBreak::BadMove { .. })
         ));
+    }
+
+    /// A key link the live stream went past (JEP-0005 rule 7b): filled in
+    /// later, it is kept once the run it sits in connects, in order, from
+    /// the record held before the run to the record after it, and then the
+    /// linked key's move holds. Filled in out of order, or from a run that
+    /// does not meet the record after it, it is kept nowhere.
+    #[test]
+    fn a_key_link_filled_in_below_the_head_counts_once_its_run_connects() {
+        let did = |k: &ed25519_dalek::SigningKey| {
+            jig_core::Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        };
+        let (owner, rotated, new) = (
+            generate_signing_key(),
+            generate_signing_key(),
+            generate_signing_key(),
+        );
+        let mut server = Seq::new();
+        let old = server.did();
+        let create = server.push("bafyCreate", 10);
+        let b1 = server.push("b1", 20);
+        let (link_bundle, link_sig, link_cid, _) = key_link_block(&owner, &rotated);
+        let linked = server.push_cid(&link_cid, 30);
+        let b3 = server.push("b3", 40);
+        let (set_bundle, set_sig) = move_block(&server, &new, &rotated);
+        let old_key = std::mem::replace(&mut server.key, new.clone());
+        let set = server.push("set", 50);
+        let live = || {
+            let mut chain = ChannelChain::new(&label_cid("bafyCreate"), &old, None)
+                .with_owners(vec![did(&owner)]);
+            assert_eq!(chain.accept(&create, None), Ok(Step::Next));
+            assert_eq!(
+                chain.accept_live(&b3, None),
+                Ok(Step::Gap { from: 1, to: 3 })
+            );
+            chain
+        };
+
+        // In order: the run connects, and the link counts from its seq.
+        let mut chain = live();
+        assert_eq!(chain.accept(&b1, None), Ok(Step::Behind));
+        assert_eq!(
+            chain.accept_block(&linked, None, &link_bundle, Some(&link_sig)),
+            Ok(Step::Behind)
+        );
+        assert_eq!(chain.owners_at(set.seq), [did(&rotated)]);
+        assert_eq!(
+            chain.accept_block_live(&set, None, &set_bundle, Some(&set_sig)),
+            Ok(Step::Next),
+            "the linked key's move holds"
+        );
+        // Kept with the head.
+        let resumed = ChannelChain::new(&label_cid("bafyCreate"), &old, chain.head().cloned())
+            .with_owners(vec![did(&owner)]);
+        assert_eq!(resumed.owners_at(set.seq + 1), [did(&rotated)]);
+
+        // Out of order: the link does not connect, and counts for nothing.
+        let mut early = live();
+        assert_eq!(
+            early.accept_block(&linked, None, &link_bundle, Some(&link_sig)),
+            Ok(Step::Behind)
+        );
+        assert_eq!(early.owners_at(set.seq), [did(&owner)]);
+        assert!(matches!(
+            early.accept_block_live(&set, None, &set_bundle, Some(&set_sig)),
+            Err(ChainBreak::BadMove { .. })
+        ));
+
+        // A run that does not meet the record after it: the sequencer's own
+        // other record 2, with the link, on top of record 1. It connects from
+        // below, but not to record 3, so the run and its link are dropped.
+        let mut forked = live();
+        assert_eq!(forked.accept(&b1, None), Ok(Step::Behind));
+        let other = Seq {
+            key: old_key,
+            records: vec![create.clone(), b1.clone()],
+        }
+        .push_cid(&link_cid, 31);
+        assert_ne!(other.hash(), linked.hash());
+        assert_eq!(
+            forked.accept_block(&other, None, &link_bundle, Some(&link_sig)),
+            Ok(Step::Behind)
+        );
+        assert_eq!(forked.owners_at(set.seq), [did(&owner)]);
+        assert!(forked.head().unwrap().gaps.is_empty());
     }
 
     /// A chain that starts with no head (a new connection) takes a move as

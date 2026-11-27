@@ -1355,28 +1355,34 @@ pub async fn ingest_sequenced(
         if set.channel_id != channel_id {
             return Err(FollowError::Mismatch("the move names another channel"));
         }
-        // An owner as of the move's place in the chain, the creator rule
-        // carried across its key links (rule 7b).
-        if !crate::roles::rights_at_channel(
-            &ctx.store,
-            chan,
-            &crate::effect::canonical_did_string(&sender.to_did_jig_string()),
-            record.seq,
-        )?
-        .owner
-        {
-            return Err(FollowError::Mismatch(
-                "a sequencer move signed by a DID that is not the channel's owner",
-            ));
-        }
         set.check_record(record.seq, &record.prev, &record.sequencer)?;
         // Behind the head it cites: keep it until the records up to that
         // head have landed. Ahead of it is the partition case: the record at
         // the set's seq is held already, and the landing below stops the
         // channel as at a fork.
         let held = ctx.store.chain_head_seq(&channel_id)?;
+        let owner_as_held = |store: &SqliteStore| -> Result<bool, FollowError> {
+            Ok(crate::roles::rights_at_channel(
+                store,
+                chan,
+                &crate::effect::canonical_did_string(&sender.to_did_jig_string()),
+                record.seq,
+            )?
+            .owner)
+        };
         if held.is_none_or(|h| h + 1 < record.seq) {
             record.verify(&set.sequencer)?;
+            // Its signer may be the owner only by a key link this server does
+            // not hold yet, so it is kept, and judged when it lands. One that
+            // is not an owner by what is held does not displace a move kept
+            // already.
+            if !owner_as_held(&ctx.store)? && ctx.store.pending_move(&channel_id)?.is_some() {
+                return Err(FollowError::Gap {
+                    channel_id,
+                    head: held,
+                    got: record.seq,
+                });
+            }
             ctx.store.keep_pending_move(
                 &channel_id,
                 &PendingMove {
@@ -1393,6 +1399,16 @@ pub async fn ingest_sequenced(
                 head: held,
                 got: record.seq,
             });
+        }
+        // An owner as of the move's place in the chain, the creator rule
+        // carried across its key links (rule 7b). Judged once the prefix the
+        // move cites is held: a key link in it, not yet here, is what can
+        // make the move's signer the owner. A move kept above is judged
+        // here when it lands.
+        if !owner_as_held(&ctx.store)? {
+            return Err(FollowError::Mismatch(
+                "a sequencer move signed by a DID that is not the channel's owner",
+            ));
         }
     }
     // Rule 12: the owner's signature, exactly, and nothing of this server's:
@@ -1846,6 +1862,7 @@ mod tests {
                 "member-add",
                 "member-remove",
                 "sequencer-set",
+                "key-link",
             ]
             .map(String::from)
             .to_vec(),
@@ -2554,6 +2571,79 @@ mod tests {
     /// the move from the new sequencer under its share with the old one, and
     /// from the set's `seq` on expects the new one: the old sequencer's
     /// records past it are refused, and the new one's need a share with it.
+    /// The owner links its key and then moves the channel with the new key
+    /// (JEP-0005 rules 7b, 11a). A follower that has not yet received the
+    /// link keeps the move rather than refusing it, takes the link from the
+    /// new sequencer, and then lands the move: its owner is judged with the
+    /// link in place.
+    #[tokio::test]
+    async fn a_move_by_a_key_the_follower_has_not_seen_linked_yet_lands_once_the_link_does() {
+        let mut owner = Owner::new().await;
+        owner.text("before the link").await;
+        let follower = owner.follower();
+        for sent in &owner.sent {
+            take(&follower, &owner, sent).await.unwrap();
+        }
+        let rotated = SigningKey::from_bytes(&[61; 32]);
+        let channel: cid::Cid = owner.channel.parse().unwrap();
+        let link = jig_core::key_link::SignedKeyLink::sign(
+            &owner.user,
+            &rotated,
+            jig_core::key_link::Audience::Channel {
+                channel_id: channel.to_bytes(),
+            },
+            1_700_000_000,
+        )
+        .unwrap();
+        let meta = serde_json::to_value(
+            jig_core::sequencer_move::KeyLinkBlock {
+                channel_id: owner.channel.clone(),
+                link,
+            }
+            .to_metadata(),
+        )
+        .unwrap();
+        owner
+            .post_parts(
+                BlockKind::KeyLink,
+                signed(&rotated, BlockKind::KeyLink, meta),
+            )
+            .await;
+        let linked = owner.sent.last().unwrap();
+        let new = SigningKey::from_bytes(&[62; 32]);
+        let moved = move_to(&owner, &new, &rotated);
+
+        // The link is not here yet: the move is kept, not refused.
+        assert!(matches!(
+            take_from(&follower, &moved, &did(&new)).await,
+            Err(FollowError::Gap { .. })
+        ));
+        assert!(
+            follower
+                .store
+                .chain_evidence(&owner.channel)
+                .unwrap()
+                .is_empty()
+        );
+        // The link, from the new sequencer: then the move lands.
+        take_from(&follower, linked, &did(&new)).await.unwrap();
+        assert_eq!(
+            follower
+                .store
+                .expected_sequencer(&owner.channel, 9)
+                .unwrap(),
+            Some(did(&new))
+        );
+        assert_eq!(follower.store.pending_move(&owner.channel).unwrap(), None);
+        assert!(
+            follower
+                .store
+                .chain_evidence(&owner.channel)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn a_follower_takes_a_move_and_then_holds_the_channel_to_the_new_sequencer() {
         let mut owner = Owner::new().await;

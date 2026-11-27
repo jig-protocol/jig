@@ -1671,6 +1671,7 @@ mod tests {
                 high: None,
                 moves: Vec::new(),
                 key_links: Vec::new(),
+                gaps: Vec::new(),
             },
         )
         .unwrap();
