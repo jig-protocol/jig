@@ -207,7 +207,11 @@ impl TestJigServer {
     async fn mint_key() -> Result<(TempDir, String)> {
         let server = Self::start().await?;
         let did = server.server_did_string.clone();
-        server._handle.abort();
+        let handle = server._handle;
+        handle.abort();
+        // Wait for the aborted task to finish, so nothing of it still holds
+        // the store when the pair boots over the same tempdir.
+        let _ = handle.await;
         Ok((server._tempdir, did))
     }
 
