@@ -403,6 +403,7 @@ pub async fn request_key_package(
                 ttl: HOLD_SECS,
                 max_per_did: MAX_HELD_PER_DID,
                 max_per_requester: MAX_HELD_PER_REQUESTER,
+                forget_expired_before: forget_expired_before(now, window),
             };
             return match store.hold_kp_request(&hold).map_err(persist_err)? {
                 Held::New(id) | Held::Already(id) => {
@@ -450,6 +451,15 @@ pub async fn request_key_package(
             .map_err(persist_err)?;
     }
     answer(&state, &did, &request, &channel_id, released?)
+}
+
+/// Requests held at or before this, and expired undecided, are forgotten.
+/// A copy of one was signed at most `window` after it was held, so by now it
+/// is answered `STALE_REQUEST` before the store is asked: past `HOLD_SECS` and
+/// twice the window, no copy is fresh.
+fn forget_expired_before(now: i64, window: i64) -> i64 {
+    now.saturating_sub(HOLD_SECS)
+        .saturating_sub(window.saturating_mul(2))
 }
 
 /// The answer to a request, for what [`release`] did.
@@ -680,7 +690,9 @@ pub async fn held_requests(
 /// The body is `did`'s own `jig-kp-decision-v1`, naming this server and the
 /// request. A request held for another DID, or none, is `404 NO_SUCH_REQUEST`,
 /// whichever it is, so a decision tells nothing of another DID's holds; one
-/// decided already is `409 DECIDED`.
+/// decided already, or expired, is `409 DECIDED`. A request that expired
+/// longer ago than [`forget_expired_before`] is forgotten, and is
+/// `404 NO_SUCH_REQUEST`.
 pub async fn decide(
     State(state): State<Arc<AppState>>,
     Path((did, request_id)): Path<(String, String)>,
@@ -1948,5 +1960,17 @@ mod tests {
         // A fresh request is held anew.
         let fresh = ask(&state, 5, 4, &custodian, now()).await.unwrap_err();
         assert_ne!(held_id(&fresh), id);
+    }
+
+    #[tokio::test]
+    async fn a_copy_of_a_forgotten_request_is_stale() {
+        let state = custodian_with_policy().await;
+        let window = i64::try_from(state.config.custody.request_window_secs).unwrap();
+        let now = now();
+        // The latest a request forgotten now could have been signed: held at
+        // the cutoff, signed one window after.
+        let signed = forget_expired_before(now, window) + window;
+        let copy = ask(&state, 5, 4, &ours(&state), signed).await.unwrap_err();
+        assert_eq!(code(&copy).1, "STALE_REQUEST");
     }
 }

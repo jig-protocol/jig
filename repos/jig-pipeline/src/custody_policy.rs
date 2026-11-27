@@ -71,6 +71,10 @@ pub struct NewHold<'a> {
     pub max_per_did: usize,
     /// Most requests held for one requester at once, across every DID.
     pub max_per_requester: usize,
+    /// Requests that expired undecided and were held at or before this are
+    /// forgotten: no copy of one is fresh enough to be asked again. Decided
+    /// requests are the DID's own log and are kept.
+    pub forget_expired_before: i64,
 }
 
 /// What became of a request to hold.
@@ -179,6 +183,10 @@ impl SqliteStore {
         let mut conn = self.conn.lock().expect("poisoned");
         let tx = conn.transaction()?;
         expire_on(&tx, hold.now.saturating_sub(hold.ttl))?;
+        tx.execute(
+            "DELETE FROM kp_holds WHERE state = 'expired' AND held_at <= ?1",
+            [hold.forget_expired_before],
+        )?;
         let waiting: Option<Vec<u8>> = tx
             .query_row(
                 "SELECT request_id FROM kp_holds
@@ -399,6 +407,7 @@ mod tests {
             ttl: TTL,
             max_per_did: 8,
             max_per_requester: 8,
+            forget_expired_before: 0,
         }
     }
 
@@ -595,5 +604,39 @@ mod tests {
             ..hold(&[3; 32], "did:jig:zS", "c1")
         };
         assert_eq!(s.hold_kp_request(&late).unwrap(), Held::Settled);
+    }
+
+    #[test]
+    fn an_expired_request_is_forgotten_and_a_decided_one_kept() {
+        let s = store();
+        let rows = |s: &SqliteStore| -> Vec<(Vec<u8>, String)> {
+            let conn = s.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT request_id, state FROM kp_holds ORDER BY held_at, rowid")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        s.hold_kp_request(&hold(&[1; 32], "did:jig:zR", "c1"))
+            .unwrap();
+        s.hold_kp_request(&hold(&[2; 32], "did:jig:zS", "c1"))
+            .unwrap();
+        assert_eq!(decide(&s, D, [1; 32], false, 110), Decided::Refused);
+        // [2] expires undecided; a hold past the window forgets it.
+        let later = NewHold {
+            now: 100 + TTL + 50,
+            forget_expired_before: 100,
+            ..hold(&[3; 32], "did:jig:zT", "c1")
+        };
+        assert_eq!(s.hold_kp_request(&later).unwrap(), Held::New([3; 32]));
+        assert_eq!(
+            rows(&s),
+            vec![
+                (vec![1; 32], "refused".to_string()),
+                (vec![3; 32], "held".to_string())
+            ]
+        );
     }
 }

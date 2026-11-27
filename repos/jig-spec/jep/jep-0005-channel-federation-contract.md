@@ -418,9 +418,9 @@ Non-goals for v0.2:
      - A custodian MUST bound what it holds: per DID, and per requester across every DID
        it holds for. The bound per DID caps what one DID's queue costs the custodian; the
        bound per requester keeps one requester from filling every DID's queue. Neither
-       stops many requesters, which cost nothing to mint, from filling one DID's queue:
-       until the DID refuses them or they expire, further requesters for that DID are
-       answered `HELD_FULL`. Requesters the DID's policy releases to are released as
+       stops many requesters that each pass admission from filling one DID's queue; the
+       server's admission policy is what bounds them. Until the DID refuses them or they
+       expire, further requesters for that DID are answered `HELD_FULL`. Requesters the DID's policy releases to are released as
        before, since they are never held. A request past a bound is answered
        `429 HELD_FULL` with when to try again. It is neither held nor released. A request
        undecided for 7 days expires and is no longer decided, so a queue nobody reads
@@ -428,7 +428,11 @@ Non-goals for v0.2:
        per requester.
      - A held request sent again after it was decided, or after it expired, is answered
        `409 DECIDED` and is not held again; the requester signs a fresh request.
-     - Every hold, decision and release is logged, as in 21a.
+     - A custodian MAY drop an expired request's entry once no copy of it could pass the
+       acceptance window (21a), and then answers a decision for it `404 NO_SUCH_REQUEST`.
+       Decided requests are the DID's own log and are kept.
+     - Every hold, decision and release is logged, as in 21a, except an expired entry
+       dropped as above.
 
      The Welcome mailbox and one package per device are not yet defined.
 
