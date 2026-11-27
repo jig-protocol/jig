@@ -270,6 +270,11 @@ Non-goals for v0.2:
 
        Because `head` sits inside the owner's signature, the new sequencer cannot
        choose where the move cuts the chain.
+     - **One slug per sequencer.** A slug names one channel per sequencer (1). A server
+       MUST NOT issue a move accept for a channel whose slug it already holds, including
+       an archived one; it refuses with `SLUG_TAKEN`. A follower that would hold two
+       channels of one slug under one sequencer stops the channel, with the evidence
+       kept. The owner renames the channel before moving it.
      - **The expected sequencer.** A reader keeps, per channel, a schedule of who signs
        each range of `seq`:
        - from `seq` 0, the server the `channel-create` names, along its public key
