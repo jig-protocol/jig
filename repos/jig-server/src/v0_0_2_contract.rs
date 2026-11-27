@@ -499,11 +499,10 @@ impl Contracts {
             Ok(Vec::new())
         })();
         match pushed {
-            // A peer the move did not reach, the sequencer it moved from
-            // included, keeps the channel due: the next tick sends it again.
+            // A peer the move did not reach gets it when it next connects
+            // ([`Self::replay_moves`]), or with its re-offer's resend.
             Ok(unreached) if !unreached.is_empty() => {
                 tracing::debug!(channel = %channel.id, ?unreached, "the move waits for peers to connect");
-                all = false;
             }
             Ok(_) => {}
             Err(e) => {
@@ -2785,9 +2784,10 @@ mod tests {
     }
 
     /// A move reaches the servers that were away when it landed (JEP-0005
-    /// rule 11a): the sequencer it moved from once a connection to it takes
-    /// the move, and a follower with each resend of its re-offer, before the
-    /// re-offer it judges by the move.
+    /// rule 11a), without the decider sending it again while they are away:
+    /// the sequencer it moved from on each new connection, and a follower
+    /// with each resend of its re-offer, before the re-offer it judges by
+    /// the move.
     #[tokio::test]
     async fn a_move_reaches_the_servers_that_were_away() {
         let p = pair(OfferPolicy::Accept).await;
@@ -2842,10 +2842,24 @@ mod tests {
             .get_channel_by_id(&channel)
             .unwrap()
             .unwrap();
-        assert!(!contracts.reoffer_each(&row, &cid).await, "not reached yet");
+        // Away: the move is not queued to it, and nothing keeps the channel
+        // due, so tick after tick sends nothing to the followers again.
+        contracts.replay_moves();
+        assert!(contracts.reoffer_each(&row, &cid).await);
+        for _ in 0..3 {
+            contracts.resume_reoffers().await;
+        }
+        assert!(
+            contracts
+                .reoffers_due()
+                .as_ref()
+                .is_none_or(|due| due.iter().all(|(c, _)| *c != channel)),
+            "the channel is not due again"
+        );
+        // It connects: the move goes on its new connection.
         let (sender, mut gone_rx) = crate::v0_0_2_peer::PeerSender::new(gone);
         p.follower.peers.register(sender);
-        assert!(contracts.reoffer_each(&row, &cid).await, "reached");
+        contracts.replay_moves();
         assert!(matches!(
             gone_rx.try_recv().map(|e| e.frame),
             Ok(jig_pipeline::envelope::Frame::Peer { kind, .. }) if kind == crate::v0_0_2_stream::RECORDS_FRAME

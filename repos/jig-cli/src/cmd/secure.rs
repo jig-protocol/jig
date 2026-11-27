@@ -216,6 +216,7 @@ pub async fn connect_pinned(server: &str, identity: Identity) -> Result<Client> 
             .unwrap_or_default(),
         carried: pins.carried_signers(server),
         owners: pins.owners(server),
+        moves: pins.moves(server),
     };
     let client = Client::connect_with_options(server, identity, options)
         .await
@@ -930,24 +931,19 @@ impl Secure {
         // listed (JEP-0005 rule 11a) is held to that server by the chain's
         // moves; its pin stays as it was pinned.
         if let Some(moved_to) = pins.moved_to(&self.server, &info.id) {
-            let listed = match other {
-                Some(sequencer) => !names_another_server(&[moved_to.to_string()], sequencer),
-                None => !names_another_server(&ours, moved_to),
-            };
-            if listed {
-                if let Some(sequencer) = other {
-                    prove_carried_after_move(
-                        &self.server,
-                        &info.slug,
-                        &info.id,
-                        sequencer,
-                        &ours,
-                        info.share.as_deref(),
-                        moved_to,
-                    )?;
-                }
-                return Ok(());
+            listing_matches_move(&self.server, &info.slug, &ours, other, moved_to)?;
+            if let Some(sequencer) = other {
+                prove_carried_after_move(
+                    &self.server,
+                    &info.slug,
+                    &info.id,
+                    sequencer,
+                    &ours,
+                    info.share.as_deref(),
+                    moved_to,
+                )?;
             }
+            return Ok(());
         }
         let owner = match other {
             Some(sequencer) => Some(prove_carried(
@@ -1984,6 +1980,18 @@ impl Secure {
 
     /// Move the head to the newest block of `delivered`, with its record.
     fn move_head(&self, slug: &str, delivered: &[DeliveredBlock]) -> Result<()> {
+        self.move_head_with(slug, delivered, None)
+    }
+
+    /// [`Self::move_head`], keeping the sequencer moves `chain` verified on
+    /// the way: a later sync's chain, rebuilt from the saved head, holds the
+    /// records past them to the new sequencer.
+    fn move_head_with(
+        &self,
+        slug: &str,
+        delivered: &[DeliveredBlock],
+        chain: Option<&ChannelChain>,
+    ) -> Result<()> {
         // Never past a block this reader stopped at.
         let (delivered, _) = before_stop(delivered);
         if let Some((d, newest)) = delivered
@@ -1991,8 +1999,13 @@ impl Secure {
             .rev()
             .find_map(|d| placed_cid(d).map(|cid| (d, cid)))
         {
-            self.session
-                .set_head(&self.server, &self.key(slug), &newest, d.ingest.as_ref())?;
+            self.session.set_head_with_moves(
+                &self.server,
+                &self.key(slug),
+                &newest,
+                d.ingest.as_ref(),
+                chain.map_or(&[], ChannelChain::moves),
+            )?;
         }
         Ok(())
     }
@@ -2081,7 +2094,7 @@ impl Secure {
             }
             self.replay_into(slug, &mut replayed, &page);
             if replayed.stopped.is_some() {
-                self.move_head(slug, &page)?;
+                self.move_head_with(slug, &page, chain.as_ref())?;
                 return Ok(Forwarded::Done(replayed));
             }
             // A page of only non-critical blocks of unknown kinds moves the
@@ -2089,7 +2102,7 @@ impl Secure {
             let Some(last) = page.iter().rev().find_map(placed_cid) else {
                 return Ok(Forwarded::Done(replayed));
             };
-            self.move_head(slug, &page)?;
+            self.move_head_with(slug, &page, chain.as_ref())?;
             cursor = last;
             if chain.is_none() {
                 chain = self.chain_from_head(slug)?;
@@ -2718,8 +2731,48 @@ fn shadow_note(reference: &str, own: &ChannelInfo, carried: &ChannelInfo) -> Str
     )
 }
 
+/// Whether a listing of `slug` on `server` agrees with the move this device
+/// verified to `moved_to` (JEP-0005 rule 11a): `other` is the sequencer the
+/// listing names, `None` for `server` itself, whose DIDs are `ours`. One
+/// that names another sequencer contradicts the chain, and is refused
+/// rather than read as the channel's first pin.
+fn listing_matches_move(
+    server: &str,
+    slug: &str,
+    ours: &[String],
+    other: Option<&str>,
+    moved_to: &str,
+) -> Result<()> {
+    let listed = match other {
+        Some(sequencer) => !names_another_server(&[moved_to.to_string()], sequencer),
+        None => !names_another_server(ours, moved_to),
+    };
+    anyhow::ensure!(
+        listed,
+        "{server} lists `{slug}` as ordered by {}, but this device verified the channel \
+         moving to {moved_to}",
+        other.unwrap_or(server),
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// A listing after a verified move must name the sequencer the channel
+    /// moved to (JEP-0005 rule 11a); one naming the old sequencer, or this
+    /// server when it is not the new one, is refused.
+    #[test]
+    fn a_listing_must_agree_with_the_verified_move() {
+        let ours = vec!["did:jig:here".to_string()];
+        let check = |other: Option<&str>, moved_to: &str| {
+            crate::cmd::secure::listing_matches_move("s.example", "#ops", &ours, other, moved_to)
+        };
+        assert!(check(Some("did:jig:new"), "did:jig:new").is_ok());
+        assert!(check(None, "did:jig:here").is_ok());
+        assert!(check(Some("did:jig:old"), "did:jig:new").is_err());
+        assert!(check(None, "did:jig:new").is_err());
+    }
     use super::{
         Asked, ChannelInfo, KeptAnswer, LocalAdds, LogWalk, RELEASE_PAGE, RecordBody, Refused,
         ReleaseEntry, ServerState, creation_group_id, first_release, forget_stock_refs, group_name,
