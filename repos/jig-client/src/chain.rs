@@ -73,6 +73,16 @@ pub struct ChainHead {
     pub gaps: Vec<HeadGap>,
 }
 
+/// The most runs a head keeps open ([`ChainHead::gaps`]): past it the
+/// oldest is dropped with its provisional links, which then count for
+/// nothing. A server that skips a live stream ahead again and again cannot
+/// grow the pin without bound.
+pub const MAX_HEAD_GAPS: usize = 64;
+
+/// The most provisional key links one run keeps ([`HeadGap::links`]): past
+/// it the run is dropped whole.
+pub const MAX_GAP_LINKS: usize = 64;
+
 /// A run of records, `from` up to `to` (exclusive), that a chain went past
 /// and has not yet filled in order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -796,8 +806,14 @@ impl ChannelChain {
         let kept = match connected {
             // Inside a run still open: provisional until the run connects.
             Some(Connected { run: Some(to), .. }) => {
-                if let Some(gap) = head.gaps.iter_mut().find(|g| g.to == to) {
-                    gap.links.push(link);
+                if let Some(at) = head.gaps.iter().position(|g| g.to == to) {
+                    if head.gaps[at].links.len() < MAX_GAP_LINKS {
+                        head.gaps[at].links.push(link);
+                    } else {
+                        // More links than a run keeps: the run, and every
+                        // link in it, counts for nothing.
+                        head.gaps.remove(at);
+                    }
                 }
                 return;
             }
@@ -933,6 +949,9 @@ impl ChannelChain {
                 // The run gone past, with the hashes it must connect.
                 Some(head) => {
                     let mut next = head.after(record);
+                    if next.gaps.len() >= MAX_HEAD_GAPS {
+                        next.gaps.remove(0);
+                    }
                     next.gaps.push(HeadGap {
                         from,
                         to,
@@ -1285,6 +1304,46 @@ mod tests {
         );
         assert_eq!(forked.owners_at(set.seq), [did(&owner)]);
         assert!(forked.head().unwrap().gaps.is_empty());
+    }
+
+    /// The runs a head keeps open are capped ([`MAX_HEAD_GAPS`]): past it the
+    /// oldest goes, and a run filled into it afterwards connects nothing and
+    /// is no fork; its key link counts for nothing.
+    #[test]
+    fn a_head_keeps_at_most_max_head_gaps_runs() {
+        let did = |k: &ed25519_dalek::SigningKey| {
+            jig_core::Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        };
+        let (owner, rotated) = (generate_signing_key(), generate_signing_key());
+        let mut server = Seq::new();
+        let old = server.did();
+        let create = server.push("bafyCreate", 10);
+        let (link_bundle, link_sig, link_cid, _) = key_link_block(&owner, &rotated);
+        let linked = server.push_cid(&link_cid, 20);
+        let mut chain =
+            ChannelChain::new(&label_cid("bafyCreate"), &old, None).with_owners(vec![did(&owner)]);
+        assert_eq!(chain.accept(&create, None), Ok(Step::Next));
+        // One gap past the link, then MAX_HEAD_GAPS more, each skipping one.
+        for i in 0..=MAX_HEAD_GAPS {
+            server.push(&format!("skipped {i}"), 30 + 2 * i as u64);
+            let ahead = server.push(&format!("ahead {i}"), 31 + 2 * i as u64);
+            assert!(matches!(
+                chain.accept_live(&ahead, None),
+                Ok(Step::Gap { .. })
+            ));
+        }
+        let head = chain.head().unwrap();
+        assert_eq!(head.gaps.len(), MAX_HEAD_GAPS);
+        assert!(
+            head.gaps.iter().all(|g| g.from > linked.seq),
+            "the oldest went"
+        );
+        // Filled into the dropped run: behind, no fork, and no owner moved.
+        assert_eq!(
+            chain.accept_block(&linked, None, &link_bundle, Some(&link_sig)),
+            Ok(Step::Behind)
+        );
+        assert_eq!(chain.owners_at(u64::MAX), [did(&owner)]);
     }
 
     /// A chain that starts with no head (a new connection) takes a move as
