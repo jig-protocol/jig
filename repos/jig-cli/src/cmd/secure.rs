@@ -236,8 +236,8 @@ pub async fn connect_pinned(server: &str, identity: Identity) -> Result<Client> 
 
 /// A reachability record as a server serves it.
 #[derive(Debug, Deserialize)]
-struct RecordBody {
-    record_b64: String,
+pub(crate) struct RecordBody {
+    pub(crate) record_b64: String,
 }
 
 /// Hold the server at `url` to `server_did` with its signed welcome, without
@@ -1152,7 +1152,7 @@ impl Secure {
     }
 
     /// The DID this device pinned for its server.
-    async fn server_did(&self) -> Result<String> {
+    pub(crate) async fn server_did(&self) -> Result<String> {
         self.ensure_pinned().await?;
         Pins::load(&Pins::default_path())?
             .offer(&self.server)
@@ -2371,6 +2371,46 @@ impl Secure {
             tidy: synced.tidy,
             ..shown
         })
+    }
+
+    /// The owner's contract records in `slug`'s log, oldest first, each
+    /// opened and its author's signature checked: every `contract-accept` and
+    /// `contract-end` block in the channel's history (JEP-0005 rules 10, 11).
+    /// The walk pages back from the newest block to the first, at most
+    /// [`MAX_CATCH_UP_PAGES`] pages. Whether it reached the first.
+    pub async fn contract_records(
+        &self,
+        slug: &str,
+    ) -> Result<(Vec<jig_client::open::OpenedBlock>, bool)> {
+        use jig_core::BlockKind;
+        let mut records = Vec::new();
+        let mut page = self
+            .history_page(slug, MAX_HISTORY_PAGE, Page::Newest)
+            .await?;
+        for _ in 0..MAX_CATCH_UP_PAGES {
+            if page.is_empty() {
+                records.reverse();
+                return Ok((records, true));
+            }
+            for delivered in page.iter().rev() {
+                if let Ok(opened) = jig_client::open::open(delivered)
+                    && matches!(
+                        opened.manifest.kind,
+                        Some(BlockKind::ContractAccept | BlockKind::ContractEnd)
+                    )
+                {
+                    records.push(opened);
+                }
+            }
+            let Some(oldest) = page.first().and_then(placed_cid) else {
+                break;
+            };
+            page = self
+                .history_page(slug, MAX_HISTORY_PAGE, Page::Before(&oldest))
+                .await?;
+        }
+        records.reverse();
+        Ok((records, false))
     }
 
     /// One page of the channel's history, oldest first: the newest `limit`

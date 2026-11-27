@@ -731,24 +731,217 @@ pub async fn kick(ctx: &CliContext, slug: String, who: String) -> Result<()> {
     let did = resolve_who(ctx, &who).await?;
     let secure = Secure::open(ctx)?;
     let info = visible_channel(&secure, &slug).await?;
-    let id = secure.identity();
-    let cid = if info.encrypted() {
-        let server = secure.server().to_string();
-        secure
-            .commit(
-                &slug,
-                |s, key| Ok(s.prepare_remove(&server, key, &did)?),
-                |c| build_member_remove(id, &slug, &did, mls_fields(c), now(id)),
-            )
-            .await?
-    } else {
-        secure
-            .submit(&build_member_remove(id, &slug, &did, json!({}), now(id)))
-            .await?
-    };
+    let cid = remove_member(&secure, &slug, &info, &did).await?;
     println!("removed {did} from {slug}");
     println!("  block_cid: {cid}");
     Ok(())
+}
+
+/// Remove `did` from the channel: a `member-remove`, carrying the commit
+/// that takes its leaf out of the group on an encrypted channel.
+async fn remove_member(
+    secure: &Secure,
+    slug: &str,
+    info: &ChannelInfo,
+    did: &str,
+) -> Result<String> {
+    let id = secure.identity();
+    if info.encrypted() {
+        let server = secure.server().to_string();
+        secure
+            .commit(
+                slug,
+                |s, key| Ok(s.prepare_remove(&server, key, did)?),
+                |c| build_member_remove(id, slug, did, mls_fields(c), now(id)),
+            )
+            .await
+    } else {
+        secure
+            .submit(&build_member_remove(id, slug, did, json!({}), now(id)))
+            .await
+    }
+}
+
+/// Apply `jig channel prune <channel> --via <server-did> [--yes]`: after
+/// `via` stopped carrying the channel, remove the members who reached it only
+/// through `via` ([`crate::cmd::prune`]). Without `yes` it only says what it
+/// would do. Against the channel's own server, which alone saw which server
+/// relayed each member's writes.
+pub async fn prune(ctx: &CliContext, slug: String, via: String, yes: bool) -> Result<()> {
+    use crate::cmd::prune::{Share, Verdict};
+    let via = canonical_did(&via)?;
+    let secure = Secure::open(ctx)?;
+    let info = visible_channel(&secure, &slug).await?;
+    let server_did = secure.server_did().await?;
+    // The pin says who orders the channel, proven when it was pinned; the
+    // listing alone is the server's word.
+    let pins = jig_client::pins::Pins::load(&jig_client::pins::Pins::default_path())?;
+    let ordered_here = pins
+        .channel(secure.server(), &slug)
+        .is_some_and(|pin| pin.sequencer.as_deref().is_none_or(|s| s == server_did));
+    if !ordered_here {
+        anyhow::bail!(
+            "{slug} is ordered by {}, not by this server: run prune against the channel's \
+             own server, the one that saw which server relayed each member's writes",
+            info.sequencer
+        );
+    }
+    let (records, complete) = secure.contract_records(&slug).await?;
+    match crate::cmd::prune::share_with(&records, &info.id, &server_did, &via) {
+        Share::Ended => {}
+        Share::Live => anyhow::bail!(
+            "{via} still carries {slug}; end the share first with \
+             `jig channel unshare {} {via}`",
+            shell_word(&slug)
+        ),
+        Share::Never if complete => anyhow::bail!(
+            "{slug}'s log holds no share with {via} accepted by this server ({server_did}); \
+             nothing removed. If this server's key has rotated or the channel has moved, prune \
+             cannot judge its members: remove them with `jig channel kick`"
+        ),
+        Share::Never => anyhow::bail!(
+            "no share of {slug} with {via} accepted by this server in the newest {} blocks of \
+             its log; nothing removed. Prune cannot judge its members: remove them with \
+             `jig channel kick`",
+            crate::cmd::secure::MAX_CATCH_UP_PAGES * crate::cmd::secure::MAX_HISTORY_PAGE
+        ),
+    }
+
+    let verdicts = judge_now(&secure, &slug, &via, None).await?;
+    let contacts = &ctx.effective().contacts;
+    let mut removing = Vec::new();
+    for (did, verdict) in &verdicts {
+        let name = contacts.get(did).map(String::as_str).unwrap_or("");
+        match verdict {
+            Verdict::Remove(why) => {
+                println!("remove  {name:<16}  {did}  ({why})");
+                removing.push(did.clone());
+            }
+            Verdict::Keep(why) => println!("keep    {name:<16}  {did}  ({why})"),
+        }
+    }
+    if removing.is_empty() {
+        println!("no one in {slug} reached it only through {via}");
+        return Ok(());
+    }
+    if !yes {
+        println!(
+            "nothing removed; run `jig channel prune {} --via {via} --yes` to remove {}",
+            shell_word(&slug),
+            if removing.len() == 1 {
+                "them".to_string()
+            } else {
+                format!("these {}", removing.len())
+            }
+        );
+        return Ok(());
+    }
+    for did in removing {
+        // Judged again just before its removal, from the membership as it is
+        // now and this member's own reachability record: a member who has
+        // since written here directly, or been listed elsewhere, is kept. The
+        // server does not check this on `member-remove`, so a write that
+        // lands between this check and the removal is not seen.
+        let now = judge_now(&secure, &slug, &via, Some(&did)).await?;
+        if !now
+            .iter()
+            .any(|(d, v)| *d == did && matches!(v, Verdict::Remove(_)))
+        {
+            println!("kept    {did}  (no longer reached {slug} only through {via})");
+            continue;
+        }
+        let cid = remove_member(&secure, &slug, &info, &did)
+            .await
+            .with_context(|| {
+                format!(
+                    "removing {did}; those listed after it were not removed. Each removal \
+                     printed above landed; run `jig channel prune {} --via {via} --yes` \
+                     again to finish: it judges from the membership as it is now",
+                    shell_word(&slug)
+                )
+            })?;
+        println!("removed {did}  (block_cid: {cid})");
+    }
+    Ok(())
+}
+
+/// The prune verdict for each member of `slug`, from its membership and
+/// reachability records as this server holds them now. With `only`, the
+/// reachability record of that member alone is read, so only its verdict is
+/// to be used.
+async fn judge_now(
+    secure: &Secure,
+    slug: &str,
+    via: &str,
+    only: Option<&str>,
+) -> Result<Vec<(String, crate::cmd::prune::Verdict)>> {
+    use crate::cmd::prune::Member;
+    let body: MembersResponse = secure
+        .get_json(&format!(
+            "/api/v1/channels/{}/members",
+            escape_slug_for_url(slug)
+        ))
+        .await?;
+    let canonical = |d: &str| canonical_did(d).unwrap_or_else(|_| d.to_string());
+    let members: Vec<Member> = body
+        .members
+        .into_iter()
+        .map(|m| Member {
+            did: canonical(&m.did),
+            role: m.role,
+            last_via: m.last_via.as_deref().map(canonical),
+        })
+        .collect();
+    let me = secure.identity().did_string();
+    let mut reach = std::collections::HashMap::new();
+    for m in members
+        .iter()
+        .filter(|m| m.last_via.as_deref() == Some(via))
+        .filter(|m| only.is_none_or(|did| m.did == did))
+    {
+        if let Some(servers) = reach_servers(secure, &m.did).await? {
+            reach.insert(m.did.clone(), servers);
+        }
+    }
+    Ok(crate::cmd::prune::judge(&members, via, &me, &reach))
+}
+
+/// `s` as one shell word: as it is when it holds only characters no shell
+/// treats specially, else single-quoted. A slug starts with `#`, which a
+/// shell reads as the start of a comment.
+fn shell_word(s: &str) -> std::borrow::Cow<'_, str> {
+    let plain = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:@=+,%".contains(c));
+    if plain {
+        s.into()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''")).into()
+    }
+}
+
+/// The servers `did`'s reachability record lists, if this server keeps one
+/// that `did` signed. `None` when it keeps none.
+async fn reach_servers(secure: &Secure, did: &str) -> Result<Option<Vec<String>>> {
+    use base64::Engine as _;
+    match secure
+        .get_json::<crate::cmd::secure::RecordBody>(&format!("/api/v1/reach/{did}"))
+        .await
+    {
+        Ok(body) => Ok(base64::engine::general_purpose::STANDARD
+            .decode(body.record_b64)
+            .ok()
+            .and_then(|e| jig_core::naming::ReachabilityRecord::from_envelope(&e).ok())
+            .filter(|r| r.did == did)
+            .map(|r| r.servers.into_iter().map(|(server, _)| server).collect())),
+        Err(e)
+            if e.downcast_ref::<Refused>()
+                .is_some_and(|r| matches!(r.status, 403 | 404)) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Apply `jig channel leave <slug>`. The owner archives instead.
@@ -1387,13 +1580,16 @@ fn channel_lines(channels: &[ChannelView]) -> Vec<String> {
         .unwrap_or(0)
         .max(10);
     // A slug two listed channels share: this server's own and one it carries
-    // for another server (#388). Each such line says which it is.
+    // for another server (#388). Each such line says which it is, with the
+    // link that names it alone. The whole id: every channel id starts with
+    // the same CID header, so a prefix would tell them apart by a few
+    // characters at best.
     let shared = |slug: &str| channels.iter().filter(|c| c.slug == slug).count() > 1;
     channels
         .iter()
         .map(|c| {
             let collision = if shared(&c.slug) && !c.id.is_empty() {
-                format!("  (slug shared: id {}, ordered by {})", c.id, c.sequencer)
+                format!("  (slug shared: jig:{}, ordered by {})", c.id, c.sequencer)
             } else {
                 String::new()
             };
@@ -1422,6 +1618,16 @@ fn channel_lines(channels: &[ChannelView]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// A hint's channel is one shell word: a `#slug` is quoted, so the shell
+    /// does not read the rest of the command as a comment.
+    #[test]
+    fn a_hinted_channel_is_one_shell_word() {
+        assert_eq!(super::shell_word("#ops"), "'#ops'");
+        assert_eq!(super::shell_word("#it's"), "'#it'\\''s'");
+        assert_eq!(super::shell_word("did:jig:z6Mk"), "did:jig:z6Mk");
+        assert_eq!(super::shell_word(""), "''");
+    }
+
     use super::*;
 
     /// `jig channel move` goes ahead only when the current sequencer
@@ -1556,11 +1762,11 @@ mod tests {
             view("#solo", "bafysolo", "did:jig:zfollower"),
         ]);
         assert!(
-            lines[0].contains("slug shared: id bafyown, ordered by did:jig:zfollower"),
+            lines[0].contains("slug shared: jig:bafyown, ordered by did:jig:zfollower"),
             "{lines:?}"
         );
         assert!(
-            lines[1].contains("slug shared: id bafycarried, ordered by did:jig:zowner"),
+            lines[1].contains("slug shared: jig:bafycarried, ordered by did:jig:zowner"),
             "{lines:?}"
         );
         assert!(!lines[2].contains("slug shared"), "{lines:?}");

@@ -372,6 +372,8 @@ mod tests {
                     // Negotiated per hello, not in the manifest, so it must
                     // not count as a contradiction of it.
                     request_auth: vec![jig_core::request_auth::VERSION.to_string()],
+                    // Likewise negotiated per hello.
+                    heads: true,
                 },
                 reputation: Reputation::none(),
                 nonce: String::new(),
@@ -398,6 +400,7 @@ mod tests {
                 tiers: false,
                 ruleset: false,
                 request_auth: Vec::new(),
+                heads: false,
             },
             peer_policy: PeerPolicy::default(),
         }
