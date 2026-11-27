@@ -523,7 +523,7 @@ mod tests {
         assert_eq!(read.manifest.kind, None);
         assert_eq!(read.manifest.metadata["channel_id"], "c");
 
-        let plain = unknown_manifest("sequencer-set", serde_json::json!({}));
+        let plain = unknown_manifest("future-kind", serde_json::json!({}));
         assert!(UnknownKindManifest::parse(&plain).unwrap().critical);
         let commit = unknown_manifest("opt-reaction", serde_json::json!({"mls_commit": "AA"}));
         assert!(UnknownKindManifest::parse(&commit).unwrap().critical);

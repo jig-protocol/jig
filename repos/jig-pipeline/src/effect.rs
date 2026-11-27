@@ -62,6 +62,10 @@ pub async fn apply_effect(
         | BlockKind::ContractAccept
         | BlockKind::ContractRefuse
         | BlockKind::ContractEnd => Ok(()),
+        // Ingest refuses a submitted move until this server can take a channel
+        // over (JEP-0005 rule 11a); a carried one lands through
+        // `apply_carried_effect`.
+        BlockKind::SequencerSet => Ok(()),
         BlockKind::FedHello => apply_fed_hello(store, &manifest, block_cid),
 
         BlockKind::NsRegister | BlockKind::NsAttestation => apply_ns_attestation(store, &manifest),
@@ -407,6 +411,9 @@ pub fn apply_carried_effect(
         | BlockKind::ContractAccept
         | BlockKind::ContractRefuse
         | BlockKind::ContractEnd => Ok(()),
+        // The move itself lands with its record (`follow::ingest_sequenced`):
+        // the schedule entry needs the record's `seq`.
+        BlockKind::SequencerSet => Ok(()),
         BlockKind::FedHello
         | BlockKind::NsRegister
         | BlockKind::NsRotate

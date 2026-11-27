@@ -3233,7 +3233,7 @@ mod tests {
                 channel_id: channel.clone(),
                 seq: head + 1,
                 block_cid: "bafkstop".to_string(),
-                kind: "sequencer-set".to_string(),
+                kind: "future-kind".to_string(),
                 found_at: 0,
             })
             .unwrap();
@@ -3258,7 +3258,7 @@ mod tests {
         let listing = list(&p.follower.ingest_ctx.store).unwrap();
         assert!(
             listing.contains(&format!(
-                "needs upgrade: channel {channel} at seq {} uses block kind `sequencer-set`",
+                "needs upgrade: channel {channel} at seq {} uses block kind `future-kind`",
                 head + 1
             )),
             "{listing}"

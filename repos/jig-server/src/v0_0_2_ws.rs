@@ -446,6 +446,7 @@ async fn handle_socket(
                                 &text,
                                 &state,
                                 &sub_tx,
+                                &mut sub_rx,
                                 &mut session,
                                 conn_id,
                                 &mut socket,
@@ -501,6 +502,48 @@ async fn handle_socket(
                         // Sub channel closed (server shutdown path).
                         break;
                     };
+                    // A block of a critical kind added after v0.2.0 that the
+                    // client does not list (a `sequencer-set`, say): it is
+                    // told so, once, and sent nothing of the channel from
+                    // there on (JEP-0005 rule 11a).
+                    let kind = block.block_kind.as_str();
+                    if session.gated
+                        || (jig_core::block_kind::gates_older_readers(kind)
+                            && !session.block_kinds.iter().any(|k| k == kind))
+                    {
+                        session.gated = true;
+                        if session.noticed != session.sub_id
+                            && let Some(channel_id) = &block.channel_id
+                        {
+                            session.noticed = session.sub_id;
+                            let seq = state
+                                .ingest_ctx
+                                .store
+                                .get_chain_record(channel_id, &block.cid)
+                                .ok()
+                                .flatten()
+                                .map_or(0, |r| r.seq);
+                            let notice = jig_pipeline::follow::ReaderGate {
+                                channel_id: channel_id.clone(),
+                                seq,
+                                kind: kind.to_string(),
+                            }
+                            .notice();
+                            if send_error(
+                                &mut socket,
+                                Some(notice.status),
+                                notice.code,
+                                Some(notice.channel_id),
+                                &notice.message,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
                     let receipts = vec![ReceiptRef {
                         server_did: receipt.server_id.clone(),
                         render_hash: receipt.render_hash.clone(),
@@ -607,6 +650,31 @@ struct ConnState {
     /// Whether the hello asked for channel tiers (JEP-0014 rule 5): a client
     /// that did not may read a `public` channel but not post to it.
     tiers: bool,
+    /// The block kinds the hello says its client implements (JEP-0002 rule
+    /// 1). A client is not sent a channel past the first block of a critical
+    /// kind added after `v0.2.0` that it does not list ([`reader_gate`]).
+    block_kinds: Vec<String>,
+    /// The subscription held now reached a block its client cannot read
+    /// ([`reader_gate`]): nothing more of the channel is sent on it.
+    gated: bool,
+}
+
+/// Where a client implementing `block_kinds` stops reading `channel_id`
+/// (JEP-0005 rule 11a; [`jig_pipeline::follow::ReaderGate`]). A subscription
+/// delivers only what lands after it, which is past any gate already in the
+/// chain: so a channel with one answers the subscribe with its notice.
+fn reader_gate(
+    state: &AppState,
+    block_kinds: &[String],
+    channel_id: &str,
+) -> Option<jig_pipeline::follow::ReaderGate> {
+    match state.ingest_ctx.store.reader_gate(channel_id, block_kinds) {
+        Ok(gate) => gate,
+        Err(e) => {
+            tracing::warn!(channel_id, "reading a channel's reader gate: {e}");
+            None
+        }
+    }
 }
 
 /// A handshake that ends with the dialer's [`Frame::PeerProof`].
@@ -675,6 +743,10 @@ async fn handle_client_frame(
     text: &str,
     state: &Arc<AppState>,
     sub_tx: &mpsc::UnboundedSender<(
+        jig_pipeline::persist::StoredBlock,
+        jig_pipeline::persist::StoredReceipt,
+    )>,
+    sub_rx: &mut mpsc::UnboundedReceiver<(
         jig_pipeline::persist::StoredBlock,
         jig_pipeline::persist::StoredReceipt,
     )>,
@@ -993,6 +1065,20 @@ async fn handle_client_frame(
                 (None, Scope::ChannelId { channel_id }) => Some(channel_id.as_str()),
                 (None, Scope::Channel { .. }) => None,
             };
+            if let Some(id) = stopped_id
+                && let Some(gate) = reader_gate(state, &session.block_kinds, id)
+            {
+                let notice = gate.notice();
+                let _ = send_error(
+                    socket,
+                    Some(notice.status),
+                    notice.code,
+                    Some(notice.channel_id),
+                    &notice.message,
+                )
+                .await;
+                return Ok(());
+            }
             if let Some(id) = stopped_id {
                 match state.ingest_ctx.store.carried_upgrade(id) {
                     Ok(None) => {}
@@ -1034,6 +1120,10 @@ async fn handle_client_frame(
             // the life of the process, long after this socket forgot it.
             if let Some(old) = session.sub_id.take() {
                 state.ingest_ctx.fanout.unsubscribe_local(old).await;
+                // Blocks the old subscription had queued are not the new
+                // one's: delivered after it, they would be read under its
+                // scope, and could gate it at another channel's block.
+                while sub_rx.try_recv().is_ok() {}
             } else {
                 // The gauge counts connections holding a subscription; a
                 // replacement is not a second unit.
@@ -1045,6 +1135,28 @@ async fn handle_client_frame(
                 .subscribe_local(sub_scope, who, sub_tx.clone())
                 .await;
             session.sub_id = Some(id);
+            session.gated = false;
+            // A move landed between the check above and this registration
+            // would reach this subscription unnoticed: check again now that
+            // it is registered, and refuse it as above if it is gated.
+            if let Some(gate) = reader_gate(state, &session.block_kinds, &sub_key) {
+                state.ingest_ctx.fanout.unsubscribe_local(id).await;
+                // As on a replacement: what it queued is no later
+                // subscription's.
+                while sub_rx.try_recv().is_ok() {}
+                session.sub_id = None;
+                metrics::subscriber_removed();
+                let notice = gate.notice();
+                let _ = send_error(
+                    socket,
+                    Some(notice.status),
+                    notice.code,
+                    Some(notice.channel_id),
+                    &notice.message,
+                )
+                .await;
+                return Ok(());
+            }
             if let Some(tx) = &session.notice_tx {
                 state.ingest_ctx.fanout.watch_notices(id, tx.clone());
                 // A stop kept between the check above and this registration
@@ -1319,6 +1431,7 @@ async fn complete_hello(
                 .map_err(|err| err.to_string())?;
             session.handshaken = true;
             session.tiers = hello.capabilities.tiers;
+            session.block_kinds = hello.capabilities.block_kinds.clone();
             if let Some(peer_did) = hello.peer_did {
                 session.awaiting_peer = Some(AwaitingPeer {
                     peer_did,
@@ -2586,6 +2699,69 @@ mod tests {
         );
     }
 
+    /// A channel whose chain holds a critical kind added after v0.2.0 (a
+    /// `sequencer-set`, JEP-0005 rule 11a) is read past it only by a client
+    /// whose hello lists the kind: one that does not (every client up to
+    /// v0.2.0 lists no kinds) could not check what follows. A subscription
+    /// delivers only what lands after it, all past the gate, so the
+    /// subscribe is answered `CHANNEL_NEEDS_UPGRADE` at the gate's seq.
+    #[tokio::test]
+    async fn a_moved_channel_is_refused_to_a_client_that_cannot_read_the_move() {
+        let (state, url) = start_test_server().await;
+        let key = jig_core::crypto::ed25519::generate_signing_key();
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+        crate::v0_0_2_federation::complete_peer_handshake(
+            &mut ws,
+            &state.server_did.to_did_jig_string(),
+            &[],
+            &key,
+        )
+        .await
+        .unwrap();
+        seed_channel(&state, "#moved");
+        let id = jig_pipeline::ingest_record::label_cid("#moved");
+        let store = &state.ingest_ctx.store;
+        assert_eq!(reader_gate(&state, &[], &id), None);
+        store.gate_for_tests(&id, 6, "sequencer-set").unwrap();
+        let sub = Envelope::new(Frame::Subscribe {
+            scope: Scope::Channel {
+                slug: "#moved".into(),
+            },
+            auth: None,
+        });
+        ws.send(TMessage::Text(serde_json::to_string(&sub).unwrap().into()))
+            .await
+            .unwrap();
+        let Frame::Error {
+            status,
+            code,
+            ref_cid,
+            message,
+            ..
+        } = next_frame(&mut ws).await.frame
+        else {
+            panic!("expected an error frame");
+        };
+        assert_eq!(status, Some(409));
+        assert_eq!(code, "CHANNEL_NEEDS_UPGRADE");
+        assert_eq!(ref_cid, Some(id.clone()));
+        assert!(message.contains("`sequencer-set` at seq 6"), "{message}");
+        assert_eq!(state.ingest_ctx.fanout.local_subscription_count().await, 0);
+
+        // What decides it: the kinds the hello listed. A non-critical kind
+        // added later never gates.
+        let gate = reader_gate(&state, &[], &id).unwrap();
+        assert_eq!((gate.seq, gate.kind.as_str()), (6, "sequencer-set"));
+        assert!(reader_gate(&state, &["text-render".to_string()], &id).is_some());
+        assert_eq!(
+            reader_gate(&state, &["sequencer-set".to_string()], &id),
+            None
+        );
+        let other = jig_pipeline::ingest_record::label_cid("#skippable");
+        store.gate_for_tests(&other, 2, "opt-reaction").unwrap();
+        assert_eq!(reader_gate(&state, &[], &other), None);
+    }
+
     /// A channel this server stopped at a block kind it does not implement
     /// (JEP-0005 rule 14c) answers a subscribe with the existing error frame,
     /// `CHANNEL_NEEDS_UPGRADE`, naming the channel, the kind and the `seq`.
@@ -2606,7 +2782,7 @@ mod tests {
             channel_id: jig_pipeline::ingest_record::label_cid(slug),
             seq,
             block_cid: "bafkstop".to_string(),
-            kind: "sequencer-set".to_string(),
+            kind: "future-kind".to_string(),
             found_at: 0,
         };
         let expect_stop = |frame: Envelope, slug: &str, seq: u64| {
@@ -2624,7 +2800,7 @@ mod tests {
             assert_eq!(code, "CHANNEL_NEEDS_UPGRADE");
             assert_eq!(ref_cid, Some(jig_pipeline::ingest_record::label_cid(slug)));
             assert!(
-                message.contains(&format!("`sequencer-set` at seq {seq}")),
+                message.contains(&format!("`future-kind` at seq {seq}")),
                 "{message}"
             );
         };

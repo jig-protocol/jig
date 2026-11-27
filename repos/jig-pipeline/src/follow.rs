@@ -103,6 +103,35 @@ pub enum FollowError {
         seq: u64,
         kind: String,
     },
+    /// A record past a `sequencer-set`, signed by a sequencer the channel
+    /// moved away from (JEP-0005 rule 11a): refused, as two keys' words,
+    /// not as a signed proof against either.
+    #[error(
+        "channel {channel_id} moved to {sequencer} before seq {seq}; a record there by {signer} is refused"
+    )]
+    Superseded {
+        channel_id: String,
+        seq: u64,
+        sequencer: String,
+        signer: String,
+    },
+    /// A `sequencer-set` to a sequencer that already orders another channel
+    /// of this slug, an archived one included (JEP-0005 rule 11a). Two
+    /// channels of one slug under one sequencer would make the slug name
+    /// either, so the channel stops here, with the evidence kept, as at a
+    /// block its group refuses.
+    #[error(
+        "channel {channel_id} stopped at seq {seq}: it moved to {sequencer}, which already orders a channel `{slug}`"
+    )]
+    SlugTaken {
+        channel_id: String,
+        seq: u64,
+        sequencer: String,
+        slug: String,
+    },
+    /// A `sequencer-set` that is not a move this server can follow.
+    #[error("the sequencer move is refused: {0}")]
+    Move(#[from] jig_core::sequencer_move::MoveError),
     /// Not followed in this slice.
     #[error("{0}")]
     Unsupported(&'static str),
@@ -208,6 +237,58 @@ impl UpgradeStop {
     }
 }
 
+/// One `sequencer-set` in a channel's chain, as this server keeps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelMove {
+    /// The `seq` of the set's record: the first the new sequencer signs.
+    pub seq: u64,
+    /// The new sequencer's DID.
+    pub sequencer: String,
+    /// The sequencer before it.
+    pub previous: String,
+    pub block_cid: String,
+}
+
+/// A `sequencer-set` that arrived before this server held the head it cites
+/// (JEP-0005 rule 11a), kept as it arrived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingMove {
+    /// The `seq` of the set's record: the cited head's + 1.
+    pub seq: u64,
+    /// The new sequencer, which sent it.
+    pub sequencer: String,
+    manifest: Vec<u8>,
+    code: Vec<u8>,
+    sig: Vec<u8>,
+    record: Vec<u8>,
+}
+
+/// Where a client stops reading a channel (JEP-0005 rules 11a and 14c): the
+/// first block of a critical kind added after `v0.2.0` that the client does
+/// not implement. It is served the channel's records before `seq`, and told
+/// at `seq` that the channel needs it to upgrade.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReaderGate {
+    pub channel_id: String,
+    pub seq: u64,
+    pub kind: String,
+}
+
+impl ReaderGate {
+    pub fn notice(&self) -> crate::fanout::ChannelNotice {
+        crate::fanout::ChannelNotice {
+            status: 409,
+            code: crate::fanout::CHANNEL_NEEDS_UPGRADE,
+            channel_id: self.channel_id.clone(),
+            message: format!(
+                "this channel needs your client to upgrade: block kind `{}` at seq {} is one it \
+                 does not implement, so it is served nothing of the channel from there on",
+                self.kind, self.seq
+            ),
+        }
+    }
+}
+
 /// The kind of a carried block: one this build implements, or one it does
 /// not (JEP-0005 rule 14c).
 enum CarriedKind {
@@ -272,6 +353,29 @@ pub(crate) fn migrate(conn: &rusqlite::Connection) -> crate::persist::Result<()>
             block_cid  TEXT NOT NULL REFERENCES blocks(cid),
             record     BLOB NOT NULL,
             PRIMARY KEY (channel_id, seq)
+        );
+        -- Each `sequencer-set` in a channel's chain (JEP-0005 rule 11a):
+        -- from `seq` on, `sequencer` signs the channel's records, where
+        -- `previous` did before.
+        CREATE TABLE IF NOT EXISTS channel_moves (
+            channel_id TEXT NOT NULL,
+            seq        INTEGER NOT NULL,
+            sequencer  TEXT NOT NULL,
+            previous   TEXT NOT NULL,
+            block_cid  TEXT NOT NULL,
+            PRIMARY KEY (channel_id, seq)
+        );
+        -- A `sequencer-set` that cites a head this server does not hold yet
+        -- (JEP-0005 rule 11a): kept, as it arrived, until the records up to
+        -- that head have landed, then landed itself.
+        CREATE TABLE IF NOT EXISTS pending_moves (
+            channel_id TEXT PRIMARY KEY,
+            seq        INTEGER NOT NULL,
+            sequencer  TEXT NOT NULL,
+            manifest   BLOB NOT NULL,
+            code       BLOB NOT NULL,
+            sig        BLOB NOT NULL,
+            record     BLOB NOT NULL
         );
         CREATE VIEW IF NOT EXISTS chain_records AS
             SELECT block_cid, channel_id, seq, record FROM ingest_records
@@ -430,6 +534,171 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    /// The moves of `channel_id`'s sequencer, oldest first (JEP-0005 rule
+    /// 11a): none for a channel that never moved.
+    pub fn channel_moves(&self, channel_id: &str) -> crate::persist::Result<Vec<ChannelMove>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT seq, sequencer, previous, block_cid FROM channel_moves
+             WHERE channel_id = ?1 ORDER BY seq",
+        )?;
+        let rows = stmt
+            .query_map([channel_id], |r| {
+                Ok(ChannelMove {
+                    seq: r.get::<_, i64>(0)? as u64,
+                    sequencer: r.get(1)?,
+                    previous: r.get(2)?,
+                    block_cid: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The `sequencer-set` kept for `channel_id` until this server holds the
+    /// head it cites, if any.
+    pub fn pending_move(&self, channel_id: &str) -> crate::persist::Result<Option<PendingMove>> {
+        let conn = self.conn.lock().expect("poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT seq, sequencer, manifest, code, sig, record FROM pending_moves
+                 WHERE channel_id = ?1",
+                [channel_id],
+                |r| {
+                    Ok(PendingMove {
+                        seq: r.get::<_, i64>(0)? as u64,
+                        sequencer: r.get(1)?,
+                        manifest: r.get(2)?,
+                        code: r.get(3)?,
+                        sig: r.get(4)?,
+                        record: r.get(5)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    fn keep_pending_move(
+        &self,
+        channel_id: &str,
+        moved: &PendingMove,
+    ) -> crate::persist::Result<()> {
+        self.conn.lock().expect("poisoned").execute(
+            "INSERT OR REPLACE INTO pending_moves
+                 (channel_id, seq, sequencer, manifest, code, sig, record)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                channel_id,
+                moved.seq as i64,
+                moved.sequencer,
+                moved.manifest,
+                moved.code,
+                moved.sig,
+                moved.record
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Whether `sequencer` orders a channel of `slug` here other than
+    /// `except`, archived or not: the rows `UNIQUE (sequencer_did, slug)`
+    /// would hold against a move of `except` to `sequencer`.
+    pub fn slug_held_by(
+        &self,
+        sequencer: &str,
+        slug: &str,
+        except: &str,
+    ) -> crate::persist::Result<bool> {
+        Ok(self.conn.lock().expect("poisoned").query_row(
+            "SELECT EXISTS(SELECT 1 FROM channels
+             WHERE sequencer_did = ?1 AND slug = ?2 AND id != ?3)",
+            params![sequencer, slug, except],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The highest `seq` of `channel_id`'s chain this server holds.
+    fn chain_head_seq(&self, channel_id: &str) -> crate::persist::Result<Option<u64>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let head: Option<i64> = conn.query_row(
+            "SELECT MAX(seq) FROM chain_records WHERE channel_id = ?1",
+            [channel_id],
+            |r| r.get(0),
+        )?;
+        Ok(head.map(|s| s as u64))
+    }
+
+    /// Where a client implementing `client_kinds` stops reading `channel_id`
+    /// ([`ReaderGate`]): the first block in its chain of a kind this build
+    /// implements, that gates older readers
+    /// ([`jig_core::block_kind::gates_older_readers`]), and that the client
+    /// does not list. `None` when it can read the whole chain.
+    pub fn reader_gate(
+        &self,
+        channel_id: &str,
+        client_kinds: &[String],
+    ) -> crate::persist::Result<Option<ReaderGate>> {
+        let gated: Vec<&str> = BlockKind::ALL
+            .iter()
+            .map(BlockKind::as_str)
+            .filter(|k| jig_core::block_kind::gates_older_readers(k))
+            .filter(|k| !client_kinds.iter().any(|c| c == k))
+            .collect();
+        if gated.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT c.seq, b.block_kind FROM chain_records c JOIN blocks b ON b.cid = c.block_cid
+             WHERE c.channel_id = ?1 AND b.block_kind IN (SELECT value FROM json_each(?2))
+             ORDER BY c.seq LIMIT 1",
+        )?;
+        Ok(stmt
+            .query_row(
+                params![channel_id, serde_json::to_string(&gated).expect("strings")],
+                |r| {
+                    Ok(ReaderGate {
+                        channel_id: channel_id.to_string(),
+                        seq: r.get::<_, i64>(0)? as u64,
+                        kind: r.get(1)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// The DID expected to sign `channel_id`'s record at `seq` (JEP-0005
+    /// rule 11a): the sequencer of the latest move at or below `seq`, else
+    /// the one the channel's row names, the sequencer it was created under
+    /// (or, along its key links, the DID that signs for it now). `None` for
+    /// a channel this server holds no row for.
+    ///
+    /// The one lookup for who signs a channel's records here; within the
+    /// first range, the DIDs the sequencer signed as before its key changed
+    /// are [`SqliteStore::owner_predecessors`].
+    pub fn expected_sequencer(
+        &self,
+        channel_id: &str,
+        seq: u64,
+    ) -> crate::persist::Result<Option<String>> {
+        if let Some(moved) = self
+            .channel_moves(channel_id)?
+            .into_iter()
+            .rev()
+            .find(|m| m.seq <= seq)
+        {
+            return Ok(Some(moved.sequencer));
+        }
+        let first = self.channel_moves(channel_id)?.into_iter().next();
+        Ok(match first {
+            // Before the first move: the DID that move took over from.
+            Some(first) => Some(first.previous),
+            None => self
+                .get_channel_by_id_including_archived(channel_id)?
+                .map(|c| crate::effect::canonical_did_string(&c.sequencer_did)),
+        })
+    }
+
     /// The stop kept for `channel_id` at a block it needs an upgrade for, if
     /// any.
     pub fn carried_upgrade(&self, channel_id: &str) -> crate::persist::Result<Option<UpgradeStop>> {
@@ -442,6 +711,41 @@ impl SqliteStore {
                 upgrade_stop,
             )
             .optional()?)
+    }
+
+    /// Keep a block of kind `kind` at `seq` of `channel_id`'s chain, with a
+    /// record signed by a fixed test key, as though the owner's stream had landed
+    /// it: for other crates' tests of what a channel answers a client that
+    /// cannot read the kind ([`Self::reader_gate`]). Returns its CID.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn gate_for_tests(
+        &self,
+        channel_id: &str,
+        seq: u64,
+        kind: &str,
+    ) -> crate::persist::Result<String> {
+        let block_cid = crate::ingest_record::label_cid(&format!("{channel_id} {seq} {kind}"));
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let record = crate::ingest_record::RecordSigner {
+            channel_id: channel_id.to_string(),
+            key: &key,
+            ingest_wall_ms: 1,
+            ingest_logical: 0,
+        }
+        .sign(seq, &block_cid, [0; 32])
+        .map_err(|e| crate::persist::PersistError::Corrupt(e.to_string()))?;
+        let conn = self.conn.lock().expect("poisoned");
+        conn.execute(
+            "INSERT INTO blocks (cid, channel_id, block_kind, sender_did, sender_sig, bundle_bytes,
+                 is_synthetic, hlc_wall_ms, hlc_logical, hlc_origin, posted_at, origin_server)
+             VALUES (?1, ?2, ?3, 'did:jig:zauthor', x'', x'', 1, 1, 0, '', 0, '')",
+            params![block_cid, channel_id, kind],
+        )?;
+        conn.execute(
+            "INSERT INTO carried_records (channel_id, seq, block_cid, record) VALUES (?1, ?2, ?3, ?4)",
+            params![channel_id, seq as i64, block_cid, record.encode()],
+        )?;
+        Ok(block_cid)
     }
 
     /// Keep `stop` as though a critical block of an unknown kind had stopped
@@ -684,6 +988,13 @@ fn note_signature_check() {
 /// checks only that an accepted share of the channel with `sequencer` exists
 /// (`NoShare` otherwise), so a caller that passes a DID the peer merely
 /// claims lets that peer speak for any owner this server follows.
+///
+/// A sequencer move (JEP-0005 rule 11a) is taken from a DID with no share of
+/// the channel: the new sequencer sends its own `sequencer-set`, and then the
+/// records up to the head it cites to a follower behind it, before its
+/// re-offer is accepted. The owner's signature is the move's authority, but
+/// only for a source the operator chose: the caller MUST pass only a DID that
+/// is a configured peer, and SHOULD charge the peer's quota before calling.
 pub async fn ingest_sequenced(
     ctx: &IngestContext,
     bundle: BlockBundle<'_>,
@@ -725,6 +1036,57 @@ pub async fn ingest_sequenced(
         sequencer: sequencer.to_string(),
     };
 
+    // JEP-0005 rule 11a: the channel's moves so far, and whether this block
+    // is the next one. A record past a move is the new sequencer's; one by a
+    // DID the channel moved away from is refused, before anything else is
+    // asked of it.
+    let moves = ctx.store.channel_moves(&channel_id)?;
+    let moving = match kind.known() {
+        Some(BlockKind::SequencerSet) => Some(
+            jig_core::sequencer_move::SequencerSet::from_metadata(&manifest.metadata)?,
+        ),
+        _ => None,
+    };
+    let range = moves.iter().rev().find(|m| m.seq <= record.seq);
+    if let Some(range) = range
+        && moving.is_none()
+        && !crate::handshake::same_did(&record.sequencer, &range.sequencer)
+    {
+        let moved_from = |did: &str| {
+            moves.iter().any(|m| {
+                crate::handshake::same_did(&m.previous, did)
+                    || (m.seq < range.seq && crate::handshake::same_did(&m.sequencer, did))
+            })
+        };
+        if moved_from(&record.sequencer) {
+            return Err(FollowError::Superseded {
+                channel_id,
+                seq: record.seq,
+                sequencer: range.sequencer.clone(),
+                signer: record.sequencer.clone(),
+            });
+        }
+    }
+
+    // A follower behind the head a move cites takes the records up to it
+    // from the new sequencer, which serves them: each is held to the range of
+    // the schedule it falls in, the old sequencer's, whoever serves it
+    // (JEP-0005 rule 11a). Below, `sequencer` is the DID the record is held
+    // to; `link` is the one that sent it.
+    let link = sequencer;
+    let pending = ctx.store.pending_move(&channel_id)?;
+    let backfill_for = match &pending {
+        Some(p)
+            if moving.is_none()
+                && crate::handshake::same_did(&p.sequencer, link)
+                && record.seq < p.seq =>
+        {
+            ctx.store.expected_sequencer(&channel_id, record.seq)?
+        }
+        _ => None,
+    };
+    let sequencer: &str = backfill_for.as_deref().unwrap_or(link);
+
     // The DIDs the owner signed as before `sequencer`, along the key links
     // its offer came with (JEP-0005 rule 7, D37): the channel's creation
     // block may name one of them, and the records signed before the owner's
@@ -748,12 +1110,17 @@ pub async fn ingest_sequenced(
         }
         None
     } else {
+        // Carried for `sequencer`, or for the server it is moving from: the
+        // new sequencer delivers its own `sequencer-set`.
         let chan = ctx
             .store
             .get_channel_by_id_including_archived(&channel_id)?
             .filter(|c| {
                 crate::effect::canonical_did_string(&c.sequencer_did)
                     == crate::effect::canonical_did_string(sequencer)
+                    || moving
+                        .as_ref()
+                        .is_some_and(|m| crate::handshake::same_did(&m.sequencer, sequencer))
             })
             .ok_or_else(not_carried)?;
         let names_it = match manifest
@@ -777,11 +1144,20 @@ pub async fn ingest_sequenced(
         Some(chan)
     };
     // This server carries only what it agreed to: an accepted share of the
-    // channel, with this sequencer.
-    if !ctx.store.has_accepted_share(&channel_id, sequencer)? {
+    // channel, with this sequencer. A move is taken under the share with the
+    // sequencer it moves from: its authority is the owner's signature, and
+    // the new sequencer's share comes after it, by a re-offer.
+    let share_with = match (&moving, record.seq.checked_sub(1)) {
+        (Some(_), Some(cited)) => ctx
+            .store
+            .expected_sequencer(&channel_id, cited)?
+            .ok_or_else(not_carried)?,
+        _ => sequencer.to_string(),
+    };
+    if !ctx.store.has_accepted_share(&channel_id, &share_with)? {
         return Err(FollowError::NoShare {
             channel_id,
-            sequencer: sequencer.to_string(),
+            sequencer: share_with,
         });
     }
     // The same block under the same record again: what landing it would
@@ -796,20 +1172,63 @@ pub async fn ingest_sequenced(
     let sender =
         crate::ingest::verify_sig(bundle.manifest_bytes, bundle.code_bytes, &manifest, &sig)?;
     note_signature_check();
+    // Rule 11a: only the owner moves the sequencer, and the set's record is
+    // the new sequencer's, right after the head it cites.
+    if let (Some(set), Some(chan)) = (&moving, &channel) {
+        if set.channel_id != channel_id {
+            return Err(FollowError::Mismatch("the move names another channel"));
+        }
+        if !chan.is_root_owner(&crate::effect::canonical_did_string(
+            &sender.to_did_jig_string(),
+        )) {
+            return Err(FollowError::Mismatch(
+                "a sequencer move signed by a DID that is not the channel's owner",
+            ));
+        }
+        set.check_record(record.seq, &record.prev, &record.sequencer)?;
+        // Behind the head it cites: keep it until the records up to that
+        // head have landed. Ahead of it is the partition case: the record at
+        // the set's seq is held already, and the landing below stops the
+        // channel as at a fork.
+        let held = ctx.store.chain_head_seq(&channel_id)?;
+        if held.is_none_or(|h| h + 1 < record.seq) {
+            record.verify(&set.sequencer)?;
+            ctx.store.keep_pending_move(
+                &channel_id,
+                &PendingMove {
+                    seq: record.seq,
+                    sequencer: set.sequencer.clone(),
+                    manifest: bundle.manifest_bytes.to_vec(),
+                    code: bundle.code_bytes.to_vec(),
+                    sig: sig.clone(),
+                    record: record_bytes.to_vec(),
+                },
+            )?;
+            return Err(FollowError::Gap {
+                channel_id,
+                head: held,
+                got: record.seq,
+            });
+        }
+    }
     // Rule 12: the owner's signature, exactly, and nothing of this server's:
     // under `sequencer`, or under a DID it signed as before (JEP-0012). Each
     // signs only in link order: once a record by a later DID is in the
     // chain, an earlier one signs nothing after it. Records land in `seq`
     // order, so the record before this one is the one to compare with.
-    let signers: Vec<&str> = predecessors
-        .iter()
-        .map(String::as_str)
-        .chain([sequencer])
-        .collect();
+    let signers: Vec<&str> = match (&moving, range) {
+        (Some(set), _) => vec![set.sequencer.as_str()],
+        (None, Some(range)) => vec![range.sequencer.as_str()],
+        (None, None) => predecessors
+            .iter()
+            .map(String::as_str)
+            .chain([sequencer])
+            .collect(),
+    };
     let rank = signers
         .iter()
         .rposition(|did| crate::handshake::same_did(did, &record.sequencer));
-    record.verify(rank.map_or(sequencer, |i| signers[i]))?;
+    record.verify(rank.map_or(signers[signers.len() - 1], |i| signers[i]))?;
     if let Some(rank) = rank
         && rank + 1 < signers.len()
         && let Some(before) = record.seq.checked_sub(1)
@@ -829,6 +1248,41 @@ pub async fn ingest_sequenced(
             channel_id,
             seq: stop.seq,
             kind: stop.kind,
+        });
+    }
+    // Rule 11a: a move to a sequencer that orders another channel of this
+    // slug, archived or not, would give the slug two channels. It stops
+    // here, with the evidence kept, rather than fail its landing on every
+    // retry. Only a move whose record verified gets this far, so no one
+    // but the owner can stop a channel this way.
+    if let (Some(set), Some(chan)) = (&moving, &channel)
+        && ctx.store.chain_evidence(&channel_id)?.is_empty()
+        && ctx
+            .store
+            .slug_held_by(&set.sequencer, &chan.slug, &channel_id)?
+    {
+        let held = match record.seq.checked_sub(1) {
+            Some(before) => ctx
+                .store
+                .ingest_record_bytes(&channel_id, before)?
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        ctx.store
+            .keep_unapplied(&channel_id, record.seq, &held, record_bytes)?;
+        tracing::warn!(
+            channel_id,
+            seq = record.seq,
+            sequencer = set.sequencer,
+            slug = chan.slug,
+            "the owner moved the channel to a sequencer that already orders a channel of \
+             this slug; the channel is stopped"
+        );
+        return Err(FollowError::SlugTaken {
+            channel_id,
+            seq: record.seq,
+            sequencer: set.sequencer.clone(),
+            slug: chan.slug.clone(),
         });
     }
     let (mls, needs_upgrade) = match &kind {
@@ -883,6 +1337,25 @@ pub async fn ingest_sequenced(
                 channel.as_ref(),
                 sequencer,
                 &predecessors,
+            )?;
+        }
+        // The move lands with its record: from here on the new sequencer
+        // signs the channel's records, and the row names it.
+        if let Some(set) = &moving {
+            conn.execute(
+                "INSERT INTO channel_moves (channel_id, seq, sequencer, previous, block_cid)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![channel_id, seq as i64, set.sequencer, share_with, block_cid],
+            )?;
+            conn.execute(
+                "UPDATE channels SET sequencer_did = ?1 WHERE id = ?2",
+                params![set.sequencer, channel_id],
+            )?;
+            // The move kept for its head, if this is it, lands with it: in
+            // this transaction, and only that move's row.
+            conn.execute(
+                "DELETE FROM pending_moves WHERE channel_id = ?1 AND seq = ?2",
+                params![channel_id, seq as i64],
             )?;
         }
         advance_mirror(conn, &channel_id, mls)
@@ -945,6 +1418,31 @@ pub async fn ingest_sequenced(
         .flatten()
         .map(crate::effect::canonical_did_string);
     deliver(ctx, &stored, &channel_id, removed).await;
+    if moving.is_none()
+        && let Some(p) = pending.filter(|p| p.seq == seq + 1)
+    {
+        // The head the kept move cites has landed: land the move now.
+        let parts = BlockBundle {
+            manifest_bytes: &p.manifest,
+            code_bytes: &p.code,
+            resources: vec![],
+        };
+        if let Err(e) = Box::pin(ingest_sequenced(
+            ctx,
+            parts,
+            p.sig.clone(),
+            &p.record,
+            &p.sequencer,
+        ))
+        .await
+        {
+            tracing::warn!(
+                channel_id,
+                seq = p.seq,
+                "a kept sequencer move did not land: {e}"
+            );
+        }
+    }
     Ok(Followed::Landed { block_cid, seq })
 }
 
@@ -1697,6 +2195,489 @@ mod tests {
             take_as(&follower, &stranger, &new_did).await,
             Err(FollowError::Record(_))
         ));
+    }
+
+    // ---- A sequencer move (JEP-0005 rule 11a) --------------------------------
+
+    /// `owner`'s channel moving to `new`: the owner's `sequencer-set`, citing
+    /// the record sent last, with its record signed by `new` right after it.
+    fn move_to(owner: &Owner, new: &SigningKey, signer: &SigningKey) -> Sent {
+        move_after(owner, new, signer, &owner.sent.last().unwrap().record)
+    }
+
+    /// [`move_to`], citing `cited` as the head.
+    fn move_after(owner: &Owner, new: &SigningKey, signer: &SigningKey, cited: &[u8]) -> Sent {
+        use jig_core::contract::{ContractAccept, ContractOffer, Grant, ManifestRef};
+        use jig_core::sequencer_move::{CitedHead, SequencerSet};
+        let last = IngestRecord::decode(cited).unwrap();
+        let channel: cid::Cid = owner.channel.parse().unwrap();
+        let held = ContractOffer::sign(
+            &owner.ctx.server_key,
+            &did(new),
+            channel,
+            Grant::Member,
+            owner.sent[0].parts.0.clone(),
+            owner.sent[0].record.clone(),
+            ManifestRef {
+                cid: channel,
+                seq: 0,
+            },
+            vec![],
+        );
+        let accept = ContractAccept::sign_move(
+            new,
+            &held,
+            ManifestRef {
+                cid: channel,
+                seq: 1,
+            },
+            vec![],
+            vec![],
+            vec![],
+        );
+        let set = SequencerSet {
+            channel_id: owner.channel.clone(),
+            sequencer: did(new),
+            head: CitedHead {
+                seq: last.seq,
+                hash: last.hash(),
+            },
+            accept,
+            reinstalls: vec![],
+        };
+        let mut meta = serde_json::Map::new();
+        meta.extend(set.to_metadata());
+        let parts = signed(
+            signer,
+            BlockKind::SequencerSet,
+            serde_json::Value::Object(meta),
+        );
+        let record = RecordSigner {
+            channel_id: owner.channel.clone(),
+            key: new,
+            ingest_wall_ms: last.ingest_wall_ms + 1,
+            ingest_logical: 0,
+        }
+        .sign(
+            last.seq + 1,
+            &bundle(&parts).block_cid().unwrap().to_string(),
+            last.hash(),
+        )
+        .unwrap()
+        .encode();
+        Sent { parts, record }
+    }
+
+    /// `parts` as the next record after `after`, signed by `key`.
+    fn after(
+        key: &SigningKey,
+        channel: &str,
+        after: &[u8],
+        parts: (Vec<u8>, Vec<u8>, Vec<u8>),
+    ) -> Sent {
+        let last = IngestRecord::decode(after).unwrap();
+        let record = RecordSigner {
+            channel_id: channel.to_string(),
+            key,
+            ingest_wall_ms: last.ingest_wall_ms + 1,
+            ingest_logical: 0,
+        }
+        .sign(
+            last.seq + 1,
+            &bundle(&parts).block_cid().unwrap().to_string(),
+            last.hash(),
+        )
+        .unwrap()
+        .encode();
+        Sent { parts, record }
+    }
+
+    async fn take_from(
+        follower: &IngestContext,
+        sent: &Sent,
+        sequencer: &str,
+    ) -> Result<Followed, FollowError> {
+        ingest_sequenced(
+            follower,
+            bundle(&sent.parts),
+            sent.parts.2.clone(),
+            &sent.record,
+            sequencer,
+        )
+        .await
+    }
+
+    /// Rule 11a: a move to a sequencer that already orders a channel of this
+    /// slug, an archived one included, stops the channel with the evidence
+    /// kept. It does not fail its landing on the constraint and come again.
+    #[tokio::test]
+    async fn a_move_onto_a_slug_the_new_sequencer_holds_stops_the_channel() {
+        let mut owner = Owner::new().await;
+        owner.text("before the move").await;
+        let follower = owner.follower();
+        for sent in &owner.sent {
+            take(&follower, &owner, sent).await.unwrap();
+        }
+        let new = SigningKey::from_bytes(&[50; 32]);
+        // The new sequencer already orders an archived channel of this slug.
+        {
+            let conn = follower.store.conn.lock().unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TEMP TABLE other AS SELECT * FROM channels WHERE id = '{channel}';
+                 UPDATE other SET id = 'bafyother', sequencer_did = '{new}', archived_at = 1;
+                 INSERT INTO channels SELECT * FROM other;
+                 DROP TABLE other;",
+                channel = owner.channel,
+                new = did(&new),
+            ))
+            .unwrap();
+        }
+        let moved = move_to(&owner, &new, &owner.user);
+        let got = take_from(&follower, &moved, &did(&new)).await;
+        assert!(
+            matches!(got, Err(FollowError::SlugTaken { seq: 2, .. })),
+            "{got:?}"
+        );
+        // Stopped, not refused again on every retry.
+        assert!(matches!(
+            take_from(&follower, &moved, &did(&new)).await,
+            Err(FollowError::Stopped { .. })
+        ));
+        assert_eq!(
+            follower.store.chain_evidence(&owner.channel).unwrap().len(),
+            1
+        );
+        assert!(
+            follower
+                .store
+                .channel_moves(&owner.channel)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            follower
+                .store
+                .get_channel_by_id(&owner.channel)
+                .unwrap()
+                .unwrap()
+                .sequencer_did,
+            owner.did()
+        );
+    }
+
+    /// The owner moves its channel to a new sequencer. The follower takes
+    /// the move from the new sequencer under its share with the old one, and
+    /// from the set's `seq` on expects the new one: the old sequencer's
+    /// records past it are refused, and the new one's need a share with it.
+    #[tokio::test]
+    async fn a_follower_takes_a_move_and_then_holds_the_channel_to_the_new_sequencer() {
+        let mut owner = Owner::new().await;
+        owner.text("before the move").await;
+        let follower = owner.follower();
+        for sent in &owner.sent {
+            take(&follower, &owner, sent).await.unwrap();
+        }
+        let new = SigningKey::from_bytes(&[50; 32]);
+        let moved = move_to(&owner, &new, &owner.user);
+        assert_eq!(
+            follower
+                .store
+                .expected_sequencer(&owner.channel, 2)
+                .unwrap(),
+            Some(owner.did())
+        );
+        match take_from(&follower, &moved, &did(&new)).await.unwrap() {
+            Followed::Landed { seq, .. } => assert_eq!(seq, 2),
+            other => panic!("{other:?}"),
+        }
+        // The schedule: the old sequencer up to the cited head, the new one
+        // from the set's seq on. The row names the new one.
+        let store = &follower.store;
+        assert_eq!(
+            store.expected_sequencer(&owner.channel, 1).unwrap(),
+            Some(owner.did())
+        );
+        assert_eq!(
+            store.expected_sequencer(&owner.channel, 2).unwrap(),
+            Some(did(&new))
+        );
+        assert_eq!(
+            store.expected_sequencer(&owner.channel, 9).unwrap(),
+            Some(did(&new))
+        );
+        assert_eq!(
+            store
+                .get_channel_by_id(&owner.channel)
+                .unwrap()
+                .unwrap()
+                .sequencer_did,
+            did(&new)
+        );
+        // The same move again is one move.
+        assert!(matches!(
+            take_from(&follower, &moved, &did(&new)).await.unwrap(),
+            Followed::Duplicate { seq: 2, .. }
+        ));
+
+        // The old sequencer past the move, at the set's seq or after it.
+        for at in [&owner.sent.last().unwrap().record, &moved.record] {
+            let stale = after(
+                &owner.ctx.server_key,
+                &owner.channel,
+                at,
+                owner.text_parts("late"),
+            );
+            assert!(matches!(
+                take_from(&follower, &stale, &owner.did()).await,
+                Err(FollowError::Superseded { .. })
+            ));
+        }
+
+        // The new sequencer's next record waits for its own share (its
+        // re-offer), then lands.
+        let next = after(
+            &new,
+            &owner.channel,
+            &moved.record,
+            owner.text_parts("after"),
+        );
+        assert!(matches!(
+            take_from(&follower, &next, &did(&new)).await,
+            Err(FollowError::NoShare { .. })
+        ));
+        share(&follower, &owner.channel, &did(&new));
+        assert!(matches!(
+            take_from(&follower, &next, &did(&new)).await.unwrap(),
+            Followed::Landed { seq: 3, .. }
+        ));
+    }
+
+    /// A follower behind the head a move cites keeps the move, takes the
+    /// records up to that head from the new sequencer (each held to the old
+    /// sequencer's signature, whoever serves it), and lands the move once it
+    /// holds the head: an old sequencer that is gone cannot strand it.
+    #[tokio::test]
+    async fn a_follower_behind_the_cited_head_catches_up_from_the_new_sequencer() {
+        let mut owner = Owner::new().await;
+        owner.text("one").await;
+        owner.text("two").await;
+        let follower = owner.follower();
+        take(&follower, &owner, &owner.sent[0]).await.unwrap();
+        let new = SigningKey::from_bytes(&[50; 32]);
+        let new_did = did(&new);
+
+        // Before any move, the new sequencer is no source for this channel.
+        assert!(
+            take_from(&follower, &owner.sent[1], &new_did)
+                .await
+                .is_err()
+        );
+
+        let moved = move_to(&owner, &new, &owner.user);
+        assert!(matches!(
+            take_from(&follower, &moved, &new_did).await,
+            Err(FollowError::Gap {
+                head: Some(0),
+                got: 3,
+                ..
+            })
+        ));
+        assert_eq!(
+            follower
+                .store
+                .pending_move(&owner.channel)
+                .unwrap()
+                .map(|p| p.seq),
+            Some(3)
+        );
+        assert!(
+            follower
+                .store
+                .channel_moves(&owner.channel)
+                .unwrap()
+                .is_empty()
+        );
+
+        // A record up to the cited head signed by the new sequencer is not
+        // the old sequencer's: refused.
+        let forged = after(
+            &new,
+            &owner.channel,
+            &owner.sent[0].record,
+            owner.sent[1].parts.clone(),
+        );
+        assert!(take_from(&follower, &forged, &new_did).await.is_err());
+
+        // The old sequencer's records, served by the new one.
+        for sent in &owner.sent[1..] {
+            assert!(matches!(
+                take_from(&follower, sent, &new_did).await.unwrap(),
+                Followed::Landed { .. }
+            ));
+        }
+        // Holding the cited head, the move has landed.
+        let store = &follower.store;
+        assert_eq!(store.pending_move(&owner.channel).unwrap(), None);
+        assert_eq!(
+            store.expected_sequencer(&owner.channel, 3).unwrap(),
+            Some(new_did.clone())
+        );
+        assert_eq!(
+            store.expected_sequencer(&owner.channel, 2).unwrap(),
+            Some(owner.did())
+        );
+    }
+
+    /// Only the owner moves the sequencer, and only with a record signed by
+    /// the server it names, right after the head it cites. A follower that
+    /// already holds the old sequencer's record at that seq stops the
+    /// channel, keeping both, as at a fork.
+    #[tokio::test]
+    async fn a_move_the_owner_did_not_make_or_that_does_not_fit_the_chain_is_refused() {
+        let mut owner = Owner::new().await;
+        owner.text("before the move").await;
+        let new = SigningKey::from_bytes(&[50; 32]);
+        // Signed by a member who is not the owner.
+        let follower = owner.follower();
+        for sent in &owner.sent {
+            take(&follower, &owner, sent).await.unwrap();
+        }
+        let stranger = SigningKey::from_bytes(&[51; 32]);
+        let by_stranger = move_to(&owner, &new, &stranger);
+        assert!(matches!(
+            take_from(&follower, &by_stranger, &did(&new)).await,
+            Err(FollowError::Mismatch(_))
+        ));
+
+        // Its record signed by another server than the one it names.
+        let mut forged = move_to(&owner, &new, &owner.user);
+        let last = owner.sent.last().unwrap();
+        forged.record = after(
+            &SigningKey::from_bytes(&[52; 32]),
+            &owner.channel,
+            &last.record,
+            forged.parts.clone(),
+        )
+        .record;
+        assert!(take_from(&follower, &forged, &did(&new)).await.is_err());
+        assert_eq!(
+            follower.store.channel_moves(&owner.channel).unwrap(),
+            vec![]
+        );
+
+        // Offered on a link from a third server, with no share at all.
+        let third = SigningKey::from_bytes(&[53; 32]);
+        let to_third = move_to(&owner, &new, &owner.user);
+        assert!(take_from(&follower, &to_third, &did(&third)).await.is_err());
+
+        // A follower that holds the old sequencer's record at the set's seq.
+        owner.text("past the cited head").await;
+        let partitioned = owner.follower();
+        for sent in &owner.sent {
+            take(&partitioned, &owner, sent).await.unwrap();
+        }
+        let before_last = &owner.sent[owner.sent.len() - 2].record;
+        let cut = move_after(&owner, &new, &owner.user, before_last);
+        assert!(matches!(
+            take_from(&partitioned, &cut, &did(&new)).await,
+            Err(FollowError::Fork { .. })
+        ));
+    }
+
+    /// The JEP-0005 chain across a move, under fixed keys: three records by
+    /// the old sequencer (seed 60), the `sequencer-set`'s record by the new
+    /// one (seed 61) right after the cited head, one more by the new one, and
+    /// one by the old sequencer past the cited head, which a reader refuses.
+    /// Block CIDs are labels; the records are as they are stored and served.
+    fn chain_across_a_move() -> serde_json::Value {
+        let (old, new) = (
+            SigningKey::from_bytes(&[60; 32]),
+            SigningKey::from_bytes(&[61; 32]),
+        );
+        let channel = crate::ingest_record::label_cid("channel-create");
+        let sign = |key: &SigningKey, seq: u64, label: &str, prev: [u8; 32]| {
+            RecordSigner {
+                channel_id: channel.clone(),
+                key,
+                ingest_wall_ms: 1_700_000_000_000 + seq,
+                ingest_logical: 0,
+            }
+            .sign(seq, &crate::ingest_record::label_cid(label), prev)
+            .unwrap()
+        };
+        let mut chain = vec![sign(
+            &old,
+            0,
+            "channel-create",
+            crate::ingest_record::GENESIS_PREV,
+        )];
+        for (seq, label) in [(1, "text 1"), (2, "text 2")] {
+            let prev = chain.last().unwrap().hash();
+            chain.push(sign(&old, seq, label, prev));
+        }
+        let cited = chain.last().unwrap().clone();
+        chain.push(sign(&new, 3, "sequencer-set", cited.hash()));
+        let set = chain.last().unwrap().clone();
+        chain.push(sign(&new, 4, "text 4", set.hash()));
+        let refused = sign(&old, 4, "text 4 by the old sequencer", set.hash());
+        let entry = |r: &IngestRecord| {
+            serde_json::json!({
+                "seq": r.seq,
+                "signed_by": r.sequencer,
+                "hash_hex": hex::encode(r.hash()),
+                "record": String::from_utf8(r.encode()).unwrap(),
+            })
+        };
+        serde_json::json!({
+            "comment": "JEP-0005 rule 11a: a chain across a sequencer-set. `record` is the ingest record as stored and served (JSON). seq 3 is the sequencer-set's record: signed by the new sequencer, its prev the cited head's hash (seq 2). `refused` is a record by the old sequencer past the cited head: a reader that holds the set refuses it.",
+            "keys": {
+                "comment": "Ed25519 seeds: every byte set to the given value",
+                "old_sequencer": {"seed_byte": 60, "did": did(&old)},
+                "new_sequencer": {"seed_byte": 61, "did": did(&new)},
+            },
+            "channel_id": channel,
+            "cited_head": {"seq": cited.seq, "hash": hex::encode(cited.hash())},
+            "chain": chain.iter().map(entry).collect::<Vec<_>>(),
+            "refused": entry(&refused),
+        })
+    }
+
+    #[test]
+    fn the_chain_across_a_move_matches_the_committed_vectors() {
+        let v: serde_json::Value = serde_json::from_str(include_str!(
+            "../../jig-spec/jep/vectors/0005/sequence-chain-move.json"
+        ))
+        .unwrap();
+        assert_eq!(chain_across_a_move(), v);
+        // Each record follows the one before it, under the key its range
+        // expects.
+        let chain: Vec<IngestRecord> = v["chain"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| IngestRecord::decode(e["record"].as_str().unwrap().as_bytes()).unwrap())
+            .collect();
+        let (old, new) = (
+            &v["keys"]["old_sequencer"]["did"],
+            &v["keys"]["new_sequencer"]["did"],
+        );
+        for (i, r) in chain.iter().enumerate() {
+            let expected = if r.seq < 3 { old } else { new };
+            r.verify(expected.as_str().unwrap()).unwrap();
+            if i > 0 {
+                assert!(r.follows(&chain[i - 1]), "seq {}", r.seq);
+            }
+        }
+    }
+
+    /// `cargo test -p jig-pipeline follow::tests::print_chain_across_a_move -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn print_chain_across_a_move() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&chain_across_a_move()).unwrap()
+        );
     }
 
     /// The owner's chain takes back a block only from this channel's relayed
@@ -2902,7 +3883,7 @@ mod tests {
 
         let critical = owner.next_after(
             &owner.sent[1].record,
-            owner.unknown("sequencer-set", serde_json::json!({})),
+            owner.unknown("future-kind", serde_json::json!({})),
         );
         match take(&follower, &owner, &critical).await {
             Err(FollowError::NeedsUpgrade {
@@ -2912,7 +3893,7 @@ mod tests {
             }) => {
                 assert_eq!(
                     (channel_id.as_str(), seq, kind.as_str()),
-                    (owner.channel.as_str(), 2, "sequencer-set")
+                    (owner.channel.as_str(), 2, "future-kind")
                 );
             }
             got => panic!("{got:?}"),
@@ -2951,7 +3932,7 @@ mod tests {
         assert_eq!(notice.code, crate::fanout::CHANNEL_NEEDS_UPGRADE);
         assert_eq!(notice.channel_id, owner.channel);
         assert!(
-            notice.message.contains("`sequencer-set` at seq 2"),
+            notice.message.contains("`future-kind` at seq 2"),
             "{}",
             notice.message
         );
@@ -3054,10 +4035,10 @@ mod tests {
         let owner = Owner::new().await;
         let follower = owner.follower();
         take(&follower, &owner, &owner.sent[0]).await.unwrap();
-        let (manifest, code, sig) = owner.unknown("sequencer-set", serde_json::json!({}));
+        let (manifest, code, sig) = owner.unknown("future-kind", serde_json::json!({}));
         let relabelled = String::from_utf8(manifest)
             .unwrap()
-            .replace("\"sequencer-set\"", "\"opt-sequencer-set\"")
+            .replace("\"future-kind\"", "\"opt-future-kind\"")
             .into_bytes();
         let forged = owner.next_after(&owner.sent[0].record, (relabelled, code, sig));
         assert!(matches!(
@@ -3106,7 +4087,7 @@ mod tests {
         ));
         // The right channel, signed by another key than its author's: refused
         // before anything is kept, critical or not.
-        for name in ["opt-reaction", "sequencer-set"] {
+        for name in ["opt-reaction", "future-kind"] {
             let (manifest, code, _) = owner.unknown(name, serde_json::json!({}));
             let stranger = SigningKey::from_bytes(&rand::random());
             let sig = stranger
@@ -3147,7 +4128,7 @@ mod tests {
         let skipped = owner.next_after(&owner.sent[0].record, owner.text_parts("skipped"));
         let critical = owner.next_after(
             &skipped.record,
-            owner.unknown("sequencer-set", serde_json::json!({})),
+            owner.unknown("future-kind", serde_json::json!({})),
         );
         assert!(matches!(
             take(&follower, &owner, &critical).await,
@@ -3167,7 +4148,7 @@ mod tests {
         {
             let store = SqliteStore::open(&path).unwrap();
             let conn = store.conn.lock().unwrap();
-            for (channel, kind) in [("a", "member-add"), ("b", "sequencer-set")] {
+            for (channel, kind) in [("a", "member-add"), ("b", "future-kind")] {
                 conn.execute(
                     "INSERT INTO carried_upgrades (channel_id, seq, block_cid, kind, found_at)
                      VALUES (?1, 3, 'bafy', ?2, 0)",
@@ -3180,7 +4161,7 @@ mod tests {
         assert!(store.carried_upgrade("a").unwrap().is_none());
         assert_eq!(
             store.carried_upgrade("b").unwrap().unwrap().kind,
-            "sequencer-set"
+            "future-kind"
         );
     }
 
@@ -3249,14 +4230,14 @@ mod tests {
                 "verifies": true,
             })
         };
-        let plain = manifest("sequencer-set", serde_json::json!({"channel_id": channel}));
+        let plain = manifest("future-kind", serde_json::json!({"channel_id": channel}));
         let relabelled = String::from_utf8(plain.clone())
             .unwrap()
-            .replace("\"sequencer-set\"", "\"opt-sequencer-set\"");
+            .replace("\"future-kind\"", "\"opt-future-kind\"");
         let vectors = serde_json::json!({
             "description": "JEP-0005 rule 14c. Each manifest is of a kind no v0.2 build implements, signed by the Ed25519 key whose 32-byte seed is all 0x14, over the JSON array [manifest bytes, code bytes] with empty code. `critical` is the rule's verdict on the manifest's bytes; `verifies` whether the author's signature holds. A follower refuses a block whose signature fails before judging it.",
             "cases": [
-                case("no marker: critical", "sequencer-set", serde_json::json!({"channel_id": channel}), true),
+                case("no marker: critical", "future-kind", serde_json::json!({"channel_id": channel}), true),
                 case("opt- prefix: non-critical", "opt-reaction", serde_json::json!({"channel_id": channel, "to": "x"}), false),
                 case("opt- prefix carrying mls_commit: critical", "opt-reaction", serde_json::json!({"channel_id": channel, "mls_commit": "AAAA"}), true),
                 case("opt- prefix carrying only mls_message and mls_epoch: non-critical", "opt-reaction", serde_json::json!({"channel_id": channel, "mls_message": "AAAA", "mls_epoch": 3}), false),
@@ -3265,7 +4246,7 @@ mod tests {
                     "name": "marker added after signing: the signature fails",
                     "manifest": relabelled,
                     "sig_hex": sign(&plain),
-                    "kind": "opt-sequencer-set",
+                    "kind": "opt-future-kind",
                     "critical": false,
                     "verifies": false,
                 },
