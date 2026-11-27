@@ -1018,39 +1018,6 @@ pub fn check_takeover(
     Ok(set)
 }
 
-impl SqliteStore {
-    /// Record that this server took a channel over by the `sequencer-set`
-    /// `block_cid` it just sequenced (JEP-0005 rule 11a): the move, from the
-    /// block's record on, and the channel's row, which names this server now.
-    pub fn take_over(&self, block_cid: &str) -> crate::persist::Result<()> {
-        let record = self.get_ingest_record(block_cid)?.ok_or_else(|| {
-            crate::persist::PersistError::Corrupt(format!("{block_cid} has no record"))
-        })?;
-        let conn = self.conn.lock().expect("poisoned");
-        let previous: String = conn.query_row(
-            "SELECT sequencer_did FROM channels WHERE id = ?1",
-            [&record.channel_id],
-            |r| r.get(0),
-        )?;
-        conn.execute(
-            "INSERT INTO channel_moves (channel_id, seq, sequencer, previous, block_cid)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                record.channel_id,
-                record.seq as i64,
-                record.sequencer,
-                crate::effect::canonical_did_string(&previous),
-                block_cid
-            ],
-        )?;
-        conn.execute(
-            "UPDATE channels SET sequencer_did = ?1 WHERE id = ?2",
-            params![record.sequencer, record.channel_id],
-        )?;
-        Ok(())
-    }
-}
-
 /// Take one block of a channel `sequencer` owns, with its record as the owner
 /// sent it (`record_bytes`, the stored form, kept byte for byte).
 ///
@@ -2670,6 +2637,85 @@ mod tests {
         assert_eq!(next.seq, record.seq + 1);
         assert!(next.follows(&record));
         assert_eq!(next.sequencer, new_did);
+    }
+
+    /// The move's write checks again what `check_takeover` checked: a record
+    /// that lands on the channel between the check and the write leaves the
+    /// move refused, with nothing of it written.
+    #[tokio::test]
+    async fn a_takeover_whose_head_moves_before_its_write_is_refused_whole() {
+        let mut owner = Owner::new().await;
+        owner.text("before the move").await;
+        let new = owner.follower();
+        for sent in &owner.sent {
+            take(&new, &owner, sent).await.unwrap();
+        }
+        let store = new.store.clone();
+        let key = new.server_key.clone();
+        let channel_id = owner.channel.clone();
+        let owner_did = owner.ctx.server_did.to_did_jig_string();
+        crate::ingest::BEFORE_LANDING.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let block = StoredBlock {
+                    cid: crate::ingest_record::label_cid("lands in the window"),
+                    channel_id: Some(channel_id.clone()),
+                    block_kind: "text-render".to_string(),
+                    sender_did: owner_did,
+                    sender_sig: vec![],
+                    bundle_bytes: vec![],
+                    is_synthetic: true,
+                    hlc_wall_ms: 0,
+                    hlc_logical: 0,
+                    hlc_origin: String::new(),
+                    posted_at: 0,
+                    origin_server: String::new(),
+                    federated_from: None,
+                };
+                store
+                    .insert_block_sequenced(
+                        &block,
+                        &crate::ingest_record::RecordSigner {
+                            channel_id,
+                            key: &key,
+                            ingest_wall_ms: 0,
+                            ingest_logical: 0,
+                        },
+                    )
+                    .unwrap();
+            }));
+        });
+        let moved = move_to(&owner, &new.server_key, &owner.user);
+        let parts = moved.parts;
+        let got = ingest(
+            &new,
+            bundle(&parts),
+            parts.2.clone(),
+            IngestSource::LocalClient {
+                conn_id: 1,
+                tiers: true,
+            },
+        )
+        .await;
+        assert!(
+            matches!(got, Err(IngestError::MoveRefused { .. })),
+            "{got:?}"
+        );
+        assert!(new.store.channel_moves(&owner.channel).unwrap().is_empty());
+        let row = new
+            .store
+            .get_channel_by_id(&owner.channel)
+            .unwrap()
+            .unwrap();
+        assert_ne!(row.sequencer_did, new.server_did.to_did_jig_string());
+        assert_eq!(
+            new.store.chain_head_seq(&owner.channel).unwrap(),
+            Some(
+                IngestRecord::decode(&owner.sent.last().unwrap().record)
+                    .unwrap()
+                    .seq
+                    + 1
+            )
+        );
     }
 
     /// Only the owner moves the sequencer, and only with a record signed by
