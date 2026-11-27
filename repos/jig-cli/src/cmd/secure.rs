@@ -1908,15 +1908,16 @@ impl Secure {
             .await?;
         if let Some(at) = position_of(&newest, &head) {
             let delivered = &newest[at + 1..];
-            self.hold_to_head(slug, delivered)?;
-            return self.process(slug, delivered);
+            let chain = self.hold_to_head(slug, delivered)?;
+            return self.process_with(slug, delivered, chain.as_ref());
         }
         if !self.pages_forward().await? {
             let (delivered, reached) = self.back_to(slug, &head, newest).await?;
-            if reached {
-                self.hold_to_head(slug, &delivered)?;
-            }
-            return self.process(slug, &delivered);
+            let chain = match reached {
+                true => self.hold_to_head(slug, &delivered)?,
+                false => None,
+            };
+            return self.process_with(slug, &delivered, chain.as_ref());
         }
         match self.forward_from(slug, &head).await? {
             Forwarded::Done(replayed) => Ok(self.finish(slug, replayed)),
@@ -1953,17 +1954,29 @@ impl Secure {
             Some(at) => (newest[at + 1..].to_vec(), true),
             None => self.back_to(slug, head, newest).await?,
         };
-        if reached {
-            self.hold_to_head(slug, &delivered)?;
-        }
+        let chain = match reached {
+            true => self.hold_to_head(slug, &delivered)?,
+            false => None,
+        };
         self.replay_into(slug, replayed, &delivered);
-        self.move_head(slug, &delivered)
+        self.move_head_with(slug, &delivered, chain.as_ref())
     }
 
     /// Replay `delivered` and move the head to its newest block.
     fn process(&self, slug: &str, delivered: &[DeliveredBlock]) -> Result<Synced> {
+        self.process_with(slug, delivered, None)
+    }
+
+    /// [`Self::process`], saving the head with the moves `chain` verified
+    /// over `delivered`.
+    fn process_with(
+        &self,
+        slug: &str,
+        delivered: &[DeliveredBlock],
+        chain: Option<&ChannelChain>,
+    ) -> Result<Synced> {
         let synced = self.replay(slug, delivered);
-        self.move_head(slug, delivered)?;
+        self.move_head_with(slug, delivered, chain)?;
         Ok(synced)
     }
 
@@ -1978,14 +1991,10 @@ impl Secure {
         )
     }
 
-    /// Move the head to the newest block of `delivered`, with its record.
-    fn move_head(&self, slug: &str, delivered: &[DeliveredBlock]) -> Result<()> {
-        self.move_head_with(slug, delivered, None)
-    }
-
-    /// [`Self::move_head`], keeping the sequencer moves `chain` verified on
-    /// the way: a later sync's chain, rebuilt from the saved head, holds the
-    /// records past them to the new sequencer.
+    /// Move the head to the newest block of `delivered`, with its record,
+    /// keeping the sequencer moves `chain` verified on the way: a later
+    /// sync's chain, rebuilt from the saved head, holds the records past them
+    /// to the new sequencer.
     fn move_head_with(
         &self,
         slug: &str,
@@ -2182,17 +2191,28 @@ impl Secure {
     /// to the chain from the head, and warn when it breaks. Nothing is
     /// left to read it from instead: the blocks are still processed, and a
     /// message the server left out may never be readable on this device.
-    fn hold_to_head(&self, slug: &str, delivered: &[DeliveredBlock]) -> Result<()> {
-        if let Some(mut chain) = self.chain_from_head(slug)?
-            && let Err(why) = continues(&mut chain, delivered)
-        {
-            eprintln!(
-                "warning: {}'s history of {slug} after this device's last block is not \
-                 whole ({why}); a message in it may never be readable on this device",
-                self.server
-            );
+    ///
+    /// Returns the chain when `delivered` continued it, with the sequencer
+    /// moves it verified on the way, for the head to keep.
+    fn hold_to_head(
+        &self,
+        slug: &str,
+        delivered: &[DeliveredBlock],
+    ) -> Result<Option<ChannelChain>> {
+        let Some(mut chain) = self.chain_from_head(slug)? else {
+            return Ok(None);
+        };
+        match continues(&mut chain, delivered) {
+            Ok(()) => Ok(Some(chain)),
+            Err(why) => {
+                eprintln!(
+                    "warning: {}'s history of {slug} after this device's last block is not \
+                     whole ({why}); a message in it may never be readable on this device",
+                    self.server
+                );
+                Ok(None)
+            }
         }
-        Ok(())
     }
 
     /// The DIDs the sequencer that signed `record` has signed as, along the
@@ -2758,6 +2778,115 @@ fn listing_matches_move(
 
 #[cfg(test)]
 mod tests {
+
+    /// A sync that reads a move resumes past it (JEP-0005 rule 11a): the
+    /// chain the head was held to keeps the move, and a chain rebuilt from a
+    /// head saved with it takes the new sequencer's next record, as the next
+    /// sync does. Rebuilt from the record alone, it refuses that record.
+    #[test]
+    fn a_sync_after_a_move_resumes_past_it() {
+        use base64::Engine as _;
+        use jig_client::chain::{ChainHead, ChannelChain, RecordSigner, label_cid};
+        use jig_core::contract::{ContractAccept, ContractOffer, Grant, ManifestRef};
+        let [old, new] = std::array::from_fn(|_| jig_core::crypto::ed25519::generate_signing_key());
+        let did = |k: &ed25519_dalek::SigningKey| {
+            jig_core::Did::from_ed25519_pubkey(k.verifying_key().as_bytes()).to_did_jig_string()
+        };
+        let channel_id = label_cid("bafyCreate");
+        let sign = |key: &ed25519_dalek::SigningKey, seq: u64, block: &str, prev: [u8; 32]| {
+            RecordSigner {
+                channel_id: channel_id.clone(),
+                key,
+                ingest_wall_ms: 1_000 + seq,
+                ingest_logical: 0,
+            }
+            .sign(seq, block, prev)
+            .unwrap()
+        };
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let delivered = |block: &jig_client::blocks::BuiltBlock,
+                         record: jig_client::chain::IngestRecord| {
+            jig_client::DeliveredBlock {
+                bundle_b64: b64.encode(block.canonical_bytes()),
+                sig_b64: Some(b64.encode(&block.sender_sig)),
+                receipts: Vec::new(),
+                delivery_cid: block.cid(),
+                ingest: Some(record),
+            }
+        };
+        let head = sign(&old, 1, &label_cid("b1"), [7; 32]);
+        let channel: cid::Cid = channel_id.parse().unwrap();
+        let held = ContractOffer::sign(
+            &old,
+            &did(&new),
+            channel,
+            Grant::Read,
+            b"create".to_vec(),
+            b"head".to_vec(),
+            ManifestRef {
+                cid: channel,
+                seq: 0,
+            },
+            vec![],
+        );
+        let set = jig_core::sequencer_move::SequencerSet {
+            channel_id: channel_id.clone(),
+            sequencer: did(&new),
+            head: jig_core::sequencer_move::CitedHead {
+                seq: 1,
+                hash: head.hash(),
+            },
+            accept: ContractAccept::sign_move(
+                &new,
+                &held,
+                ManifestRef {
+                    cid: channel,
+                    seq: 1,
+                },
+                vec![],
+                vec![],
+                vec![],
+            ),
+            reinstalls: vec![],
+        };
+        let hlc = || jig_core::HlcTimestamp::now_wall(jig_core::Did::from_ed25519_pubkey(&[1; 32]));
+        let set_block = jig_client::blocks::build_with_metadata(
+            &jig_client::Identity::from_signing_key(old.clone()),
+            jig_core::BlockKind::SequencerSet,
+            hlc(),
+            serde_json::Value::Object(set.to_metadata().into_iter().collect()),
+        );
+        let after_block = jig_client::blocks::build_with_metadata(
+            &jig_client::Identity::from_signing_key(old.clone()),
+            jig_core::BlockKind::TextRender,
+            hlc(),
+            serde_json::json!({"channel_id": channel_id, "body": "after the move"}),
+        );
+        let r2 = sign(&new, 2, &set_block.cid(), head.hash());
+        let r3 = sign(&new, 3, &after_block.cid(), r2.hash());
+        let chain_at = |head: ChainHead| {
+            ChannelChain::across(&channel_id, vec![did(&old)], Some(head))
+                .with_owners(vec![did(&old)])
+        };
+
+        // This sync: the page holds the move, and the chain keeps it.
+        let mut chain = chain_at(ChainHead::of(&head));
+        super::continues(&mut chain, &[delivered(&set_block, r2.clone())]).unwrap();
+        assert_eq!(chain.moves().len(), 1);
+
+        // The next sync, from the head saved with the chain's moves.
+        let mut saved = ChainHead::of(&r2);
+        saved.moves = chain.moves().to_vec();
+        super::continues(&mut chain_at(saved), &[delivered(&after_block, r3.clone())]).unwrap();
+        // From the record alone, the new sequencer's record is refused.
+        assert!(
+            super::continues(
+                &mut chain_at(ChainHead::of(&r2)),
+                &[delivered(&after_block, r3)]
+            )
+            .is_err()
+        );
+    }
 
     /// A listing after a verified move must name the sequencer the channel
     /// moved to (JEP-0005 rule 11a); one naming the old sequencer, or this
