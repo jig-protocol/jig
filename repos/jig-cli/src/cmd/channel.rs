@@ -1241,13 +1241,16 @@ fn channel_lines(channels: &[ChannelView]) -> Vec<String> {
         .unwrap_or(0)
         .max(10);
     // A slug two listed channels share: this server's own and one it carries
-    // for another server (#388). Each such line says which it is.
+    // for another server (#388). Each such line says which it is, with the
+    // link that names it alone. The whole id: every channel id starts with
+    // the same CID header, so a prefix would tell them apart by a few
+    // characters at best.
     let shared = |slug: &str| channels.iter().filter(|c| c.slug == slug).count() > 1;
     channels
         .iter()
         .map(|c| {
             let collision = if shared(&c.slug) && !c.id.is_empty() {
-                format!("  (slug shared: id {}, ordered by {})", c.id, c.sequencer)
+                format!("  (slug shared: jig:{}, ordered by {})", c.id, c.sequencer)
             } else {
                 String::new()
             };
@@ -1382,11 +1385,11 @@ mod tests {
             view("#solo", "bafysolo", "did:jig:zfollower"),
         ]);
         assert!(
-            lines[0].contains("slug shared: id bafyown, ordered by did:jig:zfollower"),
+            lines[0].contains("slug shared: jig:bafyown, ordered by did:jig:zfollower"),
             "{lines:?}"
         );
         assert!(
-            lines[1].contains("slug shared: id bafycarried, ordered by did:jig:zowner"),
+            lines[1].contains("slug shared: jig:bafycarried, ordered by did:jig:zowner"),
             "{lines:?}"
         );
         assert!(!lines[2].contains("slug shared"), "{lines:?}");

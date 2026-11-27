@@ -73,6 +73,12 @@ Non-goals for v0.2:
      because it can move (11a).
    - A slug is a display name, unique only per sequencer.
    - A server MUST key channels by `channel_id`, never by slug.
+   - *Non-normative.* A link to a channel is written
+     `jig:<channel_id>[?sequencer=<did>&slug=<slug>]`. The `channel_id` is in its one
+     canonical text spelling (base32 lowercase with the `b` prefix, as JEP-0004 rule 0
+     gives a CID in text), and the query values are percent-encoded. The query carries
+     hints only: a reader ignores keys it does not know, and never takes the channel from
+     a hint. The reference CLI accepts links of at most 512 bytes.
 2. The **owner** holds the channel's authoritative state, orders all blocks and validates
    all MLS commits.
 3. A **follower** is a server the channel has been shared with: it has accepted the
