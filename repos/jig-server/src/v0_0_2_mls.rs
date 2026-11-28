@@ -196,6 +196,7 @@ pub async fn take_key_package(
         now,
         repeat_window: 0,
         repeat: false,
+        fresh: true,
         per_did: custody.per_member_per_hour,
         per_requester: custody.per_requester_per_hour,
         listing: None,
@@ -220,15 +221,15 @@ pub async fn take_key_package(
         jig_pipeline::persist::Release::LocalAddsEnded => {
             Err(crate::v0_0_2_custody::local_adds_ended(&did))
         }
-        jig_pipeline::persist::Release::Empty | jig_pipeline::persist::Release::NotListed => {
-            Err(err(
-                StatusCode::NOT_FOUND,
-                "NO_KEY_PACKAGE",
-                format!(
-                    "{did} has published no MLS key packages here; they need to run a jig client against this server once"
-                ),
-            ))
-        }
+        jig_pipeline::persist::Release::Empty
+        | jig_pipeline::persist::Release::NotListed
+        | jig_pipeline::persist::Release::NotARepeat => Err(err(
+            StatusCode::NOT_FOUND,
+            "NO_KEY_PACKAGE",
+            format!(
+                "{did} has published no MLS key packages here; they need to run a jig client against this server once"
+            ),
+        )),
     }
 }
 

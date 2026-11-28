@@ -276,6 +276,7 @@ async fn per_ip_rate(
             code: code.to_string(),
             message,
             retry_after_ms: None,
+            request_id_hex: None,
         };
         return axum::response::IntoResponse::into_response((status, axum::Json(body)));
     }

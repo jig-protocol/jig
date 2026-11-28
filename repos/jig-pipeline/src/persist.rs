@@ -85,6 +85,11 @@ pub struct ReleaseAsk<'a> {
     /// for a take that names no channel: two channels must never share a
     /// package.
     pub repeat: bool,
+    /// Whether a new package may be released. Without it, only a repeat is
+    /// answered, and anything else is [`Release::NotARepeat`]: a custodian
+    /// asks this way for a requester it would otherwise hold (JEP-0005 rule
+    /// 21c), so a lost answer is still answered (21a).
+    pub fresh: bool,
     /// Most releases of one DID per hour.
     pub per_did: u64,
     /// Most releases to one requester per hour.
@@ -127,6 +132,9 @@ pub enum Release {
     /// for a channel this server sequences, or by this server's own route.
     /// Nothing was released.
     LocalAddsEnded,
+    /// Asked without [`ReleaseAsk::fresh`], and not a repeat. Nothing was
+    /// released.
+    NotARepeat,
 }
 
 /// A DID's newest `jig-local-adds-v1` marker kept here (JEP-0017 R2).
@@ -1581,6 +1589,7 @@ impl SqliteStore {
         rebuild_alias_attestations_with_suffix(conn)?;
         crate::contracts::migrate(conn)?;
         crate::follow::migrate(conn)?;
+        crate::custody_policy::migrate(conn)?;
         Ok(())
     }
 
@@ -3157,6 +3166,9 @@ impl SqliteStore {
                 package,
                 last_resort,
             });
+        }
+        if !ask.fresh {
+            return Ok(Release::NotARepeat);
         }
         // Which package, before the limits: a DID with none here is told so
         // (`Empty`), never `Limited`, so an adder falls back to its
@@ -5258,6 +5270,7 @@ mod tests {
             now,
             repeat_window: 600,
             repeat: true,
+            fresh: true,
             per_did: 3,
             per_requester: 2,
             listing: None,
@@ -5895,6 +5908,7 @@ mod tests {
                 now: 100,
                 repeat_window: 0,
                 repeat: false,
+                fresh: true,
                 per_did: 10,
                 per_requester: 10,
                 listing: None,
