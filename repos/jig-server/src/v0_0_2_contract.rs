@@ -38,7 +38,8 @@
 //! ([`crate::v0_0_2_stream`], rules 12-14), on the same connection. The
 //! follower's relayed writes (rule 15) come in a later slice.
 
-use std::sync::{Arc, RwLock};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -70,6 +71,9 @@ pub const ANSWER_FRAME: &str = "contract-answer";
 /// yet answered: one signed `contract-end`.
 pub const END_FRAME: &str = "contract-end";
 
+/// Most unconfigured peers whose dropped frames are logged, once each.
+const MAX_DELISTED_LOGGED: usize = 256;
+
 /// How often the owner sends its unanswered offers again. A send fails while
 /// there is no connection to the peer, so an offer made then goes out
 /// within this long of the connection coming up. Answering is idempotent: an
@@ -91,6 +95,9 @@ pub struct Contracts {
     /// The same [`Relay`] as `AppState::relay`, once [`handle`] has set it:
     /// one table of requests waiting on owners.
     relay: Arc<Relay>,
+    /// Peers whose stream or relay frames were dropped because they are no
+    /// longer configured, each logged once.
+    delisted: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Run the contract on `state`'s server:
@@ -229,6 +236,13 @@ fn repair_relayed_copies(store: &SqliteStore) {
 impl Contracts {
     pub fn new(state: &AppState) -> Self {
         let federation = Arc::new(state.config.federation.clone());
+        let relay = state.relay.get().cloned().unwrap_or_else(|| {
+            Arc::new(Relay::new(
+                state.ingest_ctx.clone(),
+                federation.clone(),
+                state.peers.clone(),
+            ))
+        });
         Self {
             ctx: state.ingest_ctx.clone(),
             federation: federation.clone(),
@@ -238,14 +252,10 @@ impl Contracts {
                 state.ingest_ctx.clone(),
                 federation.clone(),
                 state.peers.clone(),
+                relay.quotas(),
             ),
-            relay: state.relay.get().cloned().unwrap_or_else(|| {
-                Arc::new(Relay::new(
-                    state.ingest_ctx.clone(),
-                    &federation,
-                    state.peers.clone(),
-                ))
-            }),
+            relay,
+            delisted: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -893,6 +903,29 @@ impl PeerFrames for Contracts {
         body: &[u8],
         out: &PeerSender,
     ) -> Result<(), CloseReason> {
+        // Any DID that proves itself may hold a peer connection, so that an
+        // offer from one this server does not list is answered `NOT_A_PEER`
+        // (rule 17). It streams and relays nothing (DJ 2026-11-26): its other
+        // frames are dropped before any work, a peer delisted while its share
+        // is accepted included. The share stays as it is, for the operator.
+        if !matches!(kind, OFFER_FRAME | ANSWER_FRAME | END_FRAME) {
+            let did = peer.to_did_jig_string();
+            if self.peer(&did).is_none() {
+                // Bounded: anyone can mint DIDs to connect with.
+                let first = {
+                    let mut logged = self.delisted.lock().unwrap_or_else(|p| p.into_inner());
+                    logged.len() < MAX_DELISTED_LOGGED && logged.insert(did.clone())
+                };
+                if first {
+                    tracing::info!(
+                        peer = did,
+                        kind,
+                        "frames from a server that is not a configured peer are dropped"
+                    );
+                }
+                return Ok(());
+            }
+        }
         if let Some(handled) = self.stream.on_peer_frame(peer, kind, body, out) {
             return handled;
         }
@@ -3017,6 +3050,120 @@ mod tests {
         )
     }
 
+    /// Any server that proves its DID may hold a peer connection, but only a
+    /// configured peer streams or relays (DJ 2026-11-26). A server delisted
+    /// while its share is accepted gets nothing more, and the share stays
+    /// accepted for the operator to end. Contract frames still pass, so an
+    /// unlisted server's offer is answered `NOT_A_PEER` (rule 17).
+    #[tokio::test]
+    async fn only_a_configured_peer_streams_or_relays() {
+        let (listed, delisted) = (a_did(), a_did());
+        let owner = state_with(
+            vec![peer(
+                "ws://127.0.0.1:1",
+                listed.to_did_jig_string(),
+                OfferPolicy::Hold,
+            )],
+            &[],
+        );
+        let user = SigningKey::from_bytes(&rand::random());
+        let channel = post(
+            &owner,
+            &user,
+            BlockKind::ChannelCreate,
+            serde_json::json!({"slug": "#limited", "tier": "public"}),
+        )
+        .await
+        .unwrap();
+        for follower in [&listed, &delisted] {
+            owner
+                .ingest_ctx
+                .store
+                .put_contract_offer(&StoredOffer {
+                    offer_id: rand::random(),
+                    channel_id: channel.clone(),
+                    side: Side::Owner,
+                    peer_did: follower.to_did_jig_string(),
+                    grant: Grant::Write,
+                    state: OfferState::Accepted,
+                    offer: vec![],
+                    answer: None,
+                    share_cid: None,
+                })
+                .unwrap();
+        }
+        let contracts = Contracts::new(&owner);
+        let relay_submit = Submit {
+            request_id: 1,
+            channel_id: channel.clone(),
+            bundle: vec![0; 10],
+            sig: vec![0; 64],
+        }
+        .encode();
+
+        let (out, mut rx) = PeerSender::new(listed.clone());
+        contracts
+            .on_peer_frame(
+                &listed,
+                crate::v0_0_2_stream::RECORDS_FROM_FRAME,
+                &ask(&channel),
+                &out,
+            )
+            .unwrap();
+        assert_eq!(sent(&mut rx)[0].0, crate::v0_0_2_stream::RECORDS_FRAME);
+
+        let (out, mut rx) = PeerSender::new(delisted.clone());
+        for (kind, body) in [
+            (crate::v0_0_2_stream::RECORDS_FROM_FRAME, ask(&channel)),
+            (crate::v0_0_2_relay::RELAY_SUBMIT_FRAME, relay_submit),
+            // Malformed: dropped before it is read, not a violation.
+            (crate::v0_0_2_stream::RECORDS_FRAME, b"junk".to_vec()),
+        ] {
+            contracts
+                .on_peer_frame(&delisted, kind, &body, &out)
+                .unwrap();
+        }
+        tokio::task::yield_now().await;
+        assert!(sent(&mut rx).is_empty(), "nothing answered or relayed");
+        assert_eq!(
+            owner
+                .ingest_ctx
+                .store
+                .contract_offers_for(
+                    &channel,
+                    &delisted.to_did_jig_string(),
+                    Side::Owner,
+                    OfferState::Accepted
+                )
+                .unwrap()
+                .len(),
+            1,
+            "the share is left for the operator"
+        );
+
+        // Pushes reach configured peers only: a block posted now goes to the
+        // listed follower's connection, and nothing to the delisted one's,
+        // though both are connected and both shares are accepted.
+        let (listed_out, mut listed_rx) = PeerSender::new(listed.clone());
+        let (delisted_out, mut delisted_rx) = PeerSender::new(delisted.clone());
+        let _listed = owner.peers.register(listed_out);
+        let _delisted = owner.peers.register(delisted_out);
+        let cid = post(
+            &owner,
+            &user,
+            BlockKind::TextRender,
+            serde_json::json!({"channel_id": channel, "body": "after the delisting"}),
+        )
+        .await
+        .unwrap();
+        let block = owner.ingest_ctx.store.get_block(&cid).unwrap().unwrap();
+        contracts.stream.on_block(&block).unwrap();
+        let pushed = sent(&mut listed_rx);
+        assert_eq!(pushed.len(), 1, "{pushed:?}");
+        assert_eq!(pushed[0].0, crate::v0_0_2_stream::RECORDS_FRAME);
+        assert!(sent(&mut delisted_rx).is_empty(), "nothing pushed");
+    }
+
     /// Once the owner records a follower's accept, it sends the follower the
     /// channel from its start, so the follower carries it at once: the pair
     /// runs no pull timer, and nothing here pulls.
@@ -3457,7 +3604,16 @@ mod tests {
         state: &AppState,
         parts: &(Vec<u8>, Vec<u8>, Vec<u8>),
     ) -> Result<String, Refusal> {
-        crate::v0_0_2_relay::post(state, &parts.0, &parts.1, parts.2.clone(), 7, "ws:7", true).await
+        crate::v0_0_2_relay::post(
+            state,
+            &parts.0,
+            &parts.1,
+            parts.2.clone(),
+            7,
+            &crate::v0_0_2_relay::ws_caller(7, None, None),
+            true,
+        )
+        .await
     }
 
     /// The submit a follower would send for `parts`, into `channel`.
@@ -4130,17 +4286,18 @@ mod tests {
 
     /// A REST write's relay slots are its caller's: whoever replays an
     /// author's signed blocks from their own address fills their own
-    /// [`crate::v0_0_2_relay::MAX_IN_FLIGHT`], and the author, from theirs,
-    /// still gets through.
+    /// [`crate::v0_0_2_relay::MAX_CLIENT_IN_FLIGHT`] (each request is its
+    /// own connection, and the address is the client), and the author, from
+    /// theirs, still gets through.
     #[tokio::test]
-    async fn a_replayer_holds_its_own_relay_slots_not_the_authors() {
+    async fn a_replayer_fills_its_own_client_slots_not_the_authors() {
         let p = pair(OfferPolicy::Accept).await;
         let channel = p.carried("write").await;
         let (silent, mut swallowed) = PeerSender::new(p.owner.server_did.clone());
         let _registration = p.follower.peers.register(silent);
         let author = SigningKey::from_bytes(&rand::random());
         let mut waiting = Vec::new();
-        for i in 0..crate::v0_0_2_relay::MAX_IN_FLIGHT {
+        for i in 0..crate::v0_0_2_relay::MAX_CLIENT_IN_FLIGHT {
             let parts = signed(
                 &author,
                 BlockKind::TextRender,
@@ -4152,7 +4309,7 @@ mod tests {
             }));
         }
         let ten_s = std::time::Duration::from_secs(10);
-        for _ in 0..crate::v0_0_2_relay::MAX_IN_FLIGHT {
+        for _ in 0..crate::v0_0_2_relay::MAX_CLIENT_IN_FLIGHT {
             tokio::time::timeout(ten_s, swallowed.recv())
                 .await
                 .expect("a replayed write is relayed")
@@ -4456,8 +4613,16 @@ mod tests {
         let gone = {
             let follower = follower.clone();
             tokio::spawn(async move {
-                crate::v0_0_2_relay::post(&follower, &parts.0, &parts.1, parts.2, 8, "ws:8", true)
-                    .await
+                crate::v0_0_2_relay::post(
+                    &follower,
+                    &parts.0,
+                    &parts.1,
+                    parts.2,
+                    8,
+                    &crate::v0_0_2_relay::ws_caller(8, None, None),
+                    true,
+                )
+                .await
             })
         };
         swallowed.recv().await.expect("its relay sent");
@@ -4481,11 +4646,61 @@ mod tests {
         assert_eq!(relay.waiting(), 0, "nothing left waiting");
     }
 
+    /// A follower relays nothing to an owner it no longer lists as a peer,
+    /// though its share is accepted: the write is refused as for a carried
+    /// channel with no live share, and nothing waits on that owner.
     #[tokio::test]
-    async fn a_write_for_an_owner_not_connected_is_refused_with_when_to_retry() {
+    async fn a_write_for_an_owner_no_longer_configured_is_not_relayed() {
         let follower = state_with(vec![], &[]);
         handle(&follower);
         let owner = did_of(&SigningKey::from_bytes(&rand::random()));
+        let channel = jig_pipeline::ingest_record::label_cid("carried");
+        let store = &follower.ingest_ctx.store;
+        store
+            .upsert_channel(&StoredChannel {
+                id: channel.clone(),
+                slug: "#carried".to_string(),
+                visibility: "open".to_string(),
+                created_at: 0,
+                owner_did: owner.clone(),
+                suite: jig_core::EncryptionSuite::Unencrypted.as_str().to_string(),
+                sequencer_did: owner.clone(),
+                co_owners: vec![],
+                tiering: jig_pipeline::persist::ChannelTiering::current(
+                    "open",
+                    jig_core::EncryptionSuite::Unencrypted.as_str(),
+                ),
+            })
+            .unwrap();
+        store
+            .put_contract_offer(&StoredOffer {
+                offer_id: rand::random(),
+                channel_id: channel.clone(),
+                side: Side::Follower,
+                peer_did: owner.clone(),
+                grant: Grant::Write,
+                state: OfferState::Accepted,
+                offer: vec![],
+                answer: None,
+                share_cid: None,
+            })
+            .unwrap();
+        let author = SigningKey::from_bytes(&rand::random());
+        let parts = signed(&author, BlockKind::TextRender, text_in(&channel, "hello"));
+        let refused = client_post(&follower, &parts).await.unwrap_err();
+        assert_eq!(refused.code, "CARRIED_CHANNEL", "{refused:?}");
+        assert_eq!(follower.relay.get().unwrap().waiting(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_write_for_an_owner_not_connected_is_refused_with_when_to_retry() {
+        let owner = did_of(&SigningKey::from_bytes(&rand::random()));
+        // A configured peer, but not connected.
+        let follower = state_with(
+            vec![peer("ws://127.0.0.1:1", owner.clone(), OfferPolicy::Hold)],
+            &[],
+        );
+        handle(&follower);
         let channel = jig_pipeline::ingest_record::label_cid("carried");
         let store = &follower.ingest_ctx.store;
         store

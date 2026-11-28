@@ -24,9 +24,9 @@
 //! cannot write into a channel another server owns.
 //!
 //! What a peer streams counts against its quota (its `quota`, or
-//! `default_peer_quota`: what this server's manifest publishes, rule 16).
-//! Entries past it are not landed; a later pull fetches them once the minute
-//! turns.
+//! `default_peer_quota`: what this server's manifest publishes, rule 16),
+//! with the writes it relays here ([`PeerQuotas`]). Entries past it are not
+//! landed; a later pull fetches them once the minute turns.
 //!
 //! The frames are deterministic CBOR (`jig_core::dcbor`), with the block,
 //! its signature and its record as byte strings, so a frame's base64 on the
@@ -291,11 +291,66 @@ impl Packer {
     }
 }
 
-/// What one peer streamed in the current minute.
+/// What one peer sent in the current minute.
 struct Window {
     start: Instant,
     blocks: u64,
     bytes: u64,
+}
+
+/// Each peer's quota (its `quota`, or `default_peer_quota`: what this
+/// server's manifest publishes, rule 16), counted over everything the peer
+/// sends that lands or is relayed here: the blocks it streams as an owner and
+/// the writes it relays as a follower. One budget per peer, whichever way
+/// its blocks come.
+pub struct PeerQuotas {
+    federation: Arc<FederationSection>,
+    used: Mutex<HashMap<String, Window>>,
+}
+
+impl PeerQuotas {
+    pub fn new(federation: Arc<FederationSection>) -> Self {
+        PeerQuotas {
+            federation,
+            used: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Count one block of `bytes` against `peer`'s quota for this minute.
+    /// Whether it is within it; one past it is not counted.
+    pub fn take(&self, peer: &str, bytes: usize) -> bool {
+        self.take_or_wait(peer, bytes).is_ok()
+    }
+
+    /// [`Self::take`], or how long until `peer`'s minute starts again.
+    pub fn take_or_wait(&self, peer: &str, bytes: usize) -> Result<(), Duration> {
+        let quota: PeerQuotaConfig =
+            crate::v0_0_2_federation::configured_peer(&self.federation, peer)
+                .and_then(|p| p.quota)
+                .unwrap_or(self.federation.default_peer_quota);
+        let mut used = self.used.lock().unwrap_or_else(|p| p.into_inner());
+        let window = used.entry(peer.to_string()).or_insert(Window {
+            start: Instant::now(),
+            blocks: 0,
+            bytes: 0,
+        });
+        let minute = Duration::from_secs(60);
+        if window.start.elapsed() >= minute {
+            *window = Window {
+                start: Instant::now(),
+                blocks: 0,
+                bytes: 0,
+            };
+        }
+        if window.blocks + 1 > quota.blocks_per_min
+            || window.bytes + bytes as u64 > quota.bytes_per_min
+        {
+            return Err(minute.saturating_sub(window.start.elapsed()));
+        }
+        window.blocks += 1;
+        window.bytes += bytes as u64;
+        Ok(())
+    }
 }
 
 /// A frame waiting to be landed, with the peer it came from.
@@ -310,7 +365,8 @@ pub struct Stream {
     queue: mpsc::Sender<Queued>,
     /// The queue's other end, until [`Stream::run`] takes it.
     frames: Arc<Mutex<Option<mpsc::Receiver<Queued>>>>,
-    used: Arc<Mutex<HashMap<String, Window>>>,
+    /// Shared with this server's [`crate::v0_0_2_relay::Relay`].
+    quotas: Arc<PeerQuotas>,
     /// The owner's limit on each follower's `records-from`.
     requests: Arc<RequestLimit>,
     /// The follower's side of it: per (owner, channel), when the owner said
@@ -324,6 +380,7 @@ impl Stream {
         ctx: Arc<IngestContext>,
         federation: Arc<FederationSection>,
         peers: Arc<PeerRegistry>,
+        quotas: Arc<PeerQuotas>,
     ) -> Self {
         let (queue, frames) = mpsc::channel(QUEUE);
         let requests = Arc::new(RequestLimit::new(federation.records_from));
@@ -333,7 +390,7 @@ impl Stream {
             peers,
             queue,
             frames: Arc::new(Mutex::new(Some(frames))),
-            used: Arc::new(Mutex::new(HashMap::new())),
+            quotas,
             requests,
             retry_at: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -357,9 +414,17 @@ impl Stream {
         &self.ctx.store
     }
 
-    /// Send `body` to `peer`, if it is connected. A frame not sent is not
-    /// lost: the follower's next pull asks for what it lacks.
+    /// Send `body` to `peer`, if it is a configured peer and connected. A
+    /// frame not sent is not lost: the follower's next pull asks for what it
+    /// lacks. Every frame this server starts on a stream goes through here,
+    /// pushes and pulls alike, so a server that is not configured, one
+    /// delisted while its share is accepted included, is sent nothing
+    /// (DJ 2026-11-26); its share stays as it is, for the operator.
     fn send(&self, peer: &str, kind: &str, body: Vec<u8>) {
+        if crate::v0_0_2_federation::configured_peer(&self.federation, peer).is_none() {
+            tracing::debug!(peer, kind, "not a configured peer; nothing sent");
+            return;
+        }
         let Ok(did) = Did::from_did_jig_string(peer) else {
             return;
         };
@@ -685,36 +750,6 @@ impl Stream {
         }
     }
 
-    /// Count `bytes` of one block against `peer`'s quota for this minute.
-    /// Whether it is within it.
-    fn within_quota(&self, peer: &str, bytes: usize) -> bool {
-        let quota: PeerQuotaConfig =
-            crate::v0_0_2_federation::configured_peer(&self.federation, peer)
-                .and_then(|p| p.quota)
-                .unwrap_or(self.federation.default_peer_quota);
-        let mut used = self.used.lock().unwrap_or_else(|p| p.into_inner());
-        let window = used.entry(peer.to_string()).or_insert(Window {
-            start: Instant::now(),
-            blocks: 0,
-            bytes: 0,
-        });
-        if window.start.elapsed() >= Duration::from_secs(60) {
-            *window = Window {
-                start: Instant::now(),
-                blocks: 0,
-                bytes: 0,
-            };
-        }
-        if window.blocks + 1 > quota.blocks_per_min
-            || window.bytes + bytes as u64 > quota.bytes_per_min
-        {
-            return false;
-        }
-        window.blocks += 1;
-        window.bytes += bytes as u64;
-        true
-    }
-
     /// Land one frame from `peer`, entry by entry, with `peer` as the
     /// sequencer. The first entry that does not land ends the frame: a gap
     /// asks for what is missing, and anything else is logged (a fork's
@@ -729,7 +764,7 @@ impl Stream {
                 tracing::warn!(peer = sequencer, "a streamed block that is not a bundle");
                 return;
             };
-            if !self.within_quota(&sequencer, entry.bundle.len()) {
+            if !self.quotas.take(&sequencer, entry.bundle.len()) {
                 tracing::info!(
                     peer = sequencer,
                     "past the peer's quota; fetched again later"

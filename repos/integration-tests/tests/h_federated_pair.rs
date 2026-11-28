@@ -55,10 +55,9 @@ async fn a_share_between_a_federated_pair_is_accepted_and_carried() {
             .ok()
             .flatten()
     };
-    // A follower asks for a channel's records on its next pull, at most
-    // `PULL_EVERY` (10 s) after the share is accepted.
-    let pull = jig_server::v0_0_2_stream::PULL_EVERY.as_secs() + 5;
-    within(pull, "B carries the channel", || carried().is_some()).await;
+    // The owner sends the channel as soon as it records the accept (#510),
+    // so B carries it well before the next timed pull.
+    within(5, "B carries the channel", || carried().is_some()).await;
     assert_eq!(carried().unwrap().sequencer_did, a.server_did_string);
     let accepted = |server: &TestJigServer, peer: &TestJigServer, side| {
         server

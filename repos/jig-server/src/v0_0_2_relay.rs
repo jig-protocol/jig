@@ -10,7 +10,13 @@
 //!   1 and 1b run before it finds the channel carried);
 //! - it checks the grant itself, so the owner never sees a write it would
 //!   refuse for that, and it holds at most [`MAX_IN_FLIGHT`] relays per
-//!   client connection;
+//!   client connection (each REST request is its own, and its address is
+//!   the client), [`MAX_CLIENT_IN_FLIGHT`] per client and
+//!   [`MAX_SERVER_IN_FLIGHT`] in all, refusing past any of them with
+//!   `RELAY_BUSY` and when to try again. Nothing waits in a queue: a write
+//!   the owner cannot take now is refused with a code, never dropped (this
+//!   replaces F2's caps on writes queued while a sequencer is down, DJ
+//!   2026-11-26);
 //! - it sends the block in a [`RELAY_SUBMIT_FRAME`] and answers the client
 //!   with the owner's [`RELAY_RESULT_FRAME`]: the block's CID, or the owner's
 //!   refusal code. The block lands here only through the owner's stream,
@@ -22,9 +28,12 @@
 //! the same signed block again is safe, because the owner takes a block it
 //! already holds as accepted, before any effect.
 //!
-//! The owner takes a relayed block only from a peer holding an accepted share
-//! of the channel it names, at most `[federation.relayed_writes]` per peer and
-//! channel, and runs its full write gate on it with
+//! The owner counts each relayed write against the follower's quota
+//! ([`PeerQuotas`], shared with the stream) and holds at most
+//! [`MAX_PEER_IN_FLIGHT`] of a follower's writes at once, both before any
+//! task or lookup. It takes a relayed block only from a peer holding an
+//! accepted share of the channel it names, at most
+//! `[federation.relayed_writes]` per peer and channel, and runs its full write gate on it with
 //! [`IngestSource::Relayed`]: the author's signature, its write and role
 //! checks, the grant, and the relayed admission. Admission is the follower's
 //! to do (delegated admission): the owner does not ask a relayed author for
@@ -49,7 +58,7 @@ use jig_pipeline::ingest::{IngestContext, IngestError, IngestSource, ingest};
 use tokio::sync::oneshot;
 
 use crate::v0_0_2_peer::{CloseReason, PeerRegistry, PeerSender};
-use crate::v0_0_2_stream::RequestLimit;
+use crate::v0_0_2_stream::{PeerQuotas, RequestLimit};
 
 /// A follower's relay of one client block to the channel's owner.
 pub const RELAY_SUBMIT_FRAME: &str = "relay-submit";
@@ -61,6 +70,19 @@ pub const RELAY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The most relays one client connection may have waiting on the owner.
 pub const MAX_IN_FLIGHT: usize = 4;
+/// The most relays one client may have waiting, over all its connections:
+/// its DID on WSS, its address on REST (DJ 2026-11-26).
+pub const MAX_CLIENT_IN_FLIGHT: usize = 16;
+/// The most relays this server holds waiting on owners, from every client
+/// together. Nothing is queued past this: a write is refused, never dropped.
+pub const MAX_SERVER_IN_FLIGHT: usize = 1024;
+/// The most relayed writes one follower may have this server working on at
+/// once, on the owner's side.
+pub const MAX_PEER_IN_FLIGHT: usize = 64;
+/// What a client is told to wait when this server's relay slots are full,
+/// before [`crate::v0_0_2_ingest_error::jitter`]. A slot frees within
+/// [`RELAY_TIMEOUT`] at the latest.
+pub const BUSY_RETRY: Duration = Duration::from_secs(1);
 
 /// What a client is told to wait when the owner is not connected, before
 /// [`crate::v0_0_2_ingest_error::jitter`].
@@ -245,13 +267,37 @@ type Pending = HashMap<u64, (String, oneshot::Sender<Answer>)>;
 /// One server's side of every write it relays or takes relayed.
 pub struct Relay {
     ctx: Arc<IngestContext>,
+    federation: Arc<FederationSection>,
     peers: Arc<PeerRegistry>,
     /// The owner's limit on each follower's relayed writes.
     writes: RequestLimit,
     pending: Mutex<Pending>,
     next_id: AtomicU64,
-    /// Relays waiting on an owner, per client connection.
-    in_flight: Arc<Mutex<HashMap<String, usize>>>,
+    /// Relays waiting on an owner: per client connection, per client, and
+    /// in all.
+    in_flight: Arc<Mutex<InFlightCounts>>,
+    /// Each peer's quota, shared with this server's stream.
+    quotas: Arc<PeerQuotas>,
+    /// Relayed writes the owner is working on, per follower.
+    taking: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+/// What [`Relay::hold`] counts.
+#[derive(Default)]
+struct InFlightCounts {
+    conns: HashMap<String, usize>,
+    clients: HashMap<String, usize>,
+    total: usize,
+}
+
+/// Take one from `key`'s count, dropping the entry at zero.
+fn release(counts: &mut HashMap<String, usize>, key: &str) {
+    if let Some(n) = counts.get_mut(key) {
+        *n -= 1;
+        if *n == 0 {
+            counts.remove(key);
+        }
+    }
 }
 
 /// One request waiting on its owner's answer, forgotten when its waiter goes,
@@ -267,28 +313,42 @@ impl Drop for Waiting<'_> {
     }
 }
 
-/// One relay counted against its client connection while it waits.
+/// One relay counted against its connection, its client and this server
+/// while it waits.
 struct InFlight {
-    key: String,
-    counts: Arc<Mutex<HashMap<String, usize>>>,
+    conn: String,
+    client: String,
+    counts: Arc<Mutex<InFlightCounts>>,
 }
 
 impl Drop for InFlight {
     fn drop(&mut self) {
         let mut counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(n) = counts.get_mut(&self.key) {
-            *n -= 1;
-            if *n == 0 {
-                counts.remove(&self.key);
-            }
-        }
+        release(&mut counts.conns, &self.conn);
+        release(&mut counts.clients, &self.client);
+        counts.total -= 1;
+    }
+}
+
+/// One relayed write the owner works on, counted against its follower.
+struct Taking {
+    peer: String,
+    counts: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+impl Drop for Taking {
+    fn drop(&mut self) {
+        release(
+            &mut self.counts.lock().unwrap_or_else(|p| p.into_inner()),
+            &self.peer,
+        );
     }
 }
 
 impl Relay {
     pub fn new(
         ctx: Arc<IngestContext>,
-        federation: &FederationSection,
+        federation: Arc<FederationSection>,
         peers: Arc<PeerRegistry>,
     ) -> Self {
         Relay {
@@ -297,8 +357,16 @@ impl Relay {
             writes: RequestLimit::new(federation.relayed_writes),
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
-            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            in_flight: Arc::new(Mutex::new(InFlightCounts::default())),
+            quotas: Arc::new(PeerQuotas::new(federation.clone())),
+            federation,
+            taking: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Each peer's quota, for this server's stream to count against too.
+    pub fn quotas(&self) -> Arc<PeerQuotas> {
+        self.quotas.clone()
     }
 
     /// Handle a relay frame from `peer`, or `None` for a frame of another
@@ -321,15 +389,15 @@ impl Relay {
 
     /// Post a client's block on this server, relaying it to the channel's
     /// owner if this server carries the channel under a share whose grant
-    /// relays it. `conn` names the client's connection, for the in-flight
-    /// cap.
+    /// relays it. `caller` names the client and its connection, for the
+    /// in-flight caps.
     pub async fn submit(
         &self,
         manifest_bytes: &[u8],
         code_bytes: &[u8],
         sig: Vec<u8>,
         conn_id: u64,
-        conn: &str,
+        caller: &Caller,
         tiers: bool,
     ) -> Result<String, Refusal> {
         self.submit_as(
@@ -337,7 +405,7 @@ impl Relay {
             manifest_bytes,
             code_bytes,
             sig,
-            conn,
+            caller,
         )
         .await
     }
@@ -351,7 +419,7 @@ impl Relay {
         manifest_bytes: &[u8],
         code_bytes: &[u8],
         sig: Vec<u8>,
-        conn: &str,
+        caller: &Caller,
     ) -> Result<String, Refusal> {
         let bundle = BlockBundle {
             manifest_bytes,
@@ -373,8 +441,10 @@ impl Relay {
         self.check_self_join(manifest_bytes, channel_id)?;
         let canonical = serde_json::to_vec(&(manifest_bytes, code_bytes))
             .map_err(|e| Refusal::of(&IngestError::BundleMalformed(e.to_string())))?;
-        self.relay(&refused, kind, channel_id, sequencer, canonical, sig, conn)
-            .await
+        self.relay(
+            &refused, kind, channel_id, sequencer, canonical, sig, caller,
+        )
+        .await
     }
 
     /// A self-join to a carried `shared` channel is relayed only if this
@@ -447,7 +517,7 @@ impl Relay {
         sequencer: &str,
         bundle: Vec<u8>,
         sig: Vec<u8>,
-        conn: &str,
+        caller: &Caller,
     ) -> Result<String, Refusal> {
         let owner = jig_pipeline::effect::canonical_did_string(sequencer);
         let share = self
@@ -456,8 +526,11 @@ impl Relay {
             .contract_offers_for(channel_id, &owner, Side::Follower, OfferState::Accepted)
             .map_err(|e| Refusal::of(&IngestError::Persist(e)))?
             .pop();
-        // No live share: the channel is carried, nothing more.
-        let Some(share) = share else {
+        // No live share, or an owner no longer configured (DJ 2026-11-26):
+        // the channel is carried, nothing more, and nothing is sent to it.
+        let Some(share) = share.filter(|_| {
+            crate::v0_0_2_federation::configured_peer(&self.federation, &owner).is_some()
+        }) else {
             return Err(refusal_of(&self.ctx, refused));
         };
         let relays = kind
@@ -474,7 +547,7 @@ impl Relay {
                 ),
             ));
         }
-        let _slot = self.hold(conn)?;
+        let _slot = self.hold(caller)?;
         let Ok(owner_did) = Did::from_did_jig_string(&owner) else {
             return Err(Refusal::of(refused));
         };
@@ -541,24 +614,51 @@ impl Relay {
         Err(Refusal::new(status, &answer.code, answer.message))
     }
 
-    /// Count one relay against `conn`, or refuse it past [`MAX_IN_FLIGHT`].
-    fn hold(&self, conn: &str) -> Result<InFlight, Refusal> {
+    /// Count one relay against `caller`'s connection, `caller` and this
+    /// server, or refuse it past [`MAX_IN_FLIGHT`], [`MAX_CLIENT_IN_FLIGHT`]
+    /// or [`MAX_SERVER_IN_FLIGHT`]: `RELAY_BUSY` each time, with when to try
+    /// again.
+    fn hold(&self, caller: &Caller) -> Result<InFlight, Refusal> {
         let mut counts = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
-        let n = counts.entry(conn.to_string()).or_insert(0);
-        if *n >= MAX_IN_FLIGHT {
-            return Err(Refusal::new(
+        let busy = |whose: &str, max: usize| {
+            Err(Refusal::retry(
                 StatusCode::TOO_MANY_REQUESTS,
                 "RELAY_BUSY",
-                format!(
-                    "{MAX_IN_FLIGHT} writes from this connection are already waiting on their \
-                     channels' owners"
-                ),
-            ));
+                &format!("{max} writes from {whose} are already waiting on their channels' owners"),
+                crate::v0_0_2_ingest_error::jitter(BUSY_RETRY),
+            ))
+        };
+        if counts.conns.get(&caller.conn).copied().unwrap_or(0) >= MAX_IN_FLIGHT {
+            return busy("this connection", MAX_IN_FLIGHT);
+        }
+        if counts.clients.get(&caller.client).copied().unwrap_or(0) >= MAX_CLIENT_IN_FLIGHT {
+            return busy("this client", MAX_CLIENT_IN_FLIGHT);
+        }
+        if counts.total >= MAX_SERVER_IN_FLIGHT {
+            return busy("this server's clients", MAX_SERVER_IN_FLIGHT);
+        }
+        *counts.conns.entry(caller.conn.clone()).or_insert(0) += 1;
+        *counts.clients.entry(caller.client.clone()).or_insert(0) += 1;
+        counts.total += 1;
+        Ok(InFlight {
+            conn: caller.conn.clone(),
+            client: caller.client.clone(),
+            counts: self.in_flight.clone(),
+        })
+    }
+
+    /// Count one relayed write against follower `peer`, or `None` past
+    /// [`MAX_PEER_IN_FLIGHT`].
+    fn take_slot(&self, peer: &str) -> Option<Taking> {
+        let mut counts = self.taking.lock().unwrap_or_else(|p| p.into_inner());
+        let n = counts.entry(peer.to_string()).or_insert(0);
+        if *n >= MAX_PEER_IN_FLIGHT {
+            return None;
         }
         *n += 1;
-        Ok(InFlight {
-            key: conn.to_string(),
-            counts: self.in_flight.clone(),
+        Some(Taking {
+            peer: peer.to_string(),
+            counts: self.taking.clone(),
         })
     }
 
@@ -607,10 +707,43 @@ impl Relay {
         out: &PeerSender,
     ) -> Result<(), CloseReason> {
         let submit = Submit::decode(body).ok_or_else(|| violation("malformed relay-submit"))?;
+        // The peer's quota and its slots, before any task or lookup: a flood
+        // is answered from here.
+        let via = peer.to_did_jig_string();
+        let refuse = |answer: Answer| {
+            if let Err(e) = out.send(RELAY_RESULT_FRAME, answer.encode()) {
+                tracing::info!(peer = via, "relay-result not sent: {e}");
+            }
+            Ok(())
+        };
+        if let Err(wait) = self.quotas.take_or_wait(&via, submit.bundle.len()) {
+            let mut answer = Answer::refused(
+                submit.request_id,
+                StatusCode::TOO_MANY_REQUESTS,
+                "RELAY_RATE_LIMITED",
+                format!("`{via}` is past its quota on this server for this minute"),
+            );
+            answer.retry_after_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX).max(1);
+            return refuse(answer);
+        }
+        let Some(slot) = self.take_slot(&via) else {
+            let mut answer = Answer::refused(
+                submit.request_id,
+                StatusCode::TOO_MANY_REQUESTS,
+                "RELAY_BUSY",
+                format!(
+                    "{MAX_PEER_IN_FLIGHT} writes relayed by `{via}` are already being taken here"
+                ),
+            );
+            answer.retry_after_ms =
+                crate::v0_0_2_ingest_error::millis(crate::v0_0_2_ingest_error::jitter(BUSY_RETRY));
+            return refuse(answer);
+        };
         let relay = self.clone();
         let peer = peer.clone();
         let out = out.clone();
         tokio::spawn(async move {
+            let _slot = slot;
             let answer = relay.accept(&peer, submit).await;
             if let Err(e) = out.send(RELAY_RESULT_FRAME, answer.encode()) {
                 tracing::info!(
@@ -697,14 +830,45 @@ impl Relay {
     }
 }
 
-/// The in-flight key for a REST write from `ip`: the caller's address, so a
-/// caller resubmitting someone else's signed block holds its own relay
-/// slots, not the author's. A request with no address (a router driven
-/// without connection info) falls back to the block's `author`.
-pub fn rest_caller(ip: Option<std::net::IpAddr>, author: &str) -> String {
-    match ip {
+/// Who a write comes from, for the in-flight caps: its connection, and the
+/// client behind it, whose connections share [`MAX_CLIENT_IN_FLIGHT`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Caller {
+    pub conn: String,
+    pub client: String,
+}
+
+/// The [`Caller`] for a WSS connection: the client is the DID it
+/// authenticated as, else its address, else the connection alone.
+pub fn ws_caller(conn_id: u64, did: Option<&str>, ip: Option<std::net::IpAddr>) -> Caller {
+    let conn = format!("ws:{conn_id}");
+    let client = match (did, ip) {
+        (Some(did), _) => format!("did:{did}"),
+        (None, Some(ip)) => format!("ip:{ip}"),
+        (None, None) => conn.clone(),
+    };
+    Caller { conn, client }
+}
+
+/// The [`Caller`] for a REST write from `ip`. The client is the caller's
+/// address, so a caller resubmitting someone else's signed block holds its
+/// own relay slots, not the author's. A request with no address (a router
+/// driven without connection info) falls back to the block's `author`.
+///
+/// Each REST request is its own connection, with a key no other request
+/// shares. A REST client is bounded by [`MAX_CLIENT_IN_FLIGHT`] across its
+/// requests, not by [`MAX_IN_FLIGHT`] at its address.
+pub fn rest_caller(ip: Option<std::net::IpAddr>, author: &str) -> Caller {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static REQUEST: AtomicU64 = AtomicU64::new(0);
+
+    let client = match ip {
         Some(ip) => format!("rest:ip:{ip}"),
         None => format!("rest:{author}"),
+    };
+    Caller {
+        conn: format!("rest:req:{}", REQUEST.fetch_add(1, Ordering::Relaxed)),
+        client,
     }
 }
 
@@ -724,20 +888,20 @@ fn refusal_of(ctx: &IngestContext, e: &IngestError) -> Refusal {
 
 /// Post a client's block on `state`'s server: through its [`Relay`], once
 /// the contract runs ([`crate::v0_0_2_contract`]), or straight to ingest.
-/// `conn` names the client's connection for the in-flight cap.
+/// `caller` names the client and its connection for the in-flight caps.
 pub async fn post(
     state: &crate::v0_0_2::AppState,
     manifest_bytes: &[u8],
     code_bytes: &[u8],
     sig: Vec<u8>,
     conn_id: u64,
-    conn: &str,
+    caller: &Caller,
     tiers: bool,
 ) -> Result<String, Refusal> {
     let posted = match state.relay.get() {
         Some(relay) => {
             relay
-                .submit(manifest_bytes, code_bytes, sig, conn_id, conn, tiers)
+                .submit(manifest_bytes, code_bytes, sig, conn_id, caller, tiers)
                 .await
         }
         None => {
@@ -769,19 +933,19 @@ pub async fn post(
 /// [`post`] for a block that reaches this server as `source` rather than
 /// from a client connection: the channel-op routes' `IngestSource::AdminEndpoint`.
 /// On a channel this server carries, it is relayed to the owner like any
-/// client write, under the share's grant. `conn` names the caller for the
-/// in-flight cap.
+/// client write, under the share's grant. `caller` names the caller for the
+/// in-flight caps.
 pub async fn post_as(
     state: &crate::v0_0_2::AppState,
     source: IngestSource,
     manifest_bytes: &[u8],
     code_bytes: &[u8],
     sig: Vec<u8>,
-    conn: &str,
+    caller: &Caller,
 ) -> Result<String, Refusal> {
     if let Some(relay) = state.relay.get() {
         return relay
-            .submit_as(source, manifest_bytes, code_bytes, sig, conn)
+            .submit_as(source, manifest_bytes, code_bytes, sig, caller)
             .await;
     }
     let bundle = BlockBundle {
@@ -933,7 +1097,7 @@ mod tests {
                 &block.code_bytes,
                 block.sender_sig.clone(),
                 1,
-                "ws:1",
+                &ws_caller(1, None, None),
                 true,
             )
             .await;
@@ -943,5 +1107,202 @@ mod tests {
         assert_eq!(refusals[0].retry_after_ms, None);
         assert_eq!(refusals[1].code, "RATE_LIMITED", "{:?}", refusals[1]);
         assert_eq!(refusals[1].retry_after_ms, Some(250));
+    }
+
+    fn relay_for(state: &crate::v0_0_2::AppState) -> Arc<Relay> {
+        Arc::new(Relay::new(
+            state.ingest_ctx.clone(),
+            Arc::new(state.config.federation.clone()),
+            state.peers.clone(),
+        ))
+    }
+
+    fn caller(n: usize) -> Caller {
+        Caller {
+            conn: format!("conn:{n}"),
+            client: format!("client:{n}"),
+        }
+    }
+
+    fn busy(refusal: Refusal, whose: &str) {
+        assert_eq!(refusal.code, "RELAY_BUSY", "{refusal:?}");
+        assert_eq!(refusal.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            refusal.retry_after_ms.is_some_and(|ms| ms > 0),
+            "{refusal:?}"
+        );
+        assert!(refusal.message.contains(whose), "{refusal:?}");
+    }
+
+    /// Relays waiting on owners are bounded per connection, per client over
+    /// its connections, and over the whole server, each refused with
+    /// `RELAY_BUSY` and when to try again (DJ 2026-11-26). A slot frees when
+    /// its relay ends.
+    #[tokio::test]
+    async fn relays_waiting_are_bounded_per_connection_client_and_server() {
+        let state = crate::v0_0_2::AppState::for_test().unwrap();
+        let relay = relay_for(&state);
+        let alice = |conn| ws_caller(conn, Some("did:jig:zAlice"), None);
+
+        let mut held = Vec::new();
+        for _ in 0..MAX_IN_FLIGHT {
+            held.push(relay.hold(&alice(1)).unwrap());
+        }
+        busy(relay.hold(&alice(1)).err().unwrap(), "this connection");
+
+        // More connections of the same client, up to its own bound.
+        let mut conn = 2;
+        while held.len() < MAX_CLIENT_IN_FLIGHT {
+            for _ in 0..MAX_IN_FLIGHT {
+                held.push(relay.hold(&alice(conn)).unwrap());
+            }
+            conn += 1;
+        }
+        busy(relay.hold(&alice(conn)).err().unwrap(), "this client");
+        // Its address does not make it another client, and another client is
+        // not held up by it.
+        let ip = Some(std::net::IpAddr::from([192, 0, 2, 1]));
+        busy(
+            relay
+                .hold(&ws_caller(conn, Some("did:jig:zAlice"), ip))
+                .err()
+                .unwrap(),
+            "this client",
+        );
+        let bob = relay
+            .hold(&ws_caller(conn, Some("did:jig:zBob"), None))
+            .unwrap();
+
+        // The whole server.
+        let mut n = 0;
+        while held.len() + 1 < MAX_SERVER_IN_FLIGHT {
+            held.push(relay.hold(&caller(n)).unwrap());
+            n += 1;
+        }
+        busy(relay.hold(&caller(n)).err().unwrap(), "this server");
+
+        // Every slot frees with its relay.
+        drop(bob);
+        relay.hold(&caller(n)).unwrap();
+        drop(held);
+        for _ in 0..MAX_IN_FLIGHT {
+            std::mem::forget(relay.hold(&alice(1)).unwrap());
+        }
+        let counts = relay.in_flight.lock().unwrap();
+        assert_eq!(counts.total, MAX_IN_FLIGHT);
+        assert_eq!(counts.clients.len(), 1);
+    }
+
+    /// A REST client's writes are separate requests: one address holds up
+    /// to [`MAX_CLIENT_IN_FLIGHT`] relays, not [`MAX_IN_FLIGHT`], and a
+    /// WSS connection keeps its own bound of [`MAX_IN_FLIGHT`].
+    #[tokio::test]
+    async fn rest_writes_from_one_address_are_bounded_as_one_client() {
+        let state = crate::v0_0_2::AppState::for_test().unwrap();
+        let relay = relay_for(&state);
+        let ip = Some(std::net::IpAddr::from([192, 0, 2, 7]));
+
+        let mut held = Vec::new();
+        for _ in 0..MAX_CLIENT_IN_FLIGHT {
+            held.push(relay.hold(&rest_caller(ip, "did:jig:zAuthor")).unwrap());
+        }
+        busy(
+            relay
+                .hold(&rest_caller(ip, "did:jig:zAuthor"))
+                .err()
+                .unwrap(),
+            "this client",
+        );
+        // Another address is another client.
+        let other = Some(std::net::IpAddr::from([192, 0, 2, 8]));
+        held.push(relay.hold(&rest_caller(other, "did:jig:zAuthor")).unwrap());
+
+        // A WSS connection is still bounded on its own.
+        let carol = ws_caller(1, Some("did:jig:zCarol"), None);
+        for _ in 0..MAX_IN_FLIGHT {
+            held.push(relay.hold(&carol).unwrap());
+        }
+        busy(relay.hold(&carol).err().unwrap(), "this connection");
+    }
+
+    /// A REST request's connection key is its own, so it must not outlive
+    /// the request: after many REST relays from one address have ended,
+    /// nothing is left counted for their connections or their client.
+    #[tokio::test]
+    async fn rest_relays_leave_no_slots_behind() {
+        let state = crate::v0_0_2::AppState::for_test().unwrap();
+        let relay = relay_for(&state);
+        let ip = Some(std::net::IpAddr::from([192, 0, 2, 9]));
+        for _ in 0..4 * MAX_CLIENT_IN_FLIGHT {
+            drop(relay.hold(&rest_caller(ip, "did:jig:zAuthor")).unwrap());
+        }
+        let counts = relay.in_flight.lock().unwrap();
+        assert!(counts.conns.is_empty(), "{:?}", counts.conns);
+        assert!(counts.clients.is_empty(), "{:?}", counts.clients);
+        assert_eq!(counts.total, 0);
+    }
+
+    /// The answer `rx` carries next, as the follower would read it.
+    async fn next_answer(rx: &mut tokio::sync::mpsc::Receiver<jig_pipeline::Envelope>) -> Answer {
+        let envelope = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("an answer")
+            .expect("the connection");
+        let jig_pipeline::Frame::Peer { kind, body } = envelope.frame else {
+            panic!("not a peer frame");
+        };
+        assert_eq!(kind, RELAY_RESULT_FRAME);
+        Answer::decode(&body).unwrap()
+    }
+
+    fn submit(request_id: u64) -> Vec<u8> {
+        Submit {
+            request_id,
+            channel_id: "bafkchannel".to_string(),
+            bundle: vec![0; 100],
+            sig: vec![0; 64],
+        }
+        .encode()
+    }
+
+    /// On the owner's side, a follower's relayed writes count against its
+    /// quota, and at most [`MAX_PEER_IN_FLIGHT`] are taken at once; past
+    /// either, the follower is answered at once, with when to try again.
+    #[tokio::test]
+    async fn an_owner_bounds_a_followers_relays_before_taking_them() {
+        let mut config = jig_config::v0_0_2_server::JigServerConfig::default();
+        config.federation.default_peer_quota.blocks_per_min = 2;
+        let state = crate::v0_0_2::AppState::for_test_with_config(config).unwrap();
+        let relay = relay_for(&state);
+        let follower = Did::from_ed25519_pubkey(&[7; 32]);
+        let (out, mut rx) = PeerSender::new(follower.clone());
+
+        // Within the quota: taken, and refused for the share it lacks.
+        for id in [1, 2] {
+            relay.on_submit(&follower, &submit(id), &out).unwrap();
+            assert_eq!(next_answer(&mut rx).await.code, "NOT_SHARED");
+        }
+        // Past it.
+        relay.on_submit(&follower, &submit(3), &out).unwrap();
+        let answer = next_answer(&mut rx).await;
+        assert_eq!(answer.request_id, 3);
+        assert_eq!(answer.code, "RELAY_RATE_LIMITED");
+        assert!(answer.retry_after_ms > 0, "{answer:?}");
+        // Another follower has its own quota.
+        let other = Did::from_ed25519_pubkey(&[8; 32]);
+        let (other_out, mut other_rx) = PeerSender::new(other.clone());
+        relay.on_submit(&other, &submit(4), &other_out).unwrap();
+        assert_eq!(next_answer(&mut other_rx).await.code, "NOT_SHARED");
+
+        // Every slot of `other` taken: refused busy, before any lookup.
+        let slots: Vec<_> = (0..MAX_PEER_IN_FLIGHT)
+            .map(|_| relay.take_slot(&other.to_did_jig_string()).unwrap())
+            .collect();
+        relay.on_submit(&other, &submit(5), &other_out).unwrap();
+        let answer = next_answer(&mut other_rx).await;
+        assert_eq!((answer.request_id, answer.code.as_str()), (5, "RELAY_BUSY"));
+        assert!(answer.retry_after_ms > 0, "{answer:?}");
+        drop(slots);
+        assert!(relay.take_slot(&other.to_did_jig_string()).is_some());
     }
 }

@@ -339,6 +339,7 @@ async fn handle_socket(
     let (notice_tx, mut notice_rx) = mpsc::unbounded_channel();
     let mut session = ConnState {
         tls_exporter,
+        ip,
         notice_tx: Some(notice_tx),
         ..ConnState::default()
     };
@@ -588,6 +589,9 @@ struct ConnState {
     /// made since.
     noticed: Option<u64>,
     did: Option<jig_core::did::Did>,
+    /// The address the connection came from, for the relay's per-client
+    /// cap when it authenticated as no DID.
+    ip: Option<std::net::IpAddr>,
     handshaken: bool,
     close: Option<(u16, &'static str)>,
     /// The TLS exporter value of this connection; empty over plaintext.
@@ -1126,7 +1130,11 @@ async fn handle_client_frame(
                 &code_bytes,
                 sig,
                 conn_id,
-                &format!("ws:{conn_id}"),
+                &crate::v0_0_2_relay::ws_caller(
+                    conn_id,
+                    session.did.as_ref().map(|d| d.as_str()),
+                    session.ip,
+                ),
                 session.tiers,
             )
             .await

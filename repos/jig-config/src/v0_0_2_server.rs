@@ -689,7 +689,8 @@ pub struct FederationSection {
     /// The quota for every peer without its own `quota`, published in the
     /// server manifest (JEP-0005 rule 16). Defaults to
     /// [`DEFAULT_PEER_BLOCKS_PER_MIN`] blocks and [`DEFAULT_PEER_BYTES_PER_MIN`]
-    /// bytes a minute.
+    /// bytes a minute. One budget per peer, over the blocks it streams to
+    /// this server and the writes it relays here.
     pub default_peer_quota: PeerQuotaConfig,
     /// The name suffixes this server attests, published in the server
     /// manifest.
