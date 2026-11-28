@@ -314,6 +314,12 @@ pub struct ChannelView {
     /// server (base64): what proves `sequencer` to a client.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub share: Option<String>,
+    /// The owner's key links that came with `share` (base64, oldest first),
+    /// when the owner changed its key after it created the channel: from the
+    /// DID the creation block names to the one that signed the offer
+    /// (JEP-0005 rule 7, D37).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub share_key_links: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -374,10 +380,13 @@ pub(crate) fn view_of(
     } else {
         jig_pipeline::effect::canonical_did_string(&c.sequencer_did)
     };
-    let share = if sequencer == local {
-        None
+    let (share, share_key_links) = if sequencer == local {
+        (None, Vec::new())
     } else {
-        followed_offer(&state.ingest_ctx.store, &c.id, &sequencer)?
+        match followed_offer(&state.ingest_ctx.store, &c.id, &sequencer)? {
+            Some((offer, links)) => (Some(offer), links),
+            None => (None, Vec::new()),
+        }
     };
     Ok(ChannelView {
         id: c.id,
@@ -390,16 +399,18 @@ pub(crate) fn view_of(
         join: c.tiering.join.map(|j| j.as_str().to_string()),
         sequencer,
         share,
+        share_key_links,
     })
 }
 
 /// The offer `owner` signed for `channel_id` that this server accepted
-/// (base64), live or since ended: it proves who orders the channel.
+/// (base64), live or since ended: it proves who orders the channel. With it,
+/// the key links kept with it (base64, oldest first), if any.
 fn followed_offer(
     store: &jig_pipeline::persist::SqliteStore,
     channel_id: &str,
     owner: &str,
-) -> jig_pipeline::persist::Result<Option<String>> {
+) -> jig_pipeline::persist::Result<Option<(String, Vec<String>)>> {
     use base64::Engine as _;
     use jig_pipeline::contracts::{OfferState, Side};
     for state in [OfferState::Accepted, OfferState::Ending, OfferState::Ended] {
@@ -408,9 +419,15 @@ fn followed_offer(
             .into_iter()
             .next()
         {
-            return Ok(Some(
+            let links = store
+                .offer_key_links(&kept.offer_id)?
+                .iter()
+                .map(|l| base64::engine::general_purpose::STANDARD.encode(l))
+                .collect();
+            return Ok(Some((
                 base64::engine::general_purpose::STANDARD.encode(&kept.offer),
-            ));
+                links,
+            )));
         }
     }
     Ok(None)

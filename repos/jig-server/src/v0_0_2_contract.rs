@@ -38,6 +38,7 @@
 //! ([`crate::v0_0_2_stream`], rules 12-14), on the same connection. The
 //! follower's relayed writes (rule 15) come in a later slice.
 
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -48,7 +49,7 @@ use jig_config::v0_0_2_server::{FederationPeer, FederationSection, OfferPolicy};
 use jig_core::block_kind::BlockKind;
 use jig_core::contract::{
     AttestedSuffix, ContractAccept, ContractEnd, ContractOffer, ContractRefuse, Grant, ManifestRef,
-    RefuseCode,
+    OwnerKeyLinks, RefuseCode,
 };
 use jig_core::did::Did;
 use jig_core::{Author, BlockBundle, BlockManifest};
@@ -69,6 +70,33 @@ pub const ANSWER_FRAME: &str = "contract-answer";
 /// Either side's end of a share, or the owner's withdrawal of an offer not
 /// yet answered: one signed `contract-end`.
 pub const END_FRAME: &str = "contract-end";
+/// The owner's key-link chain for the offer it sends next (JEP-0005 rule 7,
+/// D37): one [`OwnerKeyLinks`], from the DID the channel's creation block
+/// names to the offer's signer. Sent just before the `contract-offer` it is
+/// for, on the same connection, and only when the two DIDs differ. A server
+/// that does not know the frame ignores it and judges the offer as before.
+pub const KEY_LINKS_FRAME: &str = "owner-key-links";
+
+/// The most key-link chains the offered side holds, per sending peer, for
+/// offers that have not arrived yet. Each is sent just before its offer, so a
+/// few suffice; past this many, that peer's held ones are dropped and its
+/// offers judged without.
+const MAX_PENDING_KEY_LINKS: usize = 64;
+
+/// The most key-link chains held across every peer. A contract frame may come
+/// from a DID that is not a configured peer, so the per-peer bound alone would
+/// grow with the DIDs a sender mints. When full, an incoming chain is dropped,
+/// never another peer's: its offer is judged without it, and the owner's
+/// resend tries again.
+const MAX_PENDING_KEY_LINKS_TOTAL: usize = 1024;
+
+/// How long a chain is held for its offer. The owner sends it just before the
+/// offer, on the same connection, so a chain this old is not coming to use.
+const PENDING_KEY_LINKS_TTL: Duration = Duration::from_secs(60);
+
+/// Key-link chains held for offers to come, by the sending peer's DID and the
+/// `offer_id` each is for, with when each arrived.
+type PendingKeyLinks = HashMap<(String, [u8; 32]), (tokio::time::Instant, Vec<Vec<u8>>)>;
 
 /// How often the owner sends its unanswered offers again. A send fails while
 /// there is no connection to the peer, so an offer made then goes out
@@ -91,6 +119,13 @@ pub struct Contracts {
     /// The same [`Relay`] as `AppState::relay`, once [`handle`] has set it:
     /// one table of requests waiting on owners.
     relay: Arc<Relay>,
+    /// This server's own key links, oldest first, as its welcome serves them
+    /// (JEP-0012): what it sends beside an offer for a channel created under
+    /// an earlier DID of its own.
+    key_chain: Arc<Vec<Vec<u8>>>,
+    /// Key-link chains peers sent for offers still to come, by peer and
+    /// `offer_id`.
+    pending_key_links: Arc<std::sync::Mutex<PendingKeyLinks>>,
 }
 
 /// Run the contract on `state`'s server:
@@ -246,6 +281,15 @@ impl Contracts {
                     state.peers.clone(),
                 ))
             }),
+            key_chain: Arc::new(
+                state
+                    .prior_key_links
+                    .iter()
+                    .chain(&state.key_link)
+                    .cloned()
+                    .collect(),
+            ),
+            pending_key_links: Arc::default(),
         }
     }
 
@@ -329,7 +373,10 @@ impl Contracts {
             Ok(offers) => {
                 for offer in offers {
                     if self.may_offer(&offer.channel_id, &offer.peer_did) {
-                        self.send(&offer.peer_did, OFFER_FRAME, offer.offer);
+                        let links = ContractOffer::from_envelope(&offer.offer)
+                            .ok()
+                            .and_then(|o| self.key_links_for(&o));
+                        self.send_offer(&offer.peer_did, offer.offer, links);
                     }
                 }
             }
@@ -411,9 +458,53 @@ impl Contracts {
             share_cid: Some(share_cid.to_string()),
         })?;
         if self.may_offer(&channel.id, to) {
-            self.send(to, OFFER_FRAME, offer.envelope);
+            let links = self.key_links_for(&offer);
+            self.send_offer(to, offer.envelope, links);
         }
         Ok(())
+    }
+
+    /// Send an offer to `peer`, with the key-link chain it needs, if any,
+    /// just before it.
+    /// Both go on one connection, and the offer goes only if its chain was
+    /// queued: an offer that arrived without its chain would be refused.
+    fn send_offer(&self, peer: &str, offer: Vec<u8>, links: Option<OwnerKeyLinks>) {
+        let Ok(did) = Did::from_did_jig_string(peer) else {
+            return;
+        };
+        let Some(sender) = self.peers.sender_for(&did) else {
+            tracing::debug!(peer, "no live connection to the peer");
+            return;
+        };
+        if let Some(links) = links
+            && let Err(e) = sender.send(KEY_LINKS_FRAME, links.to_bytes())
+        {
+            tracing::info!(peer, "key links not sent, so the offer waits: {e}");
+            return;
+        }
+        if let Err(e) = sender.send(OFFER_FRAME, offer) {
+            tracing::info!(peer, kind = OFFER_FRAME, "contract frame not sent: {e}");
+        }
+    }
+
+    /// The links from the DID `offer`'s creation block names as the
+    /// channel's sequencer to this server's DID, which signs the offer:
+    /// `None` when they are the same DID, or this server serves no chain
+    /// from the named one (it then cannot prove it, and the offer is refused
+    /// as before).
+    fn key_links_for(&self, offer: &ContractOffer) -> Option<OwnerKeyLinks> {
+        let named = named_sequencer(&offer.creation_block)?;
+        if jig_pipeline::handshake::same_did(&named, &offer.owner) {
+            return None;
+        }
+        let from = self.key_chain.iter().position(|bytes| {
+            jig_core::key_link::SignedKeyLink::from_envelope(bytes)
+                .is_ok_and(|l| jig_pipeline::handshake::same_did(&l.link().old, &named))
+        })?;
+        Some(OwnerKeyLinks {
+            offer_id: offer.offer_id,
+            links: self.key_chain[from..].to_vec(),
+        })
     }
 
     /// Whether `channel`'s offer may go to `peer` now. A `shared` channel's
@@ -633,12 +724,28 @@ impl Contracts {
 
     /// Answer `offer` from `owner`, or hold it. An offer already kept is
     /// answered as it was before, if it has been.
-    fn on_offer(&self, offer: ContractOffer, out: &PeerSender) -> anyhow::Result<()> {
+    ///
+    /// `links` is the key-link chain the owner sent beside the offer, if it
+    /// sent one. It is kept with the offer when it leads from the DID the
+    /// creation block names to the offer's signer; one that does not is
+    /// dropped, and the offer is judged without it.
+    fn on_offer(
+        &self,
+        offer: ContractOffer,
+        links: Option<Vec<Vec<u8>>>,
+        out: &PeerSender,
+    ) -> anyhow::Result<()> {
         if let Some(kept) = self.store().get_contract_offer(&offer.offer_id)? {
             if let Some(answer) = kept.answer {
                 send_on(out, ANSWER_FRAME, answer);
             }
             return Ok(());
+        }
+        if let Some(links) = links.and_then(|links| proven_key_links(&offer, &links)) {
+            self.store().put_offer_key_links(&OwnerKeyLinks {
+                offer_id: offer.offer_id,
+                links,
+            })?;
         }
         self.store().put_contract_offer(&StoredOffer {
             offer_id: offer.offer_id,
@@ -691,8 +798,19 @@ impl Contracts {
         {
             return Err(RefuseCode::PolicyRefused);
         }
-        let terms = jig_pipeline::ingest::channel_terms(&manifest, &offer.owner)
-            .map_err(|_| RefuseCode::PolicyRefused)?;
+        // The named server, or the DID it moved to along the key links kept
+        // with the offer (#375): a link moves the sequencer role (JEP-0012).
+        let predecessors = self
+            .store()
+            .offer_key_links(&offer.offer_id)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|bytes| jig_core::key_link::SignedKeyLink::from_envelope(bytes).ok())
+            .map(|link| link.link().old.clone())
+            .collect::<Vec<_>>();
+        let terms =
+            jig_pipeline::ingest::channel_terms_from(&manifest, &offer.owner, &predecessors)
+                .map_err(|_| RefuseCode::PolicyRefused)?;
         if terms.sequencer != offer.owner {
             return Err(RefuseCode::PolicyRefused);
         }
@@ -909,9 +1027,32 @@ impl PeerFrames for Contracts {
                 if offer.to != self.me() {
                     return Err(violation("an offer made to another server"));
                 }
-                if let Err(e) = self.on_offer(offer, out) {
+                let links = self
+                    .pending_key_links
+                    .lock()
+                    .expect("poisoned")
+                    .remove(&(peer.clone(), offer.offer_id))
+                    .filter(|(at, _)| at.elapsed() < PENDING_KEY_LINKS_TTL)
+                    .map(|(_, links)| links);
+                if let Err(e) = self.on_offer(offer, links, out) {
                     tracing::warn!(peer, "contract offer not answered: {e:#}");
                 }
+            }
+            KEY_LINKS_FRAME => {
+                let chain = OwnerKeyLinks::from_bytes(body).map_err(violation)?;
+                let mut pending = self.pending_key_links.lock().expect("poisoned");
+                pending.retain(|_, (at, _)| at.elapsed() < PENDING_KEY_LINKS_TTL);
+                // Bounded per peer: one peer's chains never push out another's.
+                let held = pending.keys().filter(|(from, _)| *from == peer).count();
+                if held >= MAX_PENDING_KEY_LINKS {
+                    pending.retain(|(from, _), _| *from != peer);
+                }
+                let key = (peer.clone(), chain.offer_id);
+                if pending.len() >= MAX_PENDING_KEY_LINKS_TOTAL && !pending.contains_key(&key) {
+                    tracing::debug!(peer, "key-link chain dropped: too many held");
+                    return Ok(());
+                }
+                pending.insert(key, (tokio::time::Instant::now(), chain.links));
             }
             ANSWER_FRAME => {
                 let answer = match ContractAccept::from_envelope(body) {
@@ -1134,6 +1275,38 @@ fn b64(bytes: &[u8]) -> String {
 fn manifest_of(bundle_bytes: &[u8]) -> anyhow::Result<BlockManifest> {
     let (manifest_bytes, _code): (Vec<u8>, Vec<u8>) = serde_json::from_slice(bundle_bytes)?;
     Ok(serde_json::from_slice(&manifest_bytes)?)
+}
+
+/// The DID a creation block names as its channel's sequencer, canonical.
+fn named_sequencer(creation_block: &[u8]) -> Option<String> {
+    let (manifest, _) = creation_of(creation_block)?;
+    manifest
+        .metadata
+        .get(jig_pipeline::ingest::SEQUENCER_KEY)
+        .and_then(|v| v.as_str())
+        .map(jig_pipeline::effect::canonical_did_string)
+}
+
+/// `links` cut to the part that leads from the DID `offer`'s creation block
+/// names to the offer's signer (JEP-0012, as a welcome's chain is checked):
+/// `None` when they do not, or the block names its signer already.
+fn proven_key_links(offer: &ContractOffer, links: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
+    let named = named_sequencer(&offer.creation_block)?;
+    if jig_pipeline::handshake::same_did(&named, &offer.owner) {
+        return None;
+    }
+    let chain: Vec<String> = links.iter().map(|l| b64(l)).collect();
+    match jig_pipeline::handshake::chain_moves(&chain, &named, &offer.owner) {
+        Ok(kept) => Some(links[links.len() - kept.len()..].to_vec()),
+        Err(reason) => {
+            tracing::info!(
+                owner = %offer.owner,
+                channel = %offer.channel_id,
+                "an offer's key links do not lead from its channel's sequencer: {reason}"
+            );
+            None
+        }
+    }
 }
 
 /// A creation block as an offer carries it, and the CID it hashes to.
@@ -1925,6 +2098,263 @@ mod tests {
         );
     }
 
+    /// A public key link from `old` to `new` (JEP-0012), as a welcome serves
+    /// it.
+    fn public_link(old: &SigningKey, new: &SigningKey) -> Vec<u8> {
+        jig_core::key_link::SignedKeyLink::sign(
+            old,
+            new,
+            jig_core::key_link::Audience::Public,
+            1_700_000_000,
+        )
+        .unwrap()
+        .envelope()
+        .to_vec()
+    }
+
+    /// Send `contracts` the owner's key-link chain for an offer, as `owner`.
+    fn send_key_links(
+        contracts: &Contracts,
+        owner: &SigningKey,
+        chain: &OwnerKeyLinks,
+    ) -> Result<(), CloseReason> {
+        let (out, _rx) =
+            PeerSender::new(Did::from_ed25519_pubkey(owner.verifying_key().as_bytes()));
+        contracts.on_peer_frame(out.peer(), KEY_LINKS_FRAME, &chain.to_bytes(), &out)
+    }
+
+    /// #375: an owner that changed its key after it created a channel offers
+    /// it under its new DID. The creation block still names the old one, so
+    /// the offer is accepted only with the key links from that DID to the
+    /// offer's signer, sent just before it; they are kept with the offer.
+    #[tokio::test]
+    async fn an_offer_from_an_owner_that_changed_its_key_needs_the_links_from_the_named_did() {
+        let (old, between, new) = (
+            SigningKey::from_bytes(&[3; 32]),
+            SigningKey::from_bytes(&[4; 32]),
+            SigningKey::from_bytes(&[6; 32]),
+        );
+        let stranger = SigningKey::from_bytes(&[5; 32]);
+        let (follower, contracts) = follower_of(&new);
+        crate::v0_0_2_manifest_log::publish(&Arc::new(follower.clone()))
+            .await
+            .unwrap();
+        let store = &follower.ingest_ctx.store;
+        let offered = |v: u32| {
+            offer_to(
+                &follower,
+                &new,
+                creation(&old, serde_json::json!({ "v": v })),
+                &[],
+            )
+        };
+        let chain = |offer: &ContractOffer, links: Vec<Vec<u8>>| OwnerKeyLinks {
+            offer_id: offer.offer_id,
+            links,
+        };
+
+        // No links: the block names another server, as before.
+        let bare = offered(1);
+        assert_eq!(
+            answer_to(&contracts, &new, &bare).as_deref(),
+            Some("POLICY_REFUSED")
+        );
+
+        // Two hops from the named DID to the signer: accepted, and kept.
+        let linked = offered(2);
+        let hops = vec![public_link(&old, &between), public_link(&between, &new)];
+        send_key_links(&contracts, &new, &chain(&linked, hops.clone())).unwrap();
+        assert_eq!(answer_to(&contracts, &new, &linked), None);
+        assert_eq!(store.offer_key_links(&linked.offer_id).unwrap(), hops);
+        assert_eq!(
+            store
+                .owner_predecessors(&linked.channel_id.to_string(), &did_of(&new))
+                .unwrap(),
+            vec![did_of(&old), did_of(&between)]
+        );
+
+        // Links that leave another DID, or stop short of the signer, prove
+        // nothing: refused, and not kept.
+        for (v, links) in [
+            (3, vec![public_link(&stranger, &new)]),
+            (4, vec![public_link(&old, &between)]),
+        ] {
+            let offer = offered(v);
+            send_key_links(&contracts, &new, &chain(&offer, links)).unwrap();
+            assert_eq!(
+                answer_to(&contracts, &new, &offer).as_deref(),
+                Some("POLICY_REFUSED")
+            );
+            assert!(store.offer_key_links(&offer.offer_id).unwrap().is_empty());
+        }
+
+        // A chain sent for another offer is not this one's.
+        let (meant, sent) = (offered(7), offered(8));
+        send_key_links(
+            &contracts,
+            &new,
+            &chain(&meant, vec![public_link(&old, &new)]),
+        )
+        .unwrap();
+        assert_eq!(
+            answer_to(&contracts, &new, &sent).as_deref(),
+            Some("POLICY_REFUSED")
+        );
+
+        // A frame that is not a chain closes the connection.
+        let (out, _rx) = PeerSender::new(Did::from_ed25519_pubkey(new.verifying_key().as_bytes()));
+        assert!(
+            contracts
+                .on_peer_frame(out.peer(), KEY_LINKS_FRAME, b"not a chain", &out)
+                .is_err()
+        );
+    }
+
+    /// Held chains are bounded per peer: one peer that fills its share
+    /// drops only its own, never another peer's chain for an offer to come.
+    #[tokio::test]
+    async fn one_peer_filling_its_held_chains_keeps_another_peers() {
+        let state = state_with(vec![], &[]);
+        let contracts = Contracts::new(&state);
+        let (a, b) = (
+            SigningKey::from_bytes(&[3; 32]),
+            SigningKey::from_bytes(&[4; 32]),
+        );
+        let chain = |id: u8| OwnerKeyLinks {
+            offer_id: [id; 32],
+            links: vec![public_link(&a, &b)],
+        };
+        send_key_links(&contracts, &a, &chain(0)).unwrap();
+        for id in 1..=(MAX_PENDING_KEY_LINKS as u8 + 1) {
+            send_key_links(&contracts, &b, &chain(id)).unwrap();
+        }
+        let pending = contracts.pending_key_links.lock().unwrap();
+        assert!(pending.contains_key(&(did_of(&a), [0; 32])));
+        let held_for_b = pending
+            .keys()
+            .filter(|(from, _)| *from == did_of(&b))
+            .count();
+        assert!(held_for_b <= MAX_PENDING_KEY_LINKS, "{held_for_b}");
+    }
+
+    /// Chains from many DIDs never hold more than the total, and a full map
+    /// drops the incoming chain, not one already held.
+    #[tokio::test]
+    async fn chains_from_many_dids_stay_within_the_total() {
+        let state = state_with(vec![], &[]);
+        let contracts = Contracts::new(&state);
+        let first = SigningKey::from_bytes(&[3; 32]);
+        let chain = OwnerKeyLinks {
+            offer_id: [0; 32],
+            links: vec![public_link(&first, &SigningKey::from_bytes(&[4; 32]))],
+        };
+        send_key_links(&contracts, &first, &chain).unwrap();
+        for i in 0..(MAX_PENDING_KEY_LINKS_TOTAL + 8) as u32 {
+            let mut seed = [9; 32];
+            seed[..4].copy_from_slice(&i.to_le_bytes());
+            send_key_links(&contracts, &SigningKey::from_bytes(&seed), &chain).unwrap();
+        }
+        let pending = contracts.pending_key_links.lock().unwrap();
+        assert_eq!(pending.len(), MAX_PENDING_KEY_LINKS_TOTAL);
+        assert!(pending.contains_key(&(did_of(&first), [0; 32])));
+    }
+
+    /// A chain held longer than its time is not used for its offer, and is
+    /// swept when the next chain arrives.
+    #[tokio::test(start_paused = true)]
+    async fn a_chain_held_too_long_is_gone() {
+        let (old, new) = (
+            SigningKey::from_bytes(&[3; 32]),
+            SigningKey::from_bytes(&[6; 32]),
+        );
+        let (follower, contracts) = follower_of(&new);
+        crate::v0_0_2_manifest_log::publish(&Arc::new(follower.clone()))
+            .await
+            .unwrap();
+        let offered = |v: u32| {
+            offer_to(
+                &follower,
+                &new,
+                creation(&old, serde_json::json!({ "v": v })),
+                &[],
+            )
+        };
+        let chain = |offer: &ContractOffer| OwnerKeyLinks {
+            offer_id: offer.offer_id,
+            links: vec![public_link(&old, &new)],
+        };
+
+        // Its offer comes after the chain's time: judged without it.
+        let late = offered(1);
+        send_key_links(&contracts, &new, &chain(&late)).unwrap();
+        tokio::time::advance(PENDING_KEY_LINKS_TTL).await;
+        assert_eq!(
+            answer_to(&contracts, &new, &late).as_deref(),
+            Some("POLICY_REFUSED")
+        );
+
+        // A chain past its time is swept when the next arrives; a fresh
+        // chain still proves its offer.
+        let (stale, fresh) = (offered(2), offered(3));
+        send_key_links(&contracts, &new, &chain(&stale)).unwrap();
+        tokio::time::advance(PENDING_KEY_LINKS_TTL).await;
+        send_key_links(&contracts, &new, &chain(&fresh)).unwrap();
+        assert!(
+            !contracts
+                .pending_key_links
+                .lock()
+                .unwrap()
+                .contains_key(&(did_of(&new), stale.offer_id))
+        );
+        assert_eq!(answer_to(&contracts, &new, &fresh), None);
+    }
+
+    /// The owner sends the links from the DID a channel's creation block
+    /// names to its own, cut from the chain it serves: none when the block
+    /// names it already, or it serves none from the named DID.
+    #[test]
+    fn the_owner_sends_the_links_from_the_named_did_to_its_own() {
+        let (oldest, older) = (
+            SigningKey::from_bytes(&[3; 32]),
+            SigningKey::from_bytes(&[4; 32]),
+        );
+        let state = state_with(vec![], &[]);
+        let mut contracts = Contracts::new(&state);
+        let me = state.ingest_ctx.server_key.clone();
+        let served = vec![public_link(&oldest, &older), public_link(&older, &me)];
+        contracts.key_chain = Arc::new(served.clone());
+        let offer_naming = |named: &SigningKey| {
+            ContractOffer::sign(
+                &me,
+                "did:jig:zFollower",
+                creation(named, serde_json::json!({})).1,
+                Grant::Read,
+                creation(named, serde_json::json!({})).0,
+                b"head".to_vec(),
+                ManifestRef {
+                    cid: creation(named, serde_json::json!({})).1,
+                    seq: 0,
+                },
+                vec![],
+            )
+        };
+        let sent = |named: &SigningKey| {
+            let offer = offer_naming(named);
+            contracts.key_links_for(&offer).map(|chain| {
+                assert_eq!(chain.offer_id, offer.offer_id);
+                chain.links
+            })
+        };
+        assert_eq!(sent(&oldest), Some(served.clone()));
+        assert_eq!(sent(&older), Some(served[1..].to_vec()));
+        assert_eq!(sent(&me), None, "the block names this server");
+        assert_eq!(
+            sent(&SigningKey::from_bytes(&[9; 32])),
+            None,
+            "no link from it"
+        );
+    }
+
     /// A frame that is not the contract, or not the proven peer's, closes the
     /// connection.
     #[test]
@@ -2709,9 +3139,11 @@ mod tests {
             &view.sequencer,
             std::slice::from_ref(&follower),
             view.share.as_deref(),
+            &view.share_key_links,
         )
         .unwrap();
-        assert_eq!(proven, owner);
+        assert_eq!(proven.did, owner);
+        assert!(proven.links.is_empty());
 
         // The owner lists its own channel as its own, with nothing to prove.
         let row = p

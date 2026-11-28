@@ -34,6 +34,7 @@ pub const KP_DECISION_DOMAIN: &str = "jig-kp-decision-v1";
 /// Most requester DIDs one release policy may name.
 pub const MAX_RELEASE_TO: usize = 256;
 pub const LOCAL_ADDS_DOMAIN: &str = "jig-local-adds-v1";
+pub const OWNER_KEY_LINKS_DOMAIN: &str = "jig-owner-key-links-v1";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ContractError {
@@ -669,6 +670,71 @@ impl ContractEnd {
 
     pub fn verify(&self) -> Result<(), ContractError> {
         verify_envelope(&self.envelope, &self.payload(), &self.server)
+    }
+}
+
+/// The most key links an [`OwnerKeyLinks`] carries: as many as a server
+/// serves in its welcome, and a client follows (JEP-0012).
+pub const MAX_OWNER_KEY_LINKS: usize = 16;
+
+/// The owner's key-link chain for one offer (JEP-0005 rule 7, note D37):
+/// from the DID the channel's creation block names as its sequencer to the
+/// DID that signs the offer, when the owner has changed its key since the
+/// channel was created. It travels in its own peer frame beside the
+/// `contract-offer`, never inside it.
+///
+/// It is not signed. Each link is a COSE_Sign by both of its keys, and the
+/// chain's ends are fixed by things that are signed: the creation block's
+/// `sequencer` and the offer's `owner`. A receiver checks the chain against
+/// both before it relies on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerKeyLinks {
+    /// The offer the chain is for.
+    pub offer_id: [u8; 32],
+    /// The links as COSE_Sign bytes, oldest first, as a welcome serves them.
+    pub links: Vec<Vec<u8>>,
+}
+
+impl OwnerKeyLinks {
+    const WHAT: &'static str = "owner key-link chain";
+
+    /// The frame body: `{domain, offer_id, links}` in deterministic CBOR.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        encode(Value::text_map([
+            ("domain", Value::text(OWNER_KEY_LINKS_DOMAIN)),
+            ("offer_id", Value::Bytes(self.offer_id.to_vec())),
+            (
+                "links",
+                Value::Array(self.links.iter().cloned().map(Value::Bytes).collect()),
+            ),
+        ]))
+    }
+
+    /// Read a frame body. It must be exactly [`Self::to_bytes`] of what it
+    /// says: no other key, no other encoding. One to
+    /// [`MAX_OWNER_KEY_LINKS`] links; whether they verify is the caller's to
+    /// check, against the creation block and the offer.
+    pub fn from_bytes(body: &[u8]) -> Result<Self, ContractError> {
+        let p = dcbor::decode(body).map_err(|_| ContractError::BadPayload(Self::WHAT))?;
+        if text(&p, "domain", Self::WHAT)? != OWNER_KEY_LINKS_DOMAIN {
+            return Err(ContractError::BadPayload(Self::WHAT));
+        }
+        let links = array(&p, "links", Self::WHAT)?
+            .iter()
+            .map(|v| v.as_bytes().map(<[u8]>::to_vec))
+            .collect::<Option<Vec<_>>>()
+            .ok_or(ContractError::BadPayload(Self::WHAT))?;
+        if links.is_empty() || links.len() > MAX_OWNER_KEY_LINKS {
+            return Err(ContractError::BadPayload(Self::WHAT));
+        }
+        let read = Self {
+            offer_id: digest(&p, "offer_id", Self::WHAT)?,
+            links,
+        };
+        if read.to_bytes() != body {
+            return Err(ContractError::BadPayload(Self::WHAT));
+        }
+        Ok(read)
     }
 }
 
@@ -1745,6 +1811,115 @@ mod tests {
         println!(
             "{}",
             serde_json::to_string_pretty(&kp_request_vectors()).unwrap()
+        );
+    }
+
+    /// A two-hop chain: the creation block's sequencer (seed 1) moved to
+    /// seed 11, then to seed 12, which signs the offer.
+    fn owner_key_links() -> OwnerKeyLinks {
+        use crate::key_link::{Audience, SignedKeyLink};
+        let hop = |old: u8, new: u8, at: i64| {
+            SignedKeyLink::sign(&key(old), &key(new), Audience::Public, at)
+                .unwrap()
+                .envelope()
+                .to_vec()
+        };
+        OwnerKeyLinks {
+            offer_id: [7; 32],
+            links: vec![hop(1, 11, 1_700_000_000), hop(11, 12, 1_700_000_600)],
+        }
+    }
+
+    #[test]
+    fn an_owner_key_link_chain_round_trips() {
+        let chain = owner_key_links();
+        assert_eq!(OwnerKeyLinks::from_bytes(&chain.to_bytes()), Ok(chain));
+    }
+
+    #[test]
+    fn an_owner_key_link_chain_in_any_other_shape_is_refused() {
+        let chain = owner_key_links();
+        let refused = |body: Vec<u8>| {
+            assert_eq!(
+                OwnerKeyLinks::from_bytes(&body),
+                Err(ContractError::BadPayload("owner key-link chain"))
+            );
+        };
+        // No link, and more than a welcome serves.
+        refused(
+            OwnerKeyLinks {
+                links: vec![],
+                ..chain.clone()
+            }
+            .to_bytes(),
+        );
+        refused(
+            OwnerKeyLinks {
+                links: vec![chain.links[0].clone(); MAX_OWNER_KEY_LINKS + 1],
+                ..chain.clone()
+            }
+            .to_bytes(),
+        );
+        // Another domain, a short offer_id, a link that is not bytes, and a
+        // key the frame does not have.
+        let with = |entries: Vec<(&str, Value)>| encode(Value::text_map(entries));
+        let links = Value::Array(chain.links.iter().cloned().map(Value::Bytes).collect());
+        refused(with(vec![
+            ("domain", Value::text(END_DOMAIN)),
+            ("offer_id", Value::Bytes(vec![7; 32])),
+            ("links", links.clone()),
+        ]));
+        refused(with(vec![
+            ("domain", Value::text(OWNER_KEY_LINKS_DOMAIN)),
+            ("offer_id", Value::Bytes(vec![7; 31])),
+            ("links", links.clone()),
+        ]));
+        refused(with(vec![
+            ("domain", Value::text(OWNER_KEY_LINKS_DOMAIN)),
+            ("offer_id", Value::Bytes(vec![7; 32])),
+            ("links", Value::Array(vec![Value::text("a link")])),
+        ]));
+        refused(with(vec![
+            ("domain", Value::text(OWNER_KEY_LINKS_DOMAIN)),
+            ("offer_id", Value::Bytes(vec![7; 32])),
+            ("links", links),
+            ("signer", Value::text("anyone")),
+        ]));
+        refused(b"not cbor".to_vec());
+    }
+
+    fn owner_key_links_vectors() -> serde_json::Value {
+        let chain = owner_key_links();
+        serde_json::json!({
+            "comment": "A jig-owner-key-links-v1 peer frame body (JEP-0005 rule 7, note D37): the owner's key-link chain from the DID its channel's creation block names to the DID that signs the offer. body_hex is the deterministic CBOR body; it is not signed. Each link is a public JEP-0012 key link (COSE_Sign), oldest first.",
+            "keys": {
+                "comment": "Ed25519 seeds: every byte set to the given value",
+                "named": {"seed_byte": 1, "did": did_of(&key(1))},
+                "between": {"seed_byte": 11, "did": did_of(&key(11))},
+                "signer": {"seed_byte": 12, "did": did_of(&key(12))},
+            },
+            "offer_id_hex": hex::encode(chain.offer_id),
+            "links_hex": chain.links.iter().map(hex::encode).collect::<Vec<_>>(),
+            "body_hex": hex::encode(chain.to_bytes()),
+        })
+    }
+
+    #[test]
+    fn owner_key_link_bytes_match_the_committed_vectors() {
+        let v: serde_json::Value = serde_json::from_str(include_str!(
+            "../../jig-spec/jep/vectors/0005/owner-key-links.json"
+        ))
+        .unwrap();
+        assert_eq!(owner_key_links_vectors(), v);
+    }
+
+    /// `cargo test -p jig-core --features ed25519 contract::tests::print_owner_key_links_vectors -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn print_owner_key_links_vectors() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&owner_key_links_vectors()).unwrap()
         );
     }
 

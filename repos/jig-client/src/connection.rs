@@ -184,10 +184,12 @@ pub struct ConnectOptions {
     /// records as ([`crate::chain::ChannelChain::across`]).
     pub key_links: Vec<String>,
     /// The channels the server carries for their owners, by channel id, each
-    /// with the owner's DID as this device proved it
-    /// ([`crate::pins::prove_carried`]): their records are held to the owner,
-    /// not to the server. Every other channel is held to the server.
-    pub carried: HashMap<String, String>,
+    /// with the DIDs the owner signed its records as, in key-link order and
+    /// ending at the owner's DID, as this device proved them
+    /// ([`crate::pins::prove_carried`], [`crate::pins::Pins::carried_signers`]):
+    /// their records are held to the owner, not to the server. Every other
+    /// channel is held to the server.
+    pub carried: HashMap<String, Vec<String>>,
 }
 
 /// Per-channel delivery senders, keyed by channel slug.
@@ -660,7 +662,7 @@ impl Client {
                                 let chain =
                                     chains.entry(record.channel_id.clone()).or_insert_with(|| {
                                         let signers = match carried.get(&record.channel_id) {
-                                            Some(owner) => vec![owner.clone()],
+                                            Some(owner) => owner.clone(),
                                             None => sequencers.clone(),
                                         };
                                         crate::chain::ChannelChain::across(
@@ -2292,8 +2294,12 @@ mod tests {
         let (follower, owner) = (test_signing_key(), test_signing_key());
         let owner_did = jig_core::Did::from_ed25519_pubkey(owner.verifying_key().as_bytes())
             .to_did_jig_string();
-        let carried =
-            || HashMap::from([(crate::chain::label_cid("bafyCreate"), owner_did.clone())]);
+        let carried = || {
+            HashMap::from([(
+                crate::chain::label_cid("bafyCreate"),
+                vec![owner_did.clone()],
+            )])
+        };
         let blocks = bundles(3);
         let cids: Vec<&str> = blocks.iter().map(|(_, c)| c.as_str()).collect();
 
