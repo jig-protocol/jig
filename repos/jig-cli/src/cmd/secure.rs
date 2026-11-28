@@ -226,6 +226,16 @@ pub async fn connect_pinned(server: &str, identity: Identity) -> Result<Client> 
     Ok(client)
 }
 
+/// A key-package request a custodian holds for our decision (JEP-0005
+/// rule 21c), as it lists it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HeldRequest {
+    pub request_id_hex: String,
+    pub requester: String,
+    pub channel_id: String,
+    pub held_at: i64,
+}
+
 /// A reachability record as a server serves it.
 #[derive(Debug, Deserialize)]
 pub(crate) struct RecordBody {
@@ -1575,6 +1585,122 @@ impl Secure {
         Ok(deleted)
     }
 
+    /// Keep our release policy on this server (JEP-0005 rule 21b): it
+    /// releases our key packages to `release_to`, or to anyone with
+    /// `release_any`, and holds every other request for our decision. Its
+    /// `seq` is the clock, so a later policy from any device replaces it.
+    /// If the server keeps one at that `seq` or later (two runs in one
+    /// second, or a device whose clock is behind), it is signed once more
+    /// just past the kept one: the policy set last is the one that holds.
+    /// The `seq` kept.
+    pub async fn put_release_policy(
+        &self,
+        release_to: Vec<String>,
+        release_any: bool,
+    ) -> Result<u64> {
+        let server_did = self.server_did().await?;
+        let now = chrono::Utc::now().timestamp();
+        let mut seq = u64::try_from(now).unwrap_or(0);
+        let answer = self
+            .send_release_policy(&server_did, seq, now, &release_to, release_any)
+            .await?;
+        if answer.stored {
+            return Ok(answer.seq);
+        }
+        seq = answer.seq.saturating_add(1);
+        let answer = self
+            .send_release_policy(&server_did, seq, now, &release_to, release_any)
+            .await?;
+        if !answer.stored {
+            anyhow::bail!(
+                "{} kept a later policy (seq {}), not this one (seq {seq}): another device \
+                 set one meanwhile; run this again to replace it",
+                self.server,
+                answer.seq
+            );
+        }
+        Ok(answer.seq)
+    }
+
+    async fn send_release_policy(
+        &self,
+        server_did: &str,
+        seq: u64,
+        now: i64,
+        release_to: &[String],
+        release_any: bool,
+    ) -> Result<StoredPolicy> {
+        let policy = self.identity.sign_release_policy(
+            server_did,
+            seq,
+            now,
+            release_to.to_vec(),
+            release_any,
+        );
+        let url = format!("{}/api/v1/custody/{}/policy", self.base, policy.did);
+        let resp = crate::cmd::trust::http(&self.base, std::time::Duration::from_secs(15))
+            .await?
+            .put(&url)
+            .json(&serde_json::json!({"policy_b64": STANDARD.encode(&policy.envelope)}))
+            .send()
+            .await
+            .with_context(|| format!("PUT {url}"))?;
+        if !resp.status().is_success() {
+            return Err(Self::refusal(resp).await.into());
+        }
+        limits::json_capped(resp, limits::MAX_DOCUMENT_BYTES)
+            .await
+            .with_context(|| format!("reading {url}"))
+    }
+
+    /// The key-package requests this server holds for our decision
+    /// (JEP-0005 rule 21c), oldest first.
+    pub async fn held_requests(&self) -> Result<Vec<HeldRequest>> {
+        #[derive(Deserialize)]
+        struct Held {
+            held: Vec<HeldRequest>,
+        }
+        let did = self.session.did().to_string();
+        let held: Held = self
+            .get_json(&format!("/api/v1/custody/{did}/requests?state=held"))
+            .await?;
+        Ok(held.held)
+    }
+
+    /// Approve or refuse the request `request_id_hex` this server holds for
+    /// us (JEP-0005 rule 21c). An approval lets that requester's next request
+    /// for the same channel through, once, within a day.
+    pub async fn decide_held(&self, request_id_hex: &str, approve: bool) -> Result<()> {
+        let request_id: [u8; 32] = hex::decode(request_id_hex)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .with_context(|| format!("`{request_id_hex}` is not a request id (64 hex digits)"))?;
+        let server_did = self.server_did().await?;
+        let decision = self.identity.sign_kp_decision(
+            &server_did,
+            request_id,
+            approve,
+            chrono::Utc::now().timestamp(),
+        );
+        let url = format!(
+            "{}/api/v1/custody/{}/requests/{}/decision",
+            self.base,
+            decision.did,
+            hex::encode(request_id)
+        );
+        let resp = crate::cmd::trust::http(&self.base, std::time::Duration::from_secs(15))
+            .await?
+            .post(&url)
+            .json(&serde_json::json!({"decision_b64": STANDARD.encode(&decision.envelope)}))
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        if !resp.status().is_success() {
+            return Err(Self::refusal(resp).await.into());
+        }
+        Ok(())
+    }
+
     /// The references of every package this server released to a custody
     /// request, from our release log, every page. An entry from a server
     /// before rule 32 carries no `kind`: it is `local` when it names no
@@ -2699,6 +2825,14 @@ fn shadow_note(reference: &str, own: &ChannelInfo, carried: &ChannelInfo) -> Str
          Name it by its id to read it.",
         own.id, carried.id, carried.sequencer
     )
+}
+
+/// A custodian's answer to a release policy: whether it kept this one, and
+/// the `seq` it keeps.
+#[derive(Deserialize)]
+struct StoredPolicy {
+    stored: bool,
+    seq: u64,
 }
 
 #[cfg(test)]

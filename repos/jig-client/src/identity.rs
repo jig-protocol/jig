@@ -818,6 +818,45 @@ impl Identity {
         jig_core::contract::LocalAdds::sign(&self.signing, server, allow, seq)
     }
 
+    /// This DID's release policy for the custodian `custodian` (JEP-0005
+    /// rule 21b): release to `release_to`, or to anyone with `release_any`,
+    /// and hold every other request for this DID's decision.
+    pub fn sign_release_policy(
+        &self,
+        custodian: &str,
+        seq: u64,
+        issued_at: i64,
+        release_to: Vec<String>,
+        release_any: bool,
+    ) -> jig_core::contract::ReleasePolicy {
+        jig_core::contract::ReleasePolicy::sign(
+            &self.signing,
+            custodian,
+            seq,
+            issued_at,
+            release_to,
+            release_any,
+        )
+    }
+
+    /// This DID's decision on the request `request_id` its custodian
+    /// `custodian` holds (JEP-0005 rule 21c).
+    pub fn sign_kp_decision(
+        &self,
+        custodian: &str,
+        request_id: [u8; 32],
+        approve: bool,
+        issued_at: i64,
+    ) -> jig_core::contract::KpDecision {
+        jig_core::contract::KpDecision::sign(
+            &self.signing,
+            custodian,
+            request_id,
+            approve,
+            issued_at,
+        )
+    }
+
     /// The DID's own key as an MLS group member. The same key signs blocks
     /// and MLS messages — see `jig_mls::credential`. Crate-private so the
     /// seed never leaves this crate.

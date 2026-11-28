@@ -247,3 +247,61 @@ async fn a_member_who_opts_out_publishes_no_record_and_has_no_custodian() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("NO_CUSTODY"), "{stderr}");
 }
+
+/// A member's own release policy (JEP-0005 rules 21b, 21c): one naming no
+/// one holds another server's member's add until the member approves it;
+/// then the add goes through, once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_s_policy_holds_an_add_until_they_approve_it() {
+    let (a, b) = (
+        TestJigServer::start().await.unwrap(),
+        TestJigServer::start().await.unwrap(),
+    );
+    let member_home = tempfile::tempdir().unwrap();
+    let member = person(member_home.path(), &b);
+    let owner_home = tempfile::tempdir().unwrap();
+    let owner = person(owner_home.path(), &a);
+    let (on_b, _) = stock(&b, &member).await;
+    assert!(on_b > 0);
+
+    let set = ok(member_home.path(), &["server", "policy"]);
+    assert!(set.contains("holds every request"), "{set}");
+    // Set again at once, within the same second: the later one still holds.
+    let again = ok(member_home.path(), &["server", "policy"]);
+    assert!(again.contains("holds every request"), "{again}");
+    ok(owner_home.path(), &["channel", "create", "#sec"]);
+
+    // Held: refused, nothing released, nothing committed.
+    let out = run(
+        owner_home.path(),
+        &["channel", "add", "#sec", &member, "--via", &b.http_url()],
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("HELD"), "{stderr}");
+    assert_eq!(stock(&b, &member).await.0, on_b, "nothing released");
+
+    // The member sees who asked, and approves it.
+    let held = ok(member_home.path(), &["server", "held"]);
+    let line = held
+        .lines()
+        .find(|l| l.contains(&owner))
+        .unwrap_or_else(|| panic!("the owner's request is held: {held}"));
+    let id = line.split_whitespace().next().unwrap();
+    assert_eq!(id.len(), 64, "{line}");
+    ok(member_home.path(), &["server", "approve", id]);
+    assert!(
+        !ok(member_home.path(), &["server", "held"]).contains(&owner),
+        "decided requests are no longer held"
+    );
+
+    let added = ok(
+        owner_home.path(),
+        &["channel", "add", "#sec", &member, "--via", &b.http_url()],
+    );
+    assert!(
+        added.contains(&format!("added {member} to #sec")),
+        "{added}"
+    );
+    assert_eq!(stock(&b, &member).await.0, on_b - 1, "one package released");
+}
