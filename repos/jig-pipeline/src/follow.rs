@@ -319,6 +319,10 @@ fn upgrade_stop(r: &rusqlite::Row<'_>) -> rusqlite::Result<UpgradeStop> {
 /// How a landing attempt ended, inside its transaction.
 enum Landing {
     Landed,
+    /// Landed, and the block's `seen` shows the owner signed two histories:
+    /// that evidence was kept in the same transaction, which stops the
+    /// channel. The `seq` of the `seen`.
+    LandedForked(u64),
     Duplicate,
     Gap(Option<u64>),
     Fork,
@@ -498,12 +502,19 @@ impl SqliteStore {
     /// With `needs_upgrade`, the block is critical and of that kind, which
     /// this build does not implement: where it would land, the channel is
     /// stopped there instead, and the block is not stored.
+    ///
+    /// `seen` is the block's `seen` (JEP-0002 rule 10), verified already as
+    /// the owner's record of the channel. It is compared with the chain in
+    /// the same transaction the block lands in, and a contradiction is kept
+    /// with it: a landed block whose `seen` went unchecked would come again
+    /// as a duplicate, and never be checked.
     fn land_carried(
         &self,
         block: &StoredBlock,
         record: &IngestRecord,
         record_bytes: &[u8],
         needs_upgrade: Option<&str>,
+        seen: Option<&IngestRecord>,
         effect: impl FnOnce(&rusqlite::Connection) -> anyhow::Result<()>,
     ) -> crate::persist::Result<Landing> {
         let mut conn = self.conn.lock().expect("poisoned");
@@ -654,8 +665,25 @@ impl SqliteStore {
             "DELETE FROM carried_stalls WHERE channel_id = ?1",
             [channel_id],
         )?;
+        let forked = match seen {
+            Some(seen) => seen_fork(&tx, record, seen)?,
+            None => None,
+        };
+        if let Some(SeenFork { at, held, offered }) = &forked {
+            tx.execute(
+                "INSERT OR IGNORE INTO chain_evidence (channel_id, seq, held, offered, found_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    channel_id,
+                    *at as i64,
+                    held,
+                    offered,
+                    chrono::Utc::now().timestamp()
+                ],
+            )?;
+        }
         tx.commit()?;
-        Ok(Landing::Landed)
+        Ok(forked.map_or(Landing::Landed, |f| Landing::LandedForked(f.at)))
     }
 }
 
@@ -842,6 +870,10 @@ pub async fn ingest_sequenced(
         federated_from: Some(sequencer.to_string()),
     };
     let seq = record.seq;
+    // The block's `seen` (JEP-0002 rule 10), when it is the owner's record of
+    // this channel: its signature is checked here, before the store's lock,
+    // and it is compared with the chain as the block lands.
+    let seen = seen_of(&manifest, &record, sequencer);
     let effect = |conn: &rusqlite::Connection| {
         // A kind this build does not implement has no effect it could apply.
         if kind.known().is_some() {
@@ -855,10 +887,14 @@ pub async fn ingest_sequenced(
         }
         advance_mirror(conn, &channel_id, mls)
     };
-    match ctx
-        .store
-        .land_carried(&stored, &record, record_bytes, needs_upgrade, effect)?
-    {
+    let forked_at = match ctx.store.land_carried(
+        &stored,
+        &record,
+        record_bytes,
+        needs_upgrade,
+        seen.as_ref(),
+        effect,
+    )? {
         Landing::Duplicate => return Ok(Followed::Duplicate { block_cid, seq }),
         Landing::Gap(head) => {
             return Err(FollowError::Gap {
@@ -903,8 +939,9 @@ pub async fn ingest_sequenced(
             });
         }
         Landing::EffectFailed(e) => return Err(FollowError::Other(e)),
-        Landing::Landed => {}
-    }
+        Landing::Landed => None,
+        Landing::LandedForked(at) => Some(at),
+    };
     // A removed member still receives its own removal, as from the owner
     // (`ingest`): on an MLS channel it carries the commit that tells its
     // client the group is gone.
@@ -913,7 +950,82 @@ pub async fn ingest_sequenced(
         .flatten()
         .map(crate::effect::canonical_did_string);
     deliver(ctx, &stored, &channel_id, removed).await;
+    // The block's `seen` showed the owner signed two histories: the evidence
+    // was kept as it landed, and stops the channel, as a fork in the stream
+    // does. The block itself is the owner's, and was delivered: its readers
+    // check the same `seen` themselves.
+    if let Some(at) = forked_at {
+        tracing::warn!(
+            channel_id,
+            seq,
+            seen = at,
+            sequencer,
+            "a block's seen shows the owner's chain forked; the channel is stopped"
+        );
+        return Err(FollowError::Fork { channel_id, seq });
+    }
     Ok(Followed::Landed { block_cid, seq })
+}
+
+/// Two records a carried block's `seen` shows the owner signed as two
+/// histories, in their stored form, for the channel's evidence.
+struct SeenFork {
+    /// The `seq` of the `seen`.
+    at: u64,
+    held: Vec<u8>,
+    offered: Vec<u8>,
+}
+
+/// A carried block's `seen`, when it is `sequencer`'s record of the block's
+/// channel. One that is not is its author's word, and shows nothing.
+fn seen_of(
+    manifest: &jig_core::BlockManifest,
+    record: &IngestRecord,
+    sequencer: &str,
+) -> Option<IngestRecord> {
+    let Some(Ok(seen)) = crate::ingest_record::read_seen(manifest) else {
+        return None;
+    };
+    (seen.channel_id == record.channel_id && seen.verify(sequencer).is_ok()).then_some(seen)
+}
+
+/// What `seen`, the owner's record, shows against the chain held on `conn`
+/// once `record` has landed: every record before it is held, since records
+/// land in order. `None` when it agrees, or names a `seq` not held.
+///
+/// - `seen` at or after the block's own record: the owner placed the block
+///   before a record its author had already verified. `held` is the block's
+///   record, `offered` the `seen`.
+/// - `seen` before it, other than the record held at that `seq`: two records
+///   the owner signed for one `seq`.
+fn seen_fork(
+    conn: &rusqlite::Connection,
+    record: &IngestRecord,
+    seen: &IngestRecord,
+) -> crate::persist::Result<Option<SeenFork>> {
+    if seen.seq >= record.seq {
+        return Ok(Some(SeenFork {
+            at: seen.seq,
+            held: record.encode(),
+            offered: seen.encode(),
+        }));
+    }
+    let held: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT record FROM chain_records WHERE channel_id = ?1 AND seq = ?2",
+            params![record.channel_id, seen.seq as i64],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(held) = held else {
+        return Ok(None);
+    };
+    let same = IngestRecord::decode(&held).is_ok_and(|h| h.cose == seen.cose);
+    Ok((!same).then(|| SeenFork {
+        at: seen.seq,
+        held,
+        offered: seen.encode(),
+    }))
 }
 
 /// Read a carried block's manifest: of a kind this build implements, or, as
@@ -1741,6 +1853,78 @@ mod tests {
             take(&fresh, &owner, &owner.sent[1]).await,
             Err(FollowError::NotCarried { .. })
         ));
+    }
+
+    /// JEP-0002 rule 10 (F2 Task 5): a carried block's `seen` is held to the
+    /// chain the follower holds. One that agrees lands. One that names
+    /// another record at a held `seq`, or that the block was placed at or
+    /// before, is the owner signing two histories: kept as the channel's
+    /// evidence, which stops it. One that is not the owner's record proves
+    /// nothing.
+    #[tokio::test]
+    async fn a_carried_blocks_seen_is_held_to_the_followers_chain() {
+        let posted = |seen: &IngestRecord, body: &str| {
+            serde_json::json!({
+                "channel_id": "",
+                "body": body,
+                crate::ingest_record::SEEN_KEY: crate::ingest_record::seen_value(seen).unwrap(),
+            })
+        };
+        let record_of = |sent: &Sent| IngestRecord::decode(&sent.record).unwrap();
+        let sign = |owner: &Owner, key: &SigningKey, seq: u64, block: &str| {
+            crate::ingest_record::RecordSigner {
+                channel_id: owner.channel.clone(),
+                key,
+                ingest_wall_ms: 1,
+                ingest_logical: 0,
+            }
+            .sign(seq, &crate::ingest_record::label_cid(block), [3; 32])
+            .unwrap()
+        };
+        for case in ["agrees", "forged", "forked", "reordered"] {
+            let mut owner = Owner::new().await;
+            let follower = owner.follower();
+            let create = record_of(&owner.sent[0]);
+            let seen = match case {
+                "agrees" => create.clone(),
+                "forged" => sign(&owner, &SigningKey::from_bytes(&rand::random()), 0, "x"),
+                "forked" => sign(&owner, &owner.ctx.server_key.clone(), 0, "other"),
+                _ => sign(&owner, &owner.ctx.server_key.clone(), 5, "later"),
+            };
+            let mut meta = posted(&seen, case);
+            meta["channel_id"] = serde_json::json!(owner.channel);
+            owner.post(BlockKind::TextRender, meta).await;
+            take(&follower, &owner, &owner.sent[0]).await.unwrap();
+            let got = take(&follower, &owner, &owner.sent[1]).await;
+            let evidence = follower.store.chain_evidence(&owner.channel).unwrap();
+            match case {
+                "agrees" | "forged" => {
+                    assert!(
+                        matches!(got, Ok(Followed::Landed { seq: 1, .. })),
+                        "{case}: {got:?}"
+                    );
+                    assert!(evidence.is_empty(), "{case}");
+                }
+                _ => {
+                    assert!(
+                        matches!(got, Err(FollowError::Fork { seq: 1, .. })),
+                        "{case}: {got:?}"
+                    );
+                    assert_eq!(evidence.len(), 1, "{case}");
+                    assert_eq!(IngestRecord::decode(&evidence[0].offered).unwrap(), seen);
+                    // The evidence landed with the block: the same block
+                    // again is the stopped channel's, never a duplicate that
+                    // skips its `seen`.
+                    assert!(
+                        matches!(
+                            take(&follower, &owner, &owner.sent[1]).await,
+                            Err(FollowError::Stopped { .. })
+                        ),
+                        "{case}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
