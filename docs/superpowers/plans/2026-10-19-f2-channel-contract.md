@@ -457,13 +457,58 @@ plus the server's `/.well-known/jig` naming that DID).
 
 ### Task 9: The contract half of a sequencer move
 
-- [ ] The new sequencer's `contract-accept` names fresh bot DIDs and carries a
-  `policy-approval` for the current `channel-policy` and for every live `block-install`
-  (rule 11b).
+Built by lane F2-B together with L7's slice 10 (design sent to the orchestrator 2026-11-25,
+decisions below). It ships as these drafts, none merged before the `v0.2.0` tag:
+
+1. **Spec.** JEP-0005 rules 7b, 8 and 11a made exact, and JEP-0002 hello `block_kinds`.
+2. **#375.** The owner's key-link chain beside an offer (D37): #497.
+3. **`jig_core`.** `sequencer-set` and `key-link` metadata, and the move accept: #498.
+   Item 4 is #506.
+4. **Pipeline, the reader side:**
+   - the schedule (`expected_sequencer(channel, seq)`, the one lookup F2-C calls);
+   - setting aside the old sequencer's records past the cited head;
+   - refusing the old sequencer after the move;
+   - gating clients whose hello lacks the kind.
+5. **Pipeline, both sequencers:**
+   - the owner route that issues the move accept;
+   - the new sequencer's takeover and re-offers;
+   - the old sequencer's `SEQUENCER_MOVED`.
+6. **Client.** The schedule in `chain.rs`, `connection.rs` and `pins.rs`, and `prove_carried`
+   by the chain's current sequencer.
+7. **`key-link`.** Roles and membership from its `seq`, the creator rule across it, and the
+   MLS leaf swap.
+8. **`policy-approval`s (rule 11b).** Blocked on lane C: no `channel-policy`, `block-install`
+   or `policy-approval` exists yet. Until then the move accept's `policy_approvals` is empty,
+   and a moved channel has no policy.
+
+- [ ] The new sequencer's move accept, carried in the `sequencer-set`, names fresh bot DIDs
+  and carries a `policy-approval` for the current `channel-policy` and for every live
+  `block-install` (rule 11b). (Approvals: item 8.)
 - [ ] A `key-link` block moves roles and membership from its `seq` onward (rule 7b).
 - [ ] Test: once a `sequencer-set` is in force, an approval-less policy reads as absent. A
   `key-link` scoped to another channel moves nothing.
 - [ ] Commit `feat(federation): sequencer move approvals and key-link roles (JEP-0005 rules 7b, 11a, 11b)`.
+
+**Decisions for the move:**
+- Orchestrator 2026-11-26:
+  - the move accept lives inside the `sequencer-set`, so a move works when the old
+    sequencer is down;
+  - `policy_approvals` is present only on a move accept;
+  - a follower holding the old sequencer's records past the cited head stops the channel
+    as for a fork, until it can rebuild the carried state (#507); a follower behind the
+    cited head catches up from the new sequencer, a configured peer;
+  - a `key-link` to a DID that already holds standing in the channel is refused;
+  - the #375 frame uses the welcome's link-list format;
+  - the set's `seen` is the cited head's record;
+  - a client is served a channel up to the first block of a critical kind, added after
+    `v0.2.0`, that it does not declare (hello `block_kinds`, or `jig-capabilities` on a
+    request).
+- DJ 2026-11-26:
+  - `jig channel move` refuses while the old sequencer is reachable and its welcome does
+    not list `sequencer-set`, unless given `--old-sequencer-unreachable`. The release
+    notes say that `v0.2.0` followers stall without notice on a moved channel.
+  - A follower auto-accepts a re-offer from a configured peer when it grants the same or
+    less, and holds a wider one (revises decision 2 below).
 
 ---
 
@@ -523,6 +568,9 @@ plus the server's `/.well-known/jig` naming that DID).
    match.
 2. **A follower holds every incoming offer for its operator by default.** It auto-accepts only
    from peers explicitly configured to auto-accept (Task 4).
+   - *Revised (DJ 2026-11-26):* a re-offer after a sequencer move (rule 11a) is accepted
+     automatically when it comes from a configured peer and grants the same as before, or
+     less, for a channel the follower already carries. A wider grant is held as before.
 3. ~~**Caps on writes queued while a sequencer is down** (Task 10), configured per server:
    per channel 1000 blocks or 10 MiB; per server 100 MiB.~~ **Retired as moot (DJ,
    2026-11-26):** relayed writes are never queued. They are bounded while in flight instead
